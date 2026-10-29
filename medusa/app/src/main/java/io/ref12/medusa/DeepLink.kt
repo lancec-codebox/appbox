@@ -3,7 +3,7 @@ package io.ref12.medusa
 import java.io.ByteArrayOutputStream
 import java.util.UUID
 
-data class JobRequest(val id: String, val url: String, val returnUrl: String?)
+data class JobRequest(val id: String, val url: String, val returnUrl: String?, val languages: List<String>? = null)
 
 object DeepLink {
     private val ID_OK = Regex("[A-Za-z0-9_-]{1,64}")
@@ -27,7 +27,8 @@ object DeepLink {
         if (!isHttp(url)) return null
         val job = params["job"]?.takeIf { ID_OK.matches(it) } ?: newId()
         val ret = params["return"]?.trim()?.takeIf { isHttp(it) }
-        return JobRequest(job, url, ret)
+        val langs = params["languages"]?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() }
+        return JobRequest(job, url, ret, langs)
     }
 
     /** The return URL with job and state appended: to the query, or after a "?" inside the hash. */

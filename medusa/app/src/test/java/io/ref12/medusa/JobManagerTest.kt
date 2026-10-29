@@ -135,4 +135,94 @@ class JobManagerTest {
         assertNull(m.info("nope"))
         assertNull(m.info("../etc"))
     }
+
+    // ---- v1.2: tracks and on-demand subtitles ----
+
+    private val tracks = listOf(TrackInfo("en", "captions", "English"), TrackInfo("fr", "auto-captions"))
+    private val enLines = listOf(Line(1.0, 2.0, "hello"))
+    private val frLines = listOf(Line(1.0, 2.0, "bonjour"))
+    private var trackFetches = 0
+    private var languagesSeen: List<String>? = null
+
+    private fun trackManager(): JobManager {
+        val root = tmp.root
+        val fetcher = object : MediaFetcher {
+            override fun fetch(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): CaptureOutcome {
+                languagesSeen = req.languages
+                return CaptureOutcome("T", 10, "youtube", "v", SubtitlesData("captions", "en", enLines), null, null, null, tracks)
+            }
+            override fun fetchTrack(url: String, language: String, workDir: File): SubtitlesData {
+                trackFetches++
+                if (language == "fr") return SubtitlesData("auto-captions", "fr", frLines)
+                throw FetchException("No captions in $language", Codes.NO_CAPTIONS)
+            }
+        }
+        return JobManager(Storage(root) { now }, MediaStore(root) { now }, fetcher, deferred) { now }
+    }
+
+    @Test fun job_without_languages_asks_for_the_original_and_the_item_lists_tracks() {
+        val m = trackManager()
+        val id = m.submit(JobSubmit("j", "https://y/x", null, Want(true, false))); runQueued()
+        assertEquals(emptyList<String>(), languagesSeen)
+        val j = org.json.JSONObject(m.resultJson(id)!!)
+        val t = j.getJSONArray("tracks")
+        assertEquals(2, t.length())
+        assertEquals("English", t.getJSONObject(0).getString("name"))
+        assertEquals("auto-captions", t.getJSONObject(1).getString("source"))
+        assertFalse(t.getJSONObject(1).has("name"))
+        assertEquals("en", j.getJSONObject("subtitles").getString("language"))
+    }
+
+    @Test fun v11_job_with_zh_languages_gets_the_same_result_shape() {
+        val m = trackManager()
+        val id = m.submit(JobSubmit("j", "https://y/x", listOf("zh-Hans", "zh"), Want(true, false))); runQueued()
+        assertEquals(listOf("zh-Hans", "zh"), languagesSeen)
+        val j = org.json.JSONObject(m.resultJson(id)!!)
+        for (k in listOf("mediaId", "url", "title", "durationSec", "extractor", "videoId", "video", "subtitles", "tracks", "sync")) assertTrue(k, j.has(k))
+    }
+
+    @Test fun other_track_is_downloaded_once_and_the_main_track_is_unchanged() {
+        val m = trackManager()
+        m.submit(JobSubmit("j", "https://y/x", null, Want(true, false))); runQueued()
+        val mid = m.media.idFor("https://y/x")
+        assertEquals("bonjour", m.subtitlesFor(mid, "fr")!!.lines[0].text)
+        assertEquals("bonjour", m.subtitlesFor(mid, "fr")!!.lines[0].text)
+        assertEquals(1, trackFetches)
+        assertEquals("en", m.media.get(mid)!!.subtitles!!.language)
+        assertEquals("hello", m.subtitlesFor(mid, "en")!!.lines[0].text) // main track: no download
+        assertEquals(1, trackFetches)
+        assertNull(m.subtitlesFor("nope", "fr"))
+    }
+
+    @Test fun unknown_track_fails_with_no_captions_naming_what_exists() {
+        val m = trackManager()
+        m.submit(JobSubmit("j", "https://y/x", null, Want(true, false))); runQueued()
+        val e = try { m.subtitlesFor(m.media.idFor("https://y/x"), "ko"); null } catch (e: FetchException) { e }!!
+        assertEquals(Codes.NO_CAPTIONS, e.code)
+        assertEquals("No captions in ko (available: en, fr)", e.message)
+    }
+
+    @Test fun changing_the_main_track_keeps_sync_and_tracks() {
+        val m = trackManager()
+        m.submit(JobSubmit("j", "https://y/x", null, Want(true, false))); runQueued()
+        val mid = m.media.idFor("https://y/x")
+        m.media.putSync(mid, listOf(Anchor(5.0, 0.5)))
+        val updated = m.setMainTrack(mid, "fr")!!
+        assertEquals("fr", updated.subtitles!!.language)
+        assertEquals("bonjour", m.media.get(mid)!!.subtitles!!.lines[0].text)
+        assertEquals(tracks, m.media.get(mid)!!.tracks)
+        assertEquals(listOf(Anchor(5.0, 0.5)), m.media.sync(mid)) // per item, not per track
+        assertNull(m.setMainTrack("nope", "fr"))
+    }
+
+    @Test fun captured_item_with_other_language_is_fetched_again_when_a_language_is_requested() {
+        val m = trackManager()
+        m.submit(JobSubmit("a", "https://y/x", null, Want(true, false))); runQueued()
+        m.submit(JobSubmit("b", "https://y/x", listOf("en"), Want(true, false)))
+        assertEquals(JobState.DONE, m.info("b")!!.state) // en is already the main track
+        assertEquals(emptyList<String>(), languagesSeen)
+        m.submit(JobSubmit("c", "https://y/x", listOf("de"), Want(true, false)))
+        assertEquals(JobState.QUEUED, m.info("c")!!.state)
+    }
 }
+

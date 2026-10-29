@@ -62,6 +62,9 @@ class HelperService : Service() {
             override fun videoFile(mediaId: String) = app.media.videoFile(mediaId)?.let { it to (app.media.get(mediaId)?.video?.contentType ?: "video/mp4") }
             override fun sync(mediaId: String) = if (app.media.get(mediaId) == null) null else app.media.sync(mediaId)
             override fun putSync(mediaId: String, anchors: List<Anchor>) = app.media.putSync(mediaId, anchors)
+            override fun subtitles(mediaId: String, language: String) = app.jobs.subtitlesFor(mediaId, language)
+            override fun setSubtitles(mediaId: String, language: String) =
+                app.jobs.setMainTrack(mediaId, language)?.let { MediaJson.item(it, app.media.sync(mediaId)).toString() }
             override fun touch() { lastRequest = System.currentTimeMillis() }
         }
         val s = HelperServer(Router(api) { app.settings.origins })

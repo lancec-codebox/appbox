@@ -19,16 +19,20 @@ object MediaJson {
             JSONObject().put("path", "/v1/media/${m.mediaId}/video").put("contentType", it.contentType).put("bytes", it.bytes)
                 .also { o -> if (forStorage) o.put("file", it.file) }
         } ?: JSONObject.NULL)
-        put("subtitles", m.subtitles?.let { s ->
-            JSONObject().put("source", s.source).put("language", s.language).also { o ->
-                if (withLines) o.put("lines", JSONArray().also { arr ->
-                    for (l in s.lines) arr.put(JSONObject().put("start", SyncMath.round3(l.start)).put("end", SyncMath.round3(l.end)).put("text", l.text))
-                })
-            }
-        } ?: JSONObject.NULL)
+        put("subtitles", m.subtitles?.let { subtitlesJson(it, withLines) } ?: JSONObject.NULL)
+        put("tracks", JSONArray().also { arr ->
+            for (t in m.tracks) arr.put(JSONObject().put("language", t.language).put("source", t.source).also { o -> t.name?.let { o.put("name", it) } })
+        })
         put("sync", anchorsJson(sync))
         if (forStorage) put("createdAt", m.createdAt)
     }
+
+    fun subtitlesJson(s: SubtitlesData, withLines: Boolean = true): JSONObject =
+        JSONObject().put("source", s.source).put("language", s.language).also { o ->
+            if (withLines) o.put("lines", JSONArray().also { arr ->
+                for (l in s.lines) arr.put(JSONObject().put("start", SyncMath.round3(l.start)).put("end", SyncMath.round3(l.end)).put("text", l.text))
+            })
+        }
 
     fun anchorsJson(a: List<Anchor>) = JSONArray().also { arr ->
         for (x in a) arr.put(JSONObject().put("at", x.at).put("offset", x.offset))
@@ -62,6 +66,7 @@ object MediaJson {
             },
             v?.let { VideoData(it.getString("file"), it.getString("contentType"), it.getLong("bytes")) },
             j.optLong("createdAt"),
+            j.optJSONArray("tracks")?.let { a -> (0 until a.length()).map { i -> a.getJSONObject(i).let { t -> TrackInfo(t.getString("language"), t.getString("source"), t.optString("name", "").ifEmpty { null }) } } } ?: emptyList(),
         )
     }
 }
@@ -100,6 +105,25 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
         val target = File(dir(id), "video." + source.extension.ifEmpty { "mp4" })
         if (!source.renameTo(target)) { source.copyTo(target, overwrite = true); source.delete() }
         return VideoData(target.name, contentType, target.length())
+    }
+
+    private fun trackFile(id: String, language: String) = File(dir(id), "sub-" + language.replace(Regex("[^A-Za-z0-9_-]"), "_") + ".json")
+
+    /** Lines of a non-main track fetched on demand (kept so it is downloaded once). */
+    fun loadTrack(id: String, language: String): SubtitlesData? {
+        val f = trackFile(id, language)
+        return try {
+            if (!f.isFile) null else JSONObject(f.readText()).let { j ->
+                val arr = j.getJSONArray("lines")
+                SubtitlesData(j.getString("source"), j.getString("language"),
+                    (0 until arr.length()).map { i -> arr.getJSONObject(i).let { l -> Line(l.getDouble("start"), l.getDouble("end"), l.getString("text")) } })
+            }
+        } catch (e: Exception) { null }
+    }
+
+    fun saveTrack(id: String, s: SubtitlesData) {
+        dir(id).mkdirs()
+        trackFile(id, s.language).writeText(MediaJson.subtitlesJson(s).toString())
     }
 
     fun videoFile(id: String): File? {

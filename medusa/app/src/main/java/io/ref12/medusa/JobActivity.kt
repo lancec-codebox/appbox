@@ -63,7 +63,7 @@ class JobActivity : Activity() {
             if (req == null) { status.text = "This link is not a valid Medusa link."; jobId = null; return }
             askNotificationPermission()
             HelperService.start(this)
-            jobId = app.jobs.submit(JobSubmit(req.id, req.url, null, Want.DEFAULT, Quality.P720, req.returnUrl))
+            jobId = app.jobs.submit(JobSubmit(req.id, req.url, req.languages ?: app.settings.defaultLanguages, Want.DEFAULT, Quality.P720, req.returnUrl))
         } else {
             jobId = intent.getStringExtra(EXTRA_JOB)
         }

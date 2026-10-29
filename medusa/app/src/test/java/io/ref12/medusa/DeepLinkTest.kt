@@ -38,4 +38,11 @@ class DeepLinkTest {
         assertEquals("https://x.y/app/#/media?job=j1&state=done", DeepLink.buildReturnUrl("https://x.y/app/#/media", "j1", "done"))
         assertEquals("https://x.y/#/m?k=v&job=j1&state=done", DeepLink.buildReturnUrl("https://x.y/#/m?k=v", "j1", "done"))
     }
+
+    @Test fun languages_are_an_optional_comma_list() {
+        assertNull(DeepLink.parse("medusa://open?url=https%3A%2F%2Fa.b")!!.languages)
+        assertEquals(listOf("en", "zh-Hans"), DeepLink.parse("medusa://open?url=https%3A%2F%2Fa.b&languages=en%2C%20zh-Hans")!!.languages)
+        assertNull(DeepLink.parse("medusa://open?url=https%3A%2F%2Fa.b&languages=")!!.languages)
+    }
 }
+

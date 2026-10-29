@@ -25,6 +25,10 @@ class MainActivity : Activity() {
     private lateinit var updateBtn: Button
     private lateinit var originsEdit: EditText
     private lateinit var linkEdit: EditText
+    private lateinit var langSpinner: android.widget.Spinner
+    private lateinit var defaultLangEdit: EditText
+    /** Spinner entries: label to (null = no subtitles, "" = original, else a language code). */
+    private var langChoices: List<Pair<String, String?>> = listOf("Original language" to "", "None" to null)
     private lateinit var recentBox: LinearLayout
     private val ui = Handler(Looper.getMainLooper())
     private val poll = object : Runnable {
@@ -57,9 +61,21 @@ class MainActivity : Activity() {
         })
 
         add(Button(this).apply { text = "Library"; setOnClickListener { startActivity(Intent(this@MainActivity, LibraryActivity::class.java)) } })
+        add(label("Default subtitle language (blank = original)"))
+        defaultLangEdit = EditText(this).apply { hint = "Original, or a code like en, zh-Hans"; setText(app.settings.defaultLanguage) }
+        add(defaultLangEdit)
+        add(Button(this).apply {
+            text = "Save default language"
+            setOnClickListener { app.settings.defaultLanguage = defaultLangEdit.text.toString(); setChoices(emptyList()) }
+        })
         add(label("Try a link"))
         linkEdit = EditText(this).apply { hint = "Paste a media link"; inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_CLASS_TEXT }
         add(linkEdit)
+        langSpinner = android.widget.Spinner(this)
+        setChoices(emptyList())
+        add(label("Subtitles"))
+        add(langSpinner)
+        add(Button(this).apply { text = "List this video's languages"; setOnClickListener { listLanguages(this) } })
         add(Button(this).apply { text = "Capture"; setOnClickListener { fetch() } })
 
         add(label("Recent jobs"))
@@ -75,8 +91,34 @@ class MainActivity : Activity() {
         val url = linkEdit.text.toString().trim()
         if (!DeepLink.isHttp(url)) { linkEdit.error = "Needs an http(s) link"; return }
         HelperService.start(this)
-        val id = app.jobs.submit(JobSubmit(null, url, null))
+        val choice = langChoices.getOrNull(langSpinner.selectedItemPosition)?.second
+        val want = if (choice == null) Want(subtitles = false, video = true) else Want.DEFAULT
+        val langs = if (choice.isNullOrEmpty()) app.settings.defaultLanguages.takeIf { choice == "" } ?: emptyList() else listOf(choice)
+        val id = app.jobs.submit(JobSubmit(null, url, langs, want))
         startActivity(Intent(this, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, id))
+    }
+
+    private fun setChoices(tracks: List<TrackInfo>) {
+        val def = app.settings.defaultLanguage
+        langChoices = listOf((if (def.isEmpty()) "Original language" else "Default ($def)") to "", "None" to null) +
+            tracks.map { (it.name ?: it.language) + " (" + it.language + ", " + (if (it.source == "captions") "captions" else "auto") + ")" to it.language }
+        langSpinner.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, langChoices.map { it.first })
+    }
+
+    private fun listLanguages(btn: Button) {
+        val url = linkEdit.text.toString().trim()
+        if (!DeepLink.isHttp(url)) { linkEdit.error = "Needs an http(s) link"; return }
+        btn.isEnabled = false
+        Thread {
+            val res = try { app.fetcher.listTracks(url) } catch (e: Exception) { null to (e.message ?: "failed") }
+            runOnUiThread {
+                btn.isEnabled = true
+                if (res is List<*>) {
+                    @Suppress("UNCHECKED_CAST") setChoices(res as List<TrackInfo>)
+                    if (res.isEmpty()) android.widget.Toast.makeText(this, "This video offers no subtitles", android.widget.Toast.LENGTH_LONG).show()
+                } else android.widget.Toast.makeText(this, (res as Pair<*, *>).second.toString(), android.widget.Toast.LENGTH_LONG).show()
+            }
+        }.start()
     }
 
     private fun updateNow() {

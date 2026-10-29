@@ -30,7 +30,23 @@ class RouterTest {
         override fun videoFile(mediaId: String) = if (mediaId == "m1" && video != null) video to "video/mp4" else null
         override fun sync(mediaId: String) = if (mediaId == "m1") sync else null
         override fun putSync(mediaId: String, anchors: List<Anchor>): Boolean { if (mediaId != "m1") return false; sync = anchors; return true }
+        var subsResult: SubtitlesData? = SubtitlesData("captions", "en", listOf(Line(1.0, 2.0, "hi")))
+        var subsError: FetchException? = null
+        var asked: String? = null
+        var mainSet: String? = null
+        override fun subtitles(mediaId: String, language: String): SubtitlesData? {
+            asked = language
+            subsError?.let { throw it }
+            return if (mediaId == "m1") subsResult else null
+        }
+        override fun setSubtitles(mediaId: String, language: String): String? {
+            subsError?.let { throw it }
+            if (mediaId != "m1") return null
+            mainSet = language
+            return """{"mediaId":"m1","subtitles":{"language":"$language"}}"""
+        }
         override fun touch() { touched++ }
+
     }
 
     private val video by lazy { tmp.newFile("v.mp4").also { it.writeBytes(ByteArray(1000) { b -> b.toByte() }) } }
@@ -161,4 +177,45 @@ class RouterTest {
         assertEquals(405, router.handle("GET", "/v1/jobs", origin, emptyMap(), null).status)
         assertEquals(200, get("/v1/status/").status)
     }
+
+    @Test fun subtitles_get_returns_another_tracks_lines() {
+        val r = get("/v1/media/m1/subtitles?language=en")
+        assertEquals(200, r.status)
+        val j = JSONObject(r.body)
+        assertEquals("en", j.getString("language"))
+        assertEquals("hi", j.getJSONArray("lines").getJSONObject(0).getString("text"))
+        get("/v1/media/m1/subtitles?language=zh-Hans")
+        assertEquals("zh-Hans", api.asked)
+    }
+
+    @Test fun subtitles_get_errors() {
+        assertEquals(400, get("/v1/media/m1/subtitles").status)
+        assertEquals(404, get("/v1/media/zz/subtitles?language=en").status)
+        api.subsError = FetchException("No captions in ko (available: en)", Codes.NO_CAPTIONS)
+        val r = get("/v1/media/m1/subtitles?language=ko")
+        assertEquals(404, r.status)
+        assertEquals("no_captions", JSONObject(r.body).getString("code"))
+        api.subsError = FetchException("Network problem", Codes.NETWORK)
+        assertEquals(502, get("/v1/media/m1/subtitles?language=en").status)
+    }
+
+    @Test fun subtitles_post_changes_the_main_track() {
+        val r = router.handle("POST", "/v1/media/m1/subtitles", origin, emptyMap(), """{"language":"fr"}""")
+        assertEquals(200, r.status)
+        assertEquals("fr", JSONObject(r.body).getJSONObject("subtitles").getString("language"))
+        assertEquals("fr", api.mainSet)
+        assertEquals(400, router.handle("POST", "/v1/media/m1/subtitles", origin, emptyMap(), "{}").status)
+        assertEquals(400, router.handle("POST", "/v1/media/m1/subtitles", origin, emptyMap(), "nope").status)
+        assertEquals(404, router.handle("POST", "/v1/media/zz/subtitles", origin, emptyMap(), """{"language":"fr"}""").status)
+        assertEquals(405, router.handle("DELETE", "/v1/media/m1/subtitles", origin, emptyMap(), null).status)
+    }
+
+    @Test fun v11_client_sending_zh_languages_is_accepted_unchanged() {
+        val r = post("""{"id":"c1","url":"https://youtu.be/x","languages":["zh-Hans","zh-CN","zh","zh-Hant","zh-TW"]}""")
+        assertEquals(200, r.status)
+        assertEquals(listOf("zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW"), api.submitted!!.languages)
+        post("""{"url":"https://youtu.be/x"}""")
+        assertNull(api.submitted!!.languages)
+    }
 }
+

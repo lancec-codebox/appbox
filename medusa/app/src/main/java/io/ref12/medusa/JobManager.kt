@@ -39,7 +39,7 @@ class JobManager(
     /** Starts a job, or returns the id of a running one for the same URL, or completes at once when already captured. */
     @Synchronized
     fun submit(req: JobSubmit): String {
-        val langs = req.languages?.takeIf { it.isNotEmpty() } ?: DEFAULT_LANGUAGES
+        val langs = req.languages?.filter { it.isNotBlank() } ?: emptyList()
         val jobId = req.id ?: UUID.randomUUID().toString()
         record(jobId)?.let { return it.id }
         jobs.values.firstOrNull { !it.state.finished && it.url == req.url && it.languages == langs }?.let { return it.id }
@@ -47,7 +47,7 @@ class JobManager(
         val rec = JobRecord(jobId, req.url, langs, req.want, req.quality, req.returnUrl, mediaId)
         jobs[jobId] = rec
         val existing = media.get(mediaId)
-        if (existing != null && (!req.want.subtitles || existing.subtitles != null) && (!req.want.video || existing.video != null)) {
+        if (existing != null && (!req.want.subtitles || (existing.subtitles != null && (langs.isEmpty() || langs.any { TrackSelector.languageMatches(existing.subtitles.language, it) }))) && (!req.want.video || existing.video != null)) {
             rec.title = existing.title
             set(rec, JobState.DONE, null, null, 1.0)
             return jobId
@@ -82,6 +82,35 @@ class JobManager(
     fun itemJson(mediaId: String, withLines: Boolean = true): String? =
         media.get(mediaId)?.let { MediaJson.item(it, media.sync(mediaId), withLines).toString() }
 
+    /**
+     * Lines of one subtitle track of a media item. The main track is answered from the item; another one is
+     * downloaded on demand (once) and kept. Returns null for an unknown media item.
+     */
+    fun subtitlesFor(mediaId: String, language: String): SubtitlesData? {
+        val meta = media.get(mediaId) ?: return null
+        meta.subtitles?.takeIf { it.language.equals(language, true) }?.let { return it }
+        val known = meta.tracks.firstOrNull { it.language.equals(language, true) }
+            ?: meta.tracks.firstOrNull { TrackSelector.languageMatches(it.language, language) }
+            ?: throw FetchException(TrackSelector.noCaptionsMessage(listOf(language), meta.tracks), Codes.NO_CAPTIONS)
+        media.loadTrack(mediaId, known.language)?.let { return it }
+        val work = media.workDir(mediaId)
+        try {
+            val s = fetcher.fetchTrack(meta.url, known.language, work)
+            media.saveTrack(mediaId, s)
+            return s
+        } finally { work.deleteRecursively() }
+    }
+
+    /** Makes [language] the item's main subtitle track. Null for an unknown media item. */
+    fun setMainTrack(mediaId: String, language: String): MediaMeta? {
+        val meta = media.get(mediaId) ?: return null
+        val s = subtitlesFor(mediaId, language) ?: return null
+        val updated = meta.copy(subtitles = s)
+        media.save(updated)
+        media.saveTrack(mediaId, s)
+        return updated
+    }
+
     fun recent(): List<JobMeta> = storage.recentJobs()
 
     private fun run(rec: JobRecord) {
@@ -107,7 +136,7 @@ class JobManager(
                     ?: FetchException("Nothing could be captured")
             }
             media.save(MediaMeta(rec.mediaId, rec.url, out.title.ifEmpty { old?.title ?: rec.url }, out.durationSec ?: old?.durationSec,
-                out.extractor, out.videoId, subtitles, video, old?.createdAt ?: clock()))
+                out.extractor, out.videoId, subtitles, video, old?.createdAt ?: clock(), out.tracks.ifEmpty { old?.tracks ?: emptyList() }))
             rec.title = out.title
             val note = listOfNotNull(
                 if (rec.want.subtitles && out.subtitles == null) out.subtitlesError?.message else null,

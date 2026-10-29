@@ -2,8 +2,6 @@ package io.ref12.medusa
 
 import java.io.File
 
-val DEFAULT_LANGUAGES = listOf("zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW")
-
 val DEFAULT_ORIGINS = listOf(
     "https://apps--hexad-project.ref12.dev",
     "https://ref12.github.io",
@@ -56,6 +54,9 @@ data class Line(val start: Double, val end: Double, val text: String)
 /** One sync anchor: from [at] (video seconds, in the line-start domain) subtitles are shifted by [offset] seconds. */
 data class Anchor(val at: Double, val offset: Double)
 
+/** A subtitle track the video offers (without its lines). */
+data class TrackInfo(val language: String, val source: String, val name: String? = null)
+
 data class SubtitlesData(val source: String, val language: String, val lines: List<Line>)
 
 data class VideoData(val file: String, val contentType: String, val bytes: Long)
@@ -70,6 +71,7 @@ data class MediaMeta(
     val subtitles: SubtitlesData?,
     val video: VideoData?,
     val createdAt: Long,
+    val tracks: List<TrackInfo> = emptyList(),
 )
 
 /** Thrown for failures with a protocol code and a message that can be shown to the user as is. */
@@ -89,6 +91,7 @@ data class JobSubmit(
 
 class CaptureRequest(
     val url: String,
+    /** Preferred subtitle languages in order; empty means the video's original language. */
     val languages: List<String>,
     val wantSubtitles: Boolean,
     val wantVideo: Boolean,
@@ -104,6 +107,7 @@ class CaptureOutcome(
     val videoFile: File?,
     val subtitlesError: FetchException?,
     val videoError: FetchException?,
+    val tracks: List<TrackInfo> = emptyList(),
 )
 
 fun interface MediaFetcher {
@@ -112,6 +116,10 @@ fun interface MediaFetcher {
      * Throws FetchException when nothing could be captured; per-part failures come back in the outcome.
      */
     fun fetch(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): CaptureOutcome
+
+    /** Downloads one more subtitle track of a video, by language. Throws FetchException (no_captions when it does not exist). */
+    fun fetchTrack(url: String, language: String, workDir: File): SubtitlesData =
+        throw FetchException("Not supported", Codes.YTDLP)
 }
 
 /** Maps yt-dlp's per-stream percentages (video, then audio) to one fraction that never goes backwards. */

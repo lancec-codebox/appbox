@@ -73,25 +73,31 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         val extractor = info.optString("extractor", info.optString("extractor_key", "")).lowercase()
         val id = info.optString("id", "")
 
+        val tracks = TrackSelector.list(info)
+        val trackInfos = tracks.map { it.info() }
         var subs: SubtitlesData? = null
         var subsErr: FetchException? = null
         if (req.wantSubtitles) {
-            try { subs = fetchSubs(req, info, workDir, progress) } catch (e: FetchException) { subsErr = e }
+            try { subs = fetchSubs(req, info, tracks, workDir, progress) } catch (e: FetchException) { subsErr = e }
         }
         var video: File? = null
         var videoErr: FetchException? = null
         if (req.wantVideo) {
             try { video = fetchVideo(req, workDir, progress) } catch (e: FetchException) { videoErr = e }
         }
-        return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr)
+        return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr, trackInfos)
     }
 
-    private fun fetchSubs(req: CaptureRequest, info: JSONObject, workDir: File, progress: (JobState, String?, Double?) -> Unit): SubtitlesData {
+    private fun fetchSubs(req: CaptureRequest, info: JSONObject, tracks: List<Track>, workDir: File, progress: (JobState, String?, Double?) -> Unit): SubtitlesData {
         val track = TrackSelector.select(info, req.languages)
-            ?: throw FetchException("No Chinese captions found for this video (looked for " + req.languages.joinToString(", ") + ")", Codes.NO_CAPTIONS)
+            ?: throw FetchException(TrackSelector.noCaptionsMessage(req.languages, tracks.map { it.info() }), Codes.NO_CAPTIONS)
         progress(JobState.FETCHING, "Downloading " + track.language + " " + (if (track.source == "captions") "captions" else "auto-captions"), null)
-        val dir = File(workDir, "subs").also { it.mkdirs() }
-        run(YoutubeDLRequest(req.url).apply {
+        return download(req.url, track, workDir)
+    }
+
+    private fun download(url: String, track: Track, workDir: File): SubtitlesData {
+        val dir = File(workDir, "subs-" + track.key).also { it.mkdirs() }
+        run(YoutubeDLRequest(url).apply {
             addOption("--skip-download"); addOption("--no-playlist"); addOption("--no-warnings"); addOption("--ignore-no-formats-error")
             addOption(if (track.source == "captions") "--write-subs" else "--write-auto-subs")
             addOption("--sub-langs", track.key); addOption("--sub-format", track.ext)
@@ -102,6 +108,26 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         val lines = SubtitleConverter.parse(track.ext, file.readText())
         if (lines.isEmpty()) throw FetchException("The caption track is empty", Codes.NO_CAPTIONS)
         return SubtitlesData(track.source, track.language, lines)
+    }
+
+    override fun fetchTrack(url: String, language: String, workDir: File): SubtitlesData {
+        ensureInit()
+        val listing = run(YoutubeDLRequest(url).apply {
+            addOption("--dump-single-json"); addOption("--skip-download"); addOption("--no-playlist"); addOption("--ignore-no-formats-error")
+        })
+        val info = JSONObject(jsonOf(listing.out))
+        val track = TrackSelector.find(info, language)
+            ?: throw FetchException(TrackSelector.noCaptionsMessage(listOf(language), TrackSelector.list(info).map { it.info() }), Codes.NO_CAPTIONS)
+        return download(url, track, workDir)
+    }
+
+    /** A quick listing for the capture screen: what subtitle tracks the video offers. */
+    fun listTracks(url: String): List<TrackInfo> {
+        ensureInit()
+        val listing = run(YoutubeDLRequest(url).apply {
+            addOption("--dump-single-json"); addOption("--skip-download"); addOption("--no-playlist"); addOption("--ignore-no-formats-error")
+        })
+        return TrackSelector.list(JSONObject(jsonOf(listing.out))).map { it.info() }
     }
 
     private fun fetchVideo(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): File {
