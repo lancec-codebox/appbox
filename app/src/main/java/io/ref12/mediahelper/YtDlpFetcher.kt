@@ -63,13 +63,20 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : T
 
     private fun attempt(url: String, languages: List<String>, progress: (String) -> Unit): Transcript {
         progress("Listing captions")
-        val info = JSONObject(jsonOf(run(YoutubeDLRequest(url).apply {
+        val listing = run(YoutubeDLRequest(url).apply {
             addOption("--dump-single-json")
             addOption("--skip-download")
             addOption("--no-playlist")
-            addOption("--no-warnings")
             addOption("--ignore-no-formats-error")
-        })))
+        })
+        val info = JSONObject(jsonOf(listing.out))
+        val noTracks = (info.optJSONObject("subtitles")?.length() ?: 0) + (info.optJSONObject("automatic_captions")?.length() ?: 0) == 0
+        if (noTracks) {
+            // --ignore-no-formats-error turns a refusal into an empty listing: look at why before saying "no captions"
+            if (listing.err.contains("Sign in to confirm", true) || listing.err.contains("not a bot", true))
+                throw FetchException("YouTube asks for a sign-in (bot check) on this network. Try another network, such as mobile data, or try again later.")
+            if (info.optString("title", "").isEmpty()) throw YtDlpFailure(listing.err.ifBlank { "yt-dlp returned no video information" })
+        }
         val track = TrackSelector.select(info, languages)
             ?: throw FetchException("No Chinese captions found for this video (looked for " + languages.joinToString(", ") + ")")
         progress("Downloading " + track.language + " " + (if (track.source == "captions") "captions" else "auto-captions"))
@@ -103,8 +110,8 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : T
         } finally { dir.deleteRecursively() }
     }
 
-    private fun run(req: YoutubeDLRequest): String = try {
-        ytdlp.execute(req, null, null).out
+    private fun run(req: YoutubeDLRequest) = try {
+        ytdlp.execute(req, null, null)
     } catch (e: YoutubeDLException) {
         val msg = e.message ?: ""
         if (msg.contains("Unsupported URL", true)) throw FetchException(explain(msg))
