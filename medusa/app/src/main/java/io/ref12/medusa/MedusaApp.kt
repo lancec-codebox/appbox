@@ -14,6 +14,13 @@ class MedusaApp : Application() {
     lateinit var jobs: JobManager
         private set
 
+    val updates: UpdateManager by lazy {
+        UpdateManager(BuildConfig.VERSION_NAME, cacheDir, HttpUpdateSource(), PackageApkInstaller(this),
+            Executors.newSingleThreadExecutor(), System::currentTimeMillis,
+            { settings.autoUpdateCheck }, { settings.lastAppUpdateCheck }, { settings.lastAppUpdateCheck = it },
+            { jobs.activeCount() > 0 })
+    }
+
     override fun onCreate() {
         super.onCreate()
         settings = Settings(this)

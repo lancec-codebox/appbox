@@ -30,6 +30,8 @@ class MainActivity : Activity() {
     /** Spinner entries: label to (null = no subtitles, "" = original, else a language code). */
     private var langChoices: List<Pair<String, String?>> = listOf("Original language" to "", "None" to null)
     private lateinit var recentBox: LinearLayout
+    private lateinit var updateBox: LinearLayout
+    private var wentToPermission = false
     private val ui = Handler(Looper.getMainLooper())
     private val poll = object : Runnable {
         override fun run() { refresh(); ui.postDelayed(this, 1500) }
@@ -44,11 +46,20 @@ class MainActivity : Activity() {
         fun add(v: android.view.View) = col.addView(v, ViewGroup.LayoutParams(-1, -2))
 
         add(TextView(this).apply { text = "Medusa"; textSize = 24f })
+        updateBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFFE8F0FE.toInt()); setPadding(24, 16, 24, 16); visibility = android.view.View.GONE }
+        add(updateBox)
         statusView = TextView(this).apply { textSize = 16f; setPadding(0, 16, 0, 0) }
         versionView = TextView(this).apply { textSize = 14f }
         updateBtn = Button(this).apply { text = "Update yt-dlp now"; setOnClickListener { updateNow() } }
         add(statusView); add(versionView); add(updateBtn)
 
+        add(label("App updates"))
+        add(android.widget.CheckBox(this).apply {
+            text = "Check for Medusa updates automatically"
+            isChecked = app.settings.autoUpdateCheck
+            setOnCheckedChangeListener { _, on -> app.settings.autoUpdateCheck = on }
+        })
+        add(Button(this).apply { text = "Check for updates"; setOnClickListener { app.updates.check(manual = true) } })
         add(label("Allowed origins (one per line)"))
         originsEdit = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
@@ -84,7 +95,47 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(col) })
     }
 
-    override fun onResume() { super.onResume(); ui.post(poll) }
+    override fun onResume() {
+        super.onResume()
+        if (wentToPermission) { wentToPermission = false; app.updates.resumeAfterPermission() }
+        app.updates.checkIfDue()
+        ui.post(poll)
+    }
+
+    private fun renderUpdate() {
+        val u = app.updates
+        updateBox.removeAllViews()
+        fun text(t: String, bold: Boolean = false) = updateBox.addView(TextView(this).apply {
+            text = t; textSize = 14f; if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        fun buttons(vararg b: Pair<String, () -> Unit>) = updateBox.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            for ((t, f) in b) addView(Button(context).apply { text = t; setOnClickListener { f() } })
+        })
+        when (val s = u.state) {
+            is UpdateState.Available -> {
+                text("Medusa " + s.offer.version + " is available", true)
+                if (s.offer.notes.isNotEmpty()) text(s.offer.notes.take(1200))
+                buttons("Update" to { u.update() }, "Later" to { u.later() })
+            }
+            is UpdateState.Downloading -> text("Downloading Medusa " + s.offer.version + (s.fraction?.let { " " + (it * 100).toInt() + "%" } ?: "..."), true)
+            is UpdateState.NeedsPermission -> {
+                text("Allow Medusa to install apps", true)
+                text("Android needs your OK once. Turn on Allow from this source, then come back: the update continues.")
+                buttons("Open settings" to { wentToPermission = true; startActivity(PackageApkInstaller.permissionIntent(this)) })
+            }
+            is UpdateState.Installing -> text(s.message + " Medusa " + s.offer.version + "...", true)
+            is UpdateState.Done -> text(s.message, true)
+            is UpdateState.Failed -> {
+                text(s.message, true)
+                buttons(*(listOfNotNull(if (s.offer != null) "Try again" to { u.update() } else null, "Dismiss" to { u.later() }).toTypedArray()))
+            }
+            is UpdateState.UpToDate -> text("Medusa " + s.version + " is up to date")
+            is UpdateState.Checking -> text("Checking for updates...")
+            UpdateState.Idle -> {}
+        }
+        updateBox.visibility = if (u.state is UpdateState.Idle) android.view.View.GONE else android.view.View.VISIBLE
+    }
     override fun onPause() { ui.removeCallbacks(poll); super.onPause() }
 
     private fun fetch() {
@@ -133,6 +184,7 @@ class MainActivity : Activity() {
     private var versionLoaded = false
 
     private fun refresh() {
+        renderUpdate()
         statusView.text = when {
             HelperService.running -> "Server running on 127.0.0.1:$SERVER_PORT"
             HelperService.lastError != null -> HelperService.lastError

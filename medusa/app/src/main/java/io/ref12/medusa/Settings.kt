@@ -17,6 +17,16 @@ class Settings(ctx: Context) {
     /** The same as a languages list for a job (empty = original). */
     val defaultLanguages: List<String> get() = defaultLanguage.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList()
 
+    /** Automatic app update checks (when the app opens, at most once a day). */
+    var autoUpdateCheck: Boolean
+        get() = prefs.getBoolean("autoUpdateCheck", true)
+        set(v) { prefs.edit().putBoolean("autoUpdateCheck", v).apply() }
+
+    var lastAppUpdateCheck: Long
+        get() = prefs.getLong("lastAppUpdateCheck", 0L)
+        set(v) { prefs.edit().putLong("lastAppUpdateCheck", v).apply() }
+
+    /** Last yt-dlp update check. */
     var lastUpdateCheck: Long
         get() = prefs.getLong("lastUpdateCheck", 0L)
         set(v) { prefs.edit().putLong("lastUpdateCheck", v).apply() }
