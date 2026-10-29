@@ -1,0 +1,130 @@
+package io.ref12.medusa
+
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.security.MessageDigest
+import java.util.UUID
+
+object MediaJson {
+    /** The media item of the protocol; [forStorage] adds the private createdAt. */
+    fun item(m: MediaMeta, sync: List<Anchor>, withLines: Boolean = true, forStorage: Boolean = false): JSONObject = JSONObject().apply {
+        put("mediaId", m.mediaId)
+        put("url", m.url)
+        put("title", m.title)
+        put("durationSec", m.durationSec ?: JSONObject.NULL)
+        put("extractor", m.extractor)
+        put("videoId", m.videoId)
+        put("video", m.video?.let {
+            JSONObject().put("path", "/v1/media/${m.mediaId}/video").put("contentType", it.contentType).put("bytes", it.bytes)
+                .also { o -> if (forStorage) o.put("file", it.file) }
+        } ?: JSONObject.NULL)
+        put("subtitles", m.subtitles?.let { s ->
+            JSONObject().put("source", s.source).put("language", s.language).also { o ->
+                if (withLines) o.put("lines", JSONArray().also { arr ->
+                    for (l in s.lines) arr.put(JSONObject().put("start", SyncMath.round3(l.start)).put("end", SyncMath.round3(l.end)).put("text", l.text))
+                })
+            }
+        } ?: JSONObject.NULL)
+        put("sync", anchorsJson(sync))
+        if (forStorage) put("createdAt", m.createdAt)
+    }
+
+    fun anchorsJson(a: List<Anchor>) = JSONArray().also { arr ->
+        for (x in a) arr.put(JSONObject().put("at", x.at).put("offset", x.offset))
+    }
+
+    /** Parses [{at, offset}]; null when it is not a valid list. */
+    fun parseAnchors(arr: JSONArray?): List<Anchor>? {
+        if (arr == null) return null
+        val out = ArrayList<Anchor>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: return null
+            if (!o.has("at") || !o.has("offset")) return null
+            val at = o.optDouble("at", Double.NaN)
+            val off = o.optDouble("offset", Double.NaN)
+            out.add(Anchor(at, off))
+        }
+        return if (SyncMath.isValid(out)) SyncMath.normalize(out) else null
+    }
+
+    fun fromStorage(j: JSONObject): MediaMeta {
+        val v = j.optJSONObject("video")
+        val s = j.optJSONObject("subtitles")
+        return MediaMeta(
+            j.getString("mediaId"), j.getString("url"), j.optString("title", ""),
+            if (j.isNull("durationSec")) null else j.optInt("durationSec"),
+            j.optString("extractor", ""), j.optString("videoId", ""),
+            s?.let {
+                val arr = it.optJSONArray("lines") ?: JSONArray()
+                SubtitlesData(it.getString("source"), it.getString("language"),
+                    (0 until arr.length()).map { i -> arr.getJSONObject(i).let { l -> Line(l.getDouble("start"), l.getDouble("end"), l.getString("text")) } })
+            },
+            v?.let { VideoData(it.getString("file"), it.getString("contentType"), it.getLong("bytes")) },
+            j.optLong("createdAt"),
+        )
+    }
+}
+
+/** Captured media as plain files: media/<id>/{item.json, video.<ext>, sync.json}. */
+class MediaStore(private val root: File, private val clock: () -> Long = System::currentTimeMillis) {
+    private val base = File(root, "media").also { it.mkdirs() }
+
+    fun idFor(url: String): String =
+        MessageDigest.getInstance("SHA-256").digest(url.trim().toByteArray()).take(8).joinToString("") { "%02x".format(it) }
+
+    private fun valid(id: String) = Regex("[A-Za-z0-9_-]{1,64}").matches(id)
+    private fun dir(id: String) = File(base, id)
+
+    fun get(id: String): MediaMeta? {
+        if (!valid(id)) return null
+        val f = File(dir(id), "item.json")
+        return try { if (f.isFile) MediaJson.fromStorage(JSONObject(f.readText())) else null } catch (e: Exception) { null }
+    }
+
+    fun list(): List<MediaMeta> =
+        (base.listFiles() ?: emptyArray()).filter { it.isDirectory }.mapNotNull { get(it.name) }.sortedByDescending { it.createdAt }
+
+    /** A fresh empty folder inside the item's folder for a download in progress. */
+    fun workDir(id: String): File = File(dir(id), "tmp-" + UUID.randomUUID()).also { it.mkdirs() }
+
+    fun save(meta: MediaMeta) {
+        dir(meta.mediaId).mkdirs()
+        File(dir(meta.mediaId), "item.json").writeText(MediaJson.item(meta, emptyList(), forStorage = true).toString())
+    }
+
+    /** Moves a finished download in as the item's video. */
+    fun adoptVideo(id: String, source: File, contentType: String): VideoData {
+        dir(id).mkdirs()
+        dir(id).listFiles()?.filter { it.name.startsWith("video.") }?.forEach { it.delete() }
+        val target = File(dir(id), "video." + source.extension.ifEmpty { "mp4" })
+        if (!source.renameTo(target)) { source.copyTo(target, overwrite = true); source.delete() }
+        return VideoData(target.name, contentType, target.length())
+    }
+
+    fun videoFile(id: String): File? {
+        val v = get(id)?.video ?: return null
+        return File(dir(id), v.file).takeIf { it.isFile }
+    }
+
+    fun bytesOf(id: String): Long = (dir(id).listFiles() ?: emptyArray()).filter { it.isFile }.sumOf { it.length() }
+
+    fun delete(id: String): Boolean {
+        if (!valid(id) || !dir(id).isDirectory) return false
+        return dir(id).deleteRecursively()
+    }
+
+    fun sync(id: String): List<Anchor> {
+        val f = File(dir(id), "sync.json")
+        return try { if (f.isFile) MediaJson.parseAnchors(JSONArray(f.readText())) ?: emptyList() else emptyList() } catch (e: Exception) { emptyList() }
+    }
+
+    /** Replaces the sync list; false when there is no such media. */
+    fun putSync(id: String, anchors: List<Anchor>): Boolean {
+        if (get(id) == null) return false
+        File(dir(id), "sync.json").writeText(MediaJson.anchorsJson(SyncMath.normalize(anchors)).toString())
+        return true
+    }
+
+    fun now() = clock()
+}
