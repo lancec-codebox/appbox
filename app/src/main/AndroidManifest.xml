@@ -14,6 +14,7 @@
         android:allowBackup="false"
         android:extractNativeLibs="true"
         android:label="Media Helper"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity
