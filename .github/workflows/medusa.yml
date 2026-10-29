@@ -77,7 +77,7 @@ jobs:
           MEDUSA_KEYSTORE_PASSWORD: ${{ secrets.MEDIA_HELPER_KEYSTORE_PASSWORD }}
           MEDUSA_KEY_PASSWORD: ${{ secrets.MEDIA_HELPER_KEY_PASSWORD }}
           # Not a secret. Same key as before the rename; set the repo variable MEDUSA_KEY_ALIAS to override.
-          MEDUSA_KEY_ALIAS: ${{ vars.MEDUSA_KEY_ALIAS || 'medusa' }}
+          MEDUSA_KEY_ALIAS: ${{ vars.MEDUSA_KEY_ALIAS || 'media-helper' }}
         run: |
           set -euo pipefail
           test -n "$KEYSTORE_BASE64" || { echo "release key secrets are not set"; exit 1; }
