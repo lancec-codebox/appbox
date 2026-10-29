@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- To switch icons change opt1 to opt2 or opt3 in these three lines (see design/icons/make_icons.py). -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_opt1_background" />
+    <foreground android:drawable="@drawable/ic_opt1_foreground" />
+    <monochrome android:drawable="@drawable/ic_opt1_monochrome" />
+</adaptive-icon>
