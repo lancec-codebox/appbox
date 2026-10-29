@@ -14,6 +14,12 @@ class MedusaApp : Application() {
     lateinit var jobs: JobManager
         private set
 
+    /** Medusa screens currently on screen (main thread only), and when the last one went away. */
+    @Volatile var visibleScreens = 0
+        private set
+    @Volatile var lastUiLeft = System.currentTimeMillis()
+        private set
+
     val updates: UpdateManager by lazy {
         UpdateManager(BuildConfig.VERSION_NAME, cacheDir, HttpUpdateSource(), PackageApkInstaller(this),
             Executors.newSingleThreadExecutor(), System::currentTimeMillis,
@@ -29,6 +35,22 @@ class MedusaApp : Application() {
         media = MediaStore(root)
         // One job at a time: yt-dlp is heavy and the phone is small.
         jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor())
+        // the server is up whenever a Medusa screen is: start it when one opens, and time the keep-alive from when the last one closes
+        registerActivityLifecycleCallbacks(object : android.app.Application.ActivityLifecycleCallbacks {
+            override fun onActivityStarted(activity: android.app.Activity) {
+                visibleScreens++
+                try { HelperService.start(this@MedusaApp) } catch (e: Exception) { HelperService.lastError = e.message }
+            }
+            override fun onActivityStopped(activity: android.app.Activity) {
+                visibleScreens = maxOf(0, visibleScreens - 1)
+                lastUiLeft = System.currentTimeMillis()
+            }
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
+            override fun onActivityResumed(activity: android.app.Activity) {}
+            override fun onActivityPaused(activity: android.app.Activity) {}
+            override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
+            override fun onActivityDestroyed(activity: android.app.Activity) {}
+        })
     }
 }
 

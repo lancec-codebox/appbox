@@ -17,6 +17,11 @@ class Settings(ctx: Context) {
     /** The same as a languages list for a job (empty = original). */
     val defaultLanguages: List<String> get() = defaultLanguage.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList()
 
+    /** How long the server stays up after the user leaves Medusa. */
+    var keepAlive: KeepAliveMode
+        get() = KeepAliveMode.fromMinutes(prefs.getInt("keepAliveMinutes", KeepAliveMode.DEFAULT.minutes))
+        set(v) { prefs.edit().putInt("keepAliveMinutes", v.minutes).apply() }
+
     /** Subtitle text size in sp (the second line is drawn smaller). */
     var subtitleSp: Float
         get() = prefs.getFloat("subtitleSp", 18f)

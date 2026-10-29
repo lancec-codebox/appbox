@@ -22,12 +22,12 @@ class JobActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var bar: ProgressBar
     private lateinit var back: Button
+    private lateinit var openApp: Button
+    private var hasPrevious = false
     private lateinit var save: Button
     private lateinit var play: Button
     private val ui = Handler(Looper.getMainLooper())
     private var jobId: String? = null
-    private var returned = false
-    private var resumed = false
 
     private val poll = object : Runnable {
         override fun run() { refresh(); ui.postDelayed(this, 500) }
@@ -39,12 +39,13 @@ class JobActivity : Activity() {
         title = TextView(this).apply { textSize = 18f }
         status = TextView(this).apply { textSize = 16f; setPadding(0, 24, 0, 24) }
         bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { isIndeterminate = true }
-        back = Button(this).apply { text = "Back to app"; setOnClickListener { goBack() } }
+        back = Button(this).apply { text = "Back to app"; setOnClickListener { finish() } } // a true back: Android returns to the app it came from, as it was
+        openApp = Button(this).apply { setOnClickListener { openReturnLink() } }
         save = Button(this).apply { text = "Save transcript"; setOnClickListener { save() } }
         play = Button(this).apply { text = "Play"; setOnClickListener {
             jobId?.let { id -> app.jobs.record(id)?.let { r -> startActivity(Intent(this@JobActivity, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, r.mediaId)) } }
         } }
-        for (v in listOf(title, status, bar, play, back, save)) col.addView(v, ViewGroup.LayoutParams(-1, -2))
+        for (v in listOf(title, status, bar, play, back, save, openApp)) col.addView(v, ViewGroup.LayoutParams(-1, -2))
         setContentView(col)
         handle(intent)
     }
@@ -52,12 +53,12 @@ class JobActivity : Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        returned = false
         handle(intent)
     }
 
     private fun handle(intent: Intent) {
         val data = intent.dataString
+        hasPrevious = BackPolicy.hasPreviousApp(data != null, referrer?.authority, packageName, intent.getBooleanExtra(EXTRA_FROM_APP, false))
         if (data != null) {
             val req = DeepLink.parse(data)
             if (req == null) { status.text = "This link is not a valid Medusa link."; jobId = null; return }
@@ -75,8 +76,8 @@ class JobActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
     }
 
-    override fun onResume() { super.onResume(); resumed = true; ui.post(poll) }
-    override fun onPause() { resumed = false; ui.removeCallbacks(poll); super.onPause() }
+    override fun onResume() { super.onResume(); ui.post(poll) }
+    override fun onPause() { ui.removeCallbacks(poll); super.onPause() }
 
     private fun refresh() {
         val id = jobId ?: return
@@ -95,15 +96,15 @@ class JobActivity : Activity() {
             JobState.DONE -> "Done. Captured" + (rec.message?.let { "\n$it" } ?: "")
             JobState.FAILED -> "Failed: " + (rec.message ?: "unknown error")
         }
-        back.visibility = if (rec.returnUrl != null) android.view.View.VISIBLE else android.view.View.GONE
+        back.text = if (hasPrevious) "Back to app" else "Close"
+        // the web app's return link is only a fallback (opened from the notification or launcher), never automatic
+        val showLink = BackPolicy.showReturnLink(rec.returnUrl, hasPrevious) && rec.state.finished
+        openApp.visibility = if (showLink) android.view.View.VISIBLE else android.view.View.GONE
+        if (showLink) openApp.text = BackPolicy.returnLabel(rec.returnUrl!!)
         save.visibility = if (rec.state == JobState.DONE) android.view.View.VISIBLE else android.view.View.GONE
-        if (finished && !returned && resumed && rec.returnUrl != null && intent.dataString != null) {
-            returned = true
-            goBack()
-        }
     }
 
-    private fun goBack() {
+    private fun openReturnLink() {
         val rec = jobId?.let { app.jobs.record(it) } ?: return
         val ret = rec.returnUrl ?: return
         val url = DeepLink.buildReturnUrl(ret, rec.id, if (rec.state == JobState.DONE) "done" else "failed")
@@ -131,5 +132,5 @@ class JobActivity : Activity() {
         if (requestCode == 2 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) save()
     }
 
-    companion object { const val EXTRA_JOB = "job" }
+    companion object { const val EXTRA_JOB = "job"; const val EXTRA_FROM_APP = "from_app" }
 }

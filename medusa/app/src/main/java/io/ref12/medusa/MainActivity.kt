@@ -64,6 +64,10 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, on -> app.settings.autoUpdateCheck = on }
         })
         add(Button(this).apply { text = "Check for updates"; setOnClickListener { app.updates.check(manual = true) } })
+        add(label("Keep Medusa ready after you leave it"))
+        add(TrackUi.radios(this, KeepAliveMode.values().map { it.label }, KeepAliveMode.values().map { "keepalive:" + it.minutes }, app.settings.keepAlive.ordinal) {
+            app.settings.keepAlive = KeepAliveMode.values()[it]
+        })
         add(label("Allowed origins (one per line)"))
         originsEdit = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
@@ -177,7 +181,7 @@ class MainActivity : Activity() {
         val want = if (choice == null) Want(subtitles = false, video = true) else Want.DEFAULT
         val langs = if (choice.isNullOrEmpty()) app.settings.defaultLanguages.takeIf { choice == "" } ?: emptyList() else listOf(choice)
         val id = app.jobs.submit(JobSubmit(null, url, langs, want))
-        startActivity(Intent(this, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, id))
+        startActivity(Intent(this, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, id).putExtra(JobActivity.EXTRA_FROM_APP, true))
     }
 
     /** Shows the subtitle choices as radio buttons: original language, each listed track, none. */
@@ -241,7 +245,7 @@ class MainActivity : Activity() {
         for (j in recent) recentBox.addView(TextView(this).apply {
             text = (j.title ?: j.url) + "\n" + j.state.wire + " - " + df.format(Date(j.updatedAt)) + (j.message?.let { "\n$it" } ?: "")
             setPadding(0, 12, 0, 12)
-            setOnClickListener { startActivity(Intent(this@MainActivity, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, j.id)) }
+            setOnClickListener { startActivity(Intent(this@MainActivity, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, j.id).putExtra(JobActivity.EXTRA_FROM_APP, true)) }
         })
     }
 }

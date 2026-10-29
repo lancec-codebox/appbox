@@ -19,11 +19,11 @@ class HelperService : Service() {
     private var server: HelperServer? = null
     private val handler = Handler(Looper.getMainLooper())
     private var lastRequest = System.currentTimeMillis()
+    private val versions by lazy { VersionCache({ app.fetcher.version() }, java.util.concurrent.Executors.newSingleThreadExecutor()) }
     private val tick = object : Runnable {
         override fun run() {
             val jobs = app.jobs
-            val idleSince = maxOf(jobs.lastActivity, lastRequest)
-            if (jobs.activeCount() == 0 && System.currentTimeMillis() - idleSince > IDLE_MS) {
+            if (KeepAlive.shouldStop(app.settings.keepAlive, System.currentTimeMillis(), lastRequest, jobs.lastActivity, app.lastUiLeft, jobs.activeCount(), app.visibleScreens > 0)) {
                 stopSelf()
                 return
             }
@@ -40,6 +40,7 @@ class HelperService : Service() {
         if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         else startForeground(NOTIF_ID, n)
         lastRequest = System.currentTimeMillis()
+        versions.get() // warm the yt-dlp version in the background so /v1/status never waits for it
         startServer()
         handler.removeCallbacks(tick)
         handler.postDelayed(tick, 2000)
@@ -50,7 +51,7 @@ class HelperService : Service() {
         if (server != null) return
         val api = object : HelperApi {
             override fun appVersion() = BuildConfig.VERSION_NAME
-            override fun ytDlpVersion() = app.fetcher.version()
+            override fun ytDlpVersion() = versions.get()
             override fun submit(req: JobSubmit) = app.jobs.submit(req)
             override fun jobInfo(id: String) = app.jobs.info(id)
             override fun resultJson(id: String) = app.jobs.resultJson(id)
@@ -78,6 +79,9 @@ class HelperService : Service() {
         }
     }
 
+    /** Android 15 limits data-sync foreground services to about 6 hours a day: stop cleanly instead of being killed. */
+    override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
+
     override fun onDestroy() {
         handler.removeCallbacks(tick)
         server?.stop()
@@ -92,11 +96,11 @@ class HelperService : Service() {
         val text = if (active > 0) {
             val j = jobs.recent().firstOrNull { !it.state.finished }
             (j?.let { jobs.info(it.id)?.message } ?: "Working") + (if (active > 1) " (+" + (active - 1) + " queued)" else "")
-        } else "Idle. Serving on 127.0.0.1:$SERVER_PORT, stops soon."
+        } else "Web apps can use Medusa now (127.0.0.1:$SERVER_PORT)"
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle(if (active > 0) "Capturing media" else "Medusa")
+            .setContentTitle(if (active > 0) "Capturing media" else "Medusa is ready")
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
@@ -114,7 +118,6 @@ class HelperService : Service() {
     companion object {
         const val CHANNEL = "media_helper"
         const val NOTIF_ID = 1
-        const val IDLE_MS = 10L * 60 * 1000
         @Volatile var running = false
         @Volatile var lastError: String? = null
 
