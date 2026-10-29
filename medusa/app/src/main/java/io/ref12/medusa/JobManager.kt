@@ -11,8 +11,10 @@ class JobRecord(
     val want: Want,
     val quality: Quality,
     val returnUrl: String?,
-    val mediaId: String,
+    mediaId: String,
 ) {
+    /** The library item this job fills; may change to an existing item once the video's identity is known. */
+    @Volatile var mediaId: String = mediaId
     @Volatile var state = JobState.QUEUED
     @Volatile var progress: Double? = null
     @Volatile var code: String? = null
@@ -40,10 +42,17 @@ class JobManager(
     @Synchronized
     fun submit(req: JobSubmit): String {
         val langs = req.languages?.filter { it.isNotBlank() } ?: emptyList()
-        val jobId = req.id ?: UUID.randomUUID().toString()
-        record(jobId)?.let { return it.id }
-        jobs.values.firstOrNull { !it.state.finished && it.url == req.url && it.languages == langs }?.let { return it.id }
-        val mediaId = media.idFor(req.url)
+        val requested = req.id
+        if (requested != null) record(requested)?.let { return requested }
+        val mediaId = media.lookupId(req.url)
+        // the same video is already being captured: the requested id becomes an alias of that job
+        jobs.values.firstOrNull { !it.state.finished && it.mediaId == mediaId && it.languages == langs }?.let { running ->
+            if (requested == null) return running.id
+            aliases[requested] = running.id
+            storage.saveAlias(requested, running.id)
+            return requested
+        }
+        val jobId = requested ?: UUID.randomUUID().toString()
         val rec = JobRecord(jobId, req.url, langs, req.want, req.quality, req.returnUrl, mediaId)
         jobs[jobId] = rec
         val existing = media.get(mediaId)
@@ -57,18 +66,30 @@ class JobManager(
         return jobId
     }
 
-    fun info(id: String): JobInfo? = record(id)?.let { JobInfo(it.id, it.state, it.progress, it.code, it.message) }
+    /** Status of a job under the id the client knows (its own id, or an alias of a job that was already running). */
+    fun info(id: String): JobInfo? = record(id)?.let { JobInfo(id, it.state, it.progress, it.code, it.message) }
 
+    private val aliases = ConcurrentHashMap<String, String>()
+
+    /** A job by id or alias, from memory or from disk (jobs survive the process being killed). */
     fun record(id: String): JobRecord? {
         jobs[id]?.let { return it }
+        val target = aliases[id] ?: storage.loadAlias(id)?.also { aliases[id] = it }
+        if (target != null && target != id) return record(target)
         val m = storage.loadJob(id) ?: return null
-        val r = JobRecord(m.id, m.url, m.languages, m.want, m.quality, m.returnUrl, m.mediaId ?: media.idFor(m.url))
-        r.state = if (m.state.finished) m.state else JobState.FAILED
-        r.code = if (m.state.finished) m.code else Codes.YTDLP
-        r.message = if (m.state.finished) m.message else "Interrupted"
-        r.progress = m.progress
+        val r = JobRecord(m.id, m.url, m.languages, m.want, m.quality, m.returnUrl, m.mediaId ?: media.lookupId(m.url))
         r.title = m.title
         r.updatedAt = m.updatedAt
+        r.progress = m.progress
+        if (m.state.finished) {
+            r.state = m.state; r.code = m.code; r.message = m.message
+        } else {
+            // it was running when the process died: say so, and keep that answer on disk
+            r.state = JobState.FAILED; r.code = Codes.INTERRUPTED
+            r.message = "Medusa was closed before this capture finished. Capture it again."
+            r.updatedAt = clock()
+            storage.saveJob(JobMeta(r.id, r.url, r.languages, r.want, r.quality, r.state, r.progress, r.code, r.message, r.title, r.mediaId, r.returnUrl, r.updatedAt))
+        }
         return jobs.putIfAbsent(id, r) ?: r
     }
 
@@ -117,30 +138,46 @@ class JobManager(
         set(rec, JobState.FETCHING, null, null, null, "Starting")
         val work = media.workDir(rec.mediaId)
         try {
-            val out = fetcher.fetch(CaptureRequest(rec.url, rec.languages, rec.want.subtitles, rec.want.video, rec.quality), work) { st, msg, frac ->
-                set(rec, st, null, msg, frac)
+            val existing = media.get(rec.mediaId)
+            // only what is missing: the video is never downloaded twice, a subtitle track only when it is not stored
+            val subsStored = existing?.subtitles != null && (rec.languages.isEmpty() || rec.languages.any { TrackSelector.languageMatches(existing.subtitles.language, it) })
+            val wantSubs = rec.want.subtitles && !subsStored
+            val wantVideo = rec.want.video && existing?.video == null
+            val req = CaptureRequest(rec.url, rec.languages, wantSubs, wantVideo, rec.quality) { extractor, id ->
+                media.findByIdentity(extractor, id)?.video != null
             }
-            val old = media.get(rec.mediaId)
-            val subtitles = out.subtitles ?: old?.subtitles
+            val out = fetcher.fetch(req, work) { st, msg, frac -> set(rec, st, null, msg, frac) }
+            // the same video under another URL spelling lands in its existing item
+            val target = media.findByIdentity(out.extractor, out.videoId)?.mediaId ?: rec.mediaId
+            rec.mediaId = target
+            val old = media.get(target)
+            var subtitles = old?.subtitles
+            if (out.subtitles != null) {
+                old?.subtitles?.let { if (!it.language.equals(out.subtitles.language, true)) media.saveTrack(target, it) } // keep the previous main track
+                subtitles = out.subtitles
+                media.saveTrack(target, out.subtitles)
+            }
             var video = old?.video
             if (out.videoFile != null) {
                 video = try {
-                    media.adoptVideo(rec.mediaId, out.videoFile, contentTypeOf(out.videoFile.extension))
+                    media.adoptVideo(target, out.videoFile, contentTypeOf(out.videoFile.extension))
                 } catch (e: java.io.IOException) {
                     throw FetchException("Could not store the video: " + e.message, Codes.STORAGE)
                 }
             }
-            val wantedGot = (rec.want.subtitles && out.subtitles != null) || (rec.want.video && out.videoFile != null)
-            if (!wantedGot && !(old != null && ((rec.want.subtitles && old.subtitles != null) || (rec.want.video && old.video != null)))) {
+            val gotSubs = out.subtitles != null || (rec.want.subtitles && subtitles != null && !wantSubs)
+            val gotVideo = out.videoFile != null || (rec.want.video && video != null)
+            if (!(rec.want.subtitles && gotSubs) && !(rec.want.video && gotVideo)) {
                 throw (if (rec.want.video && !rec.want.subtitles) out.videoError else if (rec.want.subtitles && !rec.want.video) out.subtitlesError else out.videoError ?: out.subtitlesError)
                     ?: FetchException("Nothing could be captured")
             }
-            media.save(MediaMeta(rec.mediaId, rec.url, out.title.ifEmpty { old?.title ?: rec.url }, out.durationSec ?: old?.durationSec,
-                out.extractor, out.videoId, subtitles, video, old?.createdAt ?: clock(), out.tracks.ifEmpty { old?.tracks ?: emptyList() }))
+            media.save(MediaMeta(target, if (old != null) old.url else rec.url, out.title.ifEmpty { old?.title ?: rec.url }, out.durationSec ?: old?.durationSec,
+                out.extractor.ifEmpty { old?.extractor ?: "" }, out.videoId.ifEmpty { old?.videoId ?: "" }, subtitles, video, old?.createdAt ?: clock(),
+                out.tracks.ifEmpty { old?.tracks ?: emptyList() }))
             rec.title = out.title
             val note = listOfNotNull(
-                if (rec.want.subtitles && out.subtitles == null) out.subtitlesError?.message else null,
-                if (rec.want.video && out.videoFile == null) out.videoError?.message else null,
+                if (wantSubs && out.subtitles == null) out.subtitlesError?.message else null,
+                if (wantVideo && out.videoFile == null) out.videoError?.message else null,
             ).joinToString(" ").ifEmpty { null }
             set(rec, JobState.DONE, null, note, 1.0)
         } catch (e: FetchException) {

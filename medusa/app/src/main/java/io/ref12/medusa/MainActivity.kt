@@ -25,7 +25,11 @@ class MainActivity : Activity() {
     private lateinit var updateBtn: Button
     private lateinit var originsEdit: EditText
     private lateinit var linkEdit: EditText
-    private lateinit var langSpinner: android.widget.Spinner
+    private lateinit var libraryRow: LinearLayout
+    private lateinit var libraryText: TextView
+    private var libraryId: String? = null
+    private lateinit var langBox: LinearLayout
+    private var langPicked = 0
     private lateinit var defaultLangEdit: EditText
     /** Spinner entries: label to (null = no subtitles, "" = original, else a language code). */
     private var langChoices: List<Pair<String, String?>> = listOf("Original language" to "", "None" to null)
@@ -82,10 +86,22 @@ class MainActivity : Activity() {
         add(label("Try a link"))
         linkEdit = EditText(this).apply { hint = "Paste a media link"; inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_CLASS_TEXT }
         add(linkEdit)
-        langSpinner = android.widget.Spinner(this)
-        setChoices(emptyList())
+        libraryText = TextView(this).apply { textSize = 14f; setTextColor(0xFF1B5E20.toInt()) }
+        libraryRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; visibility = android.view.View.GONE; tag = "in-library"
+            addView(libraryText, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(Button(context).apply { text = "Open"; setOnClickListener { openLibraryItem() } })
+        }
+        add(libraryRow)
+        linkEdit.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(s: android.text.Editable?) { checkLibrary(s?.toString()?.trim().orEmpty()) }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
+        langBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         add(label("Subtitles"))
-        add(langSpinner)
+        add(langBox)
+        setChoices(emptyList())
         add(Button(this).apply { text = "List this video's languages"; setOnClickListener { listLanguages(this) } })
         add(Button(this).apply { text = "Capture"; setOnClickListener { fetch() } })
 
@@ -138,22 +154,42 @@ class MainActivity : Activity() {
     }
     override fun onPause() { ui.removeCallbacks(poll); super.onPause() }
 
+    /** Shows "Already in your library" when the pasted link is a video that is already captured. */
+    internal fun checkLibrary(url: String) {
+        val id = if (DeepLink.isHttp(url)) app.media.lookupId(url) else null
+        val meta = id?.let { app.media.get(it) }
+        libraryId = meta?.mediaId
+        libraryRow.visibility = if (meta == null) android.view.View.GONE else android.view.View.VISIBLE
+        if (meta != null) libraryText.text = "Already in your library: " + meta.title + "\nCapturing again only adds subtitle tracks you don't have yet."
+    }
+
+    private fun openLibraryItem() {
+        val id = libraryId ?: return
+        if (app.media.get(id)?.video != null) startActivity(Intent(this, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, id))
+        else startActivity(Intent(this, LibraryActivity::class.java))
+    }
+
     private fun fetch() {
         val url = linkEdit.text.toString().trim()
         if (!DeepLink.isHttp(url)) { linkEdit.error = "Needs an http(s) link"; return }
         HelperService.start(this)
-        val choice = langChoices.getOrNull(langSpinner.selectedItemPosition)?.second
+        val choice = langChoices.getOrNull(langPicked)?.second
         val want = if (choice == null) Want(subtitles = false, video = true) else Want.DEFAULT
         val langs = if (choice.isNullOrEmpty()) app.settings.defaultLanguages.takeIf { choice == "" } ?: emptyList() else listOf(choice)
         val id = app.jobs.submit(JobSubmit(null, url, langs, want))
         startActivity(Intent(this, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, id))
     }
 
-    private fun setChoices(tracks: List<TrackInfo>) {
+    /** Shows the subtitle choices as radio buttons: original language, each listed track, none. */
+    internal fun setChoices(tracks: List<TrackInfo>) {
         val def = app.settings.defaultLanguage
         langChoices = listOf((if (def.isEmpty()) "Original language" else "Default ($def)") to "", "None" to null) +
-            tracks.map { (it.name ?: it.language) + " (" + it.language + ", " + (if (it.source == "captions") "captions" else "auto") + ")" to it.language }
-        langSpinner.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, langChoices.map { it.first })
+            tracks.map { TrackUi.label(it) to it.language }
+        // keep the order: original, tracks, none
+        langChoices = listOf(langChoices[0]) + langChoices.drop(2) + listOf(langChoices[1])
+        langPicked = 0
+        langBox.removeAllViews()
+        langBox.addView(TrackUi.radios(this, langChoices.map { it.first }, langChoices.map { "capture:" + (it.second ?: "none").ifEmpty { "original" } }, 0) { langPicked = it })
     }
 
     private fun listLanguages(btn: Button) {

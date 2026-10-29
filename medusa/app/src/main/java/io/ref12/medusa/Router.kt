@@ -129,12 +129,12 @@ class Router(private val api: HelperApi, private val allowedOrigins: () -> List<
     }
 
     private fun jobStatus(id: String, cors: Map<String, String>): HttpReply {
-        val info = api.jobInfo(id) ?: return err(404, "unknown job", cors)
+        val info = api.jobInfo(id) ?: return unknownJob(cors)
         return json(200, jobJson(info), cors)
     }
 
     private fun jobResult(id: String, cors: Map<String, String>): HttpReply {
-        val info = api.jobInfo(id) ?: return err(404, "unknown job", cors)
+        val info = api.jobInfo(id) ?: return unknownJob(cors)
         if (info.state != JobState.DONE) return json(409, jobJson(info).put("error", "job is not done"), cors)
         val r = api.resultJson(id) ?: return err(404, "media was deleted", cors)
         return raw(200, r, cors)
@@ -193,6 +193,10 @@ class Router(private val api: HelperApi, private val allowedOrigins: () -> List<
         if (!api.putSync(mediaId, anchors)) return err(404, "unknown media", cors)
         return json(200, JSONObject().put("sync", MediaJson.anchorsJson(anchors)), cors)
     }
+
+    private fun unknownJob(cors: Map<String, String>) = json(404, JSONObject().put("code", Codes.UNKNOWN_JOB)
+        .put("message", "Medusa does not know this job. It may be older than a day, or the app's data was cleared. Start the capture again.")
+        .put("error", "unknown job"), cors)
 
     private fun err(status: Int, msg: String, cors: Map<String, String>) = json(status, JSONObject().put("error", msg), cors)
 

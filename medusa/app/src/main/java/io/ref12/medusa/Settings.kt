@@ -17,6 +17,18 @@ class Settings(ctx: Context) {
     /** The same as a languages list for a job (empty = original). */
     val defaultLanguages: List<String> get() = defaultLanguage.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList()
 
+    /** Subtitle text size in sp (the second line is drawn smaller). */
+    var subtitleSp: Float
+        get() = prefs.getFloat("subtitleSp", 18f)
+        set(v) { prefs.edit().putFloat("subtitleSp", v).apply() }
+
+    /** Remembered subtitle choice per media item. slot = "main" or "second"; "" = off; null = never chosen. */
+    fun trackChoice(mediaId: String, slot: String): String? = prefs.getString("track.$mediaId.$slot", null)
+
+    fun setTrackChoice(mediaId: String, slot: String, language: String?) {
+        prefs.edit().putString("track.$mediaId.$slot", language ?: "").apply()
+    }
+
     /** Automatic app update checks (when the app opens, at most once a day). */
     var autoUpdateCheck: Boolean
         get() = prefs.getBoolean("autoUpdateCheck", true)

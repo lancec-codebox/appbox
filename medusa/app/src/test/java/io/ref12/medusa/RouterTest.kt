@@ -119,7 +119,14 @@ class RouterTest {
         val p = JSONObject(get("/v1/jobs/j1").body)
         assertEquals("downloading", p.getString("state"))
         assertEquals(0.457, p.getDouble("progress"), 1e-9)
-        assertEquals(404, get("/v1/jobs/other").status)
+        val unknown = get("/v1/jobs/other")
+        assertEquals(404, unknown.status)
+        val uj = JSONObject(unknown.body)
+        assertEquals("unknown_job", uj.getString("code"))
+        assertTrue(uj.getString("message").isNotEmpty())
+        assertEquals(404, get("/v1/jobs/other/result").status)
+        assertEquals("unknown_job", JSONObject(get("/v1/jobs/other/result").body).getString("code"))
+
     }
 
     @Test fun result_only_when_done() {

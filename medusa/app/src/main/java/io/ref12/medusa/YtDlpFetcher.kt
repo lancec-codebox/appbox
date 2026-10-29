@@ -82,7 +82,7 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         }
         var video: File? = null
         var videoErr: FetchException? = null
-        if (req.wantVideo) {
+        if (req.wantVideo && !req.videoAlreadyStored(extractor, id)) {
             try { video = fetchVideo(req, workDir, progress) } catch (e: FetchException) { videoErr = e }
         }
         return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr, trackInfos)

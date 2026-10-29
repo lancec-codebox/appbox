@@ -75,8 +75,19 @@ object MediaJson {
 class MediaStore(private val root: File, private val clock: () -> Long = System::currentTimeMillis) {
     private val base = File(root, "media").also { it.mkdirs() }
 
-    fun idFor(url: String): String =
-        MessageDigest.getInstance("SHA-256").digest(url.trim().toByteArray()).take(8).joinToString("") { "%02x".format(it) }
+    private fun hashId(s: String): String =
+        MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).take(8).joinToString("") { "%02x".format(it) }
+
+    /** The cache key: the same for every spelling of a video URL (see [UrlNormalizer]). */
+    fun idFor(url: String): String = hashId(UrlNormalizer.canonical(url))
+
+    /** The key of an existing item for this URL: the canonical one, else the key older versions used (hash of the raw URL). */
+    fun lookupId(url: String): String {
+        val id = idFor(url)
+        if (get(id) != null) return id
+        val legacy = hashId(url.trim())
+        return if (get(legacy) != null) legacy else id
+    }
 
     private fun valid(id: String) = Regex("[A-Za-z0-9_-]{1,64}").matches(id)
     private fun dir(id: String) = File(base, id)
@@ -86,6 +97,11 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
         val f = File(dir(id), "item.json")
         return try { if (f.isFile) MediaJson.fromStorage(JSONObject(f.readText())) else null } catch (e: Exception) { null }
     }
+
+    /** The stored item for a video's identity (extractor + id), whatever URL it was captured from. */
+    fun findByIdentity(extractor: String, videoId: String): MediaMeta? =
+        if (extractor.isEmpty() || videoId.isEmpty()) null
+        else list().firstOrNull { it.extractor.equals(extractor, true) && it.videoId == videoId }
 
     fun list(): List<MediaMeta> =
         (base.listFiles() ?: emptyArray()).filter { it.isDirectory }.mapNotNull { get(it.name) }.sortedByDescending { it.createdAt }

@@ -24,6 +24,8 @@ object Codes {
     const val NETWORK = "network"
     const val STORAGE = "storage"
     const val YTDLP = "ytdlp"
+    const val INTERRUPTED = "interrupted"
+    const val UNKNOWN_JOB = "unknown_job"
 }
 
 enum class Quality(val wire: String, val height: Int) {
@@ -96,6 +98,8 @@ class CaptureRequest(
     val wantSubtitles: Boolean,
     val wantVideo: Boolean,
     val quality: Quality,
+    /** Asked once yt-dlp has named the video (extractor, id): true when that video is already stored, so it is not downloaded again. */
+    val videoAlreadyStored: (String, String) -> Boolean = { _, _ -> false },
 )
 
 class CaptureOutcome(

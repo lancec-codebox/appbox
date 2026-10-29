@@ -9,7 +9,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/** Captured media on this phone: tap to play, long-press to delete. */
+/** Captured media on this phone: tap an item to choose its subtitles and play it. */
 class LibraryActivity : Activity() {
     private lateinit var box: LinearLayout
 
@@ -33,23 +33,47 @@ class LibraryActivity : Activity() {
             box.addView(TextView(this).apply {
                 text = m.title + "\n" + listOfNotNull(
                     m.durationSec?.let { "%d:%02d".format(it / 60, it % 60) },
-                    if (m.subtitles != null) "subtitles" else null,
+                    TrackUi.tracksOf(m).size.let { if (it == 0) "no subtitles" else "$it subtitle track" + (if (it > 1) "s" else "") },
                     if (m.video != null) "video" else "no video",
                     "$mb MB",
                 ).joinToString(" - ")
                 textSize = 16f
                 setPadding(0, 20, 0, 20)
-                setOnClickListener {
-                    if (m.video == null) android.widget.Toast.makeText(context, "This item has no video", android.widget.Toast.LENGTH_SHORT).show()
-                    else startActivity(Intent(this@LibraryActivity, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, m.mediaId))
-                }
-                setOnLongClickListener {
-                    AlertDialog.Builder(this@LibraryActivity).setTitle("Delete?").setMessage(m.title)
-                        .setPositiveButton("Delete") { _, _ -> app.media.delete(m.mediaId); render() }
-                        .setNegativeButton("Cancel", null).show()
-                    true
-                }
+                setOnClickListener { showItem(m) }
             })
         }
+    }
+
+    /** The item screen: choose the subtitle track and the second line before playing. */
+    private fun showItem(m: MediaMeta) {
+        val tracks = TrackUi.tracksOf(m)
+        val c = TrackUi.resolve(m.subtitles?.language, tracks, app.settings.trackChoice(m.mediaId, "main"), app.settings.trackChoice(m.mediaId, "second"))
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 16, 40, 0) }
+        fun header(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 24, 0, 4); setTypeface(typeface, android.graphics.Typeface.BOLD) }
+        fun group(second: Boolean): android.widget.RadioGroup {
+            val cur = if (second) c.second else c.main
+            val slot = if (second) "second" else "main"
+            val labels = listOf("Off") + tracks.map { TrackUi.label(it) }
+            val checked = if (cur == null) 0 else tracks.indexOfFirst { it.language.equals(cur, true) }.let { if (it < 0) 0 else it + 1 }
+            return TrackUi.radios(this, labels, listOf("$slot:off") + tracks.map { "$slot:" + it.language }, checked) { i ->
+                app.settings.setTrackChoice(m.mediaId, slot, if (i == 0) null else tracks[i - 1].language)
+            }
+        }
+        body.addView(header("Subtitles"))
+        body.addView(group(false))
+        body.addView(header("Second line"))
+        body.addView(group(true))
+        if (tracks.isEmpty()) body.addView(TextView(this).apply { text = "This item has no subtitle tracks."; setPadding(0, 16, 0, 0) })
+        val b = AlertDialog.Builder(this).setTitle(m.title).setView(ScrollView(this).apply { addView(body) })
+            .setNeutralButton("Delete") { _, _ ->
+                AlertDialog.Builder(this).setTitle("Delete?").setMessage(m.title)
+                    .setPositiveButton("Delete") { _, _ -> app.media.delete(m.mediaId); render() }
+                    .setNegativeButton("Cancel", null).show()
+            }
+            .setNegativeButton("Close", null)
+        if (m.video != null) b.setPositiveButton("Play") { _, _ ->
+            startActivity(Intent(this, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, m.mediaId))
+        }
+        b.show()
     }
 }

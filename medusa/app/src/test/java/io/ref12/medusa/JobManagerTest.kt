@@ -21,8 +21,9 @@ class JobManagerTest {
     private fun runQueued() { while (queue.isNotEmpty()) queue.removeAt(0).run() }
     private val seen = ArrayList<Pair<JobState, Double?>>()
 
+    private var videoIdSeen = "vid"
     private fun outcome(video: File? = null, subs: Boolean = true) = CaptureOutcome(
-        "标题", 60, "youtube", "vid",
+        "标题", 60, "youtube", videoIdSeen,
         if (subs) SubtitlesData("captions", "zh-Hans", listOf(Line(1.0, 2.0, "你好"))) else null,
         video, if (subs) null else FetchException("No captions", Codes.NO_CAPTIONS), null,
     )
@@ -74,8 +75,11 @@ class JobManagerTest {
         val m = manager { _, d -> outcome(mp4(d)) }
         val a = m.submit(sub("a", "https://y/x"))
         val b = m.submit(sub("b", "https://y/x"))
-        assertEquals(a, b)
+        assertEquals("a", a)
+        assertEquals("b", b) // the requested id answers too: it is an alias of the running job
+        assertEquals(JobState.QUEUED, m.info("b")!!.state)
         runQueued()
+        assertEquals(JobState.DONE, m.info("b")!!.state)
         assertEquals(1, fetches)
     }
 
@@ -115,7 +119,8 @@ class JobManagerTest {
     }
 
     @Test fun media_list_and_delete() {
-        val m = manager { _, d -> outcome(mp4(d)) }
+        var n = 0
+        val m = manager { _, d -> videoIdSeen = "vid" + (n++); outcome(mp4(d)) }
         m.submit(sub("a", "https://y/a")); m.submit(sub("b", "https://y/b")); runQueued()
         assertEquals(2, m.media.list().size)
         val id = m.media.idFor("https://y/a")
@@ -223,6 +228,142 @@ class JobManagerTest {
         assertEquals(emptyList<String>(), languagesSeen)
         m.submit(JobSubmit("c", "https://y/x", listOf("de"), Want(true, false)))
         assertEquals(JobState.QUEUED, m.info("c")!!.state)
+    }
+
+    // ---- 1.3.1: ids, aliases, persistence, idempotent capture ----
+
+    private class CountingFetcher(val subsByLang: Map<String, SubtitlesData>) : MediaFetcher {
+        var videoDownloads = 0
+        val subtitleFetches = ArrayList<List<String>>()
+        override fun fetch(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): CaptureOutcome {
+            val stored = req.videoAlreadyStored("youtube", "4mcienmpsnk")
+            var video: File? = null
+            if (req.wantVideo && !stored) { videoDownloads++; video = File(workDir, "video.mp4").also { it.writeBytes(ByteArray(100)) } }
+            var subs: SubtitlesData? = null
+            if (req.wantSubtitles) {
+                subtitleFetches.add(req.languages)
+                subs = if (req.languages.isEmpty()) subsByLang.values.first() else req.languages.firstNotNullOfOrNull { subsByLang[it] }
+            }
+            return CaptureOutcome("Video", 60, "youtube", "4mcienmpsnk", subs, video,
+                if (req.wantSubtitles && subs == null) FetchException("No captions", Codes.NO_CAPTIONS) else null, null,
+                subsByLang.values.map { TrackInfo(it.language, it.source) })
+        }
+    }
+
+    private val subs = mapOf(
+        "en" to SubtitlesData("captions", "en", listOf(Line(1.0, 2.0, "hello"))),
+        "fr" to SubtitlesData("captions", "fr", listOf(Line(1.0, 2.0, "bonjour"))),
+    )
+
+    private fun idManager(f: MediaFetcher, root: File = tmp.root): JobManager =
+        JobManager(Storage(root) { now }, MediaStore(root) { now }, f, deferred) { now }
+
+    @Test fun deep_link_id_becomes_the_job_id_for_a_new_capture() {
+        val m = idManager(CountingFetcher(subs))
+        val id = m.submit(JobSubmit("link-job-1", "https://m.youtube.com/watch?v=4mcienmpsnk&feature=share", null))
+        assertEquals("link-job-1", id)
+        assertEquals(JobState.QUEUED, m.info("link-job-1")!!.state)
+        runQueued()
+        assertEquals(JobState.DONE, m.info("link-job-1")!!.state)
+        assertNotNull(m.resultJson("link-job-1"))
+    }
+
+    @Test fun deep_link_id_is_an_alias_of_a_running_job_for_the_same_video() {
+        val m = idManager(CountingFetcher(subs))
+        m.submit(JobSubmit("first", "https://www.youtube.com/watch?v=4mcienmpsnk", null))
+        val id = m.submit(JobSubmit("second", "https://youtu.be/4mcienmpsnk?si=x", null)) // still queued
+        assertEquals("second", id)
+        assertEquals(JobState.QUEUED, m.info("second")!!.state)
+        assertEquals("second", m.info("second")!!.id) // answered under the id the client knows
+        runQueued()
+        assertEquals(JobState.DONE, m.info("second")!!.state)
+        assertNotNull(m.resultJson("second"))
+        assertEquals(1, m.activeCount() + 1) // only one real job ever ran
+    }
+
+    @Test fun alias_survives_a_restart() {
+        val f = CountingFetcher(subs)
+        val m = idManager(f)
+        m.submit(JobSubmit("first", "https://www.youtube.com/watch?v=4mcienmpsnk", null))
+        m.submit(JobSubmit("second", "https://youtu.be/4mcienmpsnk", null)); runQueued()
+        val m2 = idManager(f)
+        assertEquals(JobState.DONE, m2.info("second")!!.state)
+        assertNotNull(m2.resultJson("second"))
+    }
+
+    @Test fun deep_link_id_for_an_already_captured_url_is_a_done_job_at_once() {
+        val f = CountingFetcher(subs)
+        val m = idManager(f)
+        m.submit(JobSubmit("a", "https://www.youtube.com/watch?v=4mcienmpsnk", null)); runQueued()
+        val id = m.submit(JobSubmit("from-phone", "https://m.youtube.com/watch?v=4mcienmpsnk&feature=share", null))
+        assertEquals("from-phone", id)
+        assertEquals(JobState.DONE, m.info("from-phone")!!.state)
+        assertEquals(1.0, m.info("from-phone")!!.progress!!, 0.0)
+        assertEquals(0, queue.size) // nothing queued
+        assertEquals(1, f.videoDownloads)
+    }
+
+    @Test fun same_video_by_four_url_forms_is_one_item_and_one_download() {
+        val f = CountingFetcher(subs)
+        val m = idManager(f)
+        for ((i, u) in listOf("https://www.youtube.com/watch?v=4mcienmpsnk", "https://m.youtube.com/watch?v=4mcienmpsnk&t=5",
+            "https://youtu.be/4mcienmpsnk", "https://www.youtube.com/shorts/4mcienmpsnk").withIndex()) {
+            m.submit(JobSubmit("j$i", u, null)); runQueued()
+            assertEquals(JobState.DONE, m.info("j$i")!!.state)
+        }
+        assertEquals(1, m.media.list().size)
+        assertEquals(1, f.videoDownloads)
+    }
+
+    @Test fun same_video_found_by_identity_when_the_url_is_not_recognised() {
+        val f = CountingFetcher(subs)
+        val m = idManager(f)
+        m.submit(JobSubmit("a", "https://www.youtube.com/watch?v=4mcienmpsnk", null)); runQueued()
+        m.submit(JobSubmit("b", "https://some-redirector.example/x/4mcienmpsnk", null)); runQueued() // yt-dlp names the same video
+        assertEquals(1, m.media.list().size)
+        assertEquals(1, f.videoDownloads)
+        assertEquals(m.media.list()[0].mediaId, m.record("b")!!.mediaId)
+    }
+
+    @Test fun second_capture_with_a_new_language_downloads_only_that_track() {
+        val f = CountingFetcher(subs)
+        val m = idManager(f)
+        m.submit(JobSubmit("a", "https://youtu.be/4mcienmpsnk", listOf("en"))); runQueued()
+        m.submit(JobSubmit("b", "https://youtu.be/4mcienmpsnk", listOf("fr"))); runQueued()
+        assertEquals(1, f.videoDownloads)
+        assertEquals(listOf(listOf("en"), listOf("fr")), f.subtitleFetches)
+        val item = m.media.list().single()
+        assertEquals("fr", item.subtitles!!.language)
+        assertEquals("hello", m.media.loadTrack(item.mediaId, "en")!!.lines[0].text) // the English track is kept
+        // asking for English again is a no-op: stored, so nothing is fetched at all
+        m.submit(JobSubmit("c", "https://youtu.be/4mcienmpsnk", listOf("fr")))
+        assertEquals(JobState.DONE, m.info("c")!!.state)
+        assertEquals(2, f.subtitleFetches.size)
+    }
+
+    @Test fun a_job_that_was_running_when_the_process_died_is_failed_with_a_clear_message() {
+        val m = idManager(CountingFetcher(subs))
+        m.submit(JobSubmit("x", "https://www.youtube.com/watch?v=4mcienmpsnk", null)) // queued, never run
+        val m2 = idManager(CountingFetcher(subs)) // the process was killed: a new manager on the same files
+        val i = m2.info("x")!!
+        assertEquals(JobState.FAILED, i.state)
+        assertEquals(Codes.INTERRUPTED, i.code)
+        assertTrue(i.message!!.contains("closed before"))
+        assertEquals(JobState.FAILED, idManager(CountingFetcher(subs)).info("x")!!.state) // and it stays that way
+    }
+
+    @Test fun done_and_failed_jobs_are_served_after_a_restart_for_over_a_day() {
+        val f = CountingFetcher(subs)
+        val m = idManager(f)
+        m.submit(JobSubmit("done1", "https://www.youtube.com/watch?v=4mcienmpsnk", null)); runQueued()
+        val failing = idManager(MediaFetcher { _, _, _ -> throw FetchException("YouTube asks for a sign-in", Codes.BOT_CHECK) })
+        failing.submit(JobSubmit("bad1", "https://www.youtube.com/watch?v=AAAAAAAAAAA", null)); runQueued()
+        now += 25L * 3600 * 1000
+        val m2 = idManager(f)
+        assertEquals(JobState.DONE, m2.info("done1")!!.state)
+        assertNotNull(m2.resultJson("done1"))
+        val bad = m2.info("bad1")!!
+        assertEquals(JobState.FAILED, bad.state); assertEquals(Codes.BOT_CHECK, bad.code)
     }
 }
 

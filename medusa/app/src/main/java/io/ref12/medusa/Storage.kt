@@ -55,8 +55,17 @@ class Storage(root: File, private val clock: () -> Long = System::currentTimeMil
         return try { if (f.isFile) JobMeta.fromJson(JSONObject(f.readText())) else null } catch (e: Exception) { null }
     }
 
+    /** An alias: GET /v1/jobs/<alias> answers with the job <target> (a client's own id for a job that already existed). */
+    fun saveAlias(alias: String, target: String) = File(jobs, "$alias.alias").writeText(target)
+
+    fun loadAlias(alias: String): String? {
+        if (!Regex("[A-Za-z0-9_-]{1,64}").matches(alias)) return null
+        val f = File(jobs, "$alias.alias")
+        return try { if (f.isFile) f.readText().trim().takeIf { it.isNotEmpty() } else null } catch (e: Exception) { null }
+    }
+
     fun recentJobs(limit: Int = 20): List<JobMeta> =
-        (jobs.listFiles() ?: emptyArray()).mapNotNull { f ->
+        (jobs.listFiles() ?: emptyArray()).filter { it.name.endsWith(".json") }.mapNotNull { f ->
             try { JobMeta.fromJson(JSONObject(f.readText())) } catch (e: Exception) { null }
         }.sortedByDescending { it.updatedAt }.take(limit)
 
