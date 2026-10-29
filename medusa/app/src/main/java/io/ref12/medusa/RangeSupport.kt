@@ -24,7 +24,7 @@ object RangeSupport {
             return RangeResult.Partial(maxOf(0L, size - n), size - 1)
         }
         val start = a.toLongOrNull() ?: return RangeResult.Full
-        val end = if (b.isEmpty()) size - 1 else (b.toLongOrNull() ?: return RangeResult.Full)
+        val end = if (b.isEmpty()) Long.MAX_VALUE else (b.toLongOrNull() ?: return RangeResult.Full)
         if (end < start) return RangeResult.Full
         if (start >= size) return RangeResult.Unsatisfiable
         return RangeResult.Partial(start, minOf(end, size - 1))

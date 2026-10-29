@@ -7,3 +7,4 @@ local.properties
 *.keystore
 captures/
 .externalNativeBuild/
+.kotlin/
