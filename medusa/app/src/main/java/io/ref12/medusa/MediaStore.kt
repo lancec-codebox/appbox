@@ -21,7 +21,11 @@ object MediaJson {
         } ?: JSONObject.NULL)
         put("subtitles", m.subtitles?.let { subtitlesJson(it, withLines) } ?: JSONObject.NULL)
         put("tracks", JSONArray().also { arr ->
-            for (t in m.tracks) arr.put(JSONObject().put("language", t.language).put("source", t.source).also { o -> t.name?.let { o.put("name", it) } })
+            for (t in m.tracks) arr.put(JSONObject().put("language", t.language).put("source", t.source).also { o ->
+                t.name?.let { n -> o.put("name", n); if (t.added) o.put("label", n) }
+                t.trackId?.let { id -> o.put("trackId", id) }
+                if (t.added && !t.origin.isNullOrEmpty()) o.put("origin", t.origin)
+            })
         })
         put("sync", anchorsJson(sync))
         if (forStorage) put("createdAt", m.createdAt)
@@ -66,7 +70,7 @@ object MediaJson {
             },
             v?.let { VideoData(it.getString("file"), it.getString("contentType"), it.getLong("bytes")) },
             j.optLong("createdAt"),
-            j.optJSONArray("tracks")?.let { a -> (0 until a.length()).map { i -> a.getJSONObject(i).let { t -> TrackInfo(t.getString("language"), t.getString("source"), t.optString("name", "").ifEmpty { null }) } } } ?: emptyList(),
+            j.optJSONArray("tracks")?.let { a -> (0 until a.length()).map { i -> a.getJSONObject(i).let { t -> TrackInfo(t.getString("language"), t.getString("source"), t.optString("name", "").ifEmpty { null }, t.optString("trackId", "").ifEmpty { null }, t.optString("origin", "").ifEmpty { null }) } } } ?: emptyList(),
         )
     }
 }
@@ -140,6 +144,39 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
     fun saveTrack(id: String, s: SubtitlesData) {
         dir(id).mkdirs()
         trackFile(id, s.language).writeText(MediaJson.subtitlesJson(s).toString())
+    }
+
+    private fun addedFile(id: String, trackId: String) = File(dir(id), "added-$trackId.json")
+
+    /** Adds (or replaces, same language + origin) a producer-supplied track; null for unknown media. */
+    fun addTrack(id: String, t: AddedTrack): TrackInfo? {
+        val meta = get(id) ?: return null
+        val info = TrackInfo(t.language, TrackInfo.SOURCE_ADDED, t.label, t.trackId, t.origin.ifEmpty { null })
+        addedFile(id, t.trackId).writeText(MediaJson.subtitlesJson(SubtitlesData(TrackInfo.SOURCE_ADDED, t.language, t.lines)).toString())
+        val rest = meta.tracks.filter { it.trackId != t.trackId }
+        save(meta.copy(tracks = rest + info))
+        return info
+    }
+
+    fun loadAdded(id: String, trackId: String): SubtitlesData? {
+        if (!valid(trackId)) return null
+        val f = addedFile(id, trackId)
+        return try {
+            if (!f.isFile) null else JSONObject(f.readText()).let { j ->
+                val arr = j.getJSONArray("lines")
+                SubtitlesData(TrackInfo.SOURCE_ADDED, j.getString("language"),
+                    (0 until arr.length()).map { i -> arr.getJSONObject(i).let { l -> Line(l.getDouble("start"), l.getDouble("end"), l.getString("text")) } })
+            }
+        } catch (e: Exception) { null }
+    }
+
+    /** Removes an added track; false when there is none with that id. */
+    fun removeTrack(id: String, trackId: String): Boolean {
+        val meta = get(id) ?: return false
+        if (meta.tracks.none { it.trackId == trackId && it.added }) return false
+        addedFile(id, trackId).delete()
+        save(meta.copy(tracks = meta.tracks.filter { it.trackId != trackId }))
+        return true
     }
 
     fun videoFile(id: String): File? {

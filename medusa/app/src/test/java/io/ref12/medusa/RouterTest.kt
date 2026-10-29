@@ -34,8 +34,12 @@ class RouterTest {
         var subsError: FetchException? = null
         var asked: String? = null
         var mainSet: String? = null
-        override fun subtitles(mediaId: String, language: String): SubtitlesData? {
-            asked = language
+        val added = ArrayList<AddedTrack>()
+        var askedTrack: String? = null
+        override fun addTrack(mediaId: String, track: AddedTrack): String? { if (mediaId != "m1") return null; added.removeAll { it.trackId == track.trackId }; added.add(track); return track.trackId }
+        override fun removeTrack(mediaId: String, trackId: String) = mediaId == "m1" && added.removeAll { it.trackId == trackId }
+        override fun subtitles(mediaId: String, language: String, trackId: String?): SubtitlesData? {
+            asked = language; askedTrack = trackId
             subsError?.let { throw it }
             return if (mediaId == "m1") subsResult else null
         }
@@ -226,3 +230,46 @@ class RouterTest {
     }
 }
 
+
+class RouterTracksTest {
+    private val api = object : HelperApi {
+        val added = HashMap<String, AddedTrack>()
+        var askedTrack: String? = null
+        override fun appVersion() = "1.4.0"; override fun ytDlpVersion() = "x"
+        override fun submit(req: JobSubmit) = "j"; override fun jobInfo(id: String): JobInfo? = null
+        override fun resultJson(id: String): String? = null; override fun mediaListJson() = "[]"
+        override fun mediaJson(mediaId: String): String? = null; override fun deleteMedia(mediaId: String) = false
+        override fun videoFile(mediaId: String): Pair<File, String>? = null
+        override fun sync(mediaId: String): List<Anchor>? = null
+        override fun putSync(mediaId: String, anchors: List<Anchor>) = false
+        override fun subtitles(mediaId: String, language: String, trackId: String?): SubtitlesData? {
+            askedTrack = trackId
+            return added[trackId]?.let { SubtitlesData("added", it.language, it.lines) }
+        }
+        override fun setSubtitles(mediaId: String, language: String): String? = null
+        override fun addTrack(mediaId: String, track: AddedTrack): String? { if (mediaId != "m1") return null; added[track.trackId] = track; return track.trackId }
+        override fun removeTrack(mediaId: String, trackId: String) = mediaId == "m1" && added.remove(trackId) != null
+        override fun touch() {}
+    }
+    private val router = Router(api) { DEFAULT_ORIGINS }
+    private val o = "https://ref12.github.io"
+    private val good = """{"language":"en","label":"English (AI)","source":"added","origin":"lw","lines":[{"start":1,"end":2,"text":"hi"}]}"""
+
+    @Test fun post_returns_a_track_id_and_get_serves_it_and_delete_removes_it() {
+        val r = router.handle("POST", "/v1/media/m1/tracks", o, emptyMap(), good)
+        assertEquals(200, r.status)
+        val id = JSONObject(r.body).getString("trackId")
+        val g = router.handle("GET", "/v1/media/m1/subtitles?language=en&track=$id", o, emptyMap(), null)
+        assertEquals(200, g.status); assertEquals("added", JSONObject(g.body).getString("source"))
+        assertEquals(id, api.askedTrack)
+        assertEquals(200, router.handle("DELETE", "/v1/media/m1/tracks/$id", o, emptyMap(), null).status)
+        assertEquals(404, router.handle("DELETE", "/v1/media/m1/tracks/$id", o, emptyMap(), null).status)
+    }
+    @Test fun validation_errors_are_400_unknown_media_404_big_body_413() {
+        assertEquals(400, router.handle("POST", "/v1/media/m1/tracks", o, emptyMap(), good.replace("\"end\":2", "\"end\":1")).status)
+        assertEquals(400, router.handle("POST", "/v1/media/m1/tracks", o, emptyMap(), "nope").status)
+        assertEquals(404, router.handle("POST", "/v1/media/zz/tracks", o, emptyMap(), good).status)
+        assertEquals(413, router.handle("POST", "/v1/media/m1/tracks", o, emptyMap(), " ".repeat(TrackRules.MAX_BYTES + 1)).status)
+        assertEquals(405, router.handle("GET", "/v1/media/m1/tracks", o, emptyMap(), null).status)
+    }
+}

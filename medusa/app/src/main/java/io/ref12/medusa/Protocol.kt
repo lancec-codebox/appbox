@@ -57,7 +57,12 @@ data class Line(val start: Double, val end: Double, val text: String)
 data class Anchor(val at: Double, val offset: Double)
 
 /** A subtitle track the video offers (without its lines). */
-data class TrackInfo(val language: String, val source: String, val name: String? = null)
+data class TrackInfo(val language: String, val source: String, val name: String? = null, val trackId: String? = null, val origin: String? = null) {
+    /** What the pickers and saved choices use: the trackId of an added track, else the language. */
+    val key: String get() = trackId ?: language
+    val added: Boolean get() = source == SOURCE_ADDED
+    companion object { const val SOURCE_ADDED = "added" }
+}
 
 data class SubtitlesData(val source: String, val language: String, val lines: List<Line>)
 

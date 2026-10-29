@@ -53,10 +53,9 @@ class LibraryActivity : Activity() {
         fun group(second: Boolean): android.widget.RadioGroup {
             val cur = if (second) c.second else c.main
             val slot = if (second) "second" else "main"
-            val labels = listOf("Off") + tracks.map { TrackUi.label(it) }
-            val checked = if (cur == null) 0 else tracks.indexOfFirst { it.language.equals(cur, true) }.let { if (it < 0) 0 else it + 1 }
-            return TrackUi.radios(this, labels, listOf("$slot:off") + tracks.map { "$slot:" + it.language }, checked) { i ->
-                app.settings.setTrackChoice(m.mediaId, slot, if (i == 0) null else tracks[i - 1].language)
+            val (labels, tags) = TrackUi.menuEntries(tracks)
+            return TrackUi.radios(this, labels, tags.map { "$slot:$it" }, TrackUi.indexOfKey(tracks, cur)) { i ->
+                app.settings.setTrackChoice(m.mediaId, slot, if (i == 0) null else tracks[i - 1].key)
             }
         }
         body.addView(header("Subtitles"))
@@ -64,6 +63,20 @@ class LibraryActivity : Activity() {
         body.addView(header("Second line"))
         body.addView(group(true))
         if (tracks.isEmpty()) body.addView(TextView(this).apply { text = "This item has no subtitle tracks."; setPadding(0, 16, 0, 0) })
+        fun action(t: String, desc: String, f: () -> Unit) = android.widget.Button(this).apply { text = t; isAllCaps = false; contentDescription = desc; tag = desc; setOnClickListener { f() } }
+        body.addView(header("Added subtitles"))
+        body.addView(action("Import subtitles\u2026", "Import subtitles") {
+            startActivity(Intent(this, ImportActivity::class.java).putExtra(ImportActivity.EXTRA_MEDIA, m.mediaId))
+        })
+        body.addView(action("Export subtitles\u2026", "Export subtitles") { ExportUi.show(this, m) })
+        for (t in tracks.filter { it.added }) body.addView(action("Remove: " + TrackUi.label(t), "remove:" + t.key) {
+            AlertDialog.Builder(this).setTitle("Remove this track?").setMessage(TrackUi.label(t))
+                .setPositiveButton("Remove") { _, _ ->
+                    app.media.removeTrack(m.mediaId, t.trackId!!)
+                    for (slot in listOf("main", "second")) if (t.key.equals(app.settings.trackChoice(m.mediaId, slot), true)) app.settings.setTrackChoice(m.mediaId, slot, null)
+                    render(); app.media.get(m.mediaId)?.let { showItem(it) }
+                }.setNegativeButton("Cancel", null).show()
+        })
         val b = AlertDialog.Builder(this).setTitle(m.title).setView(ScrollView(this).apply { addView(body) })
             .setNeutralButton("Delete") { _, _ ->
                 AlertDialog.Builder(this).setTitle("Delete?").setMessage(m.title)

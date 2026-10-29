@@ -1,0 +1,109 @@
+package io.ref12.medusa
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+
+/**
+ * Adds a subtitle file (.srt, .vtt, *.medusa-track.json) to a library item. Reached by opening or sharing a file
+ * with Medusa, or from the item screen (which passes EXTRA_MEDIA and starts with the system file picker).
+ */
+class ImportActivity : Activity() {
+    private var forcedMedia: String? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        forcedMedia = intent.getStringExtra(EXTRA_MEDIA)
+        val uri = fileUri(intent)
+        if (uri != null) { load(uri); return }
+        if (forcedMedia == null) { Toast.makeText(this, "No subtitle file", Toast.LENGTH_LONG).show(); finish(); return }
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), PICK)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val u = data?.data
+        if (requestCode == PICK && resultCode == RESULT_OK && u != null) load(u) else finish()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun fileUri(i: Intent): Uri? = when (i.action) {
+        Intent.ACTION_VIEW -> i.data
+        Intent.ACTION_SEND -> i.getParcelableExtra(Intent.EXTRA_STREAM)
+        else -> null
+    }
+
+    private fun nameOf(u: Uri): String {
+        if (u.scheme == "content") try {
+            contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) return it.getString(0) }
+        } catch (e: Exception) { /* fall through */ }
+        return u.lastPathSegment ?: "subtitles"
+    }
+
+    private fun load(u: Uri) {
+        val name = nameOf(u)
+        Thread {
+            val r = try {
+                val bytes = contentResolver.openInputStream(u)!!.use { it.readNBytes(TrackRules.MAX_BYTES + 1) }
+                Result.success(SubtitleFiles.parse(name, String(bytes, Charsets.UTF_8)))
+            } catch (e: TrackRejected) { Result.failure(e) } catch (e: Exception) { Result.failure(TrackRejected("Could not read this file: " + e.message)) }
+            runOnUiThread { r.fold({ choose(name, it) }, { fail(it.message ?: "Could not read this file") }) }
+        }.start()
+    }
+
+    private fun fail(msg: String) {
+        AlertDialog.Builder(this).setTitle("Import subtitles").setMessage(msg).setPositiveButton("OK") { _, _ -> finish() }.setOnCancelListener { finish() }.show()
+    }
+
+    private fun choose(fileName: String, f: ImportedFile) {
+        val items = app.media.list()
+        if (items.isEmpty()) { fail("Your library is empty. Capture the video first, then import its subtitles."); return }
+        val matched = forcedMedia?.let { id -> items.firstOrNull { it.mediaId == id } } ?: ImportMatch.find(items, f.mediaId, f.url)
+        var pick = items.indexOf(matched).coerceAtLeast(0)
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 16, 40, 0) }
+        fun header(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 24, 0, 4); setTypeface(typeface, android.graphics.Typeface.BOLD) }
+        body.addView(TextView(this).apply { text = fileName + " - " + f.lines.size + " lines" })
+        if (matched == null) body.addView(TextView(this).apply { text = "Medusa could not tell which video this belongs to. Choose it below."; setPadding(0, 12, 0, 0) })
+        body.addView(header("Video"))
+        if (forcedMedia != null || matched != null && items.size == 1) body.addView(TextView(this).apply { text = items[pick].title; textSize = 16f })
+        else body.addView(TrackUi.radios(this, items.map { it.title }, items.map { "item:" + it.mediaId }, pick) { pick = it })
+        body.addView(header("Language"))
+        val lang = EditText(this).apply { setText(f.language ?: ""); hint = "en, fr, pt-BR ..."; contentDescription = "Language"; tag = "language"; setSingleLine() }
+        body.addView(lang)
+        body.addView(header("Label (shown in the subtitle menu)"))
+        val label = EditText(this).apply { setText(f.label ?: ""); hint = "English (AI)"; contentDescription = "Label"; tag = "label"; setSingleLine() }
+        body.addView(label)
+        AlertDialog.Builder(this).setTitle("Import subtitles").setView(android.widget.ScrollView(this).apply { addView(body) })
+            .setPositiveButton("Add", null).setNegativeButton("Cancel") { _, _ -> finish() }.setOnCancelListener { finish() }
+            .create().also { d ->
+                d.setOnShowListener {
+                    d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val m = items[pick]
+                        val json = org.json.JSONObject().put("language", lang.text.toString().trim()).put("lines", org.json.JSONArray().also { a ->
+                            for (l in f.lines) a.put(org.json.JSONObject().put("start", l.start).put("end", l.end).put("text", l.text))
+                        }).put("origin", f.origin ?: "import")
+                        label.text.toString().trim().takeIf { it.isNotEmpty() }?.let { json.put("label", it) }
+                        try {
+                            val t = TrackRules.parse(json)
+                            app.media.addTrack(m.mediaId, t) ?: throw TrackRejected("That video is no longer in the library")
+                            Toast.makeText(this, "Added " + (t.label ?: t.language) + " to " + m.title, Toast.LENGTH_LONG).show()
+                            d.dismiss(); startActivity(Intent(this, LibraryActivity::class.java)); finish()
+                        } catch (e: TrackRejected) { Toast.makeText(this, e.message, Toast.LENGTH_LONG).show() }
+                    }
+                }
+            }.show()
+    }
+
+    companion object {
+        const val EXTRA_MEDIA = "media"
+        private const val PICK = 7
+    }
+}

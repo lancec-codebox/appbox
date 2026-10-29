@@ -107,12 +107,18 @@ class JobManager(
      * Lines of one subtitle track of a media item. The main track is answered from the item; another one is
      * downloaded on demand (once) and kept. Returns null for an unknown media item.
      */
-    fun subtitlesFor(mediaId: String, language: String): SubtitlesData? {
+    fun subtitlesFor(mediaId: String, language: String, trackId: String? = null): SubtitlesData? {
         val meta = media.get(mediaId) ?: return null
+        if (trackId != null) {
+            val t = meta.tracks.firstOrNull { it.trackId == trackId && it.added }
+                ?: throw FetchException("This item has no added track $trackId", Codes.NO_CAPTIONS)
+            return media.loadAdded(mediaId, t.trackId!!) ?: throw FetchException("The added track's lines are missing", Codes.NO_CAPTIONS)
+        }
         meta.subtitles?.takeIf { it.language.equals(language, true) }?.let { return it }
-        val known = meta.tracks.firstOrNull { it.language.equals(language, true) }
-            ?: meta.tracks.firstOrNull { TrackSelector.languageMatches(it.language, language) }
-            ?: throw FetchException(TrackSelector.noCaptionsMessage(listOf(language), meta.tracks), Codes.NO_CAPTIONS)
+        val captured = meta.tracks.filter { !it.added }
+        val known = captured.firstOrNull { it.language.equals(language, true) }
+            ?: captured.firstOrNull { TrackSelector.languageMatches(it.language, language) }
+            ?: throw FetchException(TrackSelector.noCaptionsMessage(listOf(language), captured), Codes.NO_CAPTIONS)
         media.loadTrack(mediaId, known.language)?.let { return it }
         val work = media.workDir(mediaId)
         try {
@@ -173,7 +179,7 @@ class JobManager(
             }
             media.save(MediaMeta(target, if (old != null) old.url else rec.url, out.title.ifEmpty { old?.title ?: rec.url }, out.durationSec ?: old?.durationSec,
                 out.extractor.ifEmpty { old?.extractor ?: "" }, out.videoId.ifEmpty { old?.videoId ?: "" }, subtitles, video, old?.createdAt ?: clock(),
-                out.tracks.ifEmpty { old?.tracks ?: emptyList() }))
+                out.tracks.ifEmpty { old?.tracks?.filter { !it.added } ?: emptyList() } + (old?.tracks?.filter { it.added } ?: emptyList())))
             rec.title = out.title
             val note = listOfNotNull(
                 if (wantSubs && out.subtitles == null) out.subtitlesError?.message else null,

@@ -1,4 +1,4 @@
-# Medusa protocol, v1.2
+# Medusa protocol, v1.3
 
 Medusa (repo <https://github.com/lancec-codebox/appbox>, folder `medusa/`, package `io.ref12.medusa`) is an Android app that captures a media URL with yt-dlp on the phone: subtitles (in any language) and video. A web app (first client: LinguaWeave) talks to it only through this protocol and never runs yt-dlp. Any URL yt-dlp supports works.
 
@@ -22,7 +22,7 @@ Optional `languages=<comma list>` (for example `languages=en,fr`) works like `la
 
 ### Status
 
-`GET /v1/status` → `{ "app": "medusa", "version": "1.2.0", "ytDlp": "..." }`
+`GET /v1/status` → `{ "app": "medusa", "version": "1.4.0", "ytDlp": "..." }`
 
 ### Jobs
 
@@ -69,7 +69,21 @@ Captures persist on the phone until deleted.
 - `GET /v1/media/{id}/subtitles?language=xx` → `{ "source", "language", "lines": [...] }` of that track. Downloads it on demand (once, then kept) and does not change the item's main track. 400 without `language`; 404 with code `no_captions` when the video has no such track, 502 for other failures (body `{ "error", "code" }`).
 - `POST /v1/media/{id}/subtitles` body `{ "language": "xx" }` makes that track the main one and returns the updated media item. Same errors.
 
-Sync anchors belong to the item, not to a track: changing tracks keeps them.
+### Added tracks (v1.3)
+
+Another app can add a subtitle track it produced (for example a translation) so it plays in Medusa.
+
+- `POST /v1/media/{id}/tracks` body `{ "language": "en", "label"?: "English (AI)", "source": "added", "origin"?: "linguaweave", "lines": [ { "start", "end", "text" } ] }` → `{ "trackId" }`. An added track with the same language and origin is replaced (and keeps its trackId); other origins and the captured tracks stay.
+- The item's `tracks` then lists it as `{ "language", "source": "added", "label", "trackId", "origin"? }` (`name` is the same text as `label`).
+- `GET /v1/media/{id}/subtitles?track=<trackId>` (with or without `language`) → `{ "source": "added", "language", "lines" }`. 404 `no_captions` for an unknown trackId.
+- `DELETE /v1/media/{id}/tracks/{trackId}` → `{ "deleted": true }`; 404 if the media or the track is unknown. Only added tracks can be deleted.
+- Validation (400 `{ "error", "code": "invalid_track" }`): `language` is a tag like `en` or `pt-BR`; `source`, when given, is `added`; `origin` is 1-40 characters of letters, digits, `.`, `_`, `-`; `label` is plain text, at most 60 characters; `lines` is not empty (at most 20000), sorted by `start`, `start` >= 0, `end` > `start`, `text` a non-empty plain string (no markup or control characters, at most 2000 characters). A body over 2 MB is refused with 413. 404 for unknown media.
+
+Sync anchors belong to the item (video time), not to a track: they apply to added tracks exactly as to captured ones, and changing tracks keeps them.
+
+### Subtitle files (import and export)
+
+Medusa opens and receives shared `.srt`, `.vtt` and `*.medusa-track.json` files. The JSON is the `POST .../tracks` body plus optional `mediaId`, `url` and `title`; Medusa picks the library item by `mediaId`, else by `url` (any spelling of the same video), else asks. The item screen and the player's subtitle menu export any track (or all) as SRT (default), WebVTT or that JSON, named `<title> [<language>].<ext>`, with Share and Save to Downloads.
 
 ### Sync
 
@@ -86,4 +100,4 @@ If the browser blocks 127.0.0.1, the job screen's Save transcript writes the med
 
 ## Versions
 
-v1: Chinese subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. Later: on-device speech recognition when no captions exist.
+v1: Chinese subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. v1.3: added tracks (producer-supplied subtitles), the `track` query on `/subtitles`. Later: on-device speech recognition when no captions exist.

@@ -138,7 +138,8 @@ class PlayerActivity : Activity() {
         if (lang == null) { apply(emptyList()); done(true); return }
         ccSpinner?.visibility = View.VISIBLE
         Thread {
-            val s = try { app.jobs.subtitlesFor(mediaId, lang) } catch (e: Exception) { null }
+            val t = tracks.firstOrNull { it.key.equals(lang, true) }
+            val s = try { if (t != null && t.added) app.jobs.subtitlesFor(mediaId, t.language, t.trackId) else app.jobs.subtitlesFor(mediaId, lang) } catch (e: Exception) { null }
             runOnUiThread {
                 ccSpinner?.visibility = View.GONE
                 if (s == null) {
@@ -154,12 +155,11 @@ class PlayerActivity : Activity() {
         fun header(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 24, 0, 4); setTypeface(typeface, android.graphics.Typeface.BOLD) }
         fun group(second: Boolean): android.widget.RadioGroup {
             val cur = if (second) secondLang else mainLang
-            val labels = listOf("Off") + tracks.map { TrackUi.label(it) }
-            val tags = listOf("off") + tracks.map { it.language }
-            val checked = if (cur == null) 0 else tracks.indexOfFirst { it.language.equals(cur, true) }.let { if (it < 0) 0 else it + 1 }
+            val (labels, tags) = TrackUi.menuEntries(tracks)
+            val checked = TrackUi.indexOfKey(tracks, cur)
             val slot = if (second) "second" else "main"
             return TrackUi.radios(this, labels, tags.map { "$slot:$it" }, checked) { i ->
-                loadInto(second, if (i == 0) null else tracks[i - 1].language, remember = true)
+                loadInto(second, if (i == 0) null else tracks[i - 1].key, remember = true)
             }
         }
         body.addView(header("Subtitles"))
@@ -170,6 +170,7 @@ class PlayerActivity : Activity() {
         ccSpinner = ProgressBar(this).apply { visibility = View.GONE }
         body.addView(ccSpinner, LinearLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER_HORIZONTAL })
         ccDialog = AlertDialog.Builder(this).setTitle("Subtitles").setView(ScrollView(this).apply { addView(body) })
+            .setNeutralButton("Export\u2026") { _, _ -> app.media.get(mediaId)?.let { ExportUi.show(this, it) } }
             .setPositiveButton("Close", null).show()
     }
 

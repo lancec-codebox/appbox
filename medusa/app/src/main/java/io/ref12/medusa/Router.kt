@@ -20,9 +20,12 @@ interface HelperApi {
     fun sync(mediaId: String): List<Anchor>?
     fun putSync(mediaId: String, anchors: List<Anchor>): Boolean
     /** One track's lines as {source, language, lines}; null for unknown media; throws FetchException (no_captions ...). */
-    fun subtitles(mediaId: String, language: String): SubtitlesData?
+    fun subtitles(mediaId: String, language: String, trackId: String? = null): SubtitlesData?
     /** Makes the track the main one; returns the new media item JSON, null for unknown media. */
     fun setSubtitles(mediaId: String, language: String): String?
+    /** Adds or replaces an added track; its trackId, null for unknown media. */
+    fun addTrack(mediaId: String, track: AddedTrack): String?
+    fun removeTrack(mediaId: String, trackId: String): Boolean
     /** Called for every request, so the server knows it is still in use. */
     fun touch()
 }
@@ -77,9 +80,13 @@ class Router(private val api: HelperApi, private val allowedOrigins: () -> List<
             }
             s.size == 4 && s[1] == "media" && s[3] == "video" -> only(m, "GET", cors) { video(s[2], requestHeaders["range"], cors) }
             s.size == 4 && s[1] == "media" && s[3] == "subtitles" -> when (m) {
-                "GET" -> subtitles(s[2], queryParam(path, "language"), cors)
+                "GET" -> subtitles(s[2], queryParam(path, "language"), queryParam(path, "track"), cors)
                 "POST" -> setSubtitles(s[2], body, cors)
                 else -> err(405, "method not allowed", cors)
+            }
+            s.size == 4 && s[1] == "media" && s[3] == "tracks" -> only(m, "POST", cors) { addTrack(s[2], body, cors) }
+            s.size == 5 && s[1] == "media" && s[3] == "tracks" -> only(m, "DELETE", cors) {
+                if (api.removeTrack(s[2], s[4])) json(200, JSONObject().put("deleted", true), cors) else err(404, "unknown media or track", cors)
             }
             s.size == 4 && s[1] == "media" && s[3] == "sync" -> when (m) {
                 "GET" -> api.sync(s[2])?.let { json(200, JSONObject().put("sync", MediaJson.anchorsJson(it)), cors) } ?: err(404, "unknown media", cors)
@@ -162,10 +169,19 @@ class Router(private val api: HelperApi, private val allowedOrigins: () -> List<
     private fun failure(e: FetchException, cors: Map<String, String>) = json(
         if (e.code == Codes.NO_CAPTIONS) 404 else 502, JSONObject().put("error", e.message).put("code", e.code), cors)
 
-    private fun subtitles(mediaId: String, language: String?, cors: Map<String, String>): HttpReply {
-        if (language.isNullOrBlank()) return err(400, "language is required", cors)
+    private fun addTrack(mediaId: String, body: String?, cors: Map<String, String>): HttpReply {
+        if (body != null && body.length > TrackRules.MAX_BYTES) return err(413, "body is larger than 2 MB", cors)
+        val track = try {
+            TrackRules.parse(try { JSONObject(body ?: "") } catch (e: Exception) { throw TrackRejected("body must be a JSON object") })
+        } catch (e: TrackRejected) { return json(400, JSONObject().put("error", e.message).put("code", "invalid_track"), cors) }
+        val id = api.addTrack(mediaId, track) ?: return err(404, "unknown media", cors)
+        return json(200, JSONObject().put("trackId", id), cors)
+    }
+
+    private fun subtitles(mediaId: String, language: String?, trackId: String?, cors: Map<String, String>): HttpReply {
+        if (language.isNullOrBlank() && trackId.isNullOrBlank()) return err(400, "language is required", cors)
         return try {
-            val s = api.subtitles(mediaId, language) ?: return err(404, "unknown media", cors)
+            val s = api.subtitles(mediaId, language ?: "", trackId?.takeIf { it.isNotBlank() }) ?: return err(404, "unknown media", cors)
             json(200, MediaJson.subtitlesJson(s), cors)
         } catch (e: FetchException) { failure(e, cors) }
     }

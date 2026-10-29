@@ -28,3 +28,22 @@ class TrackUiTest {
         assertNull(TrackUi.resolve(null, emptyList(), null, null).main)
     }
 }
+
+class TrackUiMenuTest {
+    private val tracks = listOf(
+        TrackInfo("en", "captions", "English"),
+        TrackInfo("en", "added", "English (AI)", "t-aa", "lw"),
+        TrackInfo("fr", "added", null, "t-bb", "hexad"),
+    )
+    @Test fun cc_menu_lists_added_tracks_with_their_label_and_a_unique_key() {
+        val (labels, tags) = TrackUi.menuEntries(tracks)
+        org.junit.Assert.assertEquals(listOf("Off", "English (en)", "English (AI)", "French (added)"), labels)
+        org.junit.Assert.assertEquals(listOf("off", "en", "t-aa", "t-bb"), tags)
+        org.junit.Assert.assertEquals(2, TrackUi.indexOfKey(tracks, "t-aa"))
+        org.junit.Assert.assertEquals(0, TrackUi.indexOfKey(tracks, null))
+    }
+    @Test fun a_saved_added_track_choice_is_kept_and_a_removed_one_falls_back() {
+        org.junit.Assert.assertEquals(TrackUi.Choice("t-aa", "t-bb"), TrackUi.resolve("en", tracks, "t-aa", "t-bb"))
+        org.junit.Assert.assertEquals(TrackUi.Choice("en", null), TrackUi.resolve("en", tracks.take(1), "t-aa", "t-bb"))
+    }
+}
