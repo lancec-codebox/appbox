@@ -11,6 +11,10 @@ Install: download the APK from <https://github.com/lancec-codebox/appbox/release
 - **Capture** field on the main screen: paste a link to test without a web app. Choose the subtitle language (original by default, none, or a language from the video's own list after "List this video's languages"). A default language can be set in the same screen.
 - **Player track menu**: switch the subtitle track live, and optionally show a second track under the first (for example the original and English).
 
+## Updates
+
+Medusa checks the GitHub Releases of lancec-codebox/appbox when it opens (at most once a day; switch it off in the main screen) and on **Check for updates**. It considers only published, non-prerelease releases tagged `medusa-vX.Y.Z`. A newer one appears as a card with its release notes and Update / Later. It never starts while a capture runs. The APK is downloaded to the app's cache, its SHA-256 is checked against the release asset's `digest` (or the `medusa-X.Y.Z.apk.sha256` asset the release workflow attaches) and it is installed through Android's PackageInstaller. The first time, Android asks you to allow Medusa to install apps. Only APKs signed with the same key can replace the installed app.
+
 ## Building
 
 ```

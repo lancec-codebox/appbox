@@ -95,5 +95,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#medusa-v}"
-          gh release create "$GITHUB_REF_NAME" "app/build/outputs/apk/release/medusa-$VERSION.apk" \
+          APK="app/build/outputs/apk/release/medusa-$VERSION.apk"
+          # the in-app updater verifies its download against this checksum file
+          scripts/make-release-assets.sh "$APK"
+          gh release create "$GITHUB_REF_NAME" "$APK" "$APK.sha256" \
             --title "Medusa $VERSION" --generate-notes
