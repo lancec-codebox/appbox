@@ -28,6 +28,8 @@ class ServerSmokeTest {
         override fun videoFile(mediaId: String) = if (mediaId == "local") videoFile to "video/mp4" else null
         override fun sync(mediaId: String): List<Anchor>? = null
         override fun putSync(mediaId: String, anchors: List<Anchor>) = false
+        override fun subtitles(mediaId: String, language: String): SubtitlesData? = null
+        override fun setSubtitles(mediaId: String, language: String): String? = null
         override fun touch() {}
     }
 

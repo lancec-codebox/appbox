@@ -1,6 +1,6 @@
-# Medusa protocol, v1.1
+# Medusa protocol, v1.2
 
-Medusa (repo <https://github.com/lancec-codebox/appbox>, folder `medusa/`, package `io.ref12.medusa`) is an Android app that captures a media URL with yt-dlp on the phone: subtitles and video. A web app (first client: LinguaWeave) talks to it only through this protocol and never runs yt-dlp. Any URL yt-dlp supports works.
+Medusa (repo <https://github.com/lancec-codebox/appbox>, folder `medusa/`, package `io.ref12.medusa`) is an Android app that captures a media URL with yt-dlp on the phone: subtitles (in any language) and video. A web app (first client: LinguaWeave) talks to it only through this protocol and never runs yt-dlp. Any URL yt-dlp supports works.
 
 ## 1. Waking the app (deep link)
 
@@ -14,7 +14,7 @@ intent://open?job=<jobId>&url=<mediaUrl>&return=<returnUrl>#Intent;scheme=medusa
 - `url`: the media URL. `return`: optional; when the job finishes the app opens it with `job=<id>&state=done|failed` appended (to the query, or after `?` inside a hash).
 - `browser_fallback_url`: opened when the app is not installed (point it at <https://github.com/lancec-codebox/appbox/releases>).
 
-The link starts the local server and a job with the defaults below (both parts, 720p).
+Optional `languages=<comma list>` (for example `languages=en,fr`) works like `languages` in `POST /v1/jobs`. The link starts the local server and a job with the defaults below (both parts, 720p, the video's original language).
 
 ## 2. Local API
 
@@ -22,18 +22,18 @@ The link starts the local server and a job with the defaults below (both parts, 
 
 ### Status
 
-`GET /v1/status` → `{ "app": "medusa", "version": "1.1.0", "ytDlp": "..." }`
+`GET /v1/status` → `{ "app": "medusa", "version": "1.2.0", "ytDlp": "..." }`
 
 ### Jobs
 
 `POST /v1/jobs` body:
 
 ```json
-{ "id"?: "uuid", "url": "https://...", "languages"?: ["zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW"],
+{ "id"?: "uuid", "url": "https://...", "languages"?: ["en", "fr"],   // or e.g. ["zh-Hans", "zh-CN", "zh"]
   "want"?: ["subtitles", "video"], "quality"?: "720p" }
 ```
 
-→ `{ "id": "..." }`. Defaults: `want` both, `quality` `720p` (also `480p`, `360p`; video is MP4). A running job for the same URL and languages is reused and its id returned. When the media is already captured with the wanted parts, the job is created with the requested id and is `done` at once. Invalid input → 400.
+→ `{ "id": "..." }`. `languages` is optional and has no default: when omitted (or empty) Medusa picks the video's original spoken language, manual captions first, then that language's auto-captions. When given, the first language with a track wins, manual captions before auto-captions; `zh` and `zh-Hans` count as the same family, `zh-Hans` and `zh-Hant` do not. Defaults: `want` both, `quality` `720p` (also `480p`, `360p`; video is MP4). A running job for the same URL and languages is reused and its id returned. When the media is already captured with the wanted parts, the job is created with the requested id and is `done` at once. Invalid input → 400.
 
 `GET /v1/jobs/{id}` →
 
@@ -42,7 +42,7 @@ The link starts the local server and a job with the defaults below (both parts, 
   "progress"?: 0.0-1.0, "code"?: "...", "message"?: "..." }
 ```
 
-`progress` goes 0..1 and never backwards. `message` is human readable (a `done` job may carry a note when one wanted part failed). Failure `code`: `no_captions`, `bot_check`, `unsupported`, `network`, `storage`, `ytdlp`.
+`progress` goes 0..1 and never backwards. `message` is human readable (a `done` job may carry a note when one wanted part failed). Failure `code`: `no_captions` (no captions in the requested languages, or none at all when none were requested; the message names the languages that exist), `bot_check`, `unsupported`, `network`, `storage`, `ytdlp`.
 
 `GET /v1/jobs/{id}/result` (done; 409 otherwise) → the media item below.
 
@@ -58,11 +58,18 @@ Captures persist on the phone until deleted.
   "sync": [ { "at": 10.0, "offset": 0.25 } ] }
 ```
 
-Auto-captions are the video's spoken language only, never machine translations. Lines are plain text, `start`/`end` in seconds.
+`subtitles` is the chosen (main) track with its lines. `tracks` lists every subtitle track the video offers (`[]` for items captured before v1.2); auto-captions are the video's spoken language only, never machine translations. Lines are plain text, `start`/`end` in seconds.
 
 - `GET /v1/media` → array of media items without `lines`.
 - `GET /v1/media/{id}` → one media item. `DELETE /v1/media/{id}` → `{ "deleted": true }` (404 if unknown).
 - `GET /v1/media/{id}/video` → the MP4 with `Accept-Ranges: bytes`. Single `Range` requests: 206 with `Content-Range`, 416 for an unsatisfiable range, 200 for none.
+
+### Subtitle tracks
+
+- `GET /v1/media/{id}/subtitles?language=xx` → `{ "source", "language", "lines": [...] }` of that track. Downloads it on demand (once, then kept) and does not change the item's main track. 400 without `language`; 404 with code `no_captions` when the video has no such track, 502 for other failures (body `{ "error", "code" }`).
+- `POST /v1/media/{id}/subtitles` body `{ "language": "xx" }` makes that track the main one and returns the updated media item. Same errors.
+
+Sync anchors belong to the item, not to a track: changing tracks keeps them.
 
 ### Sync
 
@@ -79,4 +86,4 @@ If the browser blocks 127.0.0.1, the job screen's Save transcript writes the med
 
 ## Versions
 
-v1: subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. Later: on-device speech recognition when no captions exist.
+v1: Chinese subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. Later: on-device speech recognition when no captions exist.
