@@ -2,250 +2,175 @@ package io.ref12.medusa
 
 import android.Manifest
 import android.app.Activity
-import android.content.Intent
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
-import android.view.ViewGroup
-import android.widget.Button
-import android.widget.EditText
+import android.view.Gravity
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
-import java.text.DateFormat
-import java.util.Date
 
-/** Plain main screen: status, versions, origins, recent jobs and a paste-a-link test field. */
+/**
+ * The app shell: a top bar (menu or Up, page title, settings gear), a navigation drawer (permanent on wide screens)
+ * and one page at a time. Back rules are in [NavStack]: Back goes up one step, then to Library, and Library exits.
+ */
 class MainActivity : Activity() {
-    private lateinit var statusView: TextView
-    private lateinit var versionView: TextView
-    private lateinit var updateBtn: Button
-    private lateinit var originsEdit: EditText
-    private lateinit var linkEdit: EditText
-    private lateinit var libraryRow: LinearLayout
-    private lateinit var libraryText: TextView
-    private var libraryId: String? = null
-    private lateinit var langBox: LinearLayout
-    private var langPicked = 0
-    private lateinit var defaultLangEdit: EditText
-    /** Spinner entries: label to (null = no subtitles, "" = original, else a language code). */
-    private var langChoices: List<Pair<String, String?>> = listOf("Original language" to "", "None" to null)
-    private lateinit var recentBox: LinearLayout
-    private lateinit var updateBox: LinearLayout
-    private var wentToPermission = false
+    internal var nav = NavStack()
+    private var page: Page? = null
+    private lateinit var content: FrameLayout
+    private lateinit var title: TextView
+    private lateinit var leading: ImageButton
+    private lateinit var drawerPanel: LinearLayout
+    private lateinit var scrim: View
+    private lateinit var drawerItems: LinearLayout
+    private var wide = false
+    private var drawerOpen = false
+    /** A link to put in the Capture screen's field (from Library's paste field or the clipboard). */
+    internal var prefillLink: String? = null
     private val ui = Handler(Looper.getMainLooper())
-    private val poll = object : Runnable {
-        override fun run() { refresh(); ui.postDelayed(this, 1500) }
-    }
+    private val poll = object : Runnable { override fun run() { page?.tick(); ui.postDelayed(this, 1500) } }
+    internal val currentPage get() = page
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(R.style.Theme_Medusa)
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40) }
-        fun label(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 32, 0, 8); setTypeface(typeface, android.graphics.Typeface.BOLD) }
-        fun add(v: android.view.View) = col.addView(v, ViewGroup.LayoutParams(-1, -2))
+        nav = NavStack.restore(savedInstanceState?.getStringArray("nav"))
+        wide = resources.configuration.screenWidthDp >= 720
 
-        add(TextView(this).apply { text = "Medusa"; textSize = 24f })
-        updateBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFFE8F0FE.toInt()); setPadding(24, 16, 24, 16); visibility = android.view.View.GONE }
-        add(updateBox)
-        statusView = TextView(this).apply { textSize = 16f; setPadding(0, 16, 0, 0) }
-        versionView = TextView(this).apply { textSize = 14f }
-        updateBtn = Button(this).apply { text = "Update yt-dlp now"; setOnClickListener { updateNow() } }
-        add(statusView); add(versionView); add(updateBtn)
-
-        add(label("App updates"))
-        add(android.widget.CheckBox(this).apply {
-            text = "Check for Medusa updates automatically"
-            isChecked = app.settings.autoUpdateCheck
-            setOnCheckedChangeListener { _, on -> app.settings.autoUpdateCheck = on }
-        })
-        add(Button(this).apply { text = "Check for updates"; setOnClickListener { app.updates.check(manual = true) } })
-        add(label("Keep Medusa ready after you leave it"))
-        add(TrackUi.radios(this, KeepAliveMode.values().map { it.label }, KeepAliveMode.values().map { "keepalive:" + it.minutes }, app.settings.keepAlive.ordinal) {
-            app.settings.keepAlive = KeepAliveMode.values()[it]
-        })
-        add(label("Allowed origins (one per line)"))
-        originsEdit = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
-            setText(app.settings.origins.joinToString("\n"))
+        val root = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Ui.color(this@MainActivity, R.color.bg)) }
+        val frame = FrameLayout(this)
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        column.addView(topBar(), LinearLayout.LayoutParams(-1, Ui.dp(this, 56)))
+        column.addView(Ui.divider(this))
+        content = FrameLayout(this)
+        column.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
+        buildDrawer()
+        if (wide) {
+            root.addView(drawerPanel, LinearLayout.LayoutParams(Ui.dp(this, 240), -1))
+            root.addView(column, LinearLayout.LayoutParams(0, -1, 1f))
+            frame.addView(root, FrameLayout.LayoutParams(-1, -1))
+        } else {
+            frame.addView(column, FrameLayout.LayoutParams(-1, -1))
+            scrim = View(this).apply { setBackgroundColor(0x88000000.toInt()); visibility = View.GONE; setOnClickListener { setDrawer(false) } }
+            frame.addView(scrim, FrameLayout.LayoutParams(-1, -1))
+            drawerPanel.visibility = View.GONE
+            frame.addView(drawerPanel, FrameLayout.LayoutParams(Ui.dp(this, 280), -1, Gravity.START))
         }
-        add(originsEdit)
-        add(Button(this).apply {
-            text = "Save origins"
-            setOnClickListener { app.settings.origins = originsEdit.text.toString().lines().map { it.trim() }.filter { it.isNotEmpty() } }
-        })
+        setContentView(frame)
+        show()
+    }
 
-        add(Button(this).apply { text = "Library"; setOnClickListener { startActivity(Intent(this@MainActivity, LibraryActivity::class.java)) } })
-        add(label("Default subtitle language (blank = original)"))
-        defaultLangEdit = EditText(this).apply { hint = "Original, or a code like en, zh-Hans"; setText(app.settings.defaultLanguage) }
-        add(defaultLangEdit)
-        add(Button(this).apply {
-            text = "Save default language"
-            setOnClickListener { app.settings.defaultLanguage = defaultLangEdit.text.toString(); setChoices(emptyList()) }
-        })
-        add(label("Try a link"))
-        linkEdit = EditText(this).apply { hint = "Paste a media link"; inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_CLASS_TEXT }
-        add(linkEdit)
-        libraryText = TextView(this).apply { textSize = 14f; setTextColor(0xFF1B5E20.toInt()) }
-        libraryRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; visibility = android.view.View.GONE; tag = "in-library"
-            addView(libraryText, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(Button(context).apply { text = "Open"; setOnClickListener { openLibraryItem() } })
+    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putStringArray("nav", nav.save()) }
+
+    private fun topBar() = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+        setBackgroundColor(Ui.color(this@MainActivity, R.color.surface)); setPadding(Ui.dp(this@MainActivity, 4), 0, Ui.dp(this@MainActivity, 4), 0)
+        leading = Ui.icon(this@MainActivity, R.drawable.ic_menu, "Menu") { onLeading() }
+        addView(leading)
+        title = Ui.text(this@MainActivity, "", 19f, bold = true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = Ui.dp(this@MainActivity, 8) })
+        addView(Ui.icon(this@MainActivity, R.drawable.ic_settings, "Settings") { go(Dest.SETTINGS) })
+    }
+
+    private fun buildDrawer() {
+        drawerPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(Ui.color(this@MainActivity, R.color.surface)); isClickable = true
+            setPadding(0, Ui.dp(this@MainActivity, if (wide) 12 else 36), 0, 0)
         }
-        add(libraryRow)
-        linkEdit.addTextChangedListener(object : android.text.TextWatcher {
-            override fun afterTextChanged(s: android.text.Editable?) { checkLibrary(s?.toString()?.trim().orEmpty()) }
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-        })
-        langBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        add(label("Subtitles"))
-        add(langBox)
-        setChoices(emptyList())
-        add(Button(this).apply { text = "List this video's languages"; setOnClickListener { listLanguages(this) } })
-        add(Button(this).apply { text = "Capture"; setOnClickListener { fetch() } })
+        drawerPanel.addView(Ui.text(this, "Medusa", 22f, R.color.accent, true).apply { setPadding(Ui.dp(this@MainActivity, 20), Ui.dp(this@MainActivity, 8), 0, 0) })
+        drawerPanel.addView(Ui.muted(this, "Transcripts and videos on this phone").apply { setPadding(Ui.dp(this@MainActivity, 20), 0, Ui.dp(this@MainActivity, 16), Ui.dp(this@MainActivity, 14)) })
+        drawerItems = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        drawerPanel.addView(drawerItems, LinearLayout.LayoutParams(-1, 0, 1f))
+        drawerPanel.addView(Ui.muted(this, "Version " + BuildConfig.VERSION_NAME, 12f).apply { setPadding(Ui.dp(this@MainActivity, 20), Ui.dp(this@MainActivity, 8), 0, Ui.dp(this@MainActivity, 16)) })
+    }
 
-        add(label("Recent jobs"))
-        recentBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        add(recentBox)
-        setContentView(ScrollView(this).apply { addView(col) })
+    private fun refreshDrawer() {
+        drawerItems.removeAllViews()
+        val icons = mapOf(Dest.LIBRARY to R.drawable.ic_library, Dest.CAPTURE to R.drawable.ic_capture, Dest.SETTINGS to R.drawable.ic_settings, Dest.ABOUT to R.drawable.ic_info)
+        for (d in Dest.values().filter { it.top }) {
+            val on = d == nav.highlighted
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; tag = "drawer:" + d.name; contentDescription = d.title
+                setPadding(Ui.dp(this@MainActivity, 20), 0, Ui.dp(this@MainActivity, 12), 0)
+                if (on) background = Ui.rounded(this@MainActivity, Ui.color(this@MainActivity, R.color.selected), 8)
+                setOnClickListener { go(d) }
+            }
+            row.addView(android.widget.ImageView(this).apply { setImageResource(icons.getValue(d)); setColorFilter(Ui.color(this@MainActivity, if (on) R.color.accent else R.color.muted)) }, LinearLayout.LayoutParams(Ui.dp(this, 22), Ui.dp(this, 22)))
+            row.addView(Ui.text(this, d.title, 15f, if (on) R.color.accent else R.color.on_surface, on).apply { setPadding(Ui.dp(this@MainActivity, 16), 0, 0, 0) })
+            drawerItems.addView(row, LinearLayout.LayoutParams(-1, Ui.dp(this, 46)).apply { setMargins(Ui.dp(this@MainActivity, 8), Ui.dp(this@MainActivity, 2), Ui.dp(this@MainActivity, 8), Ui.dp(this@MainActivity, 2)) })
+        }
+    }
+
+    private fun setDrawer(open: Boolean) {
+        if (wide) return
+        drawerOpen = open
+        drawerPanel.visibility = if (open) View.VISIBLE else View.GONE
+        scrim.visibility = if (open) View.VISIBLE else View.GONE
+        if (open) refreshDrawer()
+    }
+
+    private fun onLeading() { if (nav.isTopLevel) setDrawer(!drawerOpen) else goBack() }
+
+    /** A drawer destination (Library, Capture, Settings, About). */
+    fun go(d: Dest) { setDrawer(false); nav.goTop(d); show() }
+
+    fun openItem(mediaId: String) { setDrawer(false); nav.open(Screen(Dest.ITEM, mediaId)); show() }
+
+    /** Opens Capture; [link] fills its field. */
+    fun capture(link: String? = null) { prefillLink = link; go(Dest.CAPTURE) }
+
+    fun goBack() { if (!nav.back()) finish() else show() }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (drawerOpen) { setDrawer(false); return }
+        if (!nav.back()) finish() else show()
+    }
+
+    /** The link on the clipboard when it is an http(s) one. */
+    fun clipboardLink(): String? = try {
+        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()?.takeIf { DeepLink.isHttp(it) }
+    } catch (e: Exception) { null }
+
+    internal fun show() {
+        val s = nav.current
+        val item = if (s.dest == Dest.ITEM) s.arg?.let { app.media.get(it) } else null
+        if (s.dest == Dest.ITEM && item == null) { nav.back(); show(); return }
+        val p: Page = when (s.dest) {
+            Dest.LIBRARY -> LibraryPage(this)
+            Dest.CAPTURE -> CapturePage(this)
+            Dest.SETTINGS -> SettingsPage(this)
+            Dest.ABOUT -> AboutPage(this)
+            Dest.ITEM -> ItemPage(this, s.arg!!)
+        }
+        page = p
+        title.text = if (s.dest == Dest.ITEM) item!!.title else p.title
+        leading.setImageResource(if (nav.isTopLevel) R.drawable.ic_menu else R.drawable.ic_back)
+        leading.contentDescription = if (nav.isTopLevel) "Menu" else "Back"; leading.tag = leading.contentDescription
+        leading.visibility = if (wide && nav.isTopLevel) View.GONE else View.VISIBLE
+        content.removeAllViews()
+        content.addView(p.build(), FrameLayout.LayoutParams(-1, -1))
+        if (wide) refreshDrawer()
     }
 
     override fun onResume() {
         super.onResume()
-        if (wentToPermission) { wentToPermission = false; app.updates.resumeAfterPermission() }
         app.updates.checkIfDue()
+        page?.resume()
         ui.post(poll)
     }
 
-    private fun renderUpdate() {
-        val u = app.updates
-        updateBox.removeAllViews()
-        fun text(t: String, bold: Boolean = false) = updateBox.addView(TextView(this).apply {
-            text = t; textSize = 14f; if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
-        })
-        fun buttons(vararg b: Pair<String, () -> Unit>) = updateBox.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            for ((t, f) in b) addView(Button(context).apply { text = t; setOnClickListener { f() } })
-        })
-        when (val s = u.state) {
-            is UpdateState.Available -> {
-                text("Medusa " + s.offer.version + " is available", true)
-                if (s.offer.notes.isNotEmpty()) text(s.offer.notes.take(1200))
-                buttons("Update" to { u.update() }, "Later" to { u.later() })
-            }
-            is UpdateState.Downloading -> text("Downloading Medusa " + s.offer.version + (s.fraction?.let { " " + (it * 100).toInt() + "%" } ?: "..."), true)
-            is UpdateState.NeedsPermission -> {
-                text("Allow Medusa to install apps", true)
-                text("Android needs your OK once. Turn on Allow from this source, then come back: the update continues.")
-                buttons("Open settings" to { wentToPermission = true; startActivity(PackageApkInstaller.permissionIntent(this)) })
-            }
-            is UpdateState.Installing -> text(s.message + " Medusa " + s.offer.version + "...", true)
-            is UpdateState.Done -> text(s.message, true)
-            is UpdateState.Failed -> {
-                text(s.message, true)
-                buttons(*(listOfNotNull(if (s.offer != null) "Try again" to { u.update() } else null, "Dismiss" to { u.later() }).toTypedArray()))
-            }
-            is UpdateState.UpToDate -> text("Medusa " + s.version + " is up to date")
-            is UpdateState.Checking -> text("Checking for updates...")
-            UpdateState.Idle -> {}
-        }
-        updateBox.visibility = if (u.state is UpdateState.Idle) android.view.View.GONE else android.view.View.VISIBLE
-    }
     override fun onPause() { ui.removeCallbacks(poll); super.onPause() }
 
-    /** Shows "Already in your library" when the pasted link is a video that is already captured. */
-    internal fun checkLibrary(url: String) {
-        val id = if (DeepLink.isHttp(url)) app.media.lookupId(url) else null
-        val meta = id?.let { app.media.get(it) }
-        libraryId = meta?.mediaId
-        libraryRow.visibility = if (meta == null) android.view.View.GONE else android.view.View.VISIBLE
-        if (meta != null) libraryText.text = "Already in your library: " + meta.title + "\nCapturing again only adds subtitle tracks you don't have yet."
-    }
-
-    private fun openLibraryItem() {
-        val id = libraryId ?: return
-        if (app.media.get(id)?.video != null) startActivity(Intent(this, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, id))
-        else startActivity(Intent(this, LibraryActivity::class.java))
-    }
-
-    private fun fetch() {
-        val url = linkEdit.text.toString().trim()
-        if (!DeepLink.isHttp(url)) { linkEdit.error = "Needs an http(s) link"; return }
-        HelperService.start(this)
-        val choice = langChoices.getOrNull(langPicked)?.second
-        val want = if (choice == null) Want(subtitles = false, video = true) else Want.DEFAULT
-        val langs = if (choice.isNullOrEmpty()) app.settings.defaultLanguages.takeIf { choice == "" } ?: emptyList() else listOf(choice)
-        val id = app.jobs.submit(JobSubmit(null, url, langs, want))
-        startActivity(Intent(this, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, id).putExtra(JobActivity.EXTRA_FROM_APP, true))
-    }
-
-    /** Shows the subtitle choices as radio buttons: original language, each listed track, none. */
-    internal fun setChoices(tracks: List<TrackInfo>) {
-        val def = app.settings.defaultLanguage
-        langChoices = listOf((if (def.isEmpty()) "Original language" else "Default ($def)") to "", "None" to null) +
-            tracks.map { TrackUi.label(it) to it.language }
-        // keep the order: original, tracks, none
-        langChoices = listOf(langChoices[0]) + langChoices.drop(2) + listOf(langChoices[1])
-        langPicked = 0
-        langBox.removeAllViews()
-        langBox.addView(TrackUi.radios(this, langChoices.map { it.first }, langChoices.map { "capture:" + (it.second ?: "none").ifEmpty { "original" } }, 0) { langPicked = it })
-    }
-
-    private fun listLanguages(btn: Button) {
-        val url = linkEdit.text.toString().trim()
-        if (!DeepLink.isHttp(url)) { linkEdit.error = "Needs an http(s) link"; return }
-        btn.isEnabled = false
-        Thread {
-            val res = try { app.fetcher.listTracks(url) } catch (e: Exception) { null to (e.message ?: "failed") }
-            runOnUiThread {
-                btn.isEnabled = true
-                if (res is List<*>) {
-                    @Suppress("UNCHECKED_CAST") setChoices(res as List<TrackInfo>)
-                    if (res.isEmpty()) android.widget.Toast.makeText(this, "This video offers no subtitles", android.widget.Toast.LENGTH_LONG).show()
-                } else android.widget.Toast.makeText(this, (res as Pair<*, *>).second.toString(), android.widget.Toast.LENGTH_LONG).show()
-            }
-        }.start()
-    }
-
-    private fun updateNow() {
-        updateBtn.isEnabled = false
-        updateBtn.text = "Updating..."
-        Thread {
-            val msg = try { app.fetcher.update() } catch (e: Exception) { "Update failed: " + e.message }
-            runOnUiThread { updateBtn.isEnabled = true; updateBtn.text = "Update yt-dlp now"; versionView.text = msg }
-        }.start()
-    }
-
-    private var versionLoaded = false
-
-    private fun refresh() {
-        renderUpdate()
-        statusView.text = when {
-            HelperService.running -> "Server running on 127.0.0.1:$SERVER_PORT"
-            HelperService.lastError != null -> HelperService.lastError
-            else -> "Server stopped (starts when a web app or a test link asks for a transcript)"
-        }
-        if (!versionLoaded && !app.fetcher.updating) {
-            versionLoaded = true
-            versionView.text = "Medusa " + BuildConfig.VERSION_NAME + "\nyt-dlp: ..."
-            Thread {
-                val v = app.fetcher.version()
-                runOnUiThread { versionView.text = "Medusa " + BuildConfig.VERSION_NAME + "\nyt-dlp: " + v }
-            }.start()
-        }
-        recentBox.removeAllViews()
-        val df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
-        val recent = app.jobs.recent()
-        if (recent.isEmpty()) recentBox.addView(TextView(this).apply { text = "None yet" })
-        for (j in recent) recentBox.addView(TextView(this).apply {
-            text = (j.title ?: j.url) + "\n" + j.state.wire + " - " + df.format(Date(j.updatedAt)) + (j.message?.let { "\n$it" } ?: "")
-            setPadding(0, 12, 0, 12)
-            setOnClickListener { startActivity(Intent(this@MainActivity, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, j.id).putExtra(JobActivity.EXTRA_FROM_APP, true)) }
-        })
-    }
+    /** For the emulator test: the Capture screen's language choices. */
+    internal fun setChoices(tracks: List<TrackInfo>) { (page as? CapturePage)?.setChoices(tracks) }
 }

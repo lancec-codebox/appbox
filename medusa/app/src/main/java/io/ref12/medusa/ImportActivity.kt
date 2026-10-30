@@ -95,7 +95,9 @@ class ImportActivity : Activity() {
                             val t = TrackRules.parse(json)
                             app.media.addTrack(m.mediaId, t) ?: throw TrackRejected("That video is no longer in the library")
                             Toast.makeText(this, "Added " + (t.label ?: t.language) + " to " + m.title, Toast.LENGTH_LONG).show()
-                            d.dismiss(); startActivity(Intent(this, LibraryActivity::class.java)); finish()
+                            d.dismiss()
+                            if (forcedMedia == null) startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            finish()
                         } catch (e: TrackRejected) { Toast.makeText(this, e.message, Toast.LENGTH_LONG).show() }
                     }
                 }

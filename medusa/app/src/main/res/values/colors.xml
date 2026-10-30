@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#F3F5F8</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="on_surface">#101828</color>
+    <color name="muted">#5B6676</color>
+    <color name="accent">#0B8F84</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="divider">#D9DEE6</color>
+    <color name="chip">#E4E9F0</color>
+    <color name="selected">#1F0B8F84</color>
+    <color name="danger">#C62828</color>
+</resources>

@@ -19,14 +19,14 @@ import java.io.File
 object ExportUi {
     private val FORMATS = listOf(ExportFormat.SRT to "SRT (default)", ExportFormat.VTT to "WebVTT", ExportFormat.JSON to "Medusa JSON (.medusa-track.json)")
 
-    fun show(a: Activity, m: MediaMeta) {
+    fun show(a: Activity, m: MediaMeta, preselect: String? = null) {
         val tracks = TrackUi.tracksOf(m)
         if (tracks.isEmpty()) { Toast.makeText(a, "This item has no subtitle tracks to export", Toast.LENGTH_LONG).show(); return }
         val body = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 16, 40, 0) }
         fun header(t: String) = TextView(a).apply { text = t; textSize = 14f; setPadding(0, 24, 0, 4); setTypeface(typeface, android.graphics.Typeface.BOLD) }
         val labels = tracks.map { TrackUi.label(it) } + (if (tracks.size > 1) listOf("All tracks") else emptyList())
         val main = m.subtitles?.language
-        var track = tracks.indexOfFirst { it.language.equals(main, true) && !it.added }.coerceAtLeast(0)
+        var track = (if (preselect != null) tracks.indexOfFirst { it.key == preselect } else tracks.indexOfFirst { it.language.equals(main, true) && !it.added }).coerceAtLeast(0)
         var format = 0
         body.addView(header("Track"))
         body.addView(TrackUi.radios(a, labels, tracks.map { "export:" + it.key } + (if (tracks.size > 1) listOf("export:all") else emptyList()), track) { track = it })
