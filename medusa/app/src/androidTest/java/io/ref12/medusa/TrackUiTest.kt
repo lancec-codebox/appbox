@@ -73,6 +73,7 @@ class TrackUiTest {
 
     @Test fun capture_screen_lists_tracks_as_radio_buttons() {
         ActivityScenario.launch(MainActivity::class.java).use { sc ->
+            sc.onActivity { it.go(Dest.CAPTURE) }
             sc.onActivity { it.setChoices(listOf(TrackInfo("en", "captions", "English"), TrackInfo("fr", "auto-captions", "French"), TrackInfo("zh-Hans", "captions", "Chinese (Simplified)"))) }
             sc.onActivity { a ->
                 val scroll = a.window.decorView.findViewWithTag<View>("capture:en")

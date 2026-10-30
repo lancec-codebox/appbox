@@ -46,11 +46,11 @@ class LibraryPage(a: MainActivity) : Page(a) {
         list = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
         col.addView(list, Ui.lp(-1, -2, 0f, 0, 6, 0, 0, a))
         fill()
-        UpdateUi.render(a, banner) {}
+        UpdateUi.render(a, banner, quietWhenCurrent = true) {}
         return ScrollView(a).apply { addView(col) }
     }
 
-    override fun tick() { if (::banner.isInitialized) UpdateUi.render(a, banner) {} }
+    override fun tick() { if (::banner.isInitialized) UpdateUi.render(a, banner, quietWhenCurrent = true) {} }
 
     private fun fill() {
         list.removeAllViews()

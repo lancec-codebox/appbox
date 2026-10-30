@@ -8,13 +8,13 @@ import android.widget.LinearLayout
 /** The app-update banner (shared by Library and About): shows the [UpdateManager] state and its actions. */
 object UpdateUi {
     /** Fills [box] for the current state; hidden when idle. [onPermission] is called when the user opens the install settings. */
-    fun render(a: Activity, box: LinearLayout, onPermission: () -> Unit) {
+    fun render(a: Activity, box: LinearLayout, quietWhenCurrent: Boolean = false, onPermission: () -> Unit) {
         val u = a.app.updates
         box.removeAllViews()
         fun text(t: String, bold: Boolean = false) = box.addView(Ui.text(a, t, 14f, bold = bold))
         fun buttons(vararg b: Pair<String, () -> Unit>) = box.addView(LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL
-            for ((i, p) in b.withIndex()) addView(Ui.button(a, p.first, primary = i == 0, onClick = p.second), Ui.lp(-2, -2, 0f, if (i == 0) 0 else 8, 8, 0, 0, a))
+            for ((i, p) in b.withIndex()) addView(Ui.button(a, p.first, primary = i == 0, onClick = { p.second() }), Ui.lp(-2, -2, 0f, if (i == 0) 0 else 8, 8, 0, 0, a))
         })
         when (val s = u.state) {
             is UpdateState.Available -> {
@@ -34,11 +34,11 @@ object UpdateUi {
                 text(s.message, true)
                 buttons(*(listOfNotNull(if (s.offer != null) "Try again" to { u.update() } else null, "Dismiss" to { u.later() }).toTypedArray()))
             }
-            is UpdateState.UpToDate -> text("Medusa " + s.version + " is up to date")
-            is UpdateState.Checking -> text("Checking for updates...")
+            is UpdateState.UpToDate -> if (!quietWhenCurrent) text("Medusa " + s.version + " is up to date")
+            is UpdateState.Checking -> if (!quietWhenCurrent) text("Checking for updates...")
             UpdateState.Idle -> {}
         }
-        box.visibility = if (u.state is UpdateState.Idle) View.GONE else View.VISIBLE
+        box.visibility = if (box.childCount == 0) View.GONE else View.VISIBLE
     }
 
     fun box(a: Activity) = LinearLayout(a).apply {
