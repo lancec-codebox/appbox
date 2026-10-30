@@ -29,9 +29,10 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
         // actions
         col.addView(LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL
-            if (m.video != null) addView(Ui.button(a, "Play", primary = true) {
-                a.startActivity(Intent(a, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, m.mediaId))
-            }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+            val hasVideo = m.video != null
+            addView(Ui.button(a, if (hasVideo) "Play" else "Play (no video)", primary = hasVideo) {
+                if (hasVideo) a.startActivity(Intent(a, PlayerActivity::class.java).putExtra(PlayerActivity.EXTRA_MEDIA, m.mediaId))
+            }.apply { isEnabled = hasVideo; alpha = if (hasVideo) 1f else 0.45f; tag = "play" }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
             addView(Ui.button(a, "Import subtitles") {
                 a.startActivity(Intent(a, ImportActivity::class.java).putExtra(ImportActivity.EXTRA_MEDIA, m.mediaId))
             }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
@@ -52,14 +53,16 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
             box.addView(LinearLayout(a).apply {
                 orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL
                 addView(Ui.text(a, TrackUi.label(t), 14f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
+                if (c.main.equals(t.key, true)) addView(Ui.badge(a, "MAIN", true).apply { tag = "badge-main:" + t.key }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
+                if (c.second.equals(t.key, true)) addView(Ui.badge(a, "2nd", true).apply { tag = "badge-second:" + t.key }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
                 addView(Ui.badge(a, if (t.added) "added" else t.source.replace("-", " "), t.added))
             })
             val isMain = c.main.equals(t.key, true); val isSecond = c.second.equals(t.key, true)
             box.addView(LinearLayout(a).apply {
                 orientation = LinearLayout.HORIZONTAL
                 fun chip(txt: String, on: Boolean, tg: String, f: () -> Unit) = addView(Ui.chipButton(a, txt, on, tg + ":" + t.key, f), Ui.lp(-2, -2, 0f, 0, 0, 6, 0, a))
-                chip("Main", isMain, "main") { a.app.settings.setTrackChoice(m.mediaId, "main", if (isMain) null else t.key); a.show() }
-                chip("Second line", isSecond, "second") { a.app.settings.setTrackChoice(m.mediaId, "second", if (isSecond) null else t.key); a.show() }
+                chip(if (isMain) "\u2713 Main" else "Main", isMain, "main") { a.app.settings.setTrackChoice(m.mediaId, "main", if (isMain) null else t.key); a.show() }
+                chip(if (isSecond) "\u2713 Second line" else "Second line", isSecond, "second") { a.app.settings.setTrackChoice(m.mediaId, "second", if (isSecond) null else t.key); a.show() }
                 chip("Export", false, "export") { ExportUi.show(a, m, t.key) }
                 if (t.added) chip("Remove", false, "remove") {
                     AlertDialog.Builder(a).setTitle("Remove this track?").setMessage(TrackUi.label(t)).setPositiveButton("Remove") { _, _ ->

@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersion = (findProperty("versionName") as String?) ?: "1.5.0"
+val appVersion = (findProperty("versionName") as String?) ?: "1.5.1"
 val keystoreFile: String? = System.getenv("MEDUSA_KEYSTORE_FILE")
 
 android {
