@@ -37,6 +37,7 @@ class FullscreenOrientationUiTest {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, 400_000); setInteger(MediaFormat.KEY_FRAME_RATE, 15)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
         }
         val codec = MediaCodec.createEncoderByType("video/avc")
         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -69,6 +70,7 @@ class FullscreenOrientationUiTest {
             paint.color = Color.WHITE; c.drawRect(n * 4f % w, 0f, n * 4f % w + 20f, h.toFloat(), paint)
             surface.unlockCanvasAndPost(c)
             drain(false)
+            Thread.sleep(66) // real spacing: the surface stamps frames with the clock
         }
         drain(true)
         codec.stop(); codec.release(); muxer.stop(); muxer.release(); surface.release()
@@ -114,10 +116,20 @@ class FullscreenOrientationUiTest {
     }
 
     /** The subtitle view must end above the navigation-bar inset (gesture bar) and be on screen. */
+    private fun awaitSubtitle(sc: ActivityScenario<PlayerActivity>) {
+        val end = System.currentTimeMillis() + 10_000
+        var shown = false
+        while (System.currentTimeMillis() < end && !shown) {
+            sc.onActivity { shown = it.subtitleView.visibility == android.view.View.VISIBLE && it.subtitleView.text.isNotEmpty() }
+            if (!shown) Thread.sleep(200)
+        }
+        sc.onActivity { assertTrue("subtitle shown within 10 s (text='${it.subtitleText}', main=${it.chosenMain}, fullscreen=${it.isFullscreen})", shown) }
+    }
+
     private fun assertSubtitlesAboveNavBar(sc: ActivityScenario<PlayerActivity>) {
+        awaitSubtitle(sc)
         sc.onActivity { a ->
             val sub = a.subtitleView
-            assertTrue("subtitle is shown", sub.visibility == android.view.View.VISIBLE && sub.text.isNotEmpty())
             val loc = IntArray(2); sub.getLocationOnScreen(loc)
             val bottom = loc[1] + sub.height
             val root = a.window.decorView
@@ -136,9 +148,6 @@ class FullscreenOrientationUiTest {
             Thread.sleep(1500)
             fullscreen(sc)
             awaitRequested(sc, ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT)
-            Thread.sleep(1000)
-            assertSubtitlesAboveNavBar(sc)
-            shot("fullscreen-portrait-subtitles")
             fullscreen(sc)
             assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, requested(sc))
         }
@@ -150,9 +159,6 @@ class FullscreenOrientationUiTest {
             Thread.sleep(1500)
             fullscreen(sc)
             awaitRequested(sc, ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)
-            Thread.sleep(1500)
-            assertSubtitlesAboveNavBar(sc)
-            shot("fullscreen-landscape-subtitles")
             fullscreen(sc)
             assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, requested(sc))
         }
@@ -172,6 +178,24 @@ class FullscreenOrientationUiTest {
             sc.onActivity { assertEquals(cur, it.resources.configuration.orientation) }
             fullscreen(sc)
             assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, requested(sc))
+        }
+    }
+
+    @Test fun portrait_fullscreen_subtitles_are_above_the_navigation_bar() {
+        val id = seed("fssubp", 176, 320)
+        open(id).use { sc ->
+            fullscreen(sc)
+            assertSubtitlesAboveNavBar(sc)
+            shot("fullscreen-portrait-subtitles")
+        }
+    }
+
+    @Test fun landscape_fullscreen_subtitles_are_above_the_navigation_bar() {
+        val id = seed("fssubl", 320, 176)
+        open(id).use { sc ->
+            fullscreen(sc)
+            assertSubtitlesAboveNavBar(sc)
+            shot("fullscreen-landscape-subtitles")
         }
     }
 }
