@@ -64,6 +64,10 @@ class Storage(root: File, private val clock: () -> Long = System::currentTimeMil
         return try { if (f.isFile) f.readText().trim().takeIf { it.isNotEmpty() } else null } catch (e: Exception) { null }
     }
 
+    fun jobIds(): List<String> = (jobs.listFiles() ?: emptyArray()).filter { it.name.endsWith(".json") }.map { it.name.removeSuffix(".json") }
+
+    fun deleteJob(id: String) { File(jobs, "$id.json").delete() }
+
     fun recentJobs(limit: Int = 20): List<JobMeta> =
         (jobs.listFiles() ?: emptyArray()).filter { it.name.endsWith(".json") }.mapNotNull { f ->
             try { JobMeta.fromJson(JSONObject(f.readText())) } catch (e: Exception) { null }

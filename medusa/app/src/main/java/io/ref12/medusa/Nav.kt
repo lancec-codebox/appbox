@@ -2,7 +2,7 @@ package io.ref12.medusa
 
 /** The places of the main app shell. [top] ones are in the navigation drawer. */
 enum class Dest(val title: String, val top: Boolean) {
-    LIBRARY("Library", true), CAPTURE("Download", true), SETTINGS("Settings", true), ABOUT("About & updates", true), ITEM("Item", false)
+    LIBRARY("Library", true), CAPTURE("Download", true), DOWNLOADS("Downloads", true), SETTINGS("Settings", true), ABOUT("About & updates", true), ITEM("Item", false)
 }
 
 data class Screen(val dest: Dest, val arg: String? = null) {
@@ -29,10 +29,10 @@ class NavStack(initial: List<Screen> = listOf(Screen(Dest.LIBRARY))) {
     /** The drawer entry to highlight: the drawer destination this screen belongs to. */
     val highlighted: Dest get() = stack.lastOrNull { it.dest.top }?.dest ?: Dest.LIBRARY
 
-    fun goTop(d: Dest) {
+    fun goTop(d: Dest, arg: String? = null) {
         require(d.top)
         while (stack.size > 1) stack.removeAt(stack.size - 1)
-        if (d != Dest.LIBRARY) stack.add(Screen(d))
+        if (d != Dest.LIBRARY) stack.add(Screen(d, arg))
     }
 
     fun open(s: Screen) {

@@ -16,6 +16,8 @@ class LibraryPage(a: MainActivity) : Page(a) {
     override val title = "Library"
     private lateinit var list: LinearLayout
     private lateinit var banner: LinearLayout
+    private lateinit var activeBox: LinearLayout
+    private var activeKey = ""
     private var query = ""
 
     override fun build(): View {
@@ -33,6 +35,9 @@ class LibraryPage(a: MainActivity) : Page(a) {
             addView(paste, LinearLayout.LayoutParams(0, -2, 1f))
             addView(Ui.button(a, "Download", primary = true) { go() }, Ui.lp(-2, -2, 0f, 8, 0, 0, 0, a))
         })
+        activeBox = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; tag = "active-downloads" }
+        col.addView(activeBox, Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
+        fillActive()
         val items = a.app.media.list()
         if (items.size > 4) col.addView(EditText(a).apply {
             hint = "Filter by title"; textSize = 14f; setSingleLine(); tag = "filter"; contentDescription = "Filter by title"
@@ -50,7 +55,33 @@ class LibraryPage(a: MainActivity) : Page(a) {
         return ScrollView(a).apply { addView(col) }
     }
 
-    override fun tick() { if (::banner.isInitialized) UpdateUi.render(a, banner, quietWhenCurrent = true) {} }
+    override fun tick() {
+        if (::banner.isInitialized) UpdateUi.render(a, banner, quietWhenCurrent = true) {}
+        if (::activeBox.isInitialized) fillActive()
+    }
+
+    /** In-progress downloads, compact, above the items; tapping goes to the Downloads page. */
+    private fun fillActive() {
+        val act = a.app.jobs.list().filter { !it.state.finished }.sortedBy { it.updatedAt }
+        val key = act.joinToString("|") { it.id + it.state + it.progress + it.message + it.title }
+        if (key == activeKey) return
+        activeKey = key
+        activeBox.removeAllViews()
+        for (j in act) {
+            val r = LinearLayout(a).apply {
+                orientation = LinearLayout.VERTICAL; tag = "active:" + j.id; contentDescription = DownloadsLogic.displayTitle(j)
+                setPadding(Ui.dp(a, 10), Ui.dp(a, 8), Ui.dp(a, 10), Ui.dp(a, 8))
+                background = Ui.rounded(a, Ui.color(a, R.color.selected), 8)
+                setOnClickListener { a.go(Dest.DOWNLOADS, j.id) }
+            }
+            r.addView(Ui.oneLine(Ui.text(a, DownloadsLogic.displayTitle(j), 14f, bold = true)))
+            r.addView(Ui.oneLine(Ui.muted(a, DownloadsLogic.stageText(j.state, j.message, j.progress), 12f)))
+            r.addView(android.widget.ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal).apply {
+                isIndeterminate = DownloadsLogic.indeterminate(j.state, j.progress); max = 1000; progress = ((j.progress ?: 0.0) * 1000).toInt()
+            }, Ui.lp(-1, Ui.dp(a, 5), 0f, 0, 4, 0, 0, a))
+            activeBox.addView(r, Ui.lp(-1, -2, 0f, 0, 0, 0, 6, a))
+        }
+    }
 
     private fun fill() {
         list.removeAllViews()

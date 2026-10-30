@@ -99,7 +99,9 @@ class HelperService : Service() {
             val j = jobs.recent().firstOrNull { !it.state.finished }
             (j?.let { jobs.info(it.id)?.message } ?: "Working") + (if (active > 1) " (+" + (active - 1) + " queued)" else "")
         } else "Web apps can use Medusa now (127.0.0.1:$SERVER_PORT)"
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val open = PendingIntent.getActivity(this, 0,
+            Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_DOWNLOADS, true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle(if (active > 0) "Downloading media" else "Medusa is ready")

@@ -25,6 +25,7 @@ object Codes {
     const val STORAGE = "storage"
     const val YTDLP = "ytdlp"
     const val INTERRUPTED = "interrupted"
+    const val CANCELLED = "cancelled"
     const val UNKNOWN_JOB = "unknown_job"
 }
 
@@ -137,6 +138,9 @@ fun interface MediaFetcher {
      * Throws FetchException when nothing could be captured; per-part failures come back in the outcome.
      */
     fun fetch(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): CaptureOutcome
+
+    /** Stops the capture that is running now (its process); the blocked [fetch] then throws. */
+    fun cancel() {}
 
     /** Downloads one more subtitle track of a video, by language. Throws FetchException (no_captions when it does not exist). */
     fun fetchTrack(url: String, language: String, workDir: File): SubtitlesData =

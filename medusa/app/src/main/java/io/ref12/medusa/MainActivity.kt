@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -38,8 +39,46 @@ class MainActivity : Activity() {
     /** A link to put in the Capture screen's field (from Library's paste field or the clipboard). */
     internal var prefillLink: String? = null
     private val ui = Handler(Looper.getMainLooper())
-    private val poll = object : Runnable { override fun run() { page?.tick(); ui.postDelayed(this, 1500) } }
+    private val poll = object : Runnable { override fun run() {
+        page?.tick()
+        val n = app.jobs.activeCount()
+        if (n != lastBadge) { lastBadge = n; if (wide || drawerOpen) refreshDrawer() }
+        ui.postDelayed(this, 1500)
+    } }
     internal val currentPage get() = page
+    /** True when this screen was opened by a link from another app: Back (and the chip on the job card) finish it and return there. */
+    internal var leaveOnBack = false
+        private set
+    private var callerPackage: String? = null
+    private var lastBadge = -1
+
+    /** Name of the app a link came from, for "← Back to <app>". */
+    internal fun returnLabel(): String = callerPackage?.let { p ->
+        try { packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString() } catch (e: Exception) { null }
+    } ?: "previous app"
+
+    internal fun leaveToCaller() = finish()
+
+    /** Routes a link, a notification tap or a job id to the Downloads page; a link also starts its job. */
+    internal fun handleIntent(i: Intent) {
+        val ref = try { referrer?.authority } catch (e: Exception) { null }
+        val route = LinkRouting.resolve(i.dataString, i.getStringExtra(EXTRA_JOB), i.getBooleanExtra(EXTRA_DOWNLOADS, false), ref, packageName, i.getBooleanExtra(EXTRA_FROM_APP, false))
+        if (!route.show) return
+        if (route.invalidLink) { snack("This link is not a valid Medusa link."); return }
+        if (route.request != null) {
+            val req = route.request
+            HelperService.start(this)
+            app.jobs.submit(JobSubmit(req.id, req.url, req.languages ?: app.settings.defaultLanguages, Want.DEFAULT, Quality.P720, req.returnUrl))
+        }
+        if (i.dataString != null) { leaveOnBack = route.leaveOnBack; callerPackage = if (route.leaveOnBack) ref?.takeIf { it != packageName } else null }
+        go(Dest.DOWNLOADS, route.jobId)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
 
     /** A short message bar at the bottom of the screen (above the navigation bar) that goes away by itself. */
     fun snack(text: String) {
@@ -97,9 +136,10 @@ class MainActivity : Activity() {
             }
         }
         show()
+        if (savedInstanceState == null) handleIntent(intent) else leaveOnBack = savedInstanceState.getBoolean("leave"); callerPackage = savedInstanceState?.getString("caller")
     }
 
-    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putStringArray("nav", nav.save()) }
+    override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putStringArray("nav", nav.save()); outState.putBoolean("leave", leaveOnBack); outState.putString("caller", callerPackage) }
 
     private fun topBar() = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
@@ -124,7 +164,7 @@ class MainActivity : Activity() {
 
     private fun refreshDrawer() {
         drawerItems.removeAllViews()
-        val icons = mapOf(Dest.LIBRARY to R.drawable.ic_library, Dest.CAPTURE to R.drawable.ic_capture, Dest.SETTINGS to R.drawable.ic_settings, Dest.ABOUT to R.drawable.ic_info)
+        val icons = mapOf(Dest.LIBRARY to R.drawable.ic_library, Dest.CAPTURE to R.drawable.ic_capture, Dest.DOWNLOADS to R.drawable.ic_downloads, Dest.SETTINGS to R.drawable.ic_settings, Dest.ABOUT to R.drawable.ic_info)
         for (d in Dest.values().filter { it.top }) {
             val on = d == nav.highlighted
             val row = LinearLayout(this).apply {
@@ -134,7 +174,9 @@ class MainActivity : Activity() {
                 setOnClickListener { go(d) }
             }
             row.addView(android.widget.ImageView(this).apply { setImageResource(icons.getValue(d)); setColorFilter(Ui.color(this@MainActivity, if (on) R.color.accent else R.color.muted)) }, LinearLayout.LayoutParams(Ui.dp(this, 22), Ui.dp(this, 22)))
-            row.addView(Ui.text(this, d.title, 15f, if (on) R.color.accent else R.color.on_surface, on).apply { setPadding(Ui.dp(this@MainActivity, 16), 0, 0, 0) })
+            row.addView(Ui.text(this, d.title, 15f, if (on) R.color.accent else R.color.on_surface, on).apply { setPadding(Ui.dp(this@MainActivity, 16), 0, 0, 0) }, LinearLayout.LayoutParams(0, -2, 1f))
+            if (d == Dest.DOWNLOADS && app.jobs.activeCount() > 0)
+                row.addView(Ui.badge(this, app.jobs.activeCount().toString(), true).apply { tag = "downloads-badge"; contentDescription = app.jobs.activeCount().toString() + " active downloads" })
             drawerItems.addView(row, LinearLayout.LayoutParams(-1, Ui.dp(this, 46)).apply { setMargins(Ui.dp(this@MainActivity, 8), Ui.dp(this@MainActivity, 2), Ui.dp(this@MainActivity, 8), Ui.dp(this@MainActivity, 2)) })
         }
     }
@@ -150,7 +192,7 @@ class MainActivity : Activity() {
     private fun onLeading() { if (nav.isTopLevel) setDrawer(!drawerOpen) else goBack() }
 
     /** A drawer destination (Library, Capture, Settings, About). */
-    fun go(d: Dest) { setDrawer(false); nav.goTop(d); show() }
+    fun go(d: Dest, arg: String? = null) { setDrawer(false); nav.goTop(d, arg); show() }
 
     fun openItem(mediaId: String) { setDrawer(false); nav.open(Screen(Dest.ITEM, mediaId)); show() }
 
@@ -162,6 +204,8 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (drawerOpen) { setDrawer(false); return }
+        // opened by a link from another app: Back returns there, as it was, from wherever we are in Medusa
+        if (leaveOnBack) { finish(); return }
         if (!nav.back()) finish() else show()
     }
 
@@ -178,6 +222,7 @@ class MainActivity : Activity() {
         val p: Page = when (s.dest) {
             Dest.LIBRARY -> LibraryPage(this)
             Dest.CAPTURE -> CapturePage(this)
+            Dest.DOWNLOADS -> DownloadsPage(this, s.arg)
             Dest.SETTINGS -> SettingsPage(this)
             Dest.ABOUT -> AboutPage(this)
             Dest.ITEM -> ItemPage(this, s.arg!!)
@@ -200,6 +245,8 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() { ui.removeCallbacks(poll); super.onPause() }
+
+    companion object { const val EXTRA_JOB = "job"; const val EXTRA_DOWNLOADS = "downloads"; const val EXTRA_FROM_APP = "from_app" }
 
     /** For the emulator test: the Capture screen's language choices. */
     internal fun setChoices(tracks: List<TrackInfo>) { (page as? CapturePage)?.setChoices(tracks) }

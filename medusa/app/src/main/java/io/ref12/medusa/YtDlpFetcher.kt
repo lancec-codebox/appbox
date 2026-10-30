@@ -43,7 +43,16 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         } finally { updating = false }
     }
 
+    @Volatile private var cancelled = false
+
+    /** Kills the yt-dlp process of the running capture; the capture then ends as cancelled (and is not retried). */
+    override fun cancel() {
+        cancelled = true
+        try { ytdlp.destroyProcessById(PID) } catch (e: Throwable) { /* nothing running */ }
+    }
+
     override fun fetch(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): CaptureOutcome {
+        cancelled = false
         ensureInit()
         if (System.currentTimeMillis() - settings.lastUpdateCheck > DAY_MS) {
             progress(JobState.FETCHING, "Checking for a yt-dlp update", null)
@@ -52,6 +61,7 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         return try {
             attempt(req, workDir, progress)
         } catch (e: YtDlpFailure) {
+            if (cancelled) throw FetchException("Cancelled", Codes.CANCELLED)
             progress(JobState.FETCHING, "yt-dlp failed, updating it and retrying", null)
             try { update() } catch (u: Exception) { /* retry anyway */ }
             try { attempt(req, workDir, progress) } catch (e2: YtDlpFailure) { throw explain(e2.message ?: "") }
@@ -59,10 +69,24 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
     }
 
     private fun attempt(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): CaptureOutcome {
-        progress(JobState.FETCHING, "Reading video information", 0.0)
-        val listing = run(YoutubeDLRequest(req.url).apply {
-            addOption("--dump-single-json"); addOption("--skip-download"); addOption("--no-playlist"); addOption("--ignore-no-formats-error")
-        })
+        if (cancelled) throw FetchException("Cancelled", Codes.CANCELLED)
+        // no percentage: reading the video's information has no measurable progress (the page shows a spinner)
+        progress(JobState.FETCHING, "Reading video information\u2026", null)
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        val timedOut = java.util.concurrent.atomic.AtomicBoolean(false)
+        Thread {
+            try { Thread.sleep(INFO_TIMEOUT_MS) } catch (e: InterruptedException) { return@Thread }
+            if (!finished.get()) { timedOut.set(true); try { ytdlp.destroyProcessById(PID) } catch (e: Throwable) {} }
+        }.apply { isDaemon = true; name = "info-timeout" }.start()
+        val listing = try {
+            run(YoutubeDLRequest(req.url).apply {
+                addOption("--dump-single-json"); addOption("--skip-download"); addOption("--no-playlist"); addOption("--ignore-no-formats-error")
+            })
+        } catch (e: Exception) {
+            if (cancelled) throw FetchException("Cancelled", Codes.CANCELLED)
+            if (timedOut.get()) throw FetchException("Reading the video information took longer than " + (INFO_TIMEOUT_MS / 1000) + " seconds. Check the connection or the link, then try again.", Codes.NETWORK)
+            throw e
+        } finally { finished.set(true) }
         val info = JSONObject(jsonOf(listing.out))
         val noTracks = (info.optJSONObject("subtitles")?.length() ?: 0) + (info.optJSONObject("automatic_captions")?.length() ?: 0) == 0
         if (listing.err.contains("Sign in to confirm", true) || listing.err.contains("not a bot", true))
@@ -161,7 +185,7 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
     }
 
     private fun run(req: YoutubeDLRequest, cb: ((Float, Long, String) -> Unit)? = null) = try {
-        ytdlp.execute(req, null, cb)
+        ytdlp.execute(req, PID, cb)
     } catch (e: YoutubeDLException) {
         val msg = e.message ?: ""
         if (msg.contains("Unsupported URL", true)) throw explain(msg)
@@ -195,5 +219,10 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         return FetchException(text.take(400), code)
     }
 
-    companion object { const val DAY_MS = 24L * 3600 * 1000 }
+    companion object {
+        const val DAY_MS = 24L * 3600 * 1000
+        /** Jobs run one at a time, so one process id is enough to cancel by. */
+        const val PID = "medusa-capture"
+        const val INFO_TIMEOUT_MS = 120_000L
+    }
 }

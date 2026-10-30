@@ -21,6 +21,7 @@ class JobRecord(
     @Volatile var message: String? = null
     @Volatile var title: String? = null
     @Volatile var updatedAt = 0L
+    @Volatile var cancelled = false
 }
 
 class JobManager(
@@ -42,7 +43,8 @@ class JobManager(
 
     /** Starts a job, or returns the id of a running one for the same URL, or completes at once when already captured. */
     @Synchronized
-    fun submit(req: JobSubmit): String {
+    fun submit(request: JobSubmit): String {
+        val req = request.copy(url = UrlNormalizer.clean(request.url))
         val langs = req.languages?.filter { it.isNotBlank() } ?: emptyList()
         val requested = req.id
         if (requested != null) record(requested)?.let { return requested }
@@ -160,7 +162,43 @@ class JobManager(
 
     fun recent(): List<JobMeta> = storage.recentJobs()
 
+    private fun toMeta(r: JobRecord) = JobMeta(r.id, r.url, r.languages, r.want, r.quality, r.state, r.progress, r.code, r.message, r.title, r.mediaId, r.returnUrl, r.updatedAt)
+
+    /** All known jobs, newest first: running ones from memory, older ones from disk (a job the process died in shows as failed). */
+    fun list(limit: Int = 100): List<JobMeta> {
+        val ids = LinkedHashSet<String>(); ids.addAll(jobs.keys); ids.addAll(storage.jobIds())
+        return ids.mapNotNull { record(it) }.distinctBy { it.id }.map { toMeta(it) }.sortedByDescending { it.updatedAt }.take(limit)
+    }
+
+    /** Stops a queued or running job; it ends as failed with code "cancelled". False when it is unknown or already finished. */
+    fun cancel(id: String): Boolean {
+        val rec = record(id) ?: return false
+        if (rec.state.finished) return false
+        val running = rec.state == JobState.FETCHING || rec.state == JobState.DOWNLOADING
+        rec.cancelled = true
+        set(rec, JobState.FAILED, Codes.CANCELLED, "Cancelled", null, force = true)
+        if (running) try { fetcher.cancel() } catch (e: Exception) { /* the job is already marked */ }
+        return true
+    }
+
+    /** Removes a finished job from the list. */
+    fun remove(id: String): Boolean {
+        val rec = record(id) ?: return false
+        if (!rec.state.finished) return false
+        jobs.remove(rec.id); storage.deleteJob(rec.id)
+        return true
+    }
+
+    /** Starts the same download again as a new job (the old one leaves the list); returns the new id. */
+    fun retry(id: String): String? {
+        val rec = record(id) ?: return null
+        val n = submit(JobSubmit(null, rec.url, rec.languages, rec.want, rec.quality, rec.returnUrl))
+        if (n != rec.id) remove(rec.id)
+        return n
+    }
+
     private fun run(rec: JobRecord) {
+        if (rec.cancelled) return
         set(rec, JobState.FETCHING, null, null, null, "Starting")
         val work = media.workDir(rec.mediaId)
         try {
@@ -173,6 +211,7 @@ class JobManager(
                 media.findByIdentity(extractor, id)?.video != null
             }
             val out = fetcher.fetch(req, work) { st, msg, frac -> set(rec, st, null, msg, frac) }
+            if (rec.cancelled) return
             // the same video under another URL spelling lands in its existing item
             val target = media.findByIdentity(out.extractor, out.videoId)?.mediaId ?: rec.mediaId
             rec.mediaId = target
@@ -218,7 +257,8 @@ class JobManager(
         }
     }
 
-    private fun set(rec: JobRecord, state: JobState, code: String?, message: String?, progress: Double?, keepMessage: String? = null) {
+    private fun set(rec: JobRecord, state: JobState, code: String?, message: String?, progress: Double?, keepMessage: String? = null, force: Boolean = false) {
+        if (rec.cancelled && !force) return
         rec.state = state
         rec.code = code
         rec.message = message ?: keepMessage

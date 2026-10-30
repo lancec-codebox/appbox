@@ -111,7 +111,7 @@ class CapturePage(a: MainActivity) : Page(a) {
         val want = if (choice == null) Want(subtitles = false, video = true) else Want.DEFAULT
         val langs = if (choice.isNullOrEmpty()) a.app.settings.defaultLanguages.takeIf { choice == "" } ?: emptyList() else listOf(choice)
         val id = a.app.jobs.submit(JobSubmit(null, url, langs, want, quality))
-        a.startActivity(Intent(a, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, id).putExtra(JobActivity.EXTRA_FROM_APP, true))
+        a.go(Dest.DOWNLOADS, id)
     }
 
     private fun renderJobs() {
@@ -122,7 +122,7 @@ class CapturePage(a: MainActivity) : Page(a) {
         for (j in recent) {
             val r = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(0, Ui.dp(a, 6), 0, Ui.dp(a, 6))
-                setOnClickListener { a.startActivity(Intent(a, JobActivity::class.java).putExtra(JobActivity.EXTRA_JOB, j.id).putExtra(JobActivity.EXTRA_FROM_APP, true)) }
+                setOnClickListener { a.go(Dest.DOWNLOADS, j.id) }
             }
             r.addView(Ui.oneLine(Ui.text(a, j.title ?: j.url, 14f, bold = true)))
             r.addView(Ui.oneLine(Ui.muted(a, j.state.wire + (if (!j.state.finished && j.progress != null) " " + (j.progress * 100).toInt() + "%" else "") + "  \u00b7  " + df.format(Date(j.updatedAt)) + (j.message?.let { "  \u00b7  $it" } ?: ""), 12f)))

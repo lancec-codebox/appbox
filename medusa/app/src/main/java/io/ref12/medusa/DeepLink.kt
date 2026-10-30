@@ -23,7 +23,7 @@ object DeepLink {
             val v = if (eq < 0) "" else decode(pair.substring(eq + 1))
             if (k !in params) params[k] = v
         }
-        val url = params["url"]?.trim().orEmpty()
+        val url = UrlNormalizer.clean(params["url"].orEmpty())
         if (!isHttp(url)) return null
         val job = params["job"]?.takeIf { ID_OK.matches(it) } ?: newId()
         val ret = params["return"]?.trim()?.takeIf { isHttp(it) }
