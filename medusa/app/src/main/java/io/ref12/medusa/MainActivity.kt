@@ -136,7 +136,8 @@ class MainActivity : Activity() {
             }
         }
         show()
-        if (savedInstanceState == null) handleIntent(intent) else leaveOnBack = savedInstanceState.getBoolean("leave"); callerPackage = savedInstanceState?.getString("caller")
+        if (savedInstanceState == null) handleIntent(intent)
+        else { leaveOnBack = savedInstanceState.getBoolean("leave"); callerPackage = savedInstanceState.getString("caller") }
     }
 
     override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); outState.putStringArray("nav", nav.save()); outState.putBoolean("leave", leaveOnBack); outState.putString("caller", callerPackage) }
