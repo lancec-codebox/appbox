@@ -71,6 +71,7 @@ class PlayerActivity : Activity() {
         val file = app.media.videoFile(mediaId)
         if (meta == null || file == null) { Toast.makeText(this, "No video to play", Toast.LENGTH_LONG).show(); finish(); return }
         tracks = TrackUi.tracksOf(meta)
+        app.settings.markPlayed(mediaId)
         itemMain = meta.subtitles?.language
         anchors = app.media.sync(mediaId)
 

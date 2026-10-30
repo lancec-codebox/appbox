@@ -46,6 +46,10 @@ class Settings(ctx: Context) {
         get() = prefs.getFloat("subtitleSp", 18f)
         set(v) { prefs.edit().putFloat("subtitleSp", v).apply() }
 
+    /** When an item was last played (ms), 0 if never. */
+    fun lastPlayed(mediaId: String): Long = prefs.getLong("played.$mediaId", 0L)
+    fun markPlayed(mediaId: String) { prefs.edit().putLong("played.$mediaId", System.currentTimeMillis()).apply() }
+
     /** Remembered subtitle choice per media item. slot = "main" or "second"; "" = off; null = never chosen. */
     fun trackChoice(mediaId: String, slot: String): String? = prefs.getString("track.$mediaId.$slot", null)
 

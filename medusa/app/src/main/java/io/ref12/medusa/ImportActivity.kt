@@ -6,7 +6,12 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.EditText
+import android.widget.Spinner
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -64,42 +69,63 @@ class ImportActivity : Activity() {
     }
 
     private fun choose(fileName: String, f: ImportedFile) {
-        val items = app.media.list()
-        if (items.isEmpty()) { fail("Your library is empty. Download the video first, then import its subtitles."); return }
-        val matched = forcedMedia?.let { id -> items.firstOrNull { it.mediaId == id } } ?: ImportMatch.find(items, f.mediaId, f.url)
-        var pick = items.indexOf(matched).coerceAtLeast(0)
+        val all = app.media.list()
+        if (all.isEmpty()) { fail("Your library is empty. Download the video first, then import its subtitles."); return }
+        val matched = forcedMedia?.let { id -> all.firstOrNull { it.mediaId == id } } ?: ImportMatch.find(all, f.mediaId, f.url)
+        // matched item first, then most recently played, then newest downloads
+        val items = all.sortedWith(compareByDescending<MediaMeta> { it.mediaId == matched?.mediaId }
+            .thenByDescending { app.settings.lastPlayed(it.mediaId) }.thenByDescending { it.createdAt })
+        var pick = 0
+        val detected = LanguageTools.detect(this, fileName, f.language, f.lines.map { it.text })
+        val common = LanguageTools.order(LanguageTools.COMMON, null, { it })
+        val langs = if (common.any { it.equals(detected, true) }) common else listOf(detected) + common
+        val langLabels = langs.map { LanguageTools.displayName(it) + " (" + it + ")" } + "Other..."
         val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 16, 40, 0) }
-        fun header(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 24, 0, 4); setTypeface(typeface, android.graphics.Typeface.BOLD) }
-        body.addView(TextView(this).apply { text = fileName + " - " + f.lines.size + " lines" })
-        if (matched == null) body.addView(TextView(this).apply { text = "Medusa could not tell which video this belongs to. Choose it below."; setPadding(0, 12, 0, 0) })
+        fun header(t: String) = TextView(this).apply { text = t; textSize = 14f; setPadding(0, 16, 0, 4); setTypeface(typeface, android.graphics.Typeface.BOLD) }
+        fun spinner(labels: List<String>, sel: Int, desc: String, onSel: (Int) -> Unit) = Spinner(this).apply {
+            adapter = ArrayAdapter(this@ImportActivity, android.R.layout.simple_spinner_dropdown_item, labels)
+            setSelection(sel); contentDescription = desc; tag = desc
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) = onSel(pos)
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
+        }
+        val importBtn = Button(this).apply { text = "Import"; tag = "import"; contentDescription = "Import" }
+        body.addView(importBtn)
         body.addView(header("Video"))
-        if (forcedMedia != null || matched != null && items.size == 1) body.addView(TextView(this).apply { text = items[pick].title; textSize = 16f })
-        else body.addView(TrackUi.radios(this, items.map { it.title }, items.map { "item:" + it.mediaId }, pick) { pick = it })
+        if (matched == null) body.addView(TextView(this).apply { text = "Medusa could not tell which video this belongs to. Choose it below (recently played first)." })
+        if (forcedMedia != null || matched != null && items.size == 1) body.addView(TextView(this).apply { text = items[0].title; textSize = 16f })
+        else body.addView(spinner(items.map { it.title }, 0, "Video") { pick = it })
         body.addView(header("Language"))
-        val lang = EditText(this).apply { setText(f.language ?: ""); hint = "en, fr, pt-BR ..."; contentDescription = "Language"; tag = "language"; setSingleLine() }
-        body.addView(lang)
+        var langPick = langs.indexOfFirst { it.equals(detected, true) }.coerceAtLeast(0)
+        val other = EditText(this).apply { hint = "Language tag, e.g. pt-BR"; contentDescription = "Other language"; tag = "language"; setSingleLine(); visibility = View.GONE }
+        body.addView(spinner(langLabels, langPick, "Language") { langPick = it; other.visibility = if (it == langs.size) View.VISIBLE else View.GONE })
+        body.addView(other)
         body.addView(header("Label (shown in the subtitle menu)"))
         val label = EditText(this).apply { setText(f.label ?: ""); hint = "English (AI)"; contentDescription = "Label"; tag = "label"; setSingleLine() }
         body.addView(label)
+        body.addView(header("File"))
+        body.addView(TextView(this).apply { text = fileName + "\n" + f.lines.size + " lines" + (f.lines.lastOrNull()?.let { ", " + (it.end / 60000) + " min" } ?: "") })
+        body.addView(header("Preview"))
+        body.addView(TextView(this).apply { text = f.lines.take(5).joinToString("\n") { it.text }; textSize = 13f })
         AlertDialog.Builder(this).setTitle("Import subtitles").setView(android.widget.ScrollView(this).apply { addView(body) })
-            .setPositiveButton("Add", null).setNegativeButton("Cancel") { _, _ -> finish() }.setOnCancelListener { finish() }
+            .setNegativeButton("Cancel") { _, _ -> finish() }.setOnCancelListener { finish() }
             .create().also { d ->
-                d.setOnShowListener {
-                    d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                        val m = items[pick]
-                        val json = org.json.JSONObject().put("language", lang.text.toString().trim()).put("lines", org.json.JSONArray().also { a ->
-                            for (l in f.lines) a.put(org.json.JSONObject().put("start", l.start).put("end", l.end).put("text", l.text))
-                        }).put("origin", f.origin ?: "import")
-                        label.text.toString().trim().takeIf { it.isNotEmpty() }?.let { json.put("label", it) }
-                        try {
-                            val t = TrackRules.parse(json)
-                            app.media.addTrack(m.mediaId, t) ?: throw TrackRejected("That video is no longer in the library")
-                            Toast.makeText(this, "Added " + (t.label ?: t.language) + " to " + m.title, Toast.LENGTH_LONG).show()
-                            d.dismiss()
-                            if (forcedMedia == null) startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                            finish()
-                        } catch (e: TrackRejected) { Toast.makeText(this, e.message, Toast.LENGTH_LONG).show() }
-                    }
+                importBtn.setOnClickListener {
+                    val m = items[pick]
+                    val language = (if (langPick < langs.size) langs[langPick] else other.text.toString()).trim()
+                    val json = org.json.JSONObject().put("language", language).put("lines", org.json.JSONArray().also { a ->
+                        for (l in f.lines) a.put(org.json.JSONObject().put("start", l.start).put("end", l.end).put("text", l.text))
+                    }).put("origin", f.origin ?: "import")
+                    label.text.toString().trim().takeIf { it.isNotEmpty() }?.let { json.put("label", it) }
+                    try {
+                        val t = TrackRules.parse(json)
+                        app.media.addTrack(m.mediaId, t) ?: throw TrackRejected("That video is no longer in the library")
+                        Toast.makeText(this, "Added " + (t.label ?: t.language) + " to " + m.title, Toast.LENGTH_LONG).show()
+                        d.dismiss()
+                        if (forcedMedia == null) startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        finish()
+                    } catch (e: TrackRejected) { Toast.makeText(this, e.message, Toast.LENGTH_LONG).show() }
                 }
             }.show()
     }

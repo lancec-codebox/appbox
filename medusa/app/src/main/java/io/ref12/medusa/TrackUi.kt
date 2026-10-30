@@ -19,7 +19,11 @@ object TrackUi {
 
     /** The tracks to offer for an item: its list, or just the main track for items captured before 1.2. */
     fun tracksOf(m: MediaMeta): List<TrackInfo> =
-        m.tracks.ifEmpty { m.subtitles?.let { listOf(TrackInfo(it.language, it.source)) } ?: emptyList() }
+        ordered(m.tracks.ifEmpty { m.subtitles?.let { listOf(TrackInfo(it.language, it.source)) } ?: emptyList() }, m.subtitles?.language)
+
+    /** Original language, then English, then the rest by display name; manual before auto before added within a language. */
+    fun ordered(tracks: List<TrackInfo>, original: String?): List<TrackInfo> =
+        LanguageTools.order(tracks.sortedBy { if (it.source == "captions") 0 else if (it.added) 2 else 1 }, original, { it.language }, { LanguageTools.displayName(it.language) })
 
     /** What the CC menu and the item screen list for one slot: "Off" first, then every track; the tags are the tracks' keys. */
     fun menuEntries(tracks: List<TrackInfo>): Pair<List<String>, List<String>> =

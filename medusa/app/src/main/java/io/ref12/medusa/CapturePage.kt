@@ -81,7 +81,7 @@ class CapturePage(a: MainActivity) : Page(a) {
     internal fun setChoices(tracks: List<TrackInfo>) {
         val def = a.app.settings.defaultLanguage
         val first = (if (def.isEmpty()) "Original language" else "Default ($def)") to ""
-        langChoices = listOf<Pair<String, String?>>(first) + tracks.map { TrackUi.label(it) to it.language } + listOf<Pair<String, String?>>("None" to null)
+        langChoices = listOf<Pair<String, String?>>(first) + TrackUi.ordered(tracks, null).map { TrackUi.label(it) to it.language } + listOf<Pair<String, String?>>("None" to null)
         langPicked = 0
         langBox.removeAllViews()
         langBox.addView(TrackUi.radios(a, langChoices.map { it.first }, langChoices.map { "capture:" + (it.second ?: "none").ifEmpty { "original" } }, 0) { langPicked = it })
