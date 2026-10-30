@@ -22,6 +22,11 @@ class Settings(ctx: Context) {
         get() = KeepAliveMode.fromMinutes(prefs.getInt("keepAliveMinutes", KeepAliveMode.DEFAULT.minutes))
         set(v) { prefs.edit().putInt("keepAliveMinutes", v.minutes).apply() }
 
+    /** The remembered export format's extension ("srt", "vtt" or "medusa-track.json"). */
+    var exportFormat: String
+        get() = prefs.getString("exportFormat", "srt") ?: "srt"
+        set(v) { prefs.edit().putString("exportFormat", v).apply() }
+
     /** Whether titles show in the device's language (when the site has one) or only as the original. */
     var titleMode: TitleMode
         get() = TitleMode.values().firstOrNull { it.name == prefs.getString("titleMode", null) } ?: TitleMode.DEVICE

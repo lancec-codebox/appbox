@@ -27,6 +27,8 @@ class MainActivity : Activity() {
     private lateinit var title: TextView
     private lateinit var bar: LinearLayout
     private var barPad = 0
+    private var navBottom = 0
+    private lateinit var rootFrame: FrameLayout
     private lateinit var leading: ImageButton
     private lateinit var drawerPanel: LinearLayout
     private lateinit var scrim: View
@@ -38,6 +40,16 @@ class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private val poll = object : Runnable { override fun run() { page?.tick(); ui.postDelayed(this, 1500) } }
     internal val currentPage get() = page
+
+    /** A short message bar at the bottom of the screen (above the navigation bar) that goes away by itself. */
+    fun snack(text: String) {
+        val v = TextView(this).apply {
+            this.text = text; tag = "snackbar"; setTextColor(0xFFFFFFFF.toInt()); textSize = 14f
+            setBackgroundColor(0xF2323232.toInt()); setPadding(Ui.dp(this@MainActivity, 16), Ui.dp(this@MainActivity, 14), Ui.dp(this@MainActivity, 16), Ui.dp(this@MainActivity, 14))
+        }
+        rootFrame.addView(v, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(Ui.dp(this@MainActivity, 8), 0, Ui.dp(this@MainActivity, 8), navBottom + Ui.dp(this@MainActivity, 8)) })
+        v.postDelayed({ rootFrame.removeView(v) }, 3500)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         setTheme(R.style.Theme_Medusa)
@@ -69,7 +81,9 @@ class MainActivity : Activity() {
         }
         setContentView(frame)
         // the bar's background runs under the status bar, its content sits below it; the pages end above the navigation bar
+        rootFrame = frame
         Edge.setup(this, frame) { i ->
+            navBottom = i.bottom
             bar.setPadding(Ui.dp(this, 4), i.top, Ui.dp(this, 4), 0)
             bar.layoutParams = bar.layoutParams.apply { height = barPad + i.top }
             if (wide) {

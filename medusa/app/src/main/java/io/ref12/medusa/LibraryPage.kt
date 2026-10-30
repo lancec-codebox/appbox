@@ -98,11 +98,12 @@ class LibraryPage(a: MainActivity) : Page(a) {
 
     private fun menu(anchor: View, m: MediaMeta) {
         PopupMenu(a, anchor).apply {
-            menu.add("Open"); menu.add("Export subtitles"); menu.add("Delete")
+            menu.add("Open"); menu.add("Export subtitles"); menu.add("Share subtitles\u2026"); menu.add("Delete")
             setOnMenuItemClickListener {
                 when (it.title) {
                     "Open" -> a.openItem(m.mediaId)
-                    "Export subtitles" -> ExportUi.show(a, m)
+                    "Export subtitles" -> ExportUi.export(a, m, listOfNotNull(ExportUi.defaultTrack(m)))
+                    "Share subtitles\u2026" -> ExportUi.export(a, m, listOfNotNull(ExportUi.defaultTrack(m)), share = true)
                     else -> android.app.AlertDialog.Builder(a).setTitle("Delete?").setMessage(m.title)
                         .setPositiveButton("Delete") { _, _ -> a.app.media.delete(m.mediaId); fill() }.setNegativeButton("Cancel", null).show()
                 }

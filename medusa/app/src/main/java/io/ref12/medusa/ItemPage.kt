@@ -90,7 +90,8 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
                 fun chip(txt: String, on: Boolean, tg: String, f: () -> Unit) = addView(Ui.chipButton(a, txt, on, tg + ":" + t.key, f), Ui.lp(-2, -2, 0f, 0, 0, 6, 0, a))
                 chip(if (isMain) "\u2713 Main" else "Main", isMain, "main") { a.app.settings.setTrackChoice(m.mediaId, "main", if (isMain) null else t.key); a.show() }
                 chip(if (isSecond) "\u2713 Second line" else "Second line", isSecond, "second") { a.app.settings.setTrackChoice(m.mediaId, "second", if (isSecond) null else t.key); a.show() }
-                chip("Export", false, "export") { ExportUi.show(a, m, t.key) }
+                chip("Export", false, "export") { ExportUi.export(a, m, listOf(t)) }
+                addView(Ui.chipButton(a, "\u22EE", false, "export-more:" + t.key) { ExportUi.overflow(a, m, t, this) }, Ui.lp(-2, -2, 0f, 0, 0, 6, 0, a))
                 if (t.added) chip("Remove", false, "remove") {
                     AlertDialog.Builder(a).setTitle("Remove this track?").setMessage(TrackUi.label(t)).setPositiveButton("Remove") { _, _ ->
                         a.app.media.removeTrack(m.mediaId, t.trackId!!)
