@@ -2,7 +2,7 @@ package io.ref12.medusa
 
 /** The places of the main app shell. [top] ones are in the navigation drawer. */
 enum class Dest(val title: String, val top: Boolean) {
-    LIBRARY("Library", true), CAPTURE("Capture", true), SETTINGS("Settings", true), ABOUT("About & updates", true), ITEM("Item", false)
+    LIBRARY("Library", true), CAPTURE("Download", true), SETTINGS("Settings", true), ABOUT("About & updates", true), ITEM("Item", false)
 }
 
 data class Screen(val dest: Dest, val arg: String? = null) {

@@ -88,7 +88,7 @@ class JobManager(
         } else {
             // it was running when the process died: say so, and keep that answer on disk
             r.state = JobState.FAILED; r.code = Codes.INTERRUPTED
-            r.message = "Medusa was closed before this capture finished. Capture it again."
+            r.message = "Medusa was closed before this download finished. Download it again."
             r.updatedAt = clock()
             storage.saveJob(JobMeta(r.id, r.url, r.languages, r.want, r.quality, r.state, r.progress, r.code, r.message, r.title, r.mediaId, r.returnUrl, r.updatedAt))
         }
@@ -195,7 +195,7 @@ class JobManager(
             val gotVideo = out.videoFile != null || (rec.want.video && video != null)
             if (!(rec.want.subtitles && gotSubs) && !(rec.want.video && gotVideo)) {
                 throw (if (rec.want.video && !rec.want.subtitles) out.videoError else if (rec.want.subtitles && !rec.want.video) out.subtitlesError else out.videoError ?: out.subtitlesError)
-                    ?: FetchException("Nothing could be captured")
+                    ?: FetchException("Nothing could be downloaded")
             }
             media.save(MediaMeta(target, if (old != null) old.url else rec.url, out.title.ifEmpty { old?.title ?: rec.url }, out.durationSec ?: old?.durationSec,
                 out.extractor.ifEmpty { old?.extractor ?: "" }, out.videoId.ifEmpty { old?.videoId ?: "" }, subtitles, video, old?.createdAt ?: clock(),

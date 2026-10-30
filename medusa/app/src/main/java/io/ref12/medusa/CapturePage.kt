@@ -12,7 +12,7 @@ import java.util.Date
 
 /** Capture a link: link field, subtitle language, quality, progress of recent jobs, and "already in your library". */
 class CapturePage(a: MainActivity) : Page(a) {
-    override val title = "Capture"
+    override val title = "Download"
     private lateinit var link: EditText
     private lateinit var inLib: LinearLayout
     private lateinit var inLibText: android.widget.TextView
@@ -55,7 +55,7 @@ class CapturePage(a: MainActivity) : Page(a) {
 
         col.addView(Ui.header(a, "Video quality").apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 14), 0, Ui.dp(a, 4)) })
         col.addView(TrackUi.radios(a, Quality.values().map { it.wire }, Quality.values().map { "quality:" + it.wire }, 0) { quality = Quality.values()[it] })
-        col.addView(Ui.button(a, "Capture", primary = true) { fetch() }, Ui.lp(-1, -2, 0f, 0, 14, 0, 0, a))
+        col.addView(Ui.button(a, "Download", primary = true) { fetch() }, Ui.lp(-1, -2, 0f, 0, 14, 0, 0, a))
 
         col.addView(Ui.header(a, "Recent jobs").apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 20), 0, Ui.dp(a, 4)) })
         jobsBox = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
@@ -75,7 +75,7 @@ class CapturePage(a: MainActivity) : Page(a) {
         val meta = id?.let { a.app.media.get(it) }
         libraryId = meta?.mediaId
         inLib.visibility = if (meta == null) View.GONE else View.VISIBLE
-        if (meta != null) inLibText.text = "Already in your library: " + meta.title + "\nCapturing again only adds subtitle tracks you don't have yet."
+        if (meta != null) inLibText.text = "Already in your library: " + meta.title + "\nDownloading again only adds subtitle tracks you don't have yet."
     }
 
     internal fun setChoices(tracks: List<TrackInfo>) {

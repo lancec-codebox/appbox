@@ -1,6 +1,6 @@
 # Medusa protocol, v1.3
 
-Medusa (repo <https://github.com/lancec-codebox/appbox>, folder `medusa/`, package `io.ref12.medusa`) is an Android app that captures a media URL with yt-dlp on the phone: subtitles (in any language) and video. A web app (first client: LinguaWeave) talks to it only through this protocol and never runs yt-dlp. Any URL yt-dlp supports works.
+Medusa (repo <https://github.com/lancec-codebox/appbox>, folder `medusa/`, package `io.ref12.medusa`) is an Android app that downloads a media URL with yt-dlp on the phone: subtitles (in any language) and video. A web app (first client: LinguaWeave) talks to it only through this protocol and never runs yt-dlp. Any URL yt-dlp supports works.
 
 ## 1. Waking the app (deep link)
 
@@ -33,7 +33,7 @@ Optional `languages=<comma list>` (for example `languages=en,fr`) works like `la
   "want"?: ["subtitles", "video"], "quality"?: "720p" }
 ```
 
-→ `{ "id": "..." }`. `languages` is optional and has no default: when omitted (or empty) Medusa picks the video's original spoken language, manual captions first, then that language's auto-captions. When given, the first language with a track wins, manual captions before auto-captions; `zh` and `zh-Hans` count as the same family, `zh-Hans` and `zh-Hant` do not. Defaults: `want` both, `quality` `720p` (also `480p`, `360p`; video is MP4). A running job for the same URL and languages is reused and its id returned. When the media is already captured with the wanted parts, the job is created with the requested id and is `done` at once. Invalid input → 400.
+→ `{ "id": "..." }`. `languages` is optional and has no default: when omitted (or empty) Medusa picks the video's original spoken language, manual captions first, then that language's auto-captions. When given, the first language with a track wins, manual captions before auto-captions; `zh` and `zh-Hans` count as the same family, `zh-Hans` and `zh-Hant` do not. Defaults: `want` both, `quality` `720p` (also `480p`, `360p`; video is MP4). A running job for the same URL and languages is reused and its id returned. When the media is already downloaded with the wanted parts, the job is created with the requested id and is `done` at once. Invalid input → 400.
 
 `GET /v1/jobs/{id}` →
 
@@ -48,7 +48,7 @@ Optional `languages=<comma list>` (for example `languages=en,fr`) works like `la
 
 ### Media
 
-Captures persist on the phone until deleted.
+Downloads persist on the phone until deleted.
 
 ```json
 { "mediaId": "...", "url": "...", "title": "...", "durationSec": 2712, "extractor": "youtube", "videoId": "...",
@@ -60,7 +60,7 @@ Captures persist on the phone until deleted.
 
 `title` is always the original title. When the site serves the title in the user's language (YouTube translated titles) and it differs, the item also has `"localizedTitle"` and `"localizedLanguage"` (e.g. `"en"`); both are absent otherwise (v1.3.1, additive: older clients ignore them). Clients show `localizedTitle` first and the original under it.
 
-`subtitles` is the chosen (main) track with its lines. `tracks` lists every subtitle track the video offers (`[]` for items captured before v1.2); auto-captions are the video's spoken language only, never machine translations. Lines are plain text, `start`/`end` in seconds.
+`subtitles` is the chosen (main) track with its lines. `tracks` lists every subtitle track the video offers (`[]` for items downloaded before v1.2); auto-captions are the video's spoken language only, never machine translations. Lines are plain text, `start`/`end` in seconds.
 
 - `GET /v1/media` → array of media items without `lines`.
 - `GET /v1/media/{id}` → one media item. `DELETE /v1/media/{id}` → `{ "deleted": true }` (404 if unknown).
@@ -75,13 +75,13 @@ Captures persist on the phone until deleted.
 
 Another app can add a subtitle track it produced (for example a translation) so it plays in Medusa.
 
-- `POST /v1/media/{id}/tracks` body `{ "language": "en", "label"?: "English (AI)", "source": "added", "origin"?: "linguaweave", "lines": [ { "start", "end", "text" } ] }` → `{ "trackId" }`. An added track with the same language and origin is replaced (and keeps its trackId); other origins and the captured tracks stay.
+- `POST /v1/media/{id}/tracks` body `{ "language": "en", "label"?: "English (AI)", "source": "added", "origin"?: "linguaweave", "lines": [ { "start", "end", "text" } ] }` → `{ "trackId" }`. An added track with the same language and origin is replaced (and keeps its trackId); other origins and the downloaded tracks stay.
 - The item's `tracks` then lists it as `{ "language", "source": "added", "label", "trackId", "origin"? }` (`name` is the same text as `label`).
 - `GET /v1/media/{id}/subtitles?track=<trackId>` (with or without `language`) → `{ "source": "added", "language", "lines" }`. 404 `no_captions` for an unknown trackId.
 - `DELETE /v1/media/{id}/tracks/{trackId}` → `{ "deleted": true }`; 404 if the media or the track is unknown. Only added tracks can be deleted.
 - Validation (400 `{ "error", "code": "invalid_track" }`): `language` is a tag like `en` or `pt-BR`; `source`, when given, is `added`; `origin` is 1-40 characters of letters, digits, `.`, `_`, `-`; `label` is plain text, at most 60 characters; `lines` is not empty (at most 20000), sorted by `start`, `start` >= 0, `end` > `start`, `text` a non-empty plain string (no markup or control characters, at most 2000 characters). A body over 2 MB is refused with 413. 404 for unknown media.
 
-Sync anchors belong to the item (video time), not to a track: they apply to added tracks exactly as to captured ones, and changing tracks keeps them.
+Sync anchors belong to the item (video time), not to a track: they apply to added tracks exactly as to downloaded ones, and changing tracks keeps them.
 
 ### Subtitle files (import and export)
 
@@ -102,4 +102,4 @@ If the browser blocks 127.0.0.1, the job screen's Save transcript writes the med
 
 ## Versions
 
-v1: Chinese subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. v1.3: added tracks (producer-supplied subtitles), the `track` query on `/subtitles`. v1.3.1: `localizedTitle` and `localizedLanguage` on media items. Later: on-device speech recognition when no captions exist.
+v1: Chinese subtitles only. v1.1: video download, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. v1.3: added tracks (producer-supplied subtitles), the `track` query on `/subtitles`. v1.3.1: `localizedTitle` and `localizedLanguage` on media items. Later: on-device speech recognition when no captions exist.

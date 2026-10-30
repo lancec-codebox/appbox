@@ -25,6 +25,8 @@ class MainActivity : Activity() {
     private var page: Page? = null
     private lateinit var content: FrameLayout
     private lateinit var title: TextView
+    private lateinit var bar: LinearLayout
+    private var barPad = 0
     private lateinit var leading: ImageButton
     private lateinit var drawerPanel: LinearLayout
     private lateinit var scrim: View
@@ -48,7 +50,8 @@ class MainActivity : Activity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Ui.color(this@MainActivity, R.color.bg)) }
         val frame = FrameLayout(this)
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        column.addView(topBar(), LinearLayout.LayoutParams(-1, Ui.dp(this, 56)))
+        bar = topBar(); barPad = Ui.dp(this, 56)
+        column.addView(bar, LinearLayout.LayoutParams(-1, barPad))
         column.addView(Ui.divider(this))
         content = FrameLayout(this)
         column.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -65,6 +68,20 @@ class MainActivity : Activity() {
             frame.addView(drawerPanel, FrameLayout.LayoutParams(Ui.dp(this, 280), -1, Gravity.START))
         }
         setContentView(frame)
+        // the bar's background runs under the status bar, its content sits below it; the pages end above the navigation bar
+        Edge.setup(this, frame) { i ->
+            bar.setPadding(Ui.dp(this, 4), i.top, Ui.dp(this, 4), 0)
+            bar.layoutParams = bar.layoutParams.apply { height = barPad + i.top }
+            if (wide) {
+                drawerPanel.setPadding(i.left, i.top + Ui.dp(this, 12), 0, i.bottom)
+                content.setPadding(0, 0, i.right, i.bottom)
+                bar.setPadding(Ui.dp(this, 4), i.top, i.right + Ui.dp(this, 4), 0)
+            } else {
+                drawerPanel.setPadding(i.left, i.top + Ui.dp(this, 16), 0, i.bottom)
+                content.setPadding(i.left, 0, i.right, i.bottom)
+                bar.setPadding(i.left + Ui.dp(this, 4), i.top, i.right + Ui.dp(this, 4), 0)
+            }
+        }
         show()
     }
 
@@ -83,7 +100,6 @@ class MainActivity : Activity() {
     private fun buildDrawer() {
         drawerPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Ui.color(this@MainActivity, R.color.surface)); isClickable = true
-            setPadding(0, Ui.dp(this@MainActivity, if (wide) 12 else 36), 0, 0)
         }
         drawerPanel.addView(Ui.text(this, "Medusa", 22f, R.color.accent, true).apply { setPadding(Ui.dp(this@MainActivity, 20), Ui.dp(this@MainActivity, 8), 0, 0) })
         drawerPanel.addView(Ui.muted(this, "Transcripts and videos on this phone").apply { setPadding(Ui.dp(this@MainActivity, 20), 0, Ui.dp(this@MainActivity, 16), Ui.dp(this@MainActivity, 14)) })

@@ -45,7 +45,7 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
             setOnClickListener { try { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(m.url))) } catch (e: Exception) {} }
         })
         sum.addView(Ui.muted(a, listOfNotNull(Ui.duration(m.durationSec), m.extractor.takeIf { it.isNotEmpty() }, Ui.size(a.app.media.bytesOf(m.mediaId)),
-            m.createdAt.takeIf { it > 0 }?.let { "captured " + Ui.date(it) }).joinToString("  \u00b7  ")))
+            m.createdAt.takeIf { it > 0 }?.let { "downloaded " + Ui.date(it) }).joinToString("  \u00b7  ")))
         if (Titles.supportsLocalized(m.extractor) && a.app.settings.titleLanguage() != null)
             {
                 lateinit var chip: View

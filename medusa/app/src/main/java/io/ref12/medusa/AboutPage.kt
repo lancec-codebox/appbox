@@ -39,7 +39,7 @@ class AboutPage(a: MainActivity) : Page(a) {
         col.addView(u)
         col.addView(Ui.header(a, "About").apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 18), 0, Ui.dp(a, 6)) })
         val l = Ui.card(a)
-        l.addView(Ui.muted(a, "Medusa captures transcripts and videos on this phone and serves them to web apps through a local API on 127.0.0.1.", 13f))
+        l.addView(Ui.muted(a, "Medusa downloads transcripts and videos on this phone and serves them to web apps through a local API on 127.0.0.1.", 13f))
         l.addView(Ui.text(a, "Source: github.com/" + UpdateLogic.REPO, 14f, R.color.accent).apply {
             tag = "repo-link"; setPadding(0, Ui.dp(a, 8), 0, Ui.dp(a, 4))
             setOnClickListener { try { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/" + UpdateLogic.REPO))) } catch (e: Exception) {} }
@@ -63,7 +63,7 @@ class AboutPage(a: MainActivity) : Page(a) {
         status.text = when {
             HelperService.running -> "Server running on 127.0.0.1:$SERVER_PORT"
             HelperService.lastError != null -> HelperService.lastError
-            else -> "Server stopped (starts when a web app or a capture asks for a transcript)"
+            else -> "Server stopped (starts when a web app or a download asks for a transcript)"
         }
     }
 

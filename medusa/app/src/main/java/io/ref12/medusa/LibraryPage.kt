@@ -23,7 +23,7 @@ class LibraryPage(a: MainActivity) : Page(a) {
         banner = UpdateUi.box(a)
         col.addView(banner, Ui.lp(-1, -2, 0f, 0, 0, 0, 8, a))
         val paste = EditText(a).apply {
-            hint = "Paste a link to capture"; textSize = 14f; setSingleLine(); tag = "paste-link"; contentDescription = "Paste a link"
+            hint = "Paste a link to download"; textSize = 14f; setSingleLine(); tag = "paste-link"; contentDescription = "Paste a link"
             inputType = InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_CLASS_TEXT
             setTextColor(Ui.color(a, R.color.on_surface)); setHintTextColor(Ui.color(a, R.color.muted))
         }
@@ -31,7 +31,7 @@ class LibraryPage(a: MainActivity) : Page(a) {
         col.addView(LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             addView(paste, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(Ui.button(a, "Capture", primary = true) { go() }, Ui.lp(-2, -2, 0f, 8, 0, 0, 0, a))
+            addView(Ui.button(a, "Download", primary = true) { go() }, Ui.lp(-2, -2, 0f, 8, 0, 0, 0, a))
         })
         val items = a.app.media.list()
         if (items.size > 4) col.addView(EditText(a).apply {
@@ -56,8 +56,8 @@ class LibraryPage(a: MainActivity) : Page(a) {
         list.removeAllViews()
         val all = a.app.media.list()
         if (all.isEmpty()) {
-            list.addView(Ui.text(a, "Nothing captured yet", 16f, bold = true).apply { setPadding(0, Ui.dp(a, 28), 0, Ui.dp(a, 6)) })
-            list.addView(Ui.muted(a, "Medusa captures a video's transcript and video from a link, keeps them on this phone and plays them with subtitles you can sync.", 14f))
+            list.addView(Ui.text(a, "Nothing downloaded yet", 16f, bold = true).apply { setPadding(0, Ui.dp(a, 28), 0, Ui.dp(a, 6)) })
+            list.addView(Ui.muted(a, "Medusa downloads a video's transcript and video from a link, keeps them on this phone and plays them with subtitles you can sync.", 14f))
             list.addView(Ui.muted(a, "Paste a link above, or share one to Medusa from any app. Web apps can ask Medusa for transcripts through its local API.", 14f).apply { setPadding(0, Ui.dp(a, 8), 0, 0) })
             return
         }

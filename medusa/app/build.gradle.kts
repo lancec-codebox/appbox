@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersion = (findProperty("versionName") as String?) ?: "1.5.2"
+val appVersion = (findProperty("versionName") as String?) ?: "1.5.3"
 val keystoreFile: String? = System.getenv("MEDUSA_KEYSTORE_FILE")
 
 android {
@@ -66,6 +66,7 @@ dependencies {
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
 

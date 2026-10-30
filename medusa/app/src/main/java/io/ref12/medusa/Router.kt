@@ -211,7 +211,7 @@ class Router(private val api: HelperApi, private val allowedOrigins: () -> List<
     }
 
     private fun unknownJob(cors: Map<String, String>) = json(404, JSONObject().put("code", Codes.UNKNOWN_JOB)
-        .put("message", "Medusa does not know this job. It may be older than a day, or the app's data was cleared. Start the capture again.")
+        .put("message", "Medusa does not know this job. It may be older than a day, or the app's data was cleared. Start the download again.")
         .put("error", "unknown job"), cors)
 
     private fun err(status: Int, msg: String, cors: Map<String, String>) = json(status, JSONObject().put("error", msg), cors)

@@ -61,7 +61,7 @@ class UpdateManager(
     private val autoEnabled: () -> Boolean,
     private val lastCheck: () -> Long,
     private val setLastCheck: (Long) -> Unit,
-    private val busy: () -> Boolean, // a capture job is running
+    private val busy: () -> Boolean, // a download job is running
 ) {
     @Volatile var state: UpdateState = UpdateState.Idle
         private set
@@ -104,7 +104,7 @@ class UpdateManager(
         state = UpdateState.Idle
     }
 
-    /** Update: never while a capture job runs (installing restarts the app). */
+    /** Update: never while a download job runs (installing restarts the app). */
     fun update() {
         val offer = when (val s = state) {
             is UpdateState.Available -> s.offer
@@ -112,7 +112,7 @@ class UpdateManager(
             is UpdateState.NeedsPermission -> s.offer
             else -> return
         }
-        if (busy()) { state = UpdateState.Failed("A capture is running. Update when it has finished.", offer); return }
+        if (busy()) { state = UpdateState.Failed("A download is running. Update when it has finished.", offer); return }
         state = UpdateState.Downloading(offer, null)
         executor.execute { downloadAndInstall(offer) }
     }

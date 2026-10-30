@@ -123,6 +123,8 @@ class PlayerActivity : Activity() {
         bottomPanel.addView(row("Sync to this line" to { syncLine() }, "Reset here" to { change(SyncMath.resetHere(anchors, now())) }, "Reset all" to { change(SyncMath.resetAll()) }))
         root.addView(bottomPanel, ViewGroup.LayoutParams(-1, -2))
         setContentView(root)
+        // windowed: respect the bars and cutouts; fullscreen hides the bars, so only a cutout is left to avoid
+        Edge.setup(this, root, lightBar = false) { i -> root.setPadding(i.left, i.top, i.right, i.bottom) }
 
         // the remembered choice for this item, else its own main track
         val c = TrackUi.resolve(itemMain, tracks, app.settings.trackChoice(mediaId, "main"), app.settings.trackChoice(mediaId, "second"))

@@ -65,7 +65,7 @@ class ImportActivity : Activity() {
 
     private fun choose(fileName: String, f: ImportedFile) {
         val items = app.media.list()
-        if (items.isEmpty()) { fail("Your library is empty. Capture the video first, then import its subtitles."); return }
+        if (items.isEmpty()) { fail("Your library is empty. Download the video first, then import its subtitles."); return }
         val matched = forcedMedia?.let { id -> items.firstOrNull { it.mediaId == id } } ?: ImportMatch.find(items, f.mediaId, f.url)
         var pick = items.indexOf(matched).coerceAtLeast(0)
         val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 16, 40, 0) }

@@ -35,7 +35,7 @@ class JobActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Ui.color(this@JobActivity, R.color.bg)) }
         title = TextView(this).apply { textSize = 18f }
         status = TextView(this).apply { textSize = 16f; setPadding(0, 24, 0, 24) }
         bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { isIndeterminate = true }
@@ -47,6 +47,7 @@ class JobActivity : Activity() {
         } }
         for (v in listOf(title, status, bar, play, back, save, openApp)) col.addView(v, ViewGroup.LayoutParams(-1, -2))
         setContentView(col)
+        Edge.setup(this, col) { i -> col.setPadding(48 + i.left, 48 + i.top, 48 + i.right, 48 + i.bottom) }
         handle(intent)
     }
 
@@ -93,7 +94,7 @@ class JobActivity : Activity() {
         status.text = when (rec.state) {
             JobState.QUEUED -> "Waiting"
             JobState.FETCHING, JobState.DOWNLOADING -> (rec.message ?: "Working") + (rec.progress?.let { " " + (it * 100).toInt() + "%" } ?: "")
-            JobState.DONE -> "Done. Captured" + (rec.message?.let { "\n$it" } ?: "")
+            JobState.DONE -> "Done. Downloaded" + (rec.message?.let { "\n$it" } ?: "")
             JobState.FAILED -> "Failed: " + (rec.message ?: "unknown error")
         }
         back.text = if (hasPrevious) "Back to app" else "Close"

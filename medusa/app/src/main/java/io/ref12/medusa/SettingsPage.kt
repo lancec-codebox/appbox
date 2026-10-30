@@ -28,7 +28,7 @@ class SettingsPage(a: MainActivity) : Page(a) {
         }
 
         val sub = section("Subtitles")
-        sub.addView(Ui.muted(a, "Default language when you capture (blank = the video's original language)"))
+        sub.addView(Ui.muted(a, "Default language when you download (blank = the video's original language)"))
         val lang = field("Original, or a code like en, zh-Hans", a.app.settings.defaultLanguage, "default-language")
         sub.addView(lang)
         sub.addView(Ui.muted(a, "Title language (YouTube serves translated titles; the original is shown under it)"), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
@@ -76,7 +76,7 @@ class SettingsPage(a: MainActivity) : Page(a) {
 
     private fun updateStorage() {
         val cache = a.cacheDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-        storageText.text = "Captured media: " + Ui.size(mediaBytes()) + " in " + a.app.media.list().size + " items\nCache (temporary files, exports): " + Ui.size(cache)
+        storageText.text = "Downloaded media: " + Ui.size(mediaBytes()) + " in " + a.app.media.list().size + " items\nCache (temporary files, exports): " + Ui.size(cache)
     }
 
     /** Deletes temporary files only (the cache folder, and half-finished downloads); captured items are kept. */

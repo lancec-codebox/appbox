@@ -102,7 +102,7 @@ class HelperService : Service() {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle(if (active > 0) "Capturing media" else "Medusa is ready")
+            .setContentTitle(if (active > 0) "Downloading media" else "Medusa is ready")
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)

@@ -1,14 +1,14 @@
 # Medusa
 
-An Android app (package `io.ref12.medusa`) that captures a video link (YouTube, Bilibili, TikTok and other sites yt-dlp supports) on the phone: the video as 720p MP4 by default and its subtitles in any language (the video's original spoken language by default, or the language you pick). It plays the capture itself, with app-drawn subtitles you can nudge into sync, and serves it to a web app on the same phone over a local HTTP API. The first client is LinguaWeave. The API is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+An Android app (package `io.ref12.medusa`) that downloads a video link (YouTube, Bilibili, TikTok and other sites yt-dlp supports) on the phone: the video as 720p MP4 by default and its subtitles in any language (the video's original spoken language by default, or the language you pick). It plays the download itself, with app-drawn subtitles you can nudge into sync, and serves it to a web app on the same phone over a local HTTP API. The first client is LinguaWeave. The API is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 Install: download the APK from <https://github.com/lancec-codebox/appbox/releases> (tags `medusa-v*`) and allow your browser or file manager to install apps. yt-dlp inside the app updates itself.
 
 ## Using it
 
-- **Library**: captured media on the phone. Tap to play, long-press to delete.
+- **Library**: downloaded media on the phone. Tap to play, long-press to delete.
 - **Player**: Media3/ExoPlayer with subtitles drawn by the app. Buttons: Earlier / Later 0.25 s, Sync to this line, Reset here, Reset all. Sync is stored per media as anchors and shared with web apps through the API.
-- **Capture** field on the main screen: paste a link to test without a web app. Choose the subtitle language (original by default, none, or a language from the video's own list after "List this video's languages"). A default language can be set in the same screen.
+- **Download** field on the main screen: paste a link to test without a web app. Choose the subtitle language (original by default, none, or a language from the video's own list after "List this video's languages"). A default language can be set in the same screen.
 - **Player track menu**: switch the subtitle track live, and optionally show a second track under the first (for example the original and English).
 
 - **Added subtitles**: other apps can add a track through the API (`POST /v1/media/{id}/tracks`), or you open or share a `.srt`, `.vtt` or `.medusa-track.json` file with Medusa (or use **Import subtitles** on the item screen): pick the video, language and label. Added tracks show up in the player's subtitle menu (main and second line) and can be removed on the item screen.
@@ -21,7 +21,7 @@ Install: download the APK from <https://github.com/lancec-codebox/appbox/release
 
 ## Updates
 
-Medusa checks the GitHub Releases of lancec-codebox/appbox when it opens (at most once a day; switch it off in the main screen) and on **Check for updates**. It considers only published, non-prerelease releases tagged `medusa-vX.Y.Z`. A newer one appears as a card with its release notes and Update / Later. It never starts while a capture runs. The APK is downloaded to the app's cache, its SHA-256 is checked against the release asset's `digest` (or the `medusa-X.Y.Z.apk.sha256` asset the release workflow attaches) and it is installed through Android's PackageInstaller. The first time, Android asks you to allow Medusa to install apps. Only APKs signed with the same key can replace the installed app.
+Medusa checks the GitHub Releases of lancec-codebox/appbox when it opens (at most once a day; switch it off in the main screen) and on **Check for updates**. It considers only published, non-prerelease releases tagged `medusa-vX.Y.Z`. A newer one appears as a card with its release notes and Update / Later. It never starts while a download runs. The APK is downloaded to the app's cache, its SHA-256 is checked against the release asset's `digest` (or the `medusa-X.Y.Z.apk.sha256` asset the release workflow attaches) and it is installed through Android's PackageInstaller. The first time, Android asks you to allow Medusa to install apps. Only APKs signed with the same key can replace the installed app.
 
 ## Building
 
@@ -35,7 +35,7 @@ JDK 17, Android SDK 36. Releases: push a tag `medusa-vX.Y.Z`; `.github/workflows
 
 ## How it works
 
-`JobActivity` takes `medusa://open` links. `HelperService` (foreground) runs NanoHTTPD on `127.0.0.1:38917`. `JobManager` runs one job at a time through `YtDlpFetcher` (youtubedl-android and ffmpeg): subtitles via `--dump-single-json` plus one subtitle download (`TrackSelector`, `SubtitleConverter`), video via an MP4 format selection merged with ffmpeg. `MediaStore` keeps each capture as plain files under `media/<id>/`. `SyncMath` holds the sync rules, `RangeSupport` the HTTP Range logic.
+`JobActivity` takes `medusa://open` links. `HelperService` (foreground) runs NanoHTTPD on `127.0.0.1:38917`. `JobManager` runs one job at a time through `YtDlpFetcher` (youtubedl-android and ffmpeg): subtitles via `--dump-single-json` plus one subtitle download (`TrackSelector`, `SubtitleConverter`), video via an MP4 format selection merged with ffmpeg. `MediaStore` keeps each download as plain files under `media/<id>/`. `SyncMath` holds the sync rules, `RangeSupport` the HTTP Range logic.
 
 Track choice: without a requested language, the video's original spoken language (manual captions, then its auto-captions); with requested languages, the first one that has a track, manual before auto. Auto-captions are only the spoken-language track, never a machine translation. Every offered track is listed in the item's `tracks` and can be fetched on demand.
 
