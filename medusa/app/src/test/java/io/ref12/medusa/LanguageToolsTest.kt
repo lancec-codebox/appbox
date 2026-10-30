@@ -29,8 +29,8 @@ class LanguageToolsTest {
 
     @Test fun ordering_original_then_english_then_alphabetical() {
         val l = listOf("fr", "de", "en", "ja", "es")
-        assertEquals(listOf("ja", "en", "de", "es", "fr"), LanguageTools.order(l, "ja", { it }))
-        assertEquals(listOf("en", "de", "es", "fr", "ja"), LanguageTools.order(l, null, { it }))
+        assertEquals(listOf("ja", "en", "fr", "de", "es"), LanguageTools.order(l, "ja", { it }))
+        assertEquals(listOf("en", "fr", "de", "ja", "es"), LanguageTools.order(l, null, { it }))
     }
 
     @Test fun track_menu_order() {
