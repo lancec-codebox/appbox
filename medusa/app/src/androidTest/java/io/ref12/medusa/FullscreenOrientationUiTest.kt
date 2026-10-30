@@ -89,7 +89,8 @@ class FullscreenOrientationUiTest {
         // no stored width/height: the live Media3 video size has to decide
         media.save(MediaMeta(id, "https://example.com/$id", "Orientation $id", 2, "test", id, en, video, 1L,
             listOf(TrackInfo("en", "captions", "English"))))
-        ctx.app.settings.setTrackChoice(id, "main", null); ctx.app.settings.setTrackChoice(id, "second", null)
+        // setTrackChoice(null) stores "" = Off, which is what made main=null; remove the keys so the default applies
+        ctx.getSharedPreferences("media_helper", Context.MODE_PRIVATE).edit().remove("track.$id.main").remove("track.$id.second").apply()
         return id
     }
 
