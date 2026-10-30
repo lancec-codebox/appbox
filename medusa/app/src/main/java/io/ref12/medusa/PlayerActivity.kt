@@ -176,7 +176,7 @@ class PlayerActivity : Activity() {
         ccSpinner = ProgressBar(this).apply { visibility = View.GONE }
         body.addView(ccSpinner, LinearLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER_HORIZONTAL })
         ccDialog = AlertDialog.Builder(this).setTitle("Subtitles").setView(ScrollView(this).apply { addView(body) })
-            .setNeutralButton("Export\u2026") { _, _ -> app.media.get(mediaId)?.let { ExportUi.show(this, it) } }
+            .setNeutralButton("Export") { _, _ -> app.media.get(mediaId)?.let { ExportUi.export(this, it, listOfNotNull(TrackUi.tracksOf(it).firstOrNull { t -> t.key == mainLang } ?: ExportUi.defaultTrack(it))) } }
             .setPositiveButton("Close", null).show()
     }
 
