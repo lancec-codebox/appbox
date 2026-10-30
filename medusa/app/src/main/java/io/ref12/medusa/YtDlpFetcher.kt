@@ -70,6 +70,8 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         if (noTracks && info.optString("title", "").isEmpty()) throw YtDlpFailure(listing.err.ifBlank { "yt-dlp returned no video information" })
         val title = info.optString("title", "")
         val duration = if (info.has("duration") && !info.isNull("duration")) info.optDouble("duration").toInt() else null
+        val w = info.optInt("width", 0).takeIf { it > 0 }
+        val h = info.optInt("height", 0).takeIf { it > 0 }
         val extractor = info.optString("extractor", info.optString("extractor_key", "")).lowercase()
         val id = info.optString("id", "")
         val localized = if (req.titleLanguage != null && Titles.supportsLocalized(extractor)) fetchTitle(req.url, req.titleLanguage) else null
@@ -86,7 +88,7 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         if (req.wantVideo && !req.videoAlreadyStored(extractor, id)) {
             try { video = fetchVideo(req, workDir, progress) } catch (e: FetchException) { videoErr = e }
         }
-        return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr, trackInfos, localized)
+        return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr, trackInfos, localized, if (h != null) w else null, if (w != null) h else null)
     }
 
     /** Metadata only (no download): the title YouTube serves for [language]. Null when it fails: the original title stays. */

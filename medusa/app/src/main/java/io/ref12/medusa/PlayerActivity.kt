@@ -20,6 +20,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 
@@ -42,6 +44,11 @@ class PlayerActivity : Activity() {
     private lateinit var bottomPanel: LinearLayout
     private lateinit var subBox: LinearLayout
     private var fullscreen = false
+    private var savedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    private var storedW: Int? = null
+    private var storedH: Int? = null
+    private var liveAspect: Double? = null
+    internal var appliedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     private var controllerShown = true
     private var ccDialog: AlertDialog? = null
     private var ccSpinner: ProgressBar? = null
@@ -67,7 +74,14 @@ class PlayerActivity : Activity() {
         itemMain = meta.subtitles?.language
         anchors = app.media.sync(mediaId)
 
+        storedW = meta.width; storedH = meta.height
         val p = ExoPlayer.Builder(this).build().also { player = it }
+        p.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(v: VideoSize) {
+                liveAspect = FullscreenOrientation.displayAspect(v.width, v.height, v.unappliedRotationDegrees, v.pixelWidthHeightRatio)
+                if (fullscreen) applyOrientation()
+            }
+        })
         p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
         p.prepare()
         p.playWhenReady = !intent.getBooleanExtra(EXTRA_PAUSED, false)
@@ -194,10 +208,37 @@ class PlayerActivity : Activity() {
     /** Fullscreen: landscape, system bars hidden, the bottom panel gone; the top tools show with the controls. */
     private fun toggleFullscreen() {
         fullscreen = !fullscreen
-        requestedOrientation = if (fullscreen) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        if (fullscreen) { savedOrientation = requestedOrientation; applyOrientation() }
+        else { requestedOrientation = savedOrientation; appliedOrientation = savedOrientation }
         applyImmersive(fullscreen)
-        subBox.setPadding(24, 0, 24, if (fullscreen) 96 else 112)
         applyChrome()
+        applyBottomSpace()
+    }
+
+    /** Sensor landscape for wide video, sensor portrait for tall, the current orientation when near-square or unknown. */
+    private fun applyOrientation() {
+        val aspect = liveAspect ?: FullscreenOrientation.displayAspect(storedW ?: 0, storedH ?: 0)
+        val o = when (FullscreenOrientation.choose(aspect)) {
+            FsOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            FsOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            FsOrientation.KEEP -> if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE)
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        }
+        if (o != appliedOrientation) { appliedOrientation = o; requestedOrientation = o }
+    }
+
+    /** Fullscreen hides the bars but the gesture bar still overlays: keep subtitles and controls above it. */
+    private fun applyBottomSpace() {
+        var inset = 0
+        if (fullscreen && android.os.Build.VERSION.SDK_INT >= 30)
+            inset = window.decorView.rootWindowInsets?.getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars())?.bottom ?: 0
+        playerView.setPadding(0, 0, 0, inset)
+        subBox.setPadding(24, 0, 24, (if (fullscreen) 96 else 112) + (if (fullscreen) inset else 0))
+    }
+
+    override fun onConfigurationChanged(c: android.content.res.Configuration) {
+        super.onConfigurationChanged(c)
+        if (fullscreen) window.decorView.post { applyBottomSpace() }
     }
 
     @Suppress("DEPRECATION")

@@ -201,7 +201,8 @@ class JobManager(
                 out.extractor.ifEmpty { old?.extractor ?: "" }, out.videoId.ifEmpty { old?.videoId ?: "" }, subtitles, video, old?.createdAt ?: clock(),
                 out.tracks.ifEmpty { old?.tracks?.filter { !it.added } ?: emptyList() } + (old?.tracks?.filter { it.added } ?: emptyList()),
                 Titles.localizedIfDifferent(out.title, out.localizedTitle) ?: if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedTitle else null,
-                if (Titles.localizedIfDifferent(out.title, out.localizedTitle) != null) req.titleLanguage else if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedLanguage else null))
+                if (Titles.localizedIfDifferent(out.title, out.localizedTitle) != null) req.titleLanguage else if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedLanguage else null,
+                if (out.width != null && out.height != null) out.width else old?.width, if (out.width != null && out.height != null) out.height else old?.height))
             rec.title = out.title
             val note = listOfNotNull(
                 if (wantSubs && out.subtitles == null) out.subtitlesError?.message else null,

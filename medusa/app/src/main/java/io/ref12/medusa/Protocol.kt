@@ -82,6 +82,9 @@ data class MediaMeta(
     /** The title in the user's language when the site offers one that differs from [title] (v1.3.1); null otherwise. */
     val localizedTitle: String? = null,
     val localizedLanguage: String? = null,
+    /** Video pixel size from yt-dlp when known (v1.5.3); lets fullscreen pick its orientation before playback. */
+    val width: Int? = null,
+    val height: Int? = null,
 )
 
 /** Thrown for failures with a protocol code and a message that can be shown to the user as is. */
@@ -124,6 +127,8 @@ class CaptureOutcome(
     val tracks: List<TrackInfo> = emptyList(),
     /** The title as the site serves it in [CaptureRequest.titleLanguage]; null when not asked, unsupported or failed. */
     val localizedTitle: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
 )
 
 fun interface MediaFetcher {
