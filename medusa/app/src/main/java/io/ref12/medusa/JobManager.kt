@@ -28,6 +28,8 @@ class JobManager(
     val media: MediaStore,
     private val fetcher: MediaFetcher,
     private val executor: Executor,
+    /** The language to also fetch titles in (null = Original only); read at each capture. */
+    private val titleLanguage: () -> String? = { null },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val jobs = ConcurrentHashMap<String, JobRecord>()
@@ -128,6 +130,24 @@ class JobManager(
         } finally { work.deleteRecursively() }
     }
 
+    /**
+     * Looks the title up in the device language (metadata only) and stores it when it differs from the original.
+     * Blocks on the network: call it off the main thread. Returns the updated item, or null when unknown, unsupported
+     * (not YouTube), Original-only is set, or the lookup failed. [force] repeats a lookup already done for this language.
+     */
+    fun refreshTitle(mediaId: String, done: (String) -> Boolean = { false }, mark: (String) -> Unit = {}): MediaMeta? {
+        val meta = media.get(mediaId) ?: return null
+        val lang = titleLanguage() ?: return null
+        if (!Titles.supportsLocalized(meta.extractor) || done(lang)) return null
+        val t = try { fetcher.fetchTitle(meta.url, lang) } catch (e: Exception) { null } ?: return null
+        mark(lang)
+        val local = Titles.localizedIfDifferent(meta.title, t)
+        if (local == meta.localizedTitle && (local == null || meta.localizedLanguage == lang)) return meta
+        val updated = meta.copy(localizedTitle = local, localizedLanguage = if (local != null) lang else null)
+        media.save(updated)
+        return updated
+    }
+
     /** Makes [language] the item's main subtitle track. Null for an unknown media item. */
     fun setMainTrack(mediaId: String, language: String): MediaMeta? {
         val meta = media.get(mediaId) ?: return null
@@ -149,7 +169,7 @@ class JobManager(
             val subsStored = existing?.subtitles != null && (rec.languages.isEmpty() || rec.languages.any { TrackSelector.languageMatches(existing.subtitles.language, it) })
             val wantSubs = rec.want.subtitles && !subsStored
             val wantVideo = rec.want.video && existing?.video == null
-            val req = CaptureRequest(rec.url, rec.languages, wantSubs, wantVideo, rec.quality) { extractor, id ->
+            val req = CaptureRequest(rec.url, rec.languages, wantSubs, wantVideo, rec.quality, titleLanguage()) { extractor, id ->
                 media.findByIdentity(extractor, id)?.video != null
             }
             val out = fetcher.fetch(req, work) { st, msg, frac -> set(rec, st, null, msg, frac) }
@@ -179,7 +199,9 @@ class JobManager(
             }
             media.save(MediaMeta(target, if (old != null) old.url else rec.url, out.title.ifEmpty { old?.title ?: rec.url }, out.durationSec ?: old?.durationSec,
                 out.extractor.ifEmpty { old?.extractor ?: "" }, out.videoId.ifEmpty { old?.videoId ?: "" }, subtitles, video, old?.createdAt ?: clock(),
-                out.tracks.ifEmpty { old?.tracks?.filter { !it.added } ?: emptyList() } + (old?.tracks?.filter { it.added } ?: emptyList())))
+                out.tracks.ifEmpty { old?.tracks?.filter { !it.added } ?: emptyList() } + (old?.tracks?.filter { it.added } ?: emptyList()),
+                Titles.localizedIfDifferent(out.title, out.localizedTitle) ?: if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedTitle else null,
+                if (Titles.localizedIfDifferent(out.title, out.localizedTitle) != null) req.titleLanguage else if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedLanguage else null))
             rec.title = out.title
             val note = listOfNotNull(
                 if (wantSubs && out.subtitles == null) out.subtitlesError?.message else null,

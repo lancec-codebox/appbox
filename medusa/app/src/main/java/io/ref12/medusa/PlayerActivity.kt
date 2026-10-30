@@ -109,6 +109,10 @@ class PlayerActivity : Activity() {
         root.addView(stage, LinearLayout.LayoutParams(-1, 0, 1f))
 
         bottomPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bottomPanel.addView(TextView(this).apply {
+            text = Titles.primary(meta, app.settings.titleMode); tag = "player-title"; maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            setTextColor(0xFFFFFFFF.toInt()); textSize = 15f; setPadding(24, 10, 24, 0)
+        }, ViewGroup.LayoutParams(-1, -2))
         info = TextView(this).apply { setTextColor(0xFFCCCCCC.toInt()); setPadding(24, 8, 24, 0) }
         bottomPanel.addView(info, ViewGroup.LayoutParams(-1, -2))
         fun row(vararg b: Pair<String, () -> Unit>) = LinearLayout(this).apply {

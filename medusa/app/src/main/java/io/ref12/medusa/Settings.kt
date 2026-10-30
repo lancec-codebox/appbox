@@ -22,6 +22,20 @@ class Settings(ctx: Context) {
         get() = KeepAliveMode.fromMinutes(prefs.getInt("keepAliveMinutes", KeepAliveMode.DEFAULT.minutes))
         set(v) { prefs.edit().putInt("keepAliveMinutes", v.minutes).apply() }
 
+    /** Whether titles show in the device's language (when the site has one) or only as the original. */
+    var titleMode: TitleMode
+        get() = TitleMode.values().firstOrNull { it.name == prefs.getString("titleMode", null) } ?: TitleMode.DEVICE
+        set(v) { prefs.edit().putString("titleMode", v.name).apply() }
+
+    /** The language to ask for titles in, or null when the mode is Original only. */
+    fun titleLanguage(): String? = if (titleMode == TitleMode.ORIGINAL) null else {
+        val l = java.util.Locale.getDefault(); Titles.deviceLanguage(l.language, l.country)
+    }
+
+    /** Which language the title of this item was last looked up in (so a backfill runs once per language). */
+    fun titleChecked(mediaId: String): String? = prefs.getString("titlecheck.$mediaId", null)
+    fun setTitleChecked(mediaId: String, lang: String) { prefs.edit().putString("titlecheck.$mediaId", lang).apply() }
+
     /** Subtitle text size in sp (the second line is drawn smaller). */
     var subtitleSp: Float
         get() = prefs.getFloat("subtitleSp", 18f)

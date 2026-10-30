@@ -58,6 +58,8 @@ Captures persist on the phone until deleted.
   "sync": [ { "at": 10.0, "offset": 0.25 } ] }
 ```
 
+`title` is always the original title. When the site serves the title in the user's language (YouTube translated titles) and it differs, the item also has `"localizedTitle"` and `"localizedLanguage"` (e.g. `"en"`); both are absent otherwise (v1.3.1, additive: older clients ignore them). Clients show `localizedTitle` first and the original under it.
+
 `subtitles` is the chosen (main) track with its lines. `tracks` lists every subtitle track the video offers (`[]` for items captured before v1.2); auto-captions are the video's spoken language only, never machine translations. Lines are plain text, `start`/`end` in seconds.
 
 - `GET /v1/media` → array of media items without `lines`.
@@ -100,4 +102,4 @@ If the browser blocks 127.0.0.1, the job screen's Save transcript writes the med
 
 ## Versions
 
-v1: Chinese subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. v1.3: added tracks (producer-supplied subtitles), the `track` query on `/subtitles`. Later: on-device speech recognition when no captions exist.
+v1: Chinese subtitles only. v1.1: video capture, media and sync APIs, `progress`, failure codes. v1.2: subtitles in any language: no default language (original spoken language when omitted), `tracks`, the `subtitles` endpoints, `languages` in the deep link. v1.1 clients keep working: they send explicit `languages`, and the item keeps every v1.1 field. v1.3: added tracks (producer-supplied subtitles), the `track` query on `/subtitles`. v1.3.1: `localizedTitle` and `localizedLanguage` on media items. Later: on-device speech recognition when no captions exist.

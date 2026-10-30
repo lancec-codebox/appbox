@@ -34,7 +34,7 @@ class MedusaApp : Application() {
         val root = File(filesDir, "data")
         media = MediaStore(root)
         // One job at a time: yt-dlp is heavy and the phone is small.
-        jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor())
+        jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() })
         // the server is up whenever a Medusa screen is: start it when one opens, and time the keep-alive from when the last one closes
         registerActivityLifecycleCallbacks(object : android.app.Application.ActivityLifecycleCallbacks {
             override fun onActivityStarted(activity: android.app.Activity) {

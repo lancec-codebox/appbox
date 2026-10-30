@@ -79,6 +79,9 @@ data class MediaMeta(
     val video: VideoData?,
     val createdAt: Long,
     val tracks: List<TrackInfo> = emptyList(),
+    /** The title in the user's language when the site offers one that differs from [title] (v1.3.1); null otherwise. */
+    val localizedTitle: String? = null,
+    val localizedLanguage: String? = null,
 )
 
 /** Thrown for failures with a protocol code and a message that can be shown to the user as is. */
@@ -104,6 +107,8 @@ class CaptureRequest(
     val wantVideo: Boolean,
     val quality: Quality,
     /** Asked once yt-dlp has named the video (extractor, id): true when that video is already stored, so it is not downloaded again. */
+    /** Language (e.g. "en") to also ask the site for the title in; null = do not ask. */
+    val titleLanguage: String? = null,
     val videoAlreadyStored: (String, String) -> Boolean = { _, _ -> false },
 )
 
@@ -117,6 +122,8 @@ class CaptureOutcome(
     val subtitlesError: FetchException?,
     val videoError: FetchException?,
     val tracks: List<TrackInfo> = emptyList(),
+    /** The title as the site serves it in [CaptureRequest.titleLanguage]; null when not asked, unsupported or failed. */
+    val localizedTitle: String? = null,
 )
 
 fun interface MediaFetcher {
@@ -129,6 +136,9 @@ fun interface MediaFetcher {
     /** Downloads one more subtitle track of a video, by language. Throws FetchException (no_captions when it does not exist). */
     fun fetchTrack(url: String, language: String, workDir: File): SubtitlesData =
         throw FetchException("Not supported", Codes.YTDLP)
+
+    /** Metadata only: the title the site serves for [language]. Null when the extractor has no translated titles or it failed. */
+    fun fetchTitle(url: String, language: String): String? = null
 }
 
 /** Maps yt-dlp's per-stream percentages (video, then audio) to one fraction that never goes backwards. */

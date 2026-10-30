@@ -72,6 +72,7 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         val duration = if (info.has("duration") && !info.isNull("duration")) info.optDouble("duration").toInt() else null
         val extractor = info.optString("extractor", info.optString("extractor_key", "")).lowercase()
         val id = info.optString("id", "")
+        val localized = if (req.titleLanguage != null && Titles.supportsLocalized(extractor)) fetchTitle(req.url, req.titleLanguage) else null
 
         val tracks = TrackSelector.list(info)
         val trackInfos = tracks.map { it.info() }
@@ -85,8 +86,18 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         if (req.wantVideo && !req.videoAlreadyStored(extractor, id)) {
             try { video = fetchVideo(req, workDir, progress) } catch (e: FetchException) { videoErr = e }
         }
-        return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr, trackInfos)
+        return CaptureOutcome(title, duration, extractor, id, subs, video, subsErr, videoErr, trackInfos, localized)
     }
+
+    /** Metadata only (no download): the title YouTube serves for [language]. Null when it fails: the original title stays. */
+    override fun fetchTitle(url: String, language: String): String? = try {
+        ensureInit()
+        val r = run(YoutubeDLRequest(url).apply {
+            addOption("--dump-single-json"); addOption("--skip-download"); addOption("--no-playlist"); addOption("--ignore-no-formats-error")
+            addOption("--extractor-args"); addOption("youtube:lang=$language")
+        })
+        JSONObject(jsonOf(r.out)).optString("title", "").ifEmpty { null }
+    } catch (e: Exception) { null }
 
     private fun fetchSubs(req: CaptureRequest, info: JSONObject, tracks: List<Track>, workDir: File, progress: (JobState, String?, Double?) -> Unit): SubtitlesData {
         val track = TrackSelector.select(info, req.languages)

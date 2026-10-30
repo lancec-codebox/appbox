@@ -13,18 +13,45 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
 
     override fun resume() { a.show() } // the item may have changed (imports) while another screen was open
 
+    /** Fetches the localized title off the main thread, then redraws. [force] repeats an earlier lookup. */
+    private fun refresh(btn: View?, force: Boolean) {
+        btn?.isEnabled = false
+        val app = a.app
+        Thread {
+            val updated = try {
+                app.jobs.refreshTitle(mediaId, done = { l -> !force && app.settings.titleChecked(mediaId) == l }, mark = { l -> app.settings.setTitleChecked(mediaId, l) })
+            } catch (e: Exception) { null }
+            a.runOnUiThread {
+                btn?.isEnabled = true
+                if (updated != null && a.currentPage === this) a.show()
+                else if (force) android.widget.Toast.makeText(a, "No change", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }.start()
+    }
+
     override fun build(): View {
         val m = a.app.media.get(mediaId) ?: return View(a)
         val col = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; setPadding(Ui.dp(a, 12), Ui.dp(a, 12), Ui.dp(a, 12), Ui.dp(a, 24)) }
+        // a one-off lookup of the title in the device language for items captured before it existed
+        val lang = a.app.settings.titleLanguage()
+        if (lang != null && Titles.supportsLocalized(m.extractor) && a.app.settings.titleChecked(mediaId) != lang) refresh(null, force = false)
         // summary
         val sum = Ui.card(a)
-        sum.addView(Ui.text(a, m.title.ifEmpty { m.url }, 17f, bold = true))
+        val mode = a.app.settings.titleMode
+        sum.addView(Ui.text(a, Titles.primary(m, mode), 17f, bold = true).apply { tag = "item-title" })
+        Titles.secondary(m, mode)?.let { o -> sum.addView(Ui.muted(a, o, 13f).apply { tag = "item-original-title"; setPadding(0, Ui.dp(a, 2), 0, 0) }) }
         sum.addView(Ui.text(a, m.url, 13f, R.color.accent).apply {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE; tag = "source-link"; setPadding(0, Ui.dp(a, 4), 0, Ui.dp(a, 4))
             setOnClickListener { try { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(m.url))) } catch (e: Exception) {} }
         })
         sum.addView(Ui.muted(a, listOfNotNull(Ui.duration(m.durationSec), m.extractor.takeIf { it.isNotEmpty() }, Ui.size(a.app.media.bytesOf(m.mediaId)),
             m.createdAt.takeIf { it > 0 }?.let { "captured " + Ui.date(it) }).joinToString("  \u00b7  ")))
+        if (Titles.supportsLocalized(m.extractor) && a.app.settings.titleLanguage() != null)
+            {
+                lateinit var chip: View
+                chip = Ui.chipButton(a, "Refresh details", false, "refresh-details") { refresh(chip, force = true) }
+                sum.addView(chip, Ui.lp(-2, -2, 0f, 0, 8, 0, 0, a))
+            }
         col.addView(sum)
         // actions
         col.addView(LinearLayout(a).apply {

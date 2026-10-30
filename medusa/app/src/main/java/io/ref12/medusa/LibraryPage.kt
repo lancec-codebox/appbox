@@ -61,7 +61,7 @@ class LibraryPage(a: MainActivity) : Page(a) {
             list.addView(Ui.muted(a, "Paste a link above, or share one to Medusa from any app. Web apps can ask Medusa for transcripts through its local API.", 14f).apply { setPadding(0, Ui.dp(a, 8), 0, 0) })
             return
         }
-        val items = all.filter { query.isEmpty() || it.title.contains(query, true) }
+        val items = all.filter { Titles.matches(it, query) }
         list.addView(Ui.muted(a, if (query.isEmpty()) "${all.size} item" + (if (all.size > 1) "s" else "") else "${items.size} of ${all.size}", 12f).apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 4), 0, Ui.dp(a, 4)) })
         if (items.isEmpty()) list.addView(Ui.muted(a, "No title matches", 14f).apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 12), 0, 0) })
         for (m in items) { list.addView(row(m)); list.addView(Ui.divider(a)) }
@@ -70,7 +70,7 @@ class LibraryPage(a: MainActivity) : Page(a) {
     private fun row(m: MediaMeta): View {
         val tracks = TrackUi.tracksOf(m)
         val r = LinearLayout(a).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; tag = "item:" + m.mediaId; contentDescription = m.title
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; tag = "item:" + m.mediaId; contentDescription = Titles.primary(m, a.app.settings.titleMode)
             setPadding(0, Ui.dp(a, 8), 0, Ui.dp(a, 8)); setOnClickListener { a.openItem(m.mediaId) }
             setOnLongClickListener { menu(this, m); true }
         }
@@ -79,7 +79,9 @@ class LibraryPage(a: MainActivity) : Page(a) {
             addView(android.widget.ImageView(a).apply { setImageResource(if (m.video != null) R.drawable.ic_play else R.drawable.ic_library); setColorFilter(Ui.color(a, R.color.muted)) }, LinearLayout.LayoutParams(Ui.dp(a, 22), Ui.dp(a, 22)))
         }, LinearLayout.LayoutParams(Ui.dp(a, 52), Ui.dp(a, 40)).apply { rightMargin = Ui.dp(a, 12) })
         val mid = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
-        mid.addView(Ui.text(a, m.title.ifEmpty { m.url }, 15f, bold = true).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END })
+        val mode = a.app.settings.titleMode
+        mid.addView(Ui.text(a, Titles.primary(m, mode), 15f, bold = true).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END; tag = "title:" + m.mediaId })
+        Titles.secondary(m, mode)?.let { o -> mid.addView(Ui.oneLine(Ui.muted(a, o, 12f)).apply { tag = "original:" + m.mediaId }) }
         mid.addView(Ui.oneLine(Ui.muted(a, listOfNotNull(Ui.duration(m.durationSec), Ui.size(a.app.media.bytesOf(m.mediaId)), m.createdAt.takeIf { it > 0 }?.let { Ui.date(it) }).joinToString("  \u00b7  "), 12f)))
         val badges = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, Ui.dp(a, 3), 0, 0) }
         for (t in tracks.take(6)) badges.addView(Ui.badge(a, t.language + (if (t.added) " +" else ""), t.added), Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))

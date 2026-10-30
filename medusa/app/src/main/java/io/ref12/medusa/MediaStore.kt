@@ -12,6 +12,7 @@ object MediaJson {
         put("mediaId", m.mediaId)
         put("url", m.url)
         put("title", m.title)
+        if (!m.localizedTitle.isNullOrEmpty()) { put("localizedTitle", m.localizedTitle); put("localizedLanguage", m.localizedLanguage ?: JSONObject.NULL) }
         put("durationSec", m.durationSec ?: JSONObject.NULL)
         put("extractor", m.extractor)
         put("videoId", m.videoId)
@@ -71,6 +72,7 @@ object MediaJson {
             v?.let { VideoData(it.getString("file"), it.getString("contentType"), it.getLong("bytes")) },
             j.optLong("createdAt"),
             j.optJSONArray("tracks")?.let { a -> (0 until a.length()).map { i -> a.getJSONObject(i).let { t -> TrackInfo(t.getString("language"), t.getString("source"), t.optString("name", "").ifEmpty { null }, t.optString("trackId", "").ifEmpty { null }, t.optString("origin", "").ifEmpty { null }) } } } ?: emptyList(),
+            j.optString("localizedTitle", "").ifEmpty { null }, j.optString("localizedLanguage", "").ifEmpty { null },
         )
     }
 }

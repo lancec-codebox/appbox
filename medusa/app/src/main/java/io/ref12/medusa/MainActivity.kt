@@ -153,7 +153,7 @@ class MainActivity : Activity() {
             Dest.ITEM -> ItemPage(this, s.arg!!)
         }
         page = p
-        title.text = if (s.dest == Dest.ITEM) item!!.title else p.title
+        title.text = if (s.dest == Dest.ITEM) Titles.primary(item!!, app.settings.titleMode) else p.title
         leading.setImageResource(if (nav.isTopLevel) R.drawable.ic_menu else R.drawable.ic_back)
         leading.contentDescription = if (nav.isTopLevel) "Menu" else "Back"; leading.tag = leading.contentDescription
         leading.visibility = if (wide && nav.isTopLevel) View.GONE else View.VISIBLE
