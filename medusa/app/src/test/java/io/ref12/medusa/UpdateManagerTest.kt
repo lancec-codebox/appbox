@@ -124,9 +124,9 @@ class UpdateManagerTest {
         assertTrue(m2.state is UpdateState.Failed); assertTrue(installed.isEmpty())
     }
 
-    @Test fun never_updates_while_a_capture_runs() {
+    @Test fun never_updates_while_a_download_runs() {
         setReleases(); busy = true; val m = mgr(); updateToInstalling(m)
-        assertTrue((m.state as UpdateState.Failed).message.contains("capture"))
+        assertTrue((m.state as UpdateState.Failed).message.contains("download"))
         assertEquals(0, downloads)
         busy = false; m.update(); run(); assertEquals(1, installed.size) // "Try again" works
     }
