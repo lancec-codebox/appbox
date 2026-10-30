@@ -54,7 +54,7 @@ object Ui {
     }
 
     /** primary = filled teal; otherwise an outlined button. */
-    fun button(c: Context, t: String, primary: Boolean = false, danger: Boolean = false, onClick: () -> Unit) = Button(c).apply {
+    fun button(c: Context, t: String, primary: Boolean = false, danger: Boolean = false, onClick: (View) -> Unit) = Button(c).apply {
         text = t; isAllCaps = false; textSize = 14f; minHeight = 0; minimumHeight = dp(c, 40); minWidth = 0; minimumWidth = 0
         setPadding(dp(c, 14), 0, dp(c, 14), 0); contentDescription = t; tag = t
         stateListAnimator = null
@@ -63,7 +63,7 @@ object Ui {
             val col = color(c, if (danger) R.color.danger else R.color.accent)
             setTextColor(col); background = rounded(c, 0, 8, col)
         }
-        setOnClickListener { onClick() }
+        setOnClickListener { onClick(this) }
     }
 
     /** A compact text action in a row of actions; [on] marks the current choice. */

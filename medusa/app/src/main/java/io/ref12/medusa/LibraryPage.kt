@@ -88,7 +88,9 @@ class LibraryPage(a: MainActivity) : Page(a) {
         if (m.video == null) badges.addView(Ui.badge(a, "no video"))
         mid.addView(badges)
         r.addView(mid, LinearLayout.LayoutParams(0, -2, 1f))
-        r.addView(Ui.icon(a, R.drawable.ic_more, "More", R.color.muted) { menu(it, m) })
+        lateinit var more: View
+        more = Ui.icon(a, R.drawable.ic_more, "More", R.color.muted) { menu(more, m) }
+        r.addView(more)
         return r
     }
 
