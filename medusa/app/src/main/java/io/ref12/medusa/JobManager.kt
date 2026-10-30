@@ -183,12 +183,56 @@ class JobManager(
         return true
     }
 
-    /** Removes a finished job from the list. */
+    /** Removes a finished job from the list; a failed or cancelled one also deletes its partial files. */
     fun remove(id: String): Boolean {
         val rec = record(id) ?: return false
         if (!rec.state.finished) return false
         jobs.remove(rec.id); storage.deleteJob(rec.id)
+        if (rec.state == JobState.FAILED && !activeFor(rec.mediaId)) media.clearPartial(rec.mediaId)
         return true
+    }
+
+    private fun activeFor(mediaId: String) = jobs.values.any { it.mediaId == mediaId && !it.state.finished }
+
+    /** Bytes a Resume would continue from (0 when there is nothing partial). */
+    fun partialBytes(id: String): Long = record(id)?.let { media.partialBytes(it.mediaId) } ?: 0L
+
+    /**
+     * Continues a failed or cancelled download: a new job for the same item that keeps the partial video file and downloads only
+     * what is missing (the video continues, subtitle tracks already stored are not fetched again). Returns the new job id.
+     */
+    fun resume(id: String): String? {
+        val rec = record(id) ?: return null
+        if (!rec.state.finished || activeFor(rec.mediaId)) return null
+        val n = submit(JobSubmit(null, rec.url, rec.languages, rec.want, rec.quality, rec.returnUrl))
+        if (n != rec.id) { jobs.remove(rec.id); storage.deleteJob(rec.id) }
+        return n
+    }
+
+    /** Download again from scratch: deletes the item's files (partial and finished) and redoes the whole download as a new job. */
+    fun restart(id: String): String? {
+        val rec = record(id) ?: return null
+        if (activeFor(rec.mediaId)) return null
+        media.delete(rec.mediaId)
+        media.clearPartial(rec.mediaId)
+        val n = submit(JobSubmit(null, rec.url, rec.languages, rec.want, rec.quality, rec.returnUrl))
+        if (n != rec.id) { jobs.remove(rec.id); storage.deleteJob(rec.id) }
+        return n
+    }
+
+    /** Restart for an item without a job: its incomplete download, from the item screen. */
+    fun restartItem(mediaId: String): String? {
+        val m = media.get(mediaId) ?: return null
+        if (activeFor(mediaId)) return null
+        media.delete(mediaId); media.clearPartial(mediaId)
+        return submit(JobSubmit(null, m.url, null, Want.DEFAULT, Quality.P720, null))
+    }
+
+    /** Resume for an item without a job. */
+    fun resumeItem(mediaId: String): String? {
+        val m = media.get(mediaId) ?: return null
+        if (activeFor(mediaId)) return null
+        return submit(JobSubmit(null, m.url, null, Want.DEFAULT, Quality.P720, null))
     }
 
     /** Starts the same download again as a new job (the old one leaves the list); returns the new id. */
@@ -202,7 +246,8 @@ class JobManager(
     private fun run(rec: JobRecord) {
         if (rec.cancelled) return
         set(rec, JobState.FETCHING, null, null, null, "Starting")
-        val work = media.workDir(rec.mediaId)
+        // a stable folder: what a failed or cancelled attempt leaves behind is what the next one continues from
+        val work = media.partialDir(rec.mediaId)
         try {
             val existing = media.get(rec.mediaId)
             // only what is missing: the video is never downloaded twice, a subtitle track only when it is not stored
@@ -243,20 +288,20 @@ class JobManager(
                 out.tracks.ifEmpty { old?.tracks?.filter { !it.added } ?: emptyList() } + (old?.tracks?.filter { it.added } ?: emptyList()),
                 Titles.localizedIfDifferent(out.title, out.localizedTitle) ?: if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedTitle else null,
                 if (Titles.localizedIfDifferent(out.title, out.localizedTitle) != null) req.titleLanguage else if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedLanguage else null,
-                if (out.width != null && out.height != null) out.width else old?.width, if (out.width != null && out.height != null) out.height else old?.height))
+                if (out.width != null && out.height != null) out.width else old?.width, if (out.width != null && out.height != null) out.height else old?.height,
+                old?.userTitle, old?.translatedTitle, old?.translatedLanguage))
             rec.title = out.title
             if (rec.want.subtitles && wantSubs && out.subtitles == null && video != null && old?.tracks?.none { it.ocr } != false) onNoSubtitles(target)
             val note = listOfNotNull(
                 if (wantSubs && out.subtitles == null) out.subtitlesError?.message else null,
                 if (wantVideo && out.videoFile == null) out.videoError?.message else null,
             ).joinToString(" ").ifEmpty { null }
+            media.clearPartial(rec.mediaId); media.clearPartial(target)
             set(rec, JobState.DONE, null, note, 1.0)
         } catch (e: FetchException) {
             set(rec, JobState.FAILED, e.code, e.message, null)
         } catch (e: Throwable) {
             set(rec, JobState.FAILED, Codes.YTDLP, e.message ?: e.javaClass.simpleName, null)
-        } finally {
-            work.deleteRecursively()
         }
     }
 

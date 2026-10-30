@@ -168,11 +168,13 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
     }
 
     private fun fetchVideo(req: CaptureRequest, workDir: File, progress: (JobState, String?, Double?) -> Unit): File {
-        progress(JobState.DOWNLOADING, "Downloading video (" + req.quality.wire + ")", 0.0)
         val dir = File(workDir, "video").also { it.mkdirs() }
+        progress(JobState.DOWNLOADING, Resume.message(dir, req.quality.wire), null)
         val h = req.quality.height
         val meter = ProgressMeter(2)
+        val resumeOptions = Resume.videoOptions(dir)
         run(YoutubeDLRequest(req.url).apply {
+            for (o in resumeOptions) addOption(o)
             addOption("--no-playlist"); addOption("--no-warnings")
             // MP4 (H.264 + AAC) so every Android player can play it; fall back to the best single MP4 file
             addOption("-f", "bv*[height<=$h][ext=mp4]+ba[ext=m4a]/b[height<=$h][ext=mp4]/b[height<=$h]")

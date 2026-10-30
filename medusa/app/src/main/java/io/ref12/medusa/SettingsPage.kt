@@ -33,6 +33,11 @@ class SettingsPage(a: MainActivity) : Page(a) {
         sub.addView(lang)
         sub.addView(Ui.muted(a, "Title language (YouTube serves translated titles; the original is shown under it)"), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
         sub.addView(TrackUi.radios(a, TitleMode.values().map { it.label }, TitleMode.values().map { "titlemode:" + it.name }, a.app.settings.titleMode.ordinal) { a.app.settings.titleMode = TitleMode.values()[it] })
+        sub.addView(android.widget.CheckBox(a).apply {
+            text = "Translate titles on this device"; tag = "translate-titles"; isChecked = a.app.settings.translateTitles
+            setOnCheckedChangeListener { _, on -> if (on) { if (a.app.settings.translateTitles.not()) { isChecked = false; TranslationUi.enableTitles(a) { isChecked = a.app.settings.translateTitles } } } else TranslationUi.disableTitles(a) }
+        }, Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
+        sub.addView(Ui.muted(a, "Titles YouTube has no translation for are translated offline and marked as machine-translated. Turning this off deletes the language models.", 12f))
         sub.addView(Ui.muted(a, "Text size in the player"), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
         val sizes = listOf("Small" to 14f, "Medium" to 18f, "Large" to 24f, "Extra large" to 30f)
         val cur = sizes.indexOfFirst { it.second >= a.app.settings.subtitleSp }.let { if (it < 0) sizes.size - 1 else it }

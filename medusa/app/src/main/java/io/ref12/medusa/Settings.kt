@@ -46,6 +46,16 @@ class Settings(ctx: Context) {
         get() = prefs.getFloat("subtitleSp", 18f)
         set(v) { prefs.edit().putFloat("subtitleSp", v).apply() }
 
+    /** "Translate titles on this device": null = never asked yet, true = on (model present), false = off. */
+    var translateTitles: Boolean
+        get() = prefs.getBoolean("translateTitles", false)
+        set(v) { prefs.edit().putBoolean("translateTitles", v).apply() }
+
+    /** The user agreed to the one-time language model download. */
+    var translateConsent: Boolean
+        get() = prefs.getBoolean("translateConsent", false)
+        set(v) { prefs.edit().putBoolean("translateConsent", v).apply() }
+
     /** When an item was last played (ms), 0 if never. */
     fun lastPlayed(mediaId: String): Long = prefs.getLong("played.$mediaId", 0L)
     fun markPlayed(mediaId: String) { prefs.edit().putLong("played.$mediaId", System.currentTimeMillis()).apply() }

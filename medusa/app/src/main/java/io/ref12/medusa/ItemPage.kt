@@ -40,6 +40,7 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
         val mode = a.app.settings.titleMode
         sum.addView(Ui.text(a, Titles.primary(m, mode), 17f, bold = true).apply { tag = "item-title" })
         Titles.secondary(m, mode)?.let { o -> sum.addView(Ui.muted(a, o, 13f).apply { tag = "item-original-title"; setPadding(0, Ui.dp(a, 2), 0, 0) }) }
+        Titles.machineTranslated(m, mode)?.let { tr -> sum.addView(Ui.muted(a, tr + "  \u00b7  machine-translated", 13f).apply { tag = "item-translated-title"; setPadding(0, Ui.dp(a, 2), 0, 0) }) }
         sum.addView(Ui.text(a, m.url, 13f, R.color.accent).apply {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE; tag = "source-link"; setPadding(0, Ui.dp(a, 4), 0, Ui.dp(a, 4))
             setOnClickListener { try { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(m.url))) } catch (e: Exception) {} }
@@ -63,6 +64,18 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
             addView(Ui.button(a, "Import subtitles") {
                 a.startActivity(Intent(a, ImportActivity::class.java).putExtra(ImportActivity.EXTRA_MEDIA, m.mediaId))
             }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+            if (m.video == null || a.app.media.partialBytes(m.mediaId) > 0) {
+                addView(Ui.button(a, if (a.app.media.partialBytes(m.mediaId) > 0) "Resume download" else "Download video") {
+                    val id = a.app.jobs.resumeItem(m.mediaId); HelperService.start(a); if (id != null) a.go(Dest.DOWNLOADS, id)
+                }.apply { tag = "resume-item" }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+                addView(Ui.button(a, "Download again") {
+                    AlertDialog.Builder(a).setTitle("Download again?").setMessage("This deletes this item's files and downloads it from scratch.")
+                        .setPositiveButton("Download again") { _, _ ->
+                            val id = a.app.jobs.restartItem(m.mediaId); HelperService.start(a); if (id != null) a.go(Dest.DOWNLOADS, id)
+                        }.setNegativeButton("Cancel", null).show()
+                }.apply { tag = "restart-item" }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+            }
+            addView(Ui.button(a, "Rename") { RenameUi.show(a, m) { a.show() } }.apply { tag = "rename" }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
             addView(Ui.button(a, "Delete", danger = true) {
                 AlertDialog.Builder(a).setTitle("Delete?").setMessage(m.title)
                     .setPositiveButton("Delete") { _, _ -> a.app.media.delete(m.mediaId); a.goBack() }.setNegativeButton("Cancel", null).show()
@@ -92,6 +105,7 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
                 chip(if (isMain) "\u2713 Main" else "Main", isMain, "main") { a.app.settings.setTrackChoice(m.mediaId, "main", if (isMain) null else t.key); a.show() }
                 chip(if (isSecond) "\u2713 Second line" else "Second line", isSecond, "second") { a.app.settings.setTrackChoice(m.mediaId, "second", if (isSecond) null else t.key); a.show() }
                 chip("Export", false, "export") { ExportUi.export(a, m, listOf(t)) }
+                if (t.language.substringBefore('-') != "en") chip("Translate on this device", false, "translate") { TranslationUi.translateTrack(a, m, t) { a.show() } }
                 addView(Ui.chipButton(a, "\u22EE", false, "export-more:" + t.key) { ExportUi.overflow(a, m, t, this) }, Ui.lp(-2, -2, 0f, 0, 0, 6, 0, a))
                 if (t.added) chip("Remove", false, "remove") {
                     AlertDialog.Builder(a).setTitle("Remove this track?").setMessage(TrackUi.label(t)).setPositiveButton("Remove") { _, _ ->

@@ -88,6 +88,11 @@ data class MediaMeta(
     /** Video pixel size from yt-dlp when known (v1.5.3); lets fullscreen pick its orientation before playback. */
     val width: Int? = null,
     val height: Int? = null,
+    /** The user's own title (1.6.1): wins everywhere; null = none. */
+    val userTitle: String? = null,
+    /** Machine translation of [title] into [translatedLanguage] by ML Kit on this device (1.6.1); only used when there is no [localizedTitle]. */
+    val translatedTitle: String? = null,
+    val translatedLanguage: String? = null,
 )
 
 /** Thrown for failures with a protocol code and a message that can be shown to the user as is. */

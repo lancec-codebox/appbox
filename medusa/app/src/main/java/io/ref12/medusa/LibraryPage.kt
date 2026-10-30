@@ -113,6 +113,7 @@ class LibraryPage(a: MainActivity) : Page(a) {
         val mode = a.app.settings.titleMode
         mid.addView(Ui.text(a, Titles.primary(m, mode), 15f, bold = true).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END; tag = "title:" + m.mediaId })
         Titles.secondary(m, mode)?.let { o -> mid.addView(Ui.oneLine(Ui.muted(a, o, 12f)).apply { tag = "original:" + m.mediaId }) }
+        Titles.machineTranslated(m, mode)?.let { tr -> mid.addView(Ui.oneLine(Ui.muted(a, tr + " \u00b7 machine-translated", 12f)).apply { tag = "translated:" + m.mediaId }) }
         mid.addView(Ui.oneLine(Ui.muted(a, listOfNotNull(Ui.duration(m.durationSec), Ui.size(a.app.media.bytesOf(m.mediaId)), m.createdAt.takeIf { it > 0 }?.let { Ui.date(it) }).joinToString("  \u00b7  "), 12f)))
         val badges = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, Ui.dp(a, 3), 0, 0) }
         for (t in tracks.take(6)) badges.addView(Ui.badge(a, t.language + (if (t.added) " +" else ""), t.added), Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
@@ -129,10 +130,11 @@ class LibraryPage(a: MainActivity) : Page(a) {
 
     private fun menu(anchor: View, m: MediaMeta) {
         PopupMenu(a, anchor).apply {
-            menu.add("Open"); menu.add("Export subtitles"); menu.add("Share subtitles\u2026"); menu.add("Delete")
+            menu.add("Open"); menu.add("Rename"); menu.add("Export subtitles"); menu.add("Share subtitles\u2026"); menu.add("Delete")
             setOnMenuItemClickListener {
                 when (it.title) {
                     "Open" -> a.openItem(m.mediaId)
+                    "Rename" -> RenameUi.show(a, m) { a.show() }
                     "Export subtitles" -> ExportUi.export(a, m, listOfNotNull(ExportUi.defaultTrack(m)))
                     "Share subtitles\u2026" -> ExportUi.export(a, m, listOfNotNull(ExportUi.defaultTrack(m)), share = true)
                     else -> android.app.AlertDialog.Builder(a).setTitle("Delete?").setMessage(m.title)

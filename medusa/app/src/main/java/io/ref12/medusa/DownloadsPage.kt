@@ -1,5 +1,6 @@
 package io.ref12.medusa
 
+import android.app.AlertDialog
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -73,7 +74,14 @@ class DownloadsPage(a: MainActivity, private val highlight: String?) : Page(a) {
                 actions.addView(Ui.button(a, "Read subtitles from picture") { OcrUi.configure(a, m) }.apply { tag = "ocr-offer:" + j.id }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
             }
             if (j.state == JobState.DONE && m != null) actions.addView(Ui.button(a, "Open", primary = true) { a.openItem(m.mediaId) }.apply { tag = "open:" + j.id })
-            if (j.state == JobState.FAILED) actions.addView(Ui.button(a, "Retry", primary = true) { a.app.jobs.retry(j.id); HelperService.start(a); fill(true) }.apply { tag = "retry:" + j.id })
+            if (j.state == JobState.FAILED) {
+                val partial = a.app.jobs.partialBytes(j.id)
+                actions.addView(Ui.button(a, if (partial > 0) "Resume" else "Retry", primary = true) { a.app.jobs.resume(j.id); HelperService.start(a); fill(true) }.apply { tag = "resume:" + j.id }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+                actions.addView(Ui.button(a, "Download again") {
+                    AlertDialog.Builder(a).setTitle("Download again?").setMessage("This deletes what was downloaded so far and starts over.")
+                        .setPositiveButton("Download again") { _, _ -> a.app.jobs.restart(j.id); HelperService.start(a); fill(true) }.setNegativeButton("Cancel", null).show()
+                }.apply { tag = "restart:" + j.id }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+            }
             actions.addView(Ui.button(a, "Remove") { a.app.jobs.remove(j.id); fill(true) }.apply { tag = "remove:" + j.id })
         }
         if (actions.childCount > 0) c.addView(actions, Ui.lp(-1, -2, 0f, 0, 6, 0, 0, a))

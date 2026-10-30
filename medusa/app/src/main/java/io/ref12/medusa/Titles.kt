@@ -26,15 +26,35 @@ object Titles {
         return if (l.isEmpty() || l == original.trim() || PLACEHOLDER.matches(l)) null else l
     }
 
-    /** The title to show first. */
+    /** The title to show first: the user's own, else the site's localized one, else the original. */
     fun primary(m: MediaMeta, mode: TitleMode): String =
-        (if (mode == TitleMode.DEVICE) m.localizedTitle?.takeIf { it.isNotEmpty() } else null) ?: m.title.ifEmpty { m.url }
+        m.userTitle?.takeIf { it.isNotBlank() }
+            ?: (if (mode == TitleMode.DEVICE) m.localizedTitle?.takeIf { it.isNotEmpty() } else null)
+            ?: m.title.ifEmpty { m.url }
 
-    /** The original title, shown smaller under a localized primary; null when the primary already is the original. */
-    fun secondary(m: MediaMeta, mode: TitleMode): String? =
-        if (mode == TitleMode.DEVICE && !m.localizedTitle.isNullOrEmpty() && m.title.isNotEmpty()) m.title else null
+    /** The original title, shown smaller under the primary; null when the primary already is the original. */
+    fun secondary(m: MediaMeta, mode: TitleMode): String? {
+        val p = primary(m, mode)
+        return m.title.takeIf { it.isNotEmpty() && it != p }
+    }
 
-    /** Search matches the original and the localized title. */
-    fun matches(m: MediaMeta, query: String): Boolean =
-        query.isEmpty() || m.title.contains(query, true) || (m.localizedTitle?.contains(query, true) ?: false)
+    /**
+     * A machine translation to show under the primary, marked as such. Only when nothing better exists: no user title,
+     * no localized title from the site (the localized one always wins), and the translation differs from the original.
+     */
+    fun machineTranslated(m: MediaMeta, mode: TitleMode): String? {
+        if (mode != TitleMode.DEVICE || !m.userTitle.isNullOrBlank() || !m.localizedTitle.isNullOrEmpty()) return null
+        return m.translatedTitle?.takeIf { it.isNotBlank() && it != m.title }
+    }
+
+    /** The translation is wanted for an item when it has no localized title in the device language and no translation yet. */
+    fun needsTranslation(m: MediaMeta, deviceLanguage: String): Boolean =
+        m.localizedTitle.isNullOrEmpty() && m.title.isNotBlank() && !(m.translatedTitle != null && m.translatedLanguage == deviceLanguage)
+
+    /** Search matches the original, the localized, the translated and the user's own title. */
+    fun matches(m: MediaMeta, query: String): Boolean = query.isEmpty() ||
+        listOf(m.title, m.localizedTitle, m.translatedTitle, m.userTitle).any { it?.contains(query, true) == true }
+
+    /** A rename the store accepts: trimmed, blank means "reset to original" (null). */
+    fun cleanUserTitle(input: String?): String? = input?.trim()?.takeIf { it.isNotEmpty() }
 }

@@ -12,6 +12,8 @@ object MediaJson {
         put("mediaId", m.mediaId)
         put("url", m.url)
         put("title", m.title)
+        if (!m.userTitle.isNullOrEmpty()) put("userTitle", m.userTitle)
+        if (!m.translatedTitle.isNullOrEmpty()) { put("translatedTitle", m.translatedTitle); put("translatedLanguage", m.translatedLanguage ?: JSONObject.NULL) }
         if (!m.localizedTitle.isNullOrEmpty()) { put("localizedTitle", m.localizedTitle); put("localizedLanguage", m.localizedLanguage ?: JSONObject.NULL) }
         put("durationSec", m.durationSec ?: JSONObject.NULL)
         put("extractor", m.extractor)
@@ -76,6 +78,8 @@ object MediaJson {
             j.optString("localizedTitle", "").ifEmpty { null }, j.optString("localizedLanguage", "").ifEmpty { null },
             if (j.has("width") && !j.isNull("width")) j.optInt("width").takeIf { it > 0 } else null,
             if (j.has("height") && !j.isNull("height")) j.optInt("height").takeIf { it > 0 } else null,
+            j.optString("userTitle", "").ifEmpty { null },
+            j.optString("translatedTitle", "").ifEmpty { null }, j.optString("translatedLanguage", "").ifEmpty { null },
         )
     }
 }
@@ -117,6 +121,26 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
 
     /** A fresh empty folder inside the item's folder for a download in progress. */
     fun workDir(id: String): File = File(dir(id), "tmp-" + UUID.randomUUID()).also { it.mkdirs() }
+
+    /** Unfinished download files of an item: kept when a download fails or is cancelled so Resume can continue from them. */
+    fun partialDir(id: String): File = File(dir(id), "partial").also { it.mkdirs() }
+
+    fun partialBytes(id: String): Long = if (valid(id)) Resume.partialBytes(File(dir(id), "partial")) else 0L
+
+    fun clearPartial(id: String) { if (valid(id)) File(dir(id), "partial").deleteRecursively() }
+
+    /** Sets or (blank/null) resets the user's own title. */
+    fun rename(id: String, title: String?): MediaMeta? {
+        val meta = get(id) ?: return null
+        val u = Titles.cleanUserTitle(title)
+        if (u == meta.userTitle) return meta
+        return meta.copy(userTitle = u).also { save(it) }
+    }
+
+    fun setTranslatedTitle(id: String, text: String?, language: String?): MediaMeta? {
+        val meta = get(id) ?: return null
+        return meta.copy(translatedTitle = text, translatedLanguage = if (text != null) language else null).also { save(it) }
+    }
 
     fun save(meta: MediaMeta) {
         dir(meta.mediaId).mkdirs()
