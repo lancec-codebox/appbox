@@ -66,10 +66,6 @@ class Settings(ctx: Context) {
         get() = prefs.getLong("lastAppUpdateCheck", 0L)
         set(v) { prefs.edit().putLong("lastAppUpdateCheck", v).apply() }
 
-    /** Set when a download found no subtitle track: the item screen then offers to read them from the picture (cleared once answered). */
-    fun ocrOffered(mediaId: String): Boolean = prefs.getBoolean("ocroffer.$mediaId", false)
-    fun setOcrOffered(mediaId: String, on: Boolean) { prefs.edit().putBoolean("ocroffer.$mediaId", on).apply() }
-
     /** Last yt-dlp update check. */
     var lastUpdateCheck: Long
         get() = prefs.getLong("lastUpdateCheck", 0L)

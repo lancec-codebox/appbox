@@ -8,7 +8,7 @@ import java.security.MessageDigest
 class TrackRejected(message: String) : Exception(message)
 
 /** A validated producer-supplied track. */
-data class AddedTrack(val language: String, val label: String?, val origin: String, val lines: List<Line>, val source: String = TrackInfo.SOURCE_ADDED) {
+data class AddedTrack(val language: String, val label: String?, val origin: String, val lines: List<Line>) {
     /** Same for the same language + origin, so adding again replaces the track and keeps its id. */
     val trackId: String get() = idFor(language, origin)
 
@@ -34,7 +34,7 @@ object TrackRules {
     fun parse(j: JSONObject): AddedTrack {
         val language = j.optString("language", "").trim()
         if (!LANGUAGE.matches(language)) throw TrackRejected("language must be a language tag such as \"en\" or \"pt-BR\"")
-        if (j.has("source") && !j.isNull("source") && j.optString("source") !in listOf("added", "ocr")) throw TrackRejected("source must be \"added\" or \"ocr\"")
+        if (j.has("source") && !j.isNull("source") && j.optString("source") != "added") throw TrackRejected("source must be \"added\"")
         val label = if (j.has("label") && !j.isNull("label")) j.optString("label").trim().also {
             if (it.length > 60 || CONTROL.containsMatchIn(it) || MARKUP.containsMatchIn(it)) throw TrackRejected("label must be plain text of at most 60 characters")
         }.ifEmpty { null } else null
@@ -42,7 +42,7 @@ object TrackRules {
             if (!ORIGIN.matches(it)) throw TrackRejected("origin must be 1-40 characters of letters, digits, . _ -")
         } else ""
         val arr = j.optJSONArray("lines") ?: throw TrackRejected("lines must be an array of {start, end, text}")
-        return AddedTrack(language, label, origin, lines(arr), if (j.optString("source") == "ocr") TrackInfo.SOURCE_OCR else TrackInfo.SOURCE_ADDED)
+        return AddedTrack(language, label, origin, lines(arr))
     }
 
     fun lines(arr: JSONArray): List<Line> {
@@ -150,16 +150,16 @@ object TrackExport {
 
     fun vtt(lines: List<Line>) = "WEBVTT\n\n" + lines.joinToString("\n") { "${ts(it.start, false)} --> ${ts(it.end, false)}\n${it.text}\n" }
 
-    fun json(m: MediaMeta, language: String, label: String?, origin: String?, lines: List<Line>, source: String = "added"): String = JSONObject()
+    fun json(m: MediaMeta, language: String, label: String?, origin: String?, lines: List<Line>): String = JSONObject()
         .put("mediaId", m.mediaId).put("url", m.url).put("title", m.title).put("language", language)
         .also { o -> label?.let { o.put("label", it) }; if (!origin.isNullOrEmpty()) o.put("origin", origin) }
-        .put("source", source).put("lines", JSONArray().also { a -> for (l in lines) a.put(JSONObject().put("start", l.start).put("end", l.end).put("text", l.text)) })
+        .put("source", "added").put("lines", JSONArray().also { a -> for (l in lines) a.put(JSONObject().put("start", l.start).put("end", l.end).put("text", l.text)) })
         .toString(2)
 
     fun content(f: ExportFormat, m: MediaMeta, t: TrackInfo, lines: List<Line>) = when (f) {
         ExportFormat.SRT -> srt(lines)
         ExportFormat.VTT -> vtt(lines)
-        ExportFormat.JSON -> json(m, t.language, t.name, t.origin, lines, if (t.ocr) "ocr" else "added")
+        ExportFormat.JSON -> json(m, t.language, t.name, t.origin, lines)
     }
 
     /** "<title> [<language>].<ext>" with characters files cannot have removed. */

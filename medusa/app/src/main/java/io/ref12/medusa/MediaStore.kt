@@ -156,8 +156,8 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
     /** Adds (or replaces, same language + origin) a producer-supplied track; null for unknown media. */
     fun addTrack(id: String, t: AddedTrack): TrackInfo? {
         val meta = get(id) ?: return null
-        val info = TrackInfo(t.language, t.source, t.label, t.trackId, t.origin.ifEmpty { null })
-        addedFile(id, t.trackId).writeText(MediaJson.subtitlesJson(SubtitlesData(t.source, t.language, t.lines)).toString())
+        val info = TrackInfo(t.language, TrackInfo.SOURCE_ADDED, t.label, t.trackId, t.origin.ifEmpty { null })
+        addedFile(id, t.trackId).writeText(MediaJson.subtitlesJson(SubtitlesData(TrackInfo.SOURCE_ADDED, t.language, t.lines)).toString())
         val rest = meta.tracks.filter { it.trackId != t.trackId }
         save(meta.copy(tracks = rest + info))
         return info
@@ -169,7 +169,7 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
         return try {
             if (!f.isFile) null else JSONObject(f.readText()).let { j ->
                 val arr = j.getJSONArray("lines")
-                SubtitlesData(j.optString("source", TrackInfo.SOURCE_ADDED), j.getString("language"),
+                SubtitlesData(TrackInfo.SOURCE_ADDED, j.getString("language"),
                     (0 until arr.length()).map { i -> arr.getJSONObject(i).let { l -> Line(l.getDouble("start"), l.getDouble("end"), l.getString("text")) } })
             }
         } catch (e: Exception) { null }
@@ -183,9 +183,6 @@ class MediaStore(private val root: File, private val clock: () -> Long = System:
         save(meta.copy(tracks = meta.tracks.filter { it.trackId != trackId }))
         return true
     }
-
-    /** A file in the item's folder (for state that belongs to the item, like OCR checkpoints). */
-    fun fileIn(id: String, name: String): File = File(dir(id).also { it.mkdirs() }, name)
 
     fun videoFile(id: String): File? {
         val v = get(id)?.video ?: return null

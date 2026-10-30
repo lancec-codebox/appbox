@@ -23,7 +23,7 @@ class HelperService : Service() {
     private val tick = object : Runnable {
         override fun run() {
             val jobs = app.jobs
-            if (KeepAlive.shouldStop(app.settings.keepAlive, System.currentTimeMillis(), lastRequest, jobs.lastActivity, app.lastUiLeft, jobs.activeCount() + app.ocr.activeCount(), app.visibleScreens > 0)) {
+            if (KeepAlive.shouldStop(app.settings.keepAlive, System.currentTimeMillis(), lastRequest, jobs.lastActivity, app.lastUiLeft, jobs.activeCount(), app.visibleScreens > 0)) {
                 stopSelf()
                 return
             }
@@ -94,15 +94,6 @@ class HelperService : Service() {
 
     private fun notification(): Notification {
         val jobs = app.jobs
-        val ocr = app.ocr.state?.takeIf { it.active }
-        if (ocr != null) {
-            val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-            return Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("Reading subtitles from the picture")
-                .setContentText(OcrUi.progressText(ocr))
-                .setProgress(100, ocr.percent, ocr.phase == OcrState.Phase.DETECTING)
-                .setContentIntent(open).setOngoing(true).build()
-        }
         val active = jobs.activeCount()
         val text = if (active > 0) {
             val j = jobs.recent().firstOrNull { !it.state.finished }

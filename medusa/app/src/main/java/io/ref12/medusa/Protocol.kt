@@ -61,10 +61,8 @@ data class Anchor(val at: Double, val offset: Double)
 data class TrackInfo(val language: String, val source: String, val name: String? = null, val trackId: String? = null, val origin: String? = null) {
     /** What the pickers and saved choices use: the trackId of an added track, else the language. */
     val key: String get() = trackId ?: language
-    /** A track whose lines are stored in the item folder (producer-supplied or extracted from the picture), as opposed to one yt-dlp downloads. */
-    val added: Boolean get() = source == SOURCE_ADDED || source == SOURCE_OCR
-    val ocr: Boolean get() = source == SOURCE_OCR
-    companion object { const val SOURCE_ADDED = "added"; const val SOURCE_OCR = "ocr" }
+    val added: Boolean get() = source == SOURCE_ADDED
+    companion object { const val SOURCE_ADDED = "added" }
 }
 
 data class SubtitlesData(val source: String, val language: String, val lines: List<Line>)

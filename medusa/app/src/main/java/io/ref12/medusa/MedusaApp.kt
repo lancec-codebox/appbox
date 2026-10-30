@@ -13,8 +13,6 @@ class MedusaApp : Application() {
         private set
     lateinit var jobs: JobManager
         private set
-    lateinit var ocr: OcrManager
-        private set
 
     /** Medusa screens currently on screen (main thread only), and when the last one went away. */
     @Volatile var visibleScreens = 0
@@ -26,7 +24,7 @@ class MedusaApp : Application() {
         UpdateManager(BuildConfig.VERSION_NAME, cacheDir, HttpUpdateSource(), PackageApkInstaller(this),
             Executors.newSingleThreadExecutor(), System::currentTimeMillis,
             { settings.autoUpdateCheck }, { settings.lastAppUpdateCheck }, { settings.lastAppUpdateCheck = it },
-            { jobs.activeCount() + ocr.activeCount() > 0 })
+            { jobs.activeCount() > 0 })
     }
 
     override fun onCreate() {
@@ -36,8 +34,7 @@ class MedusaApp : Application() {
         val root = File(filesDir, "data")
         media = MediaStore(root)
         // One job at a time: yt-dlp is heavy and the phone is small.
-        jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() }, onNoSubtitles = { id -> settings.setOcrOffered(id, true) })
-        ocr = OcrManager(this, media)
+        jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() })
         // one-off device-language titles for items downloaded before 1.5.2: in the background, one at a time
         Thread {
             val lang = settings.titleLanguage() ?: return@Thread
