@@ -63,6 +63,7 @@ class PlayerActivity : Activity() {
     internal val chosenMain get() = mainLang
     internal val chosenSecond get() = secondLang
     internal val isFullscreen get() = fullscreen
+    internal val subtitleView get() = subView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
