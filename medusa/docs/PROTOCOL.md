@@ -76,10 +76,11 @@ Downloads persist on the phone until deleted.
 Another app can add a subtitle track it produced (for example a translation) so it plays in Medusa.
 
 - `POST /v1/media/{id}/tracks` body `{ "language": "en", "label"?: "English (AI)", "source": "added", "origin"?: "linguaweave", "lines": [ { "start", "end", "text" } ] }` → `{ "trackId" }`. An added track with the same language and origin is replaced (and keeps its trackId); other origins and the downloaded tracks stay.
+- `source: "ocr"` (1.6.0, additive): a track Medusa read from burned-in subtitles on the phone (item screen, "Extract subtitles from the picture"). It appears in `tracks` as `{ "language": "zh-Hans" | "zh-Hant" | ..., "source": "ocr", "label": "Chinese (from picture)", "trackId", "origin": "ocr" }` and is read, exported and removed like an added track (`GET /v1/media/{id}/subtitles?track=<trackId>` answers `"source": "ocr"`). A client may also POST `"source": "ocr"`.
 - The item's `tracks` then lists it as `{ "language", "source": "added", "label", "trackId", "origin"? }` (`name` is the same text as `label`).
 - `GET /v1/media/{id}/subtitles?track=<trackId>` (with or without `language`) → `{ "source": "added", "language", "lines" }`. 404 `no_captions` for an unknown trackId.
 - `DELETE /v1/media/{id}/tracks/{trackId}` → `{ "deleted": true }`; 404 if the media or the track is unknown. Only added tracks can be deleted.
-- Validation (400 `{ "error", "code": "invalid_track" }`): `language` is a tag like `en` or `pt-BR`; `source`, when given, is `added`; `origin` is 1-40 characters of letters, digits, `.`, `_`, `-`; `label` is plain text, at most 60 characters; `lines` is not empty (at most 20000), sorted by `start`, `start` >= 0, `end` > `start`, `text` a non-empty plain string (no markup or control characters, at most 2000 characters). A body over 2 MB is refused with 413. 404 for unknown media.
+- Validation (400 `{ "error", "code": "invalid_track" }`): `language` is a tag like `en` or `pt-BR`; `source`, when given, is `added` or `ocr`; `origin` is 1-40 characters of letters, digits, `.`, `_`, `-`; `label` is plain text, at most 60 characters; `lines` is not empty (at most 20000), sorted by `start`, `start` >= 0, `end` > `start`, `text` a non-empty plain string (no markup or control characters, at most 2000 characters). A body over 2 MB is refused with 413. 404 for unknown media.
 
 Sync anchors belong to the item (video time), not to a track: they apply to added tracks exactly as to downloaded ones, and changing tracks keeps them.
 

@@ -68,6 +68,10 @@ class DownloadsPage(a: MainActivity, private val highlight: String?) : Page(a) {
         if (active) actions.addView(Ui.button(a, "Cancel") { a.app.jobs.cancel(j.id); fill(true) }.apply { tag = "cancel:" + j.id })
         else {
             val m = j.mediaId?.let { a.app.media.get(it) }
+            if (j.state == JobState.DONE && m != null && a.app.settings.ocrOffered(m.mediaId) && m.video != null) {
+                c.addView(Ui.muted(a, "No subtitle track was found. If the subtitles are in the picture, Medusa can read them.", 13f).apply { tag = "ocr-offer-text:" + j.id })
+                actions.addView(Ui.button(a, "Read subtitles from picture") { OcrUi.configure(a, m) }.apply { tag = "ocr-offer:" + j.id }, Ui.lp(-2, -2, 0f, 0, 0, 8, 0, a))
+            }
             if (j.state == JobState.DONE && m != null) actions.addView(Ui.button(a, "Open", primary = true) { a.openItem(m.mediaId) }.apply { tag = "open:" + j.id })
             if (j.state == JobState.FAILED) actions.addView(Ui.button(a, "Retry", primary = true) { a.app.jobs.retry(j.id); HelperService.start(a); fill(true) }.apply { tag = "retry:" + j.id })
             actions.addView(Ui.button(a, "Remove") { a.app.jobs.remove(j.id); fill(true) }.apply { tag = "remove:" + j.id })

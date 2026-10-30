@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersion = (findProperty("versionName") as String?) ?: "1.5.5"
+val appVersion = (findProperty("versionName") as String?) ?: "1.6.0"
 val keystoreFile: String? = System.getenv("MEDUSA_KEYSTORE_FILE")
 
 android {
@@ -69,10 +69,13 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
+    // burned-in subtitle OCR (1.6.0): the Chinese model is bundled in the APK (also reads Latin)
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }

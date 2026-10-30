@@ -68,6 +68,7 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
                     .setPositiveButton("Delete") { _, _ -> a.app.media.delete(m.mediaId); a.goBack() }.setNegativeButton("Cancel", null).show()
             })
         }, Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
+        OcrUi.section(a, m)?.let { col.addView(it, Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a)) }
         // tracks
         val tracks = TrackUi.tracksOf(m)
         val c = TrackUi.resolve(m.subtitles?.language, tracks, a.app.settings.trackChoice(m.mediaId, "main"), a.app.settings.trackChoice(m.mediaId, "second"))
@@ -82,7 +83,7 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
                 addView(Ui.text(a, TrackUi.label(t), 14f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
                 if (c.main.equals(t.key, true)) addView(Ui.badge(a, "MAIN", true).apply { tag = "badge-main:" + t.key }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
                 if (c.second.equals(t.key, true)) addView(Ui.badge(a, "2nd", true).apply { tag = "badge-second:" + t.key }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
-                addView(Ui.badge(a, if (t.added) "added" else t.source.replace("-", " "), t.added))
+                addView(Ui.badge(a, if (t.ocr) "from picture" else if (t.added) "added" else t.source.replace("-", " "), t.added))
             })
             val isMain = c.main.equals(t.key, true); val isSecond = c.second.equals(t.key, true)
             box.addView(LinearLayout(a).apply {

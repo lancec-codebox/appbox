@@ -32,6 +32,8 @@ class JobManager(
     /** The language to also fetch titles in (null = Original only); read at each capture. */
     private val titleLanguage: () -> String? = { null },
     private val clock: () -> Long = System::currentTimeMillis,
+    /** Called with the media id when a finished capture stored a video but found no subtitle track: the app then offers to read them from the picture. */
+    private val onNoSubtitles: (String) -> Unit = {},
 ) {
     private val jobs = ConcurrentHashMap<String, JobRecord>()
 
@@ -243,6 +245,7 @@ class JobManager(
                 if (Titles.localizedIfDifferent(out.title, out.localizedTitle) != null) req.titleLanguage else if (out.localizedTitle == null && req.titleLanguage != null) old?.localizedLanguage else null,
                 if (out.width != null && out.height != null) out.width else old?.width, if (out.width != null && out.height != null) out.height else old?.height))
             rec.title = out.title
+            if (rec.want.subtitles && wantSubs && out.subtitles == null && video != null && old?.tracks?.none { it.ocr } != false) onNoSubtitles(target)
             val note = listOfNotNull(
                 if (wantSubs && out.subtitles == null) out.subtitlesError?.message else null,
                 if (wantVideo && out.videoFile == null) out.videoError?.message else null,
