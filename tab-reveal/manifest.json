@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Reveal current tab",
+  "version": "0.1.0",
+  "description": "Scrolls the current tab back into view in a long vertical tab strip by briefly selecting a neighbouring tab and returning.",
+  "minimum_chrome_version": "116",
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Reveal current tab" },
+  "commands": {
+    "reveal-tab": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Reveal the current tab in the tab strip"
+    }
+  }
+}
