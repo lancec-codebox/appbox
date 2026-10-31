@@ -99,7 +99,7 @@ class HelperService : Service() {
             val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
             return Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download)
                 .setContentTitle("Reading subtitles from the picture")
-                .setContentText(OcrUi.progressText(ocr))
+                .setContentText(OcrUi.notificationText(ocr))
                 .setProgress(100, ocr.percent, ocr.phase == OcrState.Phase.DETECTING)
                 .setContentIntent(open).setOngoing(true).build()
         }

@@ -94,6 +94,9 @@ object Ui {
     fun spacer(c: Context, h: Int) = View(c).apply { layoutParams = LinearLayout.LayoutParams(-1, dp(c, h)) }
 
     // ---- formatting
+    /** Always h:mm:ss (rounds down), for the OCR progress. */
+    fun hms(sec: Double): String { val s = sec.toLong().coerceAtLeast(0); return "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) }
+
     fun duration(sec: Int?): String? = sec?.let { if (it >= 3600) "%d:%02d:%02d".format(it / 3600, it / 60 % 60, it % 60) else "%d:%02d".format(it / 60, it % 60) }
 
     fun size(bytes: Long): String = when {

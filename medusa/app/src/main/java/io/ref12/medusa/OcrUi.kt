@@ -17,10 +17,18 @@ object OcrUi {
         OcrState.Phase.DETECTING -> "Looking for the subtitle area\u2026"
         OcrState.Phase.RUNNING -> {
             val eta = s.etaSec?.let { "  \u00b7  about " + Ui.duration(it.toInt().coerceAtLeast(1)) + " left" } ?: ""
-            "${s.percent}%  \u00b7  ${s.samples} frames, ${s.ocrCalls} read  \u00b7  ${s.cues} lines$eta"
+            "${timeRead(s)}  \u00b7  ${s.samples} frames, ${s.ocrCalls} read  \u00b7  ${s.cues} lines$eta"
         }
         else -> s.message ?: ""
     }
+
+    /** "0:41:07 / 1:23:45 (49%)", or just the time read when the duration is unknown. */
+    fun timeRead(s: OcrState): String =
+        if (s.durationSec > 0) "${Ui.hms(s.positionSec)} / ${Ui.hms(s.durationSec)} (${s.percent}%)" else Ui.hms(s.positionSec)
+
+    /** Short line for the collapsed notification: time read, total and percentage only. */
+    fun notificationText(s: OcrState): String =
+        if (s.phase == OcrState.Phase.RUNNING) timeRead(s) else progressText(s)
 
     /** The card for [m], or null when the item has no video. */
     fun section(a: MainActivity, m: MediaMeta): View? {
@@ -49,7 +57,7 @@ object OcrUi {
             }, 13f).apply { tag = "ocr-note" })
             val btns = ArrayList<View>()
             if (cp != null) {
-                btns.add(Ui.button(a, "Resume (" + (if (cp.durationSec > 0) (cp.resumeSec / cp.durationSec * 100).toInt() else 0) + "%)", primary = true) {
+                btns.add(Ui.button(a, "Resume from " + Ui.hms(cp.resumeSec), primary = true) {
                     app.settings.setOcrOffered(m.mediaId, false); app.ocr.start(m.mediaId, cp.band, true); a.show()
                 }.apply { tag = "ocr-resume" })
                 btns.add(Ui.button(a, "Start over") { app.ocr.discardCheckpoint(m.mediaId); a.show() })
