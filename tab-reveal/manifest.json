@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Reveal current tab",
   "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvak6MT9S/NoPT5GPOYULoPkvhOM2kvMSFjUuY5wCKlDiZvUFMjY4B1GCWgzSsm2+0812IeqsdzNaKyVOR+7wXRZGvRA0x68f7NB+RcGxRxzrfjtBLAwaWptG6F6bOF/KXa/w5qdUpNGLaIqwCguEuumIDUeg3yy1V+HHkDDgi+hIqxjqU42qcFcJ/Swnj/Jen0qECy8UrrsSq9PDG0S8e1TMGJBHy1qJy8HRo7kC0lCQ3vrpfrZ3B/AbuVxnVeU8eTMcmO+zK4V8IZpTrf/QcxvqS1rqhBkb5v90CyJceopXBe10DMSBQ3oX63Sgi3gk+P+WupB3Axt8BjHniVEX+wIDAQAB",
   "description": "Scrolls the current tab back into view in a long vertical tab strip by briefly selecting a neighbouring tab and returning.",
   "minimum_chrome_version": "116",
   "background": { "service_worker": "background.js" },

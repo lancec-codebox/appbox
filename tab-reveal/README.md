@@ -4,12 +4,14 @@ A tiny Chromium extension for Brave's vertical tabs: with many tabs open, the cu
 
 **How it works.** Extensions can't scroll the browser's own tab strip. The strip does scroll the selected tab into view whenever the selection changes, though. So the extension selects the nearest already-loaded tab for a moment (60 ms) and then selects the current tab again. You may see a brief flicker. A discarded (sleeping) tab is never chosen, so nothing gets reloaded.
 
-## Install (unpacked)
+## Install
 
-1. Download `tab-reveal.zip` from the [tab-reveal-latest release](https://github.com/lancec-codebox/appbox/releases/tag/tab-reveal-latest) and unzip it to a folder you'll keep. Or use this `tab-reveal` folder from a clone.
-2. Open `brave://extensions` and turn on **Developer mode** (top right).
-3. Click **Load unpacked** and pick the unzipped folder. To update later, unzip the new release over it and click the reload icon on the extension's card.
-4. Optional: pin the toolbar button, or change the shortcut at `brave://extensions/shortcuts`.
+Both files are on the [tab-reveal-latest release](https://github.com/lancec-codebox/appbox/releases/tag/tab-reveal-latest) and give the same extension id. The id is fixed by the key in `manifest.json`, which matches the committed signing key `.github/crx/tab-reveal.pem`; that key is deliberately not a secret.
+
+- **CRX:** open `brave://extensions`, turn on **Developer mode** (top right) and drag `tab-reveal.crx` onto the page. Brave may leave an extension installed this way switched off; switch it on on its card.
+- **Unpacked:** unzip `tab-reveal.zip` to a folder you'll keep (or use this `tab-reveal` folder from a clone), turn on **Developer mode**, click **Load unpacked** and pick the folder. To update, unzip the new release over it and click the reload icon on the card.
+
+Optional: pin the toolbar button, or change the shortcut at `brave://extensions/shortcuts`.
 
 ## Tuning
 
