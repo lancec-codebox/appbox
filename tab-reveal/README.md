@@ -6,9 +6,10 @@ A tiny Chromium extension for Brave's vertical tabs: with many tabs open, the cu
 
 ## Install (unpacked)
 
-1. Open `brave://extensions` and turn on **Developer mode** (top right).
-2. Click **Load unpacked** and pick this `tab-reveal` folder.
-3. Optional: pin the toolbar button, or change the shortcut at `brave://extensions/shortcuts`.
+1. Download `tab-reveal.zip` from the [tab-reveal-latest release](https://github.com/lancec-codebox/appbox/releases/tag/tab-reveal-latest) and unzip it to a folder you'll keep. Or use this `tab-reveal` folder from a clone.
+2. Open `brave://extensions` and turn on **Developer mode** (top right).
+3. Click **Load unpacked** and pick the unzipped folder. To update later, unzip the new release over it and click the reload icon on the extension's card.
+4. Optional: pin the toolbar button, or change the shortcut at `brave://extensions/shortcuts`.
 
 ## Tuning
 

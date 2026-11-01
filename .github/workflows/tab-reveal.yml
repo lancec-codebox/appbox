@@ -1,0 +1,39 @@
+# Publishes the tab-reveal extension as one rolling release, tab-reveal-latest, holding tab-reveal.zip.
+name: tab-reveal release
+
+on:
+  push:
+    branches: [main]
+    paths: ['tab-reveal/**', '.github/workflows/tab-reveal.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tab-reveal-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zip the extension
+        run: |
+          cd tab-reveal
+          zip -r ../tab-reveal.zip manifest.json background.js README.md
+          echo "VERSION=$(jq -r .version manifest.json)" >> "$GITHUB_ENV"
+      - name: Move the tag and replace the asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f tab-reveal-latest
+          git push -f origin tab-reveal-latest
+          notes="Reveal current tab ${VERSION} (commit ${GITHUB_SHA::7}). Unzip, then in brave://extensions turn on Developer mode and use Load unpacked on the unzipped folder."
+          if gh release view tab-reveal-latest >/dev/null 2>&1; then
+            gh release edit tab-reveal-latest --title "Reveal current tab (latest)" --notes "$notes"
+          else
+            gh release create tab-reveal-latest --title "Reveal current tab (latest)" --notes "$notes" --latest=false
+          fi
+          gh release upload tab-reveal-latest tab-reveal.zip --clobber
