@@ -52,6 +52,7 @@ class PlayerActivity : Activity() {
     private var controllerShown = true
     private var ccDialog: AlertDialog? = null
     private var ccSpinner: ProgressBar? = null
+    private var dlNote: TextView? = null
     private val ui = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() { update(); ui.postDelayed(this, 100) }
@@ -107,6 +108,11 @@ class PlayerActivity : Activity() {
         subBox.addView(subView, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = 6 })
         subBox.addView(sub2View, LinearLayout.LayoutParams(-2, -2))
         stage.addView(subBox, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        dlNote = TextView(this).apply {
+            text = "Downloading subtitles\u2026"; tag = "subtitle-downloading"; setTextColor(0xFFFFFFFF.toInt()); textSize = 13f
+            setBackgroundColor(0xAA000000.toInt()); setPadding(16, 6, 16, 6); visibility = View.GONE
+        }
+        stage.addView(dlNote, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { setMargins(18, 24, 0, 0) })
         // tools along the top: CC menu, sync nudges and text size. They stay reachable in fullscreen (shown with the controls).
         fun tool(t: String, desc: String, f: () -> Unit) = Button(this).apply {
             text = t; isAllCaps = false; textSize = 14f; setTextColor(0xFFFFFFFF.toInt()); minWidth = 0; minimumWidth = 0
@@ -150,26 +156,33 @@ class PlayerActivity : Activity() {
         if (intent.getBooleanExtra(EXTRA_FULLSCREEN, false)) toggleFullscreen()
     }
 
-    /** Puts a track's lines in the main or second slot; downloads it first when needed (in a thread). */
+    /** Puts a track's lines in the main or second slot; downloads it first when needed (off the main thread, with a spinner). */
     private fun loadInto(second: Boolean, lang: String?, remember: Boolean, done: (Boolean) -> Unit = {}) {
         fun apply(l: List<Line>) {
             if (second) { lines2 = l; secondLang = lang } else { lines = l; mainLang = lang }
-            if (remember) app.settings.setTrackChoice(mediaId, if (second) "second" else "main", lang)
             update()
         }
+        // the choice is kept even when the download fails, so a later retry works
+        if (remember) app.settings.setTrackChoice(mediaId, if (second) "second" else "main", lang)
         if (lang == null) { apply(emptyList()); done(true); return }
-        ccSpinner?.visibility = View.VISIBLE
-        Thread {
-            val t = tracks.firstOrNull { it.key.equals(lang, true) }
-            val s = try { if (t != null && t.added) app.jobs.subtitlesFor(mediaId, t.language, t.trackId) else app.jobs.subtitlesFor(mediaId, lang) } catch (e: Exception) { null }
-            runOnUiThread {
-                ccSpinner?.visibility = View.GONE
-                if (s == null) {
-                    Toast.makeText(this, "Could not load $lang (it needs a network connection)", Toast.LENGTH_LONG).show()
-                    done(false)
-                } else { apply(s.lines); done(true) }
-            }
-        }.start()
+        val t = tracks.firstOrNull { it.key.equals(lang, true) } ?: TrackInfo(lang, "captions")
+        if (second) { lines2 = emptyList(); secondLang = lang } else { lines = emptyList(); mainLang = lang }
+        update()
+        app.trackDl.download(mediaId, t, started = { showDownloading() }) { s, err ->
+            showDownloading()
+            if (s == null) {
+                Toast.makeText(this, "Could not load " + TrackUi.label(t) + ": " + (err ?: "unknown error"), Toast.LENGTH_LONG).show()
+                done(false)
+            } else if ((if (second) secondLang else mainLang).equals(lang, true)) { apply(s.lines); done(true) }
+        }
+        showDownloading()
+    }
+
+    /** The "Downloading subtitles…" note over the video and the spinner in the CC menu follow the downloads of this item. */
+    private fun showDownloading() {
+        val busy = app.trackDl.anyRunning(mediaId)
+        ccSpinner?.visibility = if (busy) View.VISIBLE else View.GONE
+        dlNote?.visibility = if (busy) View.VISIBLE else View.GONE
     }
 
     private fun showMenu() {
@@ -189,7 +202,7 @@ class PlayerActivity : Activity() {
         body.addView(header("Second line"))
         body.addView(group(true))
         if (tracks.isEmpty()) body.addView(TextView(this).apply { text = "This video has no subtitle tracks."; setPadding(0, 16, 0, 0) })
-        ccSpinner = ProgressBar(this).apply { visibility = View.GONE }
+        ccSpinner = ProgressBar(this).apply { visibility = if (app.trackDl.anyRunning(mediaId)) View.VISIBLE else View.GONE }
         body.addView(ccSpinner, LinearLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER_HORIZONTAL })
         ccDialog = AlertDialog.Builder(this).setTitle("Subtitles").setView(ScrollView(this).apply { addView(body) })
             .setNeutralButton("Export") { _, _ -> app.media.get(mediaId)?.let { ExportUi.export(this, it, listOfNotNull(TrackUi.tracksOf(it).firstOrNull { t -> t.key == mainLang } ?: ExportUi.defaultTrack(it))) } }

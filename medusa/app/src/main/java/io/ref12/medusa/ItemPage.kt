@@ -29,6 +29,29 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
         }.start()
     }
 
+    private fun showError(t: TrackInfo, msg: String) {
+        if (a.isFinishing) return
+        AlertDialog.Builder(a).setTitle("Could not download " + TrackUi.label(t)).setMessage(msg).setPositiveButton("OK", null).show()
+    }
+
+    private fun redraw() { if (!a.isFinishing && (a.currentPage as? ItemPage)?.mediaId == mediaId) a.show() }
+
+    /** Downloads one captured track off the main thread; the page shows its progress, then refreshes (a failure shows its reason). */
+    private fun download(t: TrackInfo) {
+        a.app.trackDl.download(mediaId, t, started = { redraw() }) { _, err -> redraw(); if (err != null) showError(t, err) }
+    }
+
+    /** Fetches every captured track not yet on the device, one after another. */
+    private fun downloadAll(m: MediaMeta, tracks: List<TrackInfo>) {
+        var first: String? = null; var failures = 0
+        a.app.trackDl.downloadAll(mediaId, tracks, { t -> TrackDevice.missing(m, listOf(t)) { l -> a.app.media.loadTrack(mediaId, l) != null }.isNotEmpty() }) { t, err ->
+            if (err != null) { failures++; if (first == null) first = TrackUi.label(t) + ": " + err }
+            redraw()
+            if (err != null && !a.isFinishing && !a.app.trackDl.anyRunning(mediaId)) showError(t, if (failures > 1) first + "\n(" + failures + " tracks failed)" else err)
+        }
+        redraw()
+    }
+
     override fun build(): View {
         val m = a.app.media.get(mediaId) ?: return View(a)
         val col = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; setPadding(Ui.dp(a, 12), Ui.dp(a, 12), Ui.dp(a, 12), Ui.dp(a, 24)) }
@@ -87,6 +110,12 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
         val c = TrackUi.resolve(m.subtitles?.language, tracks, a.app.settings.trackChoice(m.mediaId, "main"), a.app.settings.trackChoice(m.mediaId, "second"))
         col.addView(Ui.header(a, "Subtitle tracks (" + tracks.size + ")").apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 18), 0, Ui.dp(a, 6)) })
         if (tracks.isEmpty()) col.addView(Ui.muted(a, "This item has no subtitle tracks. Import a file to add one.", 14f))
+        val hasSaved = { l: String -> a.app.media.loadTrack(m.mediaId, l) != null }
+        if (TrackDevice.missing(m, tracks, hasSaved).isNotEmpty()) {
+            val allBusy = TrackDevice.missing(m, tracks, hasSaved).all { a.app.trackDl.isRunning(m.mediaId, it) }
+            col.addView(Ui.chipButton(a, if (allBusy) "Downloading\u2026" else "Download all subtitles", false, "download-all") { if (!allBusy) downloadAll(m, tracks) }.apply { alpha = if (allBusy) 0.5f else 1f },
+                Ui.lp(-2, -2, 0f, 0, 0, 0, 8, a))
+        }
         val card = Ui.card(a)
         for ((i, t) in tracks.withIndex()) {
             if (i > 0) card.addView(Ui.divider(a))
@@ -96,14 +125,29 @@ class ItemPage(a: MainActivity, private val mediaId: String) : Page(a) {
                 addView(Ui.text(a, TrackUi.label(t), 14f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
                 if (c.main.equals(t.key, true)) addView(Ui.badge(a, "MAIN", true).apply { tag = "badge-main:" + t.key }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
                 if (c.second.equals(t.key, true)) addView(Ui.badge(a, "2nd", true).apply { tag = "badge-second:" + t.key }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
+                val st = a.app.trackDl.state(m.mediaId, t)
+                if (!t.added) addView(Ui.badge(a, when (st) {
+                    TrackState.ON_DEVICE -> "on device"; TrackState.DOWNLOADING -> "Downloading\u2026"
+                    TrackState.FAILED -> "download failed"; TrackState.NOT_DOWNLOADED -> "not downloaded"
+                }, st == TrackState.ON_DEVICE).apply { tag = "state:" + t.key + ":" + st.name.lowercase() }, Ui.lp(-2, -2, 0f, 0, 0, 4, 0, a))
                 addView(Ui.badge(a, if (t.ocr) "from picture" else if (t.added) "added" else t.source.replace("-", " "), t.added))
             })
+            a.app.trackDl.failure(m.mediaId, t)?.takeIf { a.app.trackDl.state(m.mediaId, t) == TrackState.FAILED }?.let { r ->
+                box.addView(Ui.muted(a, r, 12f).apply { tag = "failure:" + t.key; setPadding(0, Ui.dp(a, 4), 0, 0) })
+            }
             val isMain = c.main.equals(t.key, true); val isSecond = c.second.equals(t.key, true)
             box.addView(LinearLayout(a).apply {
                 orientation = LinearLayout.HORIZONTAL
                 fun chip(txt: String, on: Boolean, tg: String, f: () -> Unit) = addView(Ui.chipButton(a, txt, on, tg + ":" + t.key, f), Ui.lp(-2, -2, 0f, 0, 0, 6, 0, a))
-                chip(if (isMain) "\u2713 Main" else "Main", isMain, "main") { a.app.settings.setTrackChoice(m.mediaId, "main", if (isMain) null else t.key); a.show() }
-                chip(if (isSecond) "\u2713 Second line" else "Second line", isSecond, "second") { a.app.settings.setTrackChoice(m.mediaId, "second", if (isSecond) null else t.key); a.show() }
+                val st = a.app.trackDl.state(m.mediaId, t)
+                fun choose(slot: String, on: Boolean) {
+                    a.app.settings.setTrackChoice(m.mediaId, slot, if (on) null else t.key)
+                    if (!on && (st == TrackState.NOT_DOWNLOADED || st == TrackState.FAILED)) download(t) else a.show()
+                }
+                chip(if (isMain) "\u2713 Main" else "Main", isMain, "main") { choose("main", isMain) }
+                chip(if (isSecond) "\u2713 Second line" else "Second line", isSecond, "second") { choose("second", isSecond) }
+                if (st == TrackState.NOT_DOWNLOADED) chip("Download", false, "download") { download(t) }
+                if (st == TrackState.FAILED) chip("Retry", false, "retry") { download(t) }
                 chip("Export", false, "export") { ExportUi.export(a, m, listOf(t)) }
                 if (t.language.substringBefore('-') != "en") chip("Translate on this device", false, "translate") { TranslationUi.translateTrack(a, m, t) { a.show() } }
                 addView(Ui.chipButton(a, "\u22EE", false, "export-more:" + t.key) { ExportUi.overflow(a, m, t, this) }, Ui.lp(-2, -2, 0f, 0, 0, 6, 0, a))
