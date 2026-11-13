@@ -50,6 +50,8 @@ class SettingsPage(a: MainActivity) : Page(a) {
             a.app.settings.keepAlive = KeepAliveMode.values()[it]
         })
 
+        io.ref12.medusa.node.IndexNodeUi.build(a, section("Index node"))
+
         val web = section("Web apps")
         web.addView(Ui.muted(a, "Allowed origins, one per line"))
         val origins = field("https://example.app", a.app.settings.origins.joinToString("\n"), "origins", multi = true)

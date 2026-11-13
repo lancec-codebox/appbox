@@ -45,6 +45,8 @@ class MedusaApp : Application() {
         // One job at a time: yt-dlp is heavy and the phone is small.
         jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() }, onNoSubtitles = { id -> settings.setOcrOffered(id, true) })
         ocr = OcrManager(this, media)
+        io.ref12.medusa.node.CrashRedaction.install()
+        try { io.ref12.medusa.node.NodeWorker.schedule(this, io.ref12.medusa.node.NodeSettings(this)) } catch (e: Exception) { /* the node is optional */ }
         val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
         trackDl = TrackDownloads(
             onDevice = { id, t -> media.get(id)?.let { m -> TrackDevice.onDevice(m, t) { l -> media.loadTrack(id, l) != null } } ?: false },
