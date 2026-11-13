@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
     <PackageId>IndexNode</PackageId>
@@ -18,11 +18,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.23.2" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="../Nexis.Azure.Utilities/Nexis.Azure.Utilities/Nexis.Azure.Utilities.csproj" />
   </ItemGroup>
 
   <ItemGroup>
