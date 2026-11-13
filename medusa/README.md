@@ -19,6 +19,16 @@ Install: download the APK from <https://github.com/lancec-codebox/appbox/release
 1. In Medusa open the item, tap **Export subtitles**, choose SRT and **Share...** it to the app (for example hexad); ask it for a translated SRT.
 2. Open the translated file with Medusa (share or open it, check the video, language and label, Add). It appears in the subtitle menu.
 
+## Index node (1.7.0)
+
+Medusa can work as a background **download node** for the drama index. It runs only the `download` stage of the work protocol in [docs/INDEX-NODE.md](docs/INDEX-NODE.md), through a container SAS URL. The code is in the package `io.ref12.medusa.node` and is kept apart from the player and the helper server so that it can move into its own app.
+
+- **Settings > Index node:** enable switch, node name, conditions (Wi-Fi and charging, the default, or Wi-Fi any time), daily cap (default 20), the SAS URL (paste it or scan a QR code), the control state, the last run and the recent jobs, and **Test connection** (lists `index/jobs/download/` and shows what the SAS's `sp=` allows).
+- **Schedule:** a WorkManager periodic worker every 15 minutes. It needs an unmetered network, battery not low and storage not low, and charging unless you chose "Wi-Fi any time". When there is work it becomes a foreground worker (type dataSync) with the notification "Downloading for the index: <title> (n left)". On Android 15 the system limits dataSync foreground work; when it stops the work, Medusa releases its lease and does not try to keep running by other means. The next period carries on.
+- **Each job:** claim it (60 s lease, renewed every 30 s), download with the job's `maxHeight` or `format` (default 480p), subtitles (Chinese first), `info.json` and the thumbnail, upload to `index/videos/<jobId>/` (video in 8 MiB blocks), write `downloaded.json` last, create the `process` job if missing, mark the job done, release the lease and delete the local files. A permanent, transient or bot-block failure releases the lease at once; a bot block backs off for an hour. There are 20-40 s between downloads.
+- **Control and registry:** the node obeys `index/control.json` (run, drain, stop) before each claim and at every lease renewal, and keeps `index/nodes/<nodeId>.json` up to date while it runs.
+- **The SAS is a secret:** it is stored encrypted with an Android Keystore AES-GCM key, never logged, and `sig=` is redacted everywhere, error messages and crash reports included.
+
 ## Updates
 
 Medusa checks the GitHub Releases of lancec-codebox/appbox when it opens (at most once a day; switch it off in the main screen) and on **Check for updates**. It considers only published, non-prerelease releases tagged `medusa-vX.Y.Z`. A newer one appears as a card with its release notes and Update / Later. It never starts while a download runs. The APK is downloaded to the app's cache, its SHA-256 is checked against the release asset's `digest` (or the `medusa-X.Y.Z.apk.sha256` asset the release workflow attaches) and it is installed through Android's PackageInstaller. The first time, Android asks you to allow Medusa to install apps. Only APKs signed with the same key can replace the installed app.
