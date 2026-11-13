@@ -62,6 +62,11 @@ class MemState : NodeState {
     override fun saveControl(text: String) { control = text }
 }
 
+const val SAMPLE_INFO = """{"format_id":"394+251","vcodec":"av01.0.00M.08","acodec":"opus","playable_in_embed":true,"description":"第一集 hello",
+"requested_formats":[{"format_id":"394","vcodec":"av01.0.00M.08","acodec":"none"},{"format_id":"251-0","vcodec":"none","acodec":"opus","language":"zh","format_note":"original (default)"}],
+"formats":[{"format_id":"251-0","vcodec":"none","acodec":"opus","language":"zh","format_note":"original (default)"},{"format_id":"251-1","vcodec":"none","acodec":"opus","language":"en","format_note":"English (dubbed)"},{"format_id":"251-2","vcodec":"none","acodec":"opus","language":"en","format_note":"English (dubbed)"},{"format_id":"394","vcodec":"av01","acodec":"none"}],
+"subtitles":{"zh-Hans":[{}],"en":[{}]},"automatic_captions":{"en":[{}],"zh-Hans":[{}],"zh-Hant":[{}]}}"""
+
 class FakeFetcher(private val behavior: (DownloadJob, File, FakeFetcher) -> Unit = { _, _, _ -> }) : NodeFetcher {
     @Volatile var cancelled = false
     val jobs = ArrayList<DownloadJob>()
@@ -70,9 +75,13 @@ class FakeFetcher(private val behavior: (DownloadJob, File, FakeFetcher) -> Unit
         jobs.add(job); dir.mkdirs(); progress("download 10%", "Title " + job.jobId)
         behavior(job, dir, this)
         val v = File(dir, "video.mp4").apply { writeBytes(ByteArray(100)) }
-        val info = File(dir, "video.info.json").apply { writeText("{}") }
+        val info = File(dir, "video.info.json").apply { writeText(SAMPLE_INFO) }
+        val p = NodeInfo.parse(SAMPLE_INFO)
+        val desc = File(dir, "description.txt").apply { writeText(p.description) }
         val sub = File(dir, "video.zh-Hans.vtt").apply { writeText("WEBVTT") }
-        return DownloadedFiles(v, listOf(Triple("info.json", info, "application/json"), Triple("subs/zh-Hans.vtt", sub, "text/vtt")), 480, 61.5)
+        val subs = NodeInfo.order(listOf("zh-Hans", "en", "zh-Hans.auto"))
+        return DownloadedFiles(v, listOf(Triple("info.json", info, "application/json"), Triple("description.txt", desc, "text/plain; charset=utf-8"), Triple("subs/zh-Hans.vtt", sub, "text/vtt")),
+            480, 61.5, p.vcodec, p.acodec, p.formatId, subs, p.embeddable, p.audioLanguage, p.audioNote, p.audioTracks)
     }
 }
 
@@ -102,15 +111,43 @@ class NodeRunnerTest {
         assertTrue(puts.indexOf("put:index/jobs/download/aaaaaaaaaaa.json") > puts.indexOf("put:index/jobs/process/aaaaaaaaaaa.json"))
         val marker = JSONObject(String(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"]!!.bytes))
         assertEquals(100, marker.getInt("bytes")); assertEquals(480, marker.getInt("height")); assertEquals(61.5, marker.getDouble("durationSeconds"), 0.0); assertEquals("lancecm1-a1b2c3", marker.getString("nodeId"))
+        assertEquals(1, marker.getInt("v")); assertEquals("av01.0.00M.08", marker.getString("vcodec")); assertEquals("opus", marker.getString("acodec"))
+        assertEquals("zh", marker.getString("audioLanguage")); assertEquals("original (default)", marker.getString("audioNote"))
+          val at = marker.getJSONArray("audioTracks"); assertEquals(2, at.length())
+          assertEquals("zh", at.getJSONObject(0).getString("language")); assertEquals("original (default)", at.getJSONObject(0).getString("note"))
+          assertEquals("en", at.getJSONObject(1).getString("language")); assertEquals("English (dubbed)", at.getJSONObject(1).getString("note"))
+          assertEquals("394+251", marker.getString("formatId")); assertEquals(true, marker.getBoolean("embeddable")); assertTrue(marker.has("at"))
+        assertEquals("[\"zh-Hans\",\"en\",\"zh-Hans.auto\"]", marker.getJSONArray("subs").toString())
+        assertEquals("第一集 hello", String(api.blobs["index/videos/aaaaaaaaaaa/description.txt"]!!.bytes, Charsets.UTF_8))
         val p = api.blobs["index/jobs/process/aaaaaaaaaaa.json"]!!
-        assertEquals("pending", p.tags["idx_state"]); assertEquals("process", p.tags["idx_stage"])
-        assertEquals(listOf("frames", "sscd", "compress"), JSONObject(String(p.bytes)).getJSONArray("steps").let { a -> (0 until a.length()).map { a.getString(it) } })
+        assertEquals("pending", p.tags["idx_state"]); assertEquals("process", p.tags["idx_stage"]); assertNotNull(p.tags["idx_added"])
+        val pj = JSONObject(String(p.bytes)); assertEquals(0, pj.getInt("attempts")); assertFalse(pj.has("compress"))
+        val c = api.blobs["index/jobs/comments/aaaaaaaaaaa.json"]!!; val cj = JSONObject(String(c.bytes))
+        assertEquals("comments", c.tags["idx_stage"]); assertEquals("pending", c.tags["idx_state"]); assertEquals(pj.getString("addedAt"), c.tags["idx_due"]); assertEquals(c.tags["idx_added"], c.tags["idx_due"])
+        assertEquals(1000, cj.getInt("maxComments")); assertEquals("top", cj.getString("sort")); assertEquals(0, cj.getInt("round")); assertEquals(0, cj.getInt("attempts")); assertEquals(1, cj.getInt("v"))
+        assertTrue(cj.getString("url").isNotEmpty()); assertEquals("aaaaaaaaaaa", cj.getString("jobId"))
+        assertEquals(listOf("frames", "sscd", "clip", "transcribe", "ocrsubs"), JSONObject(String(p.bytes)).getJSONArray("steps").let { a -> (0 until a.length()).map { a.getString(it) } })
         val j = api.job("aaaaaaaaaaa"); val o = api.jobJson("aaaaaaaaaaa")
         assertEquals("done", j.tags["idx_state"]); assertEquals("download", j.tags["idx_stage"]); assertNotNull(j.tags["idx_added"])
         assertEquals("lancecm1-a1b2c3", o.getString("nodeId")); assertTrue(o.has("finishedAt")); assertTrue(o.has("elapsedSeconds"))
         assertNull(j.lease); assertEquals(1, api.count("release:"))
         assertFalse(File(work, "aaaaaaaaaaa").exists())
         assertEquals(1, state.doneToday(NodeRunner.day(now)))
+    }
+
+    @Test fun anExistingCommentsJobIsLeftAlone() {
+        api.addJob("aaaaaaaaaaa", 1)
+        api.blobs["index/jobs/comments/aaaaaaaaaaa.json"] = FakeBlobs.B("{\"keep\":1}".toByteArray(), mapOf("idx_state" to "done"))
+        runner(FakeFetcher()).run()
+        assertEquals("{\"keep\":1}", String(api.blobs["index/jobs/comments/aaaaaaaaaaa.json"]!!.bytes))
+        assertEquals("done", api.blobs["index/jobs/comments/aaaaaaaaaaa.json"]!!.tags["idx_state"])
+    }
+
+    @Test fun infoJsonSplitsUploadedAndAutomaticSubtitles() {
+        val p = NodeInfo.parse(SAMPLE_INFO)
+        assertEquals("zh-Hans", NodeInfo.subName("zh-Hans", p)); assertEquals("zh-Hant.auto", NodeInfo.subName("zh-Hant", p)); assertEquals("en", NodeInfo.subName("en", p))
+        assertEquals(listOf("zh-Hans", "en", "zh-Hans.auto"), NodeInfo.order(listOf("zh-Hans.auto", "en", "zh-Hans")))
+        assertEquals(true, p.embeddable); assertNull(NodeInfo.parse("{}").embeddable); assertEquals("", NodeInfo.parse("{}").description)
     }
 
     @Test fun anExistingProcessJobIsLeftAlone() {
@@ -306,8 +343,10 @@ class NodeRunnerTest {
 
     @Test fun theFormatSelector() {
         val d = DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":null,\"format\":null}")
-        assertEquals(480, d.maxHeight); assertEquals("bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480]/b", d.selector())
-        assertEquals("bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]/b", DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720}").selector())
+        assertEquals(480, d.maxHeight)
+        fun sel(h: Int) = "bv*[height<=$h][vcodec^=av01]+ba[acodec=opus][abr<=80]/bv*[height<=$h][vcodec^=vp9]+ba[acodec=opus][abr<=80]/bv*[height<=$h]+ba/b[height<=$h]/b"
+        assertEquals(sel(480), d.selector())
+        assertEquals(sel(720), DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720}").selector())
         assertEquals("best", DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720,\"format\":\"best\"}").selector())
     }
 }

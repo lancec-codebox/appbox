@@ -197,14 +197,21 @@ class NodeRunner(
                     if (cancelled()) throw BlobCancelled()
                     val at = iso(env.clock())
                     val marker = JSONObject().put("v", 1).put("bytes", out.video.length()).put("height", out.height ?: JSONObject.NULL)
-                        .put("durationSeconds", out.durationSeconds ?: JSONObject.NULL).put("nodeId", cfg.nodeId).put("at", at)
+                        .put("durationSeconds", out.durationSeconds ?: JSONObject.NULL).put("vcodec", out.vcodec ?: JSONObject.NULL)
+                        .put("acodec", out.acodec ?: JSONObject.NULL).put("formatId", out.formatId ?: JSONObject.NULL)
+                        .put("subs", JSONArray(out.subs)).put("embeddable", out.embeddable ?: JSONObject.NULL)
+                        .put("audioLanguage", out.audioLanguage ?: JSONObject.NULL).put("audioNote", out.audioNote ?: JSONObject.NULL)
+                        .put("audioTracks", JSONArray().also { a -> out.audioTracks.forEach { a.put(JSONObject().put("language", it.first).put("note", it.second ?: JSONObject.NULL)) } }).put("nodeId", cfg.nodeId).put("at", at)
                     api.put(base + "downloaded.json", marker.toString().toByteArray(), "application/json")
                     val pj = JSONObject().put("v", 1).put("stage", "process").put("jobId", ref.id)
-                        .put("steps", JSONArray(listOf("frames", "sscd", "compress")))
-                        .put("compress", JSONObject().put("codec", "av1").put("crf", 38).put("preset", 8).put("audioKbps", 48).put("keepOriginal", false))
+                        .put("steps", JSONArray(listOf("frames", "sscd", "clip", "transcribe", "ocrsubs")))
                         .put("addedAt", at).put("attempts", 0)
                     api.put("index/jobs/process/${ref.id}.json", pj.toString().toByteArray(), "application/json",
                         mapOf("idx_stage" to "process", "idx_state" to "pending", "idx_added" to at), null, true)
+                    val cj = JSONObject().put("v", 1).put("stage", "comments").put("jobId", ref.id).put("url", job.url)
+                        .put("maxComments", 1000).put("sort", "top").put("round", 0).put("addedAt", at).put("attempts", 0)
+                    api.put("index/jobs/comments/${ref.id}.json", cj.toString().toByteArray(), "application/json",
+                        mapOf("idx_stage" to "comments", "idx_state" to "pending", "idx_added" to at, "idx_due" to at), null, true)
                     val done = JSONObject(jobText).put("finishedAt", at).put("nodeId", cfg.nodeId).put("elapsedSeconds", (env.clock() - t0) / 1000)
                     api.put(ref.name, done.toString().toByteArray(), "application/json", tagsOf(ref, "done"), leaseId)
                     release(ref.name, leaseId)
@@ -301,7 +308,8 @@ class NodeRunner(
 
 class DownloadJob(val jobId: String, val url: String, val maxHeight: Int, val format: String?, val subs: Boolean) {
     /** The protocol's selector: a raw format wins, else the default capped at the height. */
-    fun selector(): String = format ?: "bv*[height<=$maxHeight][ext=mp4]+ba[ext=m4a]/b[height<=$maxHeight]/b"
+    fun selector(): String = format ?: ("bv*[height<=$maxHeight][vcodec^=av01]+ba[acodec=opus][abr<=80]/bv*[height<=$maxHeight][vcodec^=vp9]+ba[acodec=opus][abr<=80]/" +
+          "bv*[height<=$maxHeight]+ba/b[height<=$maxHeight]/b")
     companion object {
         fun parse(text: String): DownloadJob {
             val o = JSONObject(text)
@@ -311,7 +319,40 @@ class DownloadJob(val jobId: String, val url: String, val maxHeight: Int, val fo
     }
 }
 
-class DownloadedFiles(val video: File, val extras: List<Triple<String, File, String>>, val height: Int?, val durationSeconds: Double?)
+class DownloadedFiles(
+    val video: File, val extras: List<Triple<String, File, String>>, val height: Int?, val durationSeconds: Double?,
+    val vcodec: String? = null, val acodec: String? = null, val formatId: String? = null,
+    val subs: List<String> = emptyList(), val embeddable: Boolean? = null,
+    val audioLanguage: String? = null, val audioNote: String? = null, val audioTracks: List<Pair<String, String?>> = emptyList(),
+)
+
+/** What the node reads from yt-dlp's info.json. */
+object NodeInfo {
+    class Parsed(val vcodec: String?, val acodec: String?, val formatId: String?, val embeddable: Boolean?, val description: String,
+                 val manual: Set<String>, val auto: Set<String>,
+                 val audioLanguage: String?, val audioNote: String?, val audioTracks: List<Pair<String, String?>>)
+
+    fun parse(text: String): Parsed {
+        val o = JSONObject(text)
+        fun s(k: String) = if (o.isNull(k)) null else o.optString(k).ifEmpty { null }
+        fun keys(k: String): Set<String> = o.optJSONObject(k)?.keys()?.asSequence()?.toSet() ?: emptySet()
+        fun str(x: JSONObject, k: String) = if (x.isNull(k)) null else x.optString(k).ifEmpty { null }
+        fun isAudio(x: JSONObject) = str(x, "acodec").let { it != null && it != "none" } && (str(x, "vcodec") ?: "none") == "none"
+        val chosen = o.optJSONArray("requested_formats")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) }.firstOrNull { isAudio(it) } }
+        val tracks = LinkedHashMap<String, String?>()
+        o.optJSONArray("formats")?.let { a -> for (i in 0 until a.length()) { val f = a.getJSONObject(i)
+            if (isAudio(f)) str(f, "language")?.let { if (it !in tracks) tracks[it] = str(f, "format_note") } } }
+        return Parsed(s("vcodec"), s("acodec"), s("format_id"), if (o.isNull("playable_in_embed")) null else o.optBoolean("playable_in_embed"),
+            s("description") ?: "", keys("subtitles"), keys("automatic_captions"),
+            chosen?.let { str(it, "language") }, chosen?.let { str(it, "format_note") }, tracks.map { it.key to it.value })
+    }
+
+    /** A language under subtitles is uploaded; one only under automatic_captions is automatic ("<lang>.auto"). */
+    fun subName(lang: String, p: Parsed) = if (lang !in p.manual && lang in p.auto) "$lang.auto" else lang
+
+    /** Uploaded before automatic, Chinese before the rest. */
+    fun order(names: Collection<String>) = names.sortedWith(compareBy({ it.endsWith(".auto") }, { !it.startsWith("zh") }, { it }))
+}
 
 interface NodeFetcher {
     /** Downloads the job into [dir]; [progress] gets (text, title). Throws NodeFetchException. */
