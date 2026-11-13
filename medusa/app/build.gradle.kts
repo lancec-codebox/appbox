@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersion = (findProperty("versionName") as String?) ?: "1.6.3"
+val appVersion = (findProperty("versionName") as String?) ?: "1.7.0"
 val keystoreFile: String? = System.getenv("MEDUSA_KEYSTORE_FILE")
 
 android {
@@ -67,6 +67,10 @@ dependencies {
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     implementation("androidx.core:core-ktx:1.13.1")
+    // index node (1.7.0): the 15-minute periodic worker and its dataSync foreground service, and the SAS QR scanner
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
     // burned-in subtitle OCR (1.6.0): the Chinese model is bundled in the APK (also reads Latin)
@@ -75,6 +79,7 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
