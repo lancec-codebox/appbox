@@ -30,6 +30,14 @@ public class OcrSegmentTests
         Assert.Equal(serial, par);
     }
 
+    [Theory]
+    [InlineData(1, 24, 12)]
+    [InlineData(4, 24, 12)]
+    [InlineData(16, 24, 16)]
+    [InlineData(0, 2, 1)]
+    public void Ocr_takes_the_larger_of_its_share_and_half_the_cores(int share, int cores, int expected) =>
+        Assert.Equal(expected, OcrSubs.Segments(share, cores));
+
     [Fact]
     public void A_running_job_carries_startedAt_in_the_node_record()
     {

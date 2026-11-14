@@ -56,6 +56,10 @@ public static class OcrSubs
         return BandFinder.Find(boxes, h) is { } r ? (r.Y, r.Height) : null;
     }
 
+    /// <summary>OCR is the long pole: it takes max(thread share, cores/2) segments, each with <see cref="IntraThreads"/> intra-op threads, even when that is more than its share (the other steps can wait).</summary>
+    public const int IntraThreads = 2;
+    public static int Segments(int share, int cores) => Math.Max(Math.Max(1, share), Math.Max(1, cores / 2));
+
     /// <summary>The segments for the parallel read: equal parts whose boundaries are snapped to the sampling grid (multiples of 1/fps from the start), so every segment samples exactly the instants the serial read would, and the merged frames are identical to it.</summary>
     public static List<(double Start, double End)> PlanSegments(double duration, int workers, double fps = OcrCues.Fps)
     {
@@ -77,12 +81,12 @@ public static class OcrSubs
     {
         var sw = Stopwatch.StartNew();
         var ffmpeg = await tools.FfmpegAsync(ct);
-        var plan = PlanSegments(duration, workers).Select(s => (Start: start + s.Start, End: start + s.End)).ToList();
+        var plan = PlanSegments(duration, Segments(workers, Environment.ProcessorCount)).Select(s => (Start: start + s.Start, End: start + s.End)).ToList();
         var perSeg = new List<FrameText>[plan.Count];
         int frameBytes = w * bandH * 3, total = 0;
         await Task.WhenAll(plan.Select((seg, k) => Task.Run(async () =>
         {
-            using var eng = new OcrEngine(ocrDet, ocrRec, dict, 1);
+            using var eng = new OcrEngine(ocrDet, ocrRec, dict, IntraThreads);
             var list = new List<FrameText>(); perSeg[k] = list;
             var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
             foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1", "-ss", seg.Start.ToString("F3", CultureInfo.InvariantCulture), "-t", (seg.End - seg.Start).ToString("F3", CultureInfo.InvariantCulture),
