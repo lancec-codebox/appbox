@@ -82,6 +82,30 @@
         </activity>
 
         <activity
+            android:name=".NodeSetupActivity"
+            android:exported="true"
+            android:label="Medusa index node"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.Dialog.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="medusa" android:host="node-setup" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.medusa-node\\.json" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name=".ShareUrlActivity"
             android:exported="false"
             android:label="Follow in index"

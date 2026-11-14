@@ -63,6 +63,10 @@ class ImportActivity : Activity() {
         Thread {
             val r = try {
                 val bytes = contentResolver.openInputStream(u)!!.use { it.readNBytes(TrackRules.MAX_BYTES + 1) }
+                if (io.ref12.medusa.node.NodeSetup.looksLike(String(bytes, Charsets.UTF_8))) { // node settings from the desktop node, not subtitles
+                    runOnUiThread { startActivity(Intent(this, NodeSetupActivity::class.java).setAction(Intent.ACTION_VIEW).setData(u).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)); finish() }
+                    return@Thread
+                }
                 Result.success(SubtitleFiles.parse(name, String(bytes, Charsets.UTF_8)))
             } catch (e: TrackRejected) { Result.failure(e) } catch (e: Exception) { Result.failure(TrackRejected("Could not read this file: " + e.message)) }
             runOnUiThread { r.fold({ choose(name, it) }, { fail(it.message ?: "Could not read this file") }) }

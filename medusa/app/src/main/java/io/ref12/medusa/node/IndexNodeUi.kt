@@ -89,6 +89,18 @@ object IndexNodeUi {
                     .addOnFailureListener { e -> Toast.makeText(a, "Scan failed: " + Redact.sas(e.message), Toast.LENGTH_LONG).show() }
             } catch (e: Exception) { Toast.makeText(a, "No QR scanner on this device", Toast.LENGTH_LONG).show() }
         }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.button(a, "Scan setup QR") {
+            a.startActivity(android.content.Intent(a, io.ref12.medusa.NodeSetupActivity::class.java).setAction(io.ref12.medusa.NodeSetupActivity.ACTION_SCAN))
+        }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.button(a, "Import settings file") {
+            a.startActivity(android.content.Intent(a, io.ref12.medusa.NodeSetupActivity::class.java).setAction(io.ref12.medusa.NodeSetupActivity.ACTION_PICK))
+        }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.button(a, "Export settings") {
+            // the same JSON the desktop node writes, without the storage key
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(android.content.Intent.EXTRA_SUBJECT, "node.medusa-node.json").putExtra(android.content.Intent.EXTRA_TEXT, NodeSetup.export(s.current()))
+            a.startActivity(android.content.Intent.createChooser(send, "Export node settings (no storage key)"))
+        }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.button(a, "Test connection") {
             val u = s.vault.load()
             if (u == null) { Toast.makeText(a, "Save a SAS first", Toast.LENGTH_SHORT).show(); return@button }

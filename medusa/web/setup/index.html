@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>Set up Medusa</title>
+<style>
+  body { font: 17px/1.45 system-ui, sans-serif; margin: 0; padding: 20px; max-width: 30rem; margin: 0 auto; color: #1b1b1f; background: #fff; }
+  h1 { font-size: 1.4rem; margin: 8px 0 4px; }
+  p, li { margin: 8px 0; }
+  .btn { display: block; text-align: center; padding: 14px 16px; margin: 12px 0; border-radius: 12px; background: #3b5bdb; color: #fff; text-decoration: none; font-weight: 600; }
+  .btn.alt { background: #eef0fb; color: #243a9c; }
+  .step { border: 1px solid #d7d9e4; border-radius: 12px; padding: 4px 16px 8px; margin: 16px 0; }
+  .small { font-size: .88rem; color: #555; }
+  .err { color: #b00020; }
+  @media (prefers-color-scheme: dark) { body { background: #121214; color: #e8e8ee; } .step { border-color: #3a3a46; } .btn.alt { background: #23263a; color: #b9c4ff; } .small { color: #aaa; } .err { color: #ff8a80; } }
+</style>
+</head>
+<body>
+<h1>Set up Medusa</h1>
+<p id="what">Set up this phone as a download node.</p>
+
+<div id="ok" hidden>
+  <a class="btn" id="open" href="#">Open in Medusa</a>
+  <p class="small">Medusa is already installed? Tap the button above.</p>
+
+  <div class="step">
+    <p><strong>1. Install Medusa</strong> (first time only)</p>
+    <a class="btn alt" href="https://github.com/lancec-codebox/appbox/releases/download/medusa-latest/medusa.apk">Download Medusa</a>
+    <p class="small">Android will ask once to allow installs from your browser: tap Allow, then Install, and &ldquo;Install anyway&rdquo; if Play Protect asks.</p>
+    <p><strong>2. Come back and tap &ldquo;Open in Medusa&rdquo;</strong> above.</p>
+  </div>
+</div>
+
+<p id="bad" class="err" hidden>This page needs the setup link from the desktop node (it ends with <code>#d=&hellip;</code>). Scan the QR code again or open the full link.</p>
+
+<p class="small">The settings stay in this link&rsquo;s fragment: your browser never sends it to any server, and this page loads nothing from elsewhere.</p>
+<script>
+(function () {
+  var m = /(?:^#|&)d=([A-Za-z0-9_=-]+)/.exec(location.hash);
+  if (!m) { document.getElementById("bad").hidden = false; return; }
+  document.getElementById("open").href = "medusa://node-setup?d=" + m[1];
+  document.getElementById("ok").hidden = false;
+})();
+</script>
+</body>
+</html>

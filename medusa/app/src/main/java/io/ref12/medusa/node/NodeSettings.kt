@@ -50,7 +50,7 @@ enum class NodeConditions(val label: String, val wire: String) {
 }
 
 /** Settings and counters of the index node. The SAS goes only through [vault]. */
-class NodeSettings(ctx: Context) : NodeState {
+class NodeSettings(ctx: Context) : NodeState, SetupStore {
     private val prefs = ctx.getSharedPreferences("index_node", Context.MODE_PRIVATE)
     val vault = SasVault(prefs)
 
@@ -74,6 +74,18 @@ class NodeSettings(ctx: Context) : NodeState {
     override fun budgetKey() = prefs.getString("budgetKey", null)
     override fun budgetLeft() = prefs.getInt("budgetLeft", 0)
     override fun setBudget(key: String?, left: Int) { prefs.edit().putString("budgetKey", key).putInt("budgetLeft", left).apply() }
+
+    var maxHeight: Int get() = prefs.getInt("maxHeight", 480); set(v) { prefs.edit().putInt("maxHeight", v.coerceIn(144, 4320)).apply() }
+
+    override fun current() = SetupCurrent(name, conditions.wire, dailyCap, budget, schedule, window, maxHeight, vault.has())
+    override fun putSas(sas: String) = vault.save(sas)
+    override fun putName(v: String) { name = v }
+    override fun putConditions(wire: String) { NodeConditions.values().firstOrNull { it.wire == wire }?.let { conditions = it } }
+    override fun putDailyCap(v: Int) { dailyCap = v }
+    override fun putBudget(v: Int) { budget = v }
+    override fun putSchedule(v: String) { schedule = v }
+    override fun putWindow(v: String) { window = v }
+    override fun putMaxHeight(v: Int) { maxHeight = v }
 
     /** Fixed for the install: the name at first use plus 6 random hex characters. */
     val nodeId: String get() = prefs.getString("nodeId", null) ?: run {

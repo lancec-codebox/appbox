@@ -5,6 +5,7 @@ on:
     branches: ["**"]
     paths: ["medusa/**", ".github/workflows/medusa.yml"]
     tags: ["medusa-v*"]
+  workflow_dispatch:
   pull_request:
     paths: ["medusa/**", ".github/workflows/medusa.yml"]
 
@@ -100,3 +101,43 @@ jobs:
           scripts/make-release-assets.sh "$APK"
           gh release create "$GITHUB_REF_NAME" "$APK" "$APK.sha256" \
             --title "Medusa $VERSION" --generate-notes
+      - name: Update the stable install link (medusa-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#medusa-v}"
+          APK="app/build/outputs/apk/release/medusa-$VERSION.apk"
+          # a fixed release with a fixed asset name: .../releases/download/medusa-latest/medusa.apk
+          # never "latest" (make_latest false), so IndexNode releases and this one never fight over the Latest badge
+          cp "$APK" "$RUNNER_TEMP/medusa.apk"
+          NOTES="Stable install link for the newest Medusa ($VERSION). Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME"
+          if gh release view medusa-latest >/dev/null 2>&1; then
+            gh release edit medusa-latest --title "Medusa (latest: $VERSION)" --notes "$NOTES" --prerelease=false --latest=false
+          else
+            gh release create medusa-latest --target "$GITHUB_SHA" --title "Medusa (latest: $VERSION)" --notes "$NOTES" --latest=false
+          fi
+          gh release upload medusa-latest "$RUNNER_TEMP/medusa.apk" --clobber
+
+  pages:
+    # The https setup page (medusa/web/setup). Needs Pages enabled on the repo with source "GitHub Actions".
+    if: startsWith(github.ref, 'refs/tags/medusa-v') || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: medusa/web
+      - id: deployment
+        uses: actions/deploy-pages@v4
