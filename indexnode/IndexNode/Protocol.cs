@@ -32,7 +32,8 @@ public static partial class Protocol
     /// <summary>"process" means the legacy stage and all step stages.</summary>
     public static string[] ExpandStages(IEnumerable<string> stages) =>
         stages.SelectMany(s => s == "process" ? new[] { "process" }.Concat(StepStages) : [s]).Distinct().ToArray();
-    public static readonly string[] DefaultSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs"];
+    // owner 2026-11-14: search vectors (clip) dropped from the default pipeline (weak matches; screenshot search is SSCD). The step still runs when asked for explicitly.
+    public static readonly string[] DefaultSteps = ["frames", "sscd", "transcribe", "ocrsubs"];
     public const int LeaseSeconds = 60;
     public const int MaxAttempts = 3;
 
