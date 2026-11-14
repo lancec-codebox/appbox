@@ -6,8 +6,19 @@ public enum FailureKind { None, Permanent, BotBlock, Transient }
 
 public static class YtDlp
 {
+    /// <summary>The -f expression: a job's explicit format wins, else the protocol's default.</summary>
     public static string Selector(int maxHeight, string? format) =>
-        !string.IsNullOrWhiteSpace(format) ? format : $"bv*[height<={maxHeight}][ext=mp4]+ba[ext=m4a]/b[height<={maxHeight}]/b";
+        !string.IsNullOrWhiteSpace(format) ? format : DefaultSelector;
+
+    /// <summary>
+    /// The protocol's rule: resolution first, then codec. <c>-S res:H</c> sorts by resolution closest to (and not above) H, then yt-dlp's
+    /// default order (codec: AV1, VP9, H.264...), so 480p VP9 beats 240p AV1; audio is compact Opus when there is one.
+    /// </summary>
+    public const string DefaultSelector = "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b";
+
+    /// <summary>The format arguments for yt-dlp: <c>-S res:H -f ...</c>, or just <c>-f format</c> when the job sets one.</summary>
+    public static string[] FormatArgs(int maxHeight, string? format) =>
+        !string.IsNullOrWhiteSpace(format) ? ["-f", format] : ["-S", $"res:{maxHeight}", "-f", DefaultSelector];
 
     private static readonly Regex[] Bot =
     [

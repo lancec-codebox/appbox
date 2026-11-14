@@ -55,6 +55,13 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
         return list.OrderBy(x => Rank(x.Name)).ThenBy(x => x.Name, StringComparer.Ordinal).ToList();
     }
 
+    /// <summary>One YouTube subtitle file through <see cref="CueShaper"/>; automatic captions are rolling, so they are deduped first.</summary>
+    public static (string Vtt, ShapeStats Stats) ShapeSubs(string vtt, bool auto)
+    {
+        var cues = CueShaper.Shape(CueShaper.ParseVtt(vtt), null, rolling: auto);
+        return (CueShaper.ToVtt(cues), CueShaper.Stats(cues));
+    }
+
     public async Task RunAsync(JobContext ctx)
     {
         var ct = ctx.Token;
@@ -80,12 +87,12 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             if (!string.IsNullOrEmpty(cookies)) { common.Add("--cookies"); common.Add(cookies); }
 
             ctx.Report("download", "starting");
-            var main = new List<string>(common)
-            {
-                "-f", YtDlp.Selector(job.MaxHeight ?? 480, job.Format), "--merge-output-format", "mp4",
-                "--write-info-json", "--write-thumbnail", "--convert-thumbnails", "jpg",
+            var main = new List<string>(common);
+            main.AddRange(YtDlp.FormatArgs(job.MaxHeight ?? 480, job.Format));
+            main.AddRange(new[] {
+                "--merge-output-format", "mp4", "--write-info-json", "--write-thumbnail", "--convert-thumbnails", "jpg",
                 "-o", Path.Combine(work, "video.%(ext)s"), job.Url,
-            };
+            });
             var r = await tools.RunYtDlpAsync(main, ct, onStdout: line =>
             {
                 var m = Regex.Match(line, @"\[download\]\s+(\d+(\.\d+)?)%");
@@ -122,12 +129,14 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             if (!File.Exists(videoFile)) throw new InvalidOperationException("yt-dlp finished but video.mp4 was not produced");
             var infoFile = Path.Combine(work, "video.info.json");
             int height = 0; double duration = 0;
+            DownloadedFormats? fmt = null;
             var descriptionFile = Path.Combine(work, "description.txt");
             if (File.Exists(infoFile))
             {
                 var node = JsonNode.Parse(File.ReadAllText(infoFile))!.AsObject();
                 File.WriteAllText(descriptionFile, (string?)node["description"] ?? "");
                 node.Remove("comments");
+                fmt = DownloadedFormats.FromInfo(node); // before the size trim below drops "formats"
                 File.WriteAllText(infoFile, node.ToJsonString());
                 height = (int?)node["height"] ?? 0; duration = (double?)node["duration"] ?? 0;
                 if (new FileInfo(infoFile).Length > 1_500_000)
@@ -149,9 +158,20 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             if (File.Exists(descriptionFile)) await store.PutFileAsync(paths.Video(id, "description.txt"), descriptionFile, "text/plain; charset=utf-8", null, ct);
             var subFiles = CollectSubs(manualDir, autoDir);
             foreach (var (local, name) in subFiles)
-                await store.PutFileAsync(paths.Video(id, $"subs/{name}.vtt"), local, "text/vtt", null, ct);
+            {
+                var (vtt, stats) = ShapeSubs(await File.ReadAllTextAsync(local, ct), name.EndsWith(".auto", StringComparison.Ordinal));
+                await store.PutAsync(paths.Video(id, $"subs/{name}.vtt"), System.Text.Encoding.UTF8.GetBytes(vtt), null, null, false, ct, "text/vtt");
+                await store.PutAsync(paths.Video(id, $"subs/{name}.json"), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, shape = stats.ToJson() }), null, null, false, ct);
+            }
 
-            var marker = JsonSerializer.SerializeToUtf8Bytes(new { v = 1, bytes, height, durationSeconds = Math.Round(duration, 2), subs = subFiles.Select(s => s.Name).ToArray(), nodeId = ctx.NodeId, at = Protocol.NowUtc() });
+            var marker = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                v = 1, bytes, height, durationSeconds = Math.Round(duration, 2),
+                vcodec = fmt?.VCodec, acodec = fmt?.ACodec, formatId = fmt?.FormatId,
+                audioLanguage = fmt?.AudioLanguage, audioNote = fmt?.AudioNote,
+                audioTracks = (fmt?.AudioTracks ?? []).Select(t => new { language = t.Language, note = t.Note }).ToArray(),
+                subs = subFiles.Select(s => s.Name).ToArray(), embeddable = fmt?.Embeddable ?? false, nodeId = ctx.NodeId, at = Protocol.NowUtc(),
+            });
             await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);
             await EnsureFollowUpJobs(ctx);
         }

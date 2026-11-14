@@ -165,7 +165,7 @@ public class CommentsTests
         var s = new FakeStore();
         await s.AddJob(P, "process", "vid", Ago(10));
         var job = s.Job(P.Job("process", "vid"));
-        job.Steps = ["frames", "sscd", "transcribe", "compress"];
+        job.Steps = ["frames", "sscd", "faces", "compress"];
         await s.PutAsync(P.Job("process", "vid"), job.ToBytes(), Tags.Job("process", "pending", job.AddedAt), null, false, default);
         var stage = new ProcessStage(new Tools(new HttpClient()), null!, new NodeConfig(), new HttpClient());
         await Engine(s, "process", stage.RunAsync).RunAsync(default);
@@ -214,10 +214,10 @@ public class CommentsTests
             case "$mode" in
               main)
                 printf VIDEO > "${base}mp4"; printf JPG > "${base}jpg"
-                echo '{"id":"x","description":"line one\nline two","height":480,"duration":12.5,"comments":[{"id":"zz"}]}' > "${base}info.json";;
+                echo '{"id":"x","description":"line one\nline two","height":480,"duration":12.5,"playable_in_embed":true,"format_id":"398+251-0","vcodec":"av01.0.04M.08","acodec":"opus","requested_formats":[{"vcodec":"av01.0.04M.08","acodec":"none"},{"vcodec":"none","acodec":"opus","language":"zh-Hans","format_note":"Chinese, original (default), low"}],"formats":[{"vcodec":"none","acodec":"opus","language":"zh-Hans","format_note":"Chinese, original (default), low"},{"vcodec":"none","acodec":"opus","language":"en-US","format_note":"English (US), dubbed-auto, low"}],"comments":[{"id":"zz"}]}' > "${base}info.json";;
               subs|auto)
                 if [[ "$url" == *nosubs* ]]; then echo "ERROR: There are no subtitles" >&2; exit 1; fi
-                printf "WEBVTT $mode en" > "${base}en.vtt"; printf "WEBVTT $mode zh" > "${base}zh-Hans.vtt";;
+                printf "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n$mode en\n" > "${base}en.vtt"; printf "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n$mode zh\n" > "${base}zh-Hans.vtt";;
               comments)
                 if [[ "$ea" == *comment_sort=new* ]]; then
                   echo '{"comment_count":42,"comments":[{"id":"c2","parent":"c1","author":"B","author_id":"UCb","text":"reply","like_count":1,"timestamp":1700000100,"is_pinned":false,"author_is_uploader":true},{"id":"c3","parent":"root","author":"C","author_id":"UCc","text":"new","like_count":0,"timestamp":1700000200,"is_pinned":false,"author_is_uploader":false}]}' > "${base}info.json"
@@ -261,6 +261,12 @@ public class CommentsTests
         Assert.Equal(new[] { "en", "zh-Hans", "en.auto", "zh-Hans.auto" }.OrderBy(x => x), marker.GetProperty("subs").EnumerateArray().Select(x => x.GetString()!).OrderBy(x => x));
         Assert.Equal(480, marker.GetProperty("height").GetInt32());
         Assert.Equal(12.5, marker.GetProperty("durationSeconds").GetDouble());
+        Assert.Equal(("av01.0.04M.08", "opus", "398+251-0", "zh-Hans", "Chinese, original (default)"),
+            (marker.GetProperty("vcodec").GetString(), marker.GetProperty("acodec").GetString(), marker.GetProperty("formatId").GetString(), marker.GetProperty("audioLanguage").GetString(), marker.GetProperty("audioNote").GetString()));
+        Assert.Equal(["zh-Hans", "en-US"], marker.GetProperty("audioTracks").EnumerateArray().Select(t => t.GetProperty("language").GetString()!));
+        Assert.True(marker.GetProperty("embeddable").GetBoolean());
+        Assert.Equal(["frames", "sscd", "clip", "transcribe", "ocrsubs"], s.Job(P.Job("process", id)).Steps);
+        Assert.Null(s.Job(P.Job("process", id)).Compress);
 
         var cn = P.Job("comments", id);
         Assert.Equal("pending", s.State(cn));

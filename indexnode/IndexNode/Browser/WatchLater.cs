@@ -1,58 +1,31 @@
-﻿using System.Text.Json;
+﻿using System.Collections.Concurrent;
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace IndexNode;
 
 public enum SourceState { Ok, SignedOut }
 
-/// <summary>Reads the owner's Watch Later list through the dedicated browser profile. Cookie values are never read.</summary>
-public static partial class WatchLater
+/// <summary>One cookie as the browser reports it (Storage.getCookies). The value is a secret: never log it.</summary>
+public sealed record BrowserCookie(string Name, string Value, string Domain, string Path, double Expires, bool HttpOnly, bool Secure);
+
+public sealed record SeedVideo(string Id, string? Title, string? ChannelId, string? ChannelName);
+public sealed record SeedChannel(string ChannelId, string? Name, int Count);
+
+/// <summary>
+/// Watch Later is only a source of seeds (channels worth following); it never creates download jobs. The browser connection is used
+/// only to get the cookies of the dedicated profile; yt-dlp reads the playlist with them from a private, short-lived cookie file.
+/// </summary>
+public static class WatchLater
 {
     public const string ListUrl = "https://www.youtube.com/playlist?list=WL";
     public const string LibraryUrl = "https://www.youtube.com/feed/library";
-
     public const string SignedInExpression = "(function(){ try { return !!(window.ytcfg && ytcfg.get && ytcfg.get('LOGGED_IN') === true); } catch (e) { return false; } })()";
-    public const string InitialDataExpression = "JSON.stringify(window.ytInitialData || null)";
-    // scrolls to the bottom, gives the next continuation 1.5 s to load, and returns the watch links rendered so far
-    public const string ScrollExpression = "(async function(){ window.scrollTo(0, document.documentElement.scrollHeight); await new Promise(r => setTimeout(r, 1500)); return JSON.stringify(Array.from(document.querySelectorAll('ytd-playlist-video-renderer a[href*=\"/watch?v=\"]')).map(a => a.href)); })()";
+    public const string SignedOutMessage = "Watch Later: profile not signed in, run `indexnode browser login`";
 
-    [GeneratedRegex(@"^[A-Za-z0-9_-]{11}$")] private static partial Regex IdRegex();
-    [GeneratedRegex(@"[?&]v=([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")] private static partial Regex HrefRegex();
-
-    public static string? IdFromHref(string href) => HrefRegex().Match(href) is { Success: true } m ? m.Groups[1].Value : null;
-
-    /// <summary>
-    /// Video ids, in order and without duplicates, from ytInitialData or a continuation response: every playlistVideoRenderer
-    /// (and, in the newer layout, video lockupViewModel) anywhere in the tree. continuationItemRenderer entries are ignored.
-    /// </summary>
-    public static List<string> ParseIds(string json)
-    {
-        var ids = new List<string>(); var seen = new HashSet<string>();
-        if (string.IsNullOrWhiteSpace(json) || json == "null") return ids;
-        using var doc = JsonDocument.Parse(json);
-        void Add(string? id) { if (id != null && IdRegex().IsMatch(id) && seen.Add(id)) ids.Add(id); }
-        void Walk(JsonElement e)
-        {
-            switch (e.ValueKind)
-            {
-                case JsonValueKind.Object:
-                    foreach (var p in e.EnumerateObject())
-                    {
-                        if (p.Name == "playlistVideoRenderer" && p.Value.ValueKind == JsonValueKind.Object && p.Value.TryGetProperty("videoId", out var v)) Add(v.GetString());
-                        else if (p.Name == "lockupViewModel" && p.Value.ValueKind == JsonValueKind.Object && p.Value.TryGetProperty("contentId", out var cid)
-                            && p.Value.TryGetProperty("contentType", out var ct) && (ct.GetString() ?? "").Contains("VIDEO")) Add(cid.GetString());
-                        Walk(p.Value);
-                    }
-                    break;
-                case JsonValueKind.Array:
-                    foreach (var x in e.EnumerateArray()) Walk(x);
-                    break;
-            }
-        }
-        Walk(doc.RootElement);
-        return ids;
-    }
-
+    /// <summary>`browser status`: asks the library page whether YouTube considers the profile signed in.</summary>
     public static async Task<bool> IsSignedInAsync(IPage page, CancellationToken ct)
     {
         await page.NavigateAsync(LibraryUrl, ct);
@@ -60,66 +33,122 @@ public static partial class WatchLater
         return v.ValueKind == JsonValueKind.True;
     }
 
-    /// <summary>The first page comes from ytInitialData; then the page is scrolled until three rounds in a row bring no new id.</summary>
-    public static async Task<List<string>> ReadIdsAsync(IPage page, CancellationToken ct, int maxRounds = 500, int quietRounds = 3)
+    private static bool IsGoogleDomain(string d) => d.TrimStart('.').EndsWith("youtube.com", StringComparison.OrdinalIgnoreCase) || d.TrimStart('.').EndsWith("google.com", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The cookies yt-dlp needs for YouTube (youtube.com and google.com only).</summary>
+    public static List<BrowserCookie> ForYouTube(IEnumerable<BrowserCookie> all) => all.Where(c => IsGoogleDomain(c.Domain)).ToList();
+
+    /// <summary>A signed-in profile has Google's session cookies; no navigation needed.</summary>
+    public static bool LooksSignedIn(IEnumerable<BrowserCookie> cookies) =>
+        cookies.Any(c => IsGoogleDomain(c.Domain) && c.Name is "SAPISID" or "__Secure-3PSID" or "__Secure-1PSID" or "SID" && c.Value.Length > 0);
+
+    /// <summary>Netscape cookie-file text for yt-dlp (<c>#HttpOnly_</c> prefix for HttpOnly cookies; 0 expiry for session cookies).</summary>
+    public static string ToNetscape(IEnumerable<BrowserCookie> cookies)
     {
-        await page.NavigateAsync(ListUrl, ct);
-        var ids = new List<string>(); var seen = new HashSet<string>();
-        void Merge(IEnumerable<string> more) { foreach (var i in more) if (seen.Add(i)) ids.Add(i); }
-        var init = await page.EvaluateAsync(InitialDataExpression, ct);
-        if (init.ValueKind == JsonValueKind.String) Merge(ParseIds(init.GetString()!));
-        int quiet = 0;
-        for (int round = 0; round < maxRounds && quiet < quietRounds; round++)
+        var sb = new StringBuilder("# Netscape HTTP Cookie File\n");
+        foreach (var c in cookies)
         {
-            ct.ThrowIfCancellationRequested();
-            var before = ids.Count;
-            var links = await page.EvaluateAsync(ScrollExpression, ct);
-            if (links.ValueKind == JsonValueKind.String)
-                using (var doc = JsonDocument.Parse(links.GetString()!))
-                    Merge(doc.RootElement.EnumerateArray().Select(h => IdFromHref(h.GetString() ?? "")).Where(i => i != null).Select(i => i!).ToList());
-            quiet = ids.Count == before ? quiet + 1 : 0;
+            if (c.Name.AsSpan().IndexOfAny('\t', '\n', '\r') >= 0 || c.Value.AsSpan().IndexOfAny('\t', '\n', '\r') >= 0) continue;
+            var expires = c.Expires > 0 ? ((long)c.Expires).ToString(CultureInfo.InvariantCulture) : "0";
+            sb.Append(c.HttpOnly ? "#HttpOnly_" : "").Append(c.Domain).Append('\t')
+              .Append(c.Domain.StartsWith('.') ? "TRUE" : "FALSE").Append('\t')
+              .Append(string.IsNullOrEmpty(c.Path) ? "/" : c.Path).Append('\t')
+              .Append(c.Secure ? "TRUE" : "FALSE").Append('\t').Append(expires).Append('\t')
+              .Append(c.Name).Append('\t').Append(c.Value).Append('\n');
         }
-        return ids;
+        return sb.ToString();
     }
 
-    public sealed record Counts(int Found, int New, int Existing);
-
-    /// <summary>Adds a download job for every id that has no job yet (in any state).</summary>
-    public static async Task<Counts> EnqueueAsync(IStore store, Paths paths, IEnumerable<string> ids, int maxHeight, CancellationToken ct)
+    /// <summary>Videos from yt-dlp's --flat-playlist -J output; entries without an id are dropped, duplicates kept once.</summary>
+    public static List<SeedVideo> ParsePlaylist(string json)
     {
-        int found = 0, added = 0;
-        foreach (var id in ids.Distinct())
+        var list = new List<SeedVideo>(); var seen = new HashSet<string>();
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array) return list;
+        static string? S(JsonElement e, string n) => e.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String && v.GetString() is { Length: > 0 } s ? s : null;
+        foreach (var e in entries.EnumerateArray())
         {
-            found++;
-            var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id, maxHeight, null);
-            if (await store.PutAsync(paths.Job("download", job.JobId), job.ToBytes(), Tags.Job("download", "pending", job.AddedAt), null, true, ct)) added++;
+            if (e.ValueKind != JsonValueKind.Object || S(e, "id") is not { } id || !seen.Add(id)) continue;
+            list.Add(new SeedVideo(id, S(e, "title"), S(e, "channel_id") ?? S(e, "uploader_id"), S(e, "channel") ?? S(e, "uploader")));
         }
-        return new Counts(found, added, found - added);
+        return list;
     }
 
-    /// <summary>One poll of the source: signed-out profiles are skipped (the caller logs the hint).</summary>
-    public static async Task<(SourceState State, Counts? Counts)> PollAsync(BrowserConfig cfg, HttpClient http, IStore store, Paths paths, int maxHeight, CancellationToken ct)
+    /// <summary>Channels with the number of seed videos, most videos first (then by name, so the order is stable).</summary>
+    public static List<SeedChannel> CountChannels(IEnumerable<SeedVideo> videos) =>
+        videos.Where(v => v.ChannelId != null).GroupBy(v => v.ChannelId!)
+            .Select(g => new SeedChannel(g.Key, g.Select(v => v.ChannelName).FirstOrDefault(n => n != null), g.Count()))
+            .OrderByDescending(c => c.Count).ThenBy(c => c.Name, StringComparer.Ordinal).ThenBy(c => c.ChannelId, StringComparer.Ordinal).ToList();
+
+    public sealed record SeedResult(SourceState State, int Videos, int Channels);
+
+    private static readonly Regex SignInHint = new(@"(?i)sign in|log ?in|cookies.*(no longer valid|expired)|playlist does not exist|private|This playlist type is unviewable");
+
+    /// <summary>
+    /// Gets the cookies, writes them to a Netscape file in a private temp folder, runs yt-dlp on the playlist, deletes the file in a
+    /// finally, and stores the two seed files. Nothing is enqueued.
+    /// </summary>
+    public static async Task<SeedResult> WriteSeedsAsync(IStore store, Paths paths, Func<CancellationToken, Task<IReadOnlyList<BrowserCookie>>> getCookies,
+        Func<IReadOnlyList<string>, CancellationToken, Task<ProcResult>> ytdlp, DateTimeOffset now, CancellationToken ct)
     {
-        await using var browser = await CdpBrowser.OpenAsync(cfg, http, ct);
-        var page = await browser.NewPageAsync(ct);
+        var cookies = ForYouTube(await getCookies(ct));
+        if (!LooksSignedIn(cookies)) return new SeedResult(SourceState.SignedOut, 0, 0);
+        foreach (var c in cookies) Redact.Register(c.Value);
+        string? dir = null;
         try
         {
-            if (!await IsSignedInAsync(page, ct)) return (SourceState.SignedOut, null);
-            var ids = await ReadIdsAsync(page, ct);
-            await page.CloseAsync();
-            return (SourceState.Ok, await EnqueueAsync(store, paths, ids, maxHeight, ct));
+            dir = PrivateTempDir();
+            var file = Path.Combine(dir, "cookies.txt");
+            WritePrivate(file, ToNetscape(cookies));
+            var r = await ytdlp(["--flat-playlist", "-J", "--no-warnings", "--cookies", file, ListUrl], ct);
+            if (r.ExitCode != 0)
+            {
+                if (SignInHint.IsMatch(r.Stderr)) return new SeedResult(SourceState.SignedOut, 0, 0);
+                YtDlp.Throw(r.Stderr);
+            }
+            var videos = ParsePlaylist(r.Stdout);
+            var channels = CountChannels(videos);
+            var day = now.UtcDateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+            var at = Protocol.Utc(now);
+            await store.PutAsync(paths.Seed($"watch-later-{day}.json"), JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                v = 1, at, count = videos.Count,
+                videos = videos.Select(v => new { id = v.Id, title = v.Title, channelId = v.ChannelId, channelName = v.ChannelName }),
+            }), null, null, false, ct, "application/json");
+            await store.PutAsync(paths.Seed($"channels-{day}.json"), JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                v = 1, at, count = channels.Count,
+                channels = channels.Select(c => new { channelId = c.ChannelId, name = c.Name, count = c.Count }),
+            }), null, null, false, ct, "application/json");
+            return new SeedResult(SourceState.Ok, videos.Count, channels.Count);
         }
-        finally { await page.CloseAsync(); }
+        finally
+        {
+            if (dir != null) { try { Directory.Delete(dir, true); } catch { } }
+            Redact.ClearKnown();
+        }
     }
 
-    public const string SignedOutMessage = "Watch Later: profile not signed in, run `indexnode browser login`";
-
-    /// <summary>"6h", "30m", "1d", "90s".</summary>
-    public static TimeSpan ParseInterval(string s)
+    private static string PrivateTempDir()
     {
-        var m = Regex.Match(s.Trim(), @"^(\d+)\s*([smhd])$", RegexOptions.IgnoreCase);
-        if (!m.Success) throw new ArgumentException($"bad interval '{s}' (use e.g. 6h, 30m, 1d)");
-        var n = int.Parse(m.Groups[1].Value);
-        return char.ToLowerInvariant(m.Groups[2].Value[0]) switch { 's' => TimeSpan.FromSeconds(n), 'm' => TimeSpan.FromMinutes(n), 'h' => TimeSpan.FromHours(n), _ => TimeSpan.FromDays(n) };
+        var dir = Directory.CreateTempSubdirectory("indexnode-cookies-");
+        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(dir.FullName, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return dir.FullName;
+    }
+
+    private static void WritePrivate(string path, string text)
+    {
+        var o = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows()) o.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        using var fs = new FileStream(path, o);
+        fs.Write(new UTF8Encoding(false).GetBytes(text));
+    }
+
+    /// <summary>The real thing: cookies from the dedicated profile over CDP, yt-dlp through the tools.</summary>
+    public static async Task<SeedResult> RunAsync(BrowserConfig cfg, HttpClient http, Tools tools, IStore store, Paths paths, CancellationToken ct)
+    {
+        return await WriteSeedsAsync(store, paths,
+            async t => { await using var b = await CdpBrowser.OpenAsync(cfg, http, t); return await b.GetCookiesAsync(t); },
+            (args, t) => tools.RunYtDlpAsync(args, t), DateTimeOffset.UtcNow, ct);
     }
 }

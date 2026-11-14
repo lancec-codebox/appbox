@@ -211,6 +211,22 @@ public sealed class CdpBrowser : IAsyncDisposable
         catch { if (proc != null) Proc.Kill(proc); throw; }
     }
 
+    /// <summary>All cookies of the browser profile (Storage.getCookies). The values are secrets.</summary>
+    public async Task<IReadOnlyList<BrowserCookie>> GetCookiesAsync(CancellationToken ct)
+    {
+        var r = await conn.SendAsync("Storage.getCookies", null, null, ct);
+        var list = new List<BrowserCookie>();
+        if (!r.TryGetProperty("cookies", out var arr)) return list;
+        foreach (var c in arr.EnumerateArray())
+        {
+            string S(string n) => c.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+            bool B(string n) => c.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.True;
+            double expires = c.TryGetProperty("expires", out var e) && e.ValueKind == JsonValueKind.Number ? e.GetDouble() : -1;
+            list.Add(new BrowserCookie(S("name"), S("value"), S("domain"), S("path"), expires, B("httpOnly"), B("secure")));
+        }
+        return list;
+    }
+
     public async Task<CdpPage> NewPageAsync(CancellationToken ct, string url = "about:blank")
     {
         var created = await conn.SendAsync("Target.createTarget", new { url }, null, ct);

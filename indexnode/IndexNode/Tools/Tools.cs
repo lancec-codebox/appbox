@@ -8,6 +8,45 @@ namespace IndexNode;
 public sealed class Tools(HttpClient http, NodeConfig? config = null)
 {
     public const string YtDlpVersion = "2026.10.26";
+
+    /// <summary>The pinned ffmpeg build (BtbN autobuild of the n9.0 branch, GPL, with libsvtav1): one asset per platform, with its sha256.</summary>
+    public const string FfmpegVersion = "n9.0.2-57-gd838f9f9ae";
+    public sealed record FfmpegAsset(string Url, string Sha256, bool Zip);
+    private const string FfmpegBase = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-13-12-43/ffmpeg-n9.0.2-57-gd838f9f9ae-";
+
+    public static FfmpegAsset FfmpegFor(bool windows, bool arm) => windows
+        ? new(FfmpegBase + "win64-gpl-9.0.zip", "ae2b8d3f88cf9a1dd22d4e29a27d933dc51abff28a39172b8282488a3030b3e3", true)
+        : arm ? new(FfmpegBase + "linuxarm64-gpl-9.0.tar.xz", "ad525931f3a90c185c41fe6c978db125324658f12773e7c547f25911b8ce2786", false)
+              : new(FfmpegBase + "linux64-gpl-9.0.tar.xz", "01f1a5a6721de2d4e2e49dbadf6eb30bb750934429f685f6f5a389168ac27e23", false);
+
+    /// <summary>Set by tests: replaces the yt-dlp process (same arguments as the real run, after the JS-runtime flags).</summary>
+    public Func<IReadOnlyList<string>, CancellationToken, Action<string>?, Task<ProcResult>>? YtDlpOverride { get; set; }
+
+    /// <summary>
+    /// yt-dlp needs a JavaScript runtime for YouTube. The config's ytdlp.jsRuntime wins ("node", "deno:/path/to/deno", ...);
+    /// otherwise node on PATH, else deno. Null when none is available.
+    /// </summary>
+    public static string? ChooseJsRuntime(string? configured, Func<string, string?> onPath)
+    {
+        if (!string.IsNullOrWhiteSpace(configured)) return configured.Trim().Equals("none", StringComparison.OrdinalIgnoreCase) ? null : configured.Trim();
+        if (onPath("node") is { } n) return "node:" + n;
+        if (onPath("deno") is { } d) return "deno:" + d;
+        return null;
+    }
+
+    public string? JsRuntime => ChooseJsRuntime(config?.Ytdlp?.JsRuntime, OnPath);
+
+    /// <summary>One line per tool for `indexnode tools status`.</summary>
+    public IReadOnlyList<string> Status()
+    {
+        var lines = new List<string>();
+        var cmd = config?.Ytdlp?.Command;
+        lines.Add("yt-dlp:     " + (cmd is { Length: > 0 } ? string.Join(' ', cmd) + " (configured)" : OnPath("yt-dlp") ?? InTools("yt-dlp") ?? "not installed (downloaded on first use)") + $"  [pinned {YtDlpVersion}]");
+        lines.Add("js runtime: " + (JsRuntime is { } js ? js + (string.IsNullOrWhiteSpace(config?.Ytdlp?.JsRuntime) ? " (found on PATH)" : " (configured)") : "NONE: YouTube downloads need node or deno on PATH, or: indexnode config set ytdlp.js-runtime node:/path/to/node"));
+        lines.Add("ffmpeg:      " + (OnPath("ffmpeg") ?? InTools("ffmpeg") ?? $"not installed (indexnode tools install --ffmpeg fetches the pinned build {FfmpegVersion})"));
+        lines.Add("ffprobe:     " + (OnPath("ffprobe") ?? InTools("ffprobe") ?? "not installed"));
+        return lines;
+    }
     private string? ytdlp, ffmpeg, ffprobe;
     private readonly SemaphoreSlim gate = new(1, 1);
 
@@ -33,7 +72,9 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
     /// <summary>Runs yt-dlp through the launcher; a start failure that looks like a policy block says so and names the fix.</summary>
     public async Task<ProcResult> RunYtDlpAsync(IEnumerable<string> args, CancellationToken ct, Action<string>? onStdout = null)
     {
-        var (file, full) = YtDlpLauncher.Compose(await YtDlpCommandAsync(ct), args);
+        var withJs = JsRuntime is { } js ? ["--js-runtimes", js, ..args] : args.ToArray();
+        if (YtDlpOverride != null) return await YtDlpOverride(withJs, ct, onStdout);
+        var (file, full) = YtDlpLauncher.Compose(await YtDlpCommandAsync(ct), withJs);
         ProcResult r;
         try { r = await Proc.RunAsync(file, full, ct, onStdout); }
         catch (System.ComponentModel.Win32Exception e) when (YtDlpLauncher.LooksBlocked(e.Message, e.NativeErrorCode)) { throw new InvalidOperationException(BlockedHint + " [" + e.Message + "]"); }
@@ -80,10 +121,11 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         finally { gate.Release(); }
     }
 
-    private async Task Download(string url, string dest, CancellationToken ct)
+    private async Task Download(string url, string dest, CancellationToken ct, string? sha256 = null)
     {
         Log.Info($"tools: downloading {url}");
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+        if (sha256 != null) { await Fetch.VerifiedAsync(http, url, dest, sha256, ct); return; }
         using var r = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
         r.EnsureSuccessStatusCode();
         await using var fs = File.Create(dest);
@@ -100,8 +142,11 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         return dest;
     }
 
+    public Task InstallFfmpegPinnedAsync(CancellationToken ct) => InstallFfmpegAsync(ct);
+
     private async Task InstallFfmpegAsync(CancellationToken ct)
     {
+        var asset = FfmpegFor(OperatingSystem.IsWindows(), RuntimeInformation.OSArchitecture == Architecture.Arm64);
         var tools = NodeConfig.ToolsDir();
         Directory.CreateDirectory(tools);
         var tmp = Path.Combine(tools, "dl");
@@ -109,7 +154,7 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         if (OperatingSystem.IsWindows())
         {
             var zip = Path.Combine(tmp, "ffmpeg.zip");
-            await Download("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip", zip, ct);
+            await Download(asset.Url, zip, ct, asset.Sha256);
             using var za = ZipFile.OpenRead(zip);
             foreach (var e in za.Entries.Where(e => e.FullName.EndsWith("/bin/ffmpeg.exe") || e.FullName.EndsWith("/bin/ffprobe.exe")))
                 e.ExtractToFile(Path.Combine(tools, e.Name), true);
@@ -119,7 +164,7 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
             var arm = RuntimeInformation.OSArchitecture == Architecture.Arm64;
             var archive = Path.Combine(tmp, "ffmpeg.tar.xz");
             // BtbN's Linux build, because the johnvansickle static builds have no libsvtav1
-            await Download($"https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-{(arm ? "linuxarm64" : "linux64")}-gpl.tar.xz", archive, ct);
+            await Download(asset.Url, archive, ct, asset.Sha256);
             var r = await Proc.RunAsync("tar", ["-xJf", archive, "-C", tmp, "--wildcards", "*/bin/ffmpeg", "*/bin/ffprobe"], ct);
             if (r.ExitCode != 0) throw new InvalidOperationException("could not unpack ffmpeg: " + r.Stderr);
             foreach (var f in Directory.GetFiles(tmp, "ff*", SearchOption.AllDirectories).Where(f => Path.GetFileName(f) is "ffmpeg" or "ffprobe"))

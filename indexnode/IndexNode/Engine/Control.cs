@@ -44,11 +44,11 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         if (stage == null)
         {
             cur.Mode = level;
-            cur.Stages = new() { ["download"] = "run", ["process"] = "run" }; // a global setting replaces per-stage overrides
+            cur.Stages = new() { ["download"] = "run", ["process"] = "run", ["watch"] = "run" }; // a global setting replaces per-stage overrides
         }
         else
         {
-            cur.Stages ??= new() { ["download"] = "run", ["process"] = "run" };
+            cur.Stages ??= new() { ["download"] = "run", ["process"] = "run", ["watch"] = "run" };
             cur.Stages[stage] = level;
         }
         if (message != null) cur.Message = message;

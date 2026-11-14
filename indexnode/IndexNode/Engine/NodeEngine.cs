@@ -49,6 +49,12 @@ public sealed class EngineOptions
     public TimeSpan BotBackoff { get; init; } = TimeSpan.FromHours(1);
     public Func<int, TimeSpan> TransientBackoff { get; init; } = attempts => TimeSpan.FromMinutes(Math.Pow(2, attempts));
     public string? Conditions { get; init; }
+    /// <summary>The process steps this node can run (advertised in the registry).</summary>
+    public string[]? Steps { get; init; }
+    /// <summary>Claim filter: a job this returns false for is left to another node.</summary>
+    public Func<JobDescriptor, bool>? CanRun { get; init; }
+    /// <summary>Budget, schedule and window; null: no limits.</summary>
+    public LimitState? Limits { get; init; }
 }
 
 public sealed class NodeEngine
@@ -87,6 +93,7 @@ public sealed class NodeEngine
         Control = new ControlWatcher(store, paths);
         Budget = new ThreadBudget(options.Threads);
         Control.Changed += OnControlChanged;
+        o.Limits?.Apply(Control.Current);
     }
 
     // ---------------------------------------------------------------- registry
@@ -97,6 +104,7 @@ public sealed class NodeEngine
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) == Level.Stop)) return "stopped";
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) >= Level.Drain)) return "draining";
         if (!running.IsEmpty) return "working";
+        if (o.Limits?.Status() is { } limited) return limited;
         if (stageBackoff.Any(b => b.Value > DateTimeOffset.UtcNow)) return "backoff";
         return "idle";
     }
@@ -105,11 +113,10 @@ public sealed class NodeEngine
     {
         NodeId = o.NodeId, Name = o.Name, Kind = o.Kind, Version = o.Version, Platform = PlatformInfo.Platform(),
         Stages = o.Stages, Jobs = o.Jobs.Where(j => o.Stages.Contains(j.Key)).ToDictionary(j => j.Key, j => j.Value),
-        Threads = o.Threads, Conditions = o.Conditions,
+        Threads = o.Threads, Conditions = o.Conditions, Steps = o.Steps,
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
         Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker }).ToList(),
-        Sources = sources.IsEmpty ? null : new Dictionary<string, string>(sources),
         LastSeen = Protocol.NowUtc(), StartedAt = Protocol.Utc(startedAt),
     };
 
@@ -127,17 +134,7 @@ public sealed class NodeEngine
         finally { registryGate.Release(); }
     }
 
-    private readonly ConcurrentDictionary<string, string> sources = new();
-
-    /// <summary>Records the state of a source this node polls (e.g. watch-later = ok | signed-out) in the node registry.</summary>
-    public void SetSource(string name, string state)
-    {
-        if (sources.TryGetValue(name, out var old) && old == state) return;
-        sources[name] = state;
-        _ = WriteRegistryAsync();
-    }
-
-    private static string RegistryKey(NodeInfo i) => i.State + "|" + i.Control + "|" + string.Join(',', (i.Sources ?? new()).Select(s => s.Key + "=" + s.Value)) + "|" + string.Join(';', i.Running.Select(r => $"{r.JobId}/{r.Stage}/{r.Step}"));
+    private static string RegistryKey(NodeInfo i) => i.State + "|" + i.Control + "|" + string.Join(';', i.Running.Select(r => $"{r.JobId}/{r.Stage}/{r.Step}"));
 
     private void RegistryChanged()
     {
@@ -174,6 +171,7 @@ public sealed class NodeEngine
 
     private void OnControlChanged()
     {
+        o.Limits?.Apply(Control.Current);
         foreach (var r in running.Keys)
             if (Control.Effective(r.Info.Stage) == Level.Stop) { r.StopRequested = true; r.Cts.Cancel(); }
         RegistryChanged();
@@ -240,7 +238,14 @@ public sealed class NodeEngine
                     await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Max(0.05, (until - DateTimeOffset.UtcNow).TotalSeconds))), ct);
                     continue;
                 }
-                if (!TryReserve()) return;
+                if (o.Limits != null && !o.Limits.TryAcquire(stage))
+                {
+                    RegistryChanged();
+                    if (o.Once) return;
+                    await Task.Delay(o.PollInterval, ct);
+                    continue;
+                }
+                if (!TryReserve()) { o.Limits?.Release(stage, false); return; }
                 Claim? claim;
                 try { claim = await TryClaimAsync(stage, ct); }
                 catch (OperationCanceledException) { throw; }
@@ -248,6 +253,7 @@ public sealed class NodeEngine
                 {
                     Log.Info($"{stage}: looking for work failed ({e.Message})");
                     Interlocked.Decrement(ref reserved);
+                    o.Limits?.Release(stage, false);
                     if (o.Once) return;
                     await Task.Delay(o.PollInterval, ct);
                     continue;
@@ -255,12 +261,14 @@ public sealed class NodeEngine
                 if (claim == null)
                 {
                     Interlocked.Decrement(ref reserved);
+                    o.Limits?.Release(stage, false);
                     if (o.Once) return;
                     RegistryChanged();
                     await Task.Delay(o.PollInterval, ct);
                     continue;
                 }
-                await RunJobAsync(stage, worker, claim, ct);
+                var finished = await RunJobAsync(stage, worker, claim, ct);
+                o.Limits?.Release(stage, finished);
             }
         }
         catch (OperationCanceledException) { }
@@ -305,6 +313,13 @@ public sealed class NodeEngine
                 var body = await store.GetAsync(b.Name, ct);
                 if (body == null) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); continue; }
                 var job = JobDescriptor.Parse(body.Data);
+                if (o.CanRun != null && !o.CanRun(job))
+                {
+                    // this node lacks a step the job needs: leave it to another node, and look again later
+                    await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
+                    ignoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(10);
+                    continue;
+                }
                 return new Claim(b.Name, lease, job, new Dictionary<string, string>(tags));
             }
             catch
@@ -320,7 +335,7 @@ public sealed class NodeEngine
 
     private enum Outcome { Done, Permanent, Bot, Transient, Released, LeaseLost, Skipped }
 
-    private async Task RunJobAsync(string stage, int worker, Claim claim, CancellationToken ct)
+    private async Task<bool> RunJobAsync(string stage, int worker, Claim claim, CancellationToken ct)
     {
         var watch = System.Diagnostics.Stopwatch.StartNew();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -362,6 +377,7 @@ public sealed class NodeEngine
         running.TryRemove(run, out _);
         RegistryChanged();
         Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: {outcome}{(error != null ? " (" + Redact.Sas(error) + ")" : "")} in {watch.Elapsed.TotalSeconds:F1}s");
+        return outcome == Outcome.Done;
     }
 
     private async Task RenewLoopAsync(string stage, Claim claim, Running run, CancellationToken token)

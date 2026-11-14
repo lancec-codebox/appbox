@@ -165,13 +165,6 @@ public class YtDlpTests
     public void Classifies_errors(string stderr, FailureKind expected) => Assert.Equal(expected, YtDlp.Classify(stderr));
 
     [Fact]
-    public void Default_selector_matches_the_protocol()
-    {
-        Assert.Equal("bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480]/b", YtDlp.Selector(480, null));
-        Assert.Equal("worst", YtDlp.Selector(480, "worst"));
-    }
-
-    [Fact]
     public void Single_video_urls_skip_playlist_expansion()
     {
         Assert.True(YtDlp.IsSingleVideoUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));

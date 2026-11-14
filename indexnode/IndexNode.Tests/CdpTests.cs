@@ -12,6 +12,7 @@ public sealed class FakeCdpServer : IDisposable
     public int Port { get; }
     public readonly List<string> Methods = new();
     public readonly List<string> Navigated = new();
+    public object[] Cookies { get; set; } = [];
     private HttpListener? listener;
     private readonly CancellationTokenSource stop = new();
 
@@ -71,6 +72,7 @@ public sealed class FakeCdpServer : IDisposable
                             await Send(new { id, result = new { frameId = "F" } });
                             await Send(new { method = "Page.loadEventFired", @params = new { timestamp = 1.0 }, sessionId = session });
                             break;
+                        case "Storage.getCookies": await Send(new { id, result = new { cookies = Cookies } }); break;
                         case "Runtime.evaluate":
                             var expr = p.GetProperty("expression").GetString()!;
                             if (expr == "throw") await Send(new { id, result = new { exceptionDetails = new { text = "Uncaught" } } });

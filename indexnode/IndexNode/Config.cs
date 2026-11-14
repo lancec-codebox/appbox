@@ -15,6 +15,18 @@ public sealed class NodeConfig
     public BrowserConfig? Browser { get; set; }
     public YtDlpConfig? Ytdlp { get; set; }
 
+    /// <summary>Run limits (see LimitState). BudgetSetAt restarts the countdown when the budget is set again.</summary>
+    public int? Budget { get; set; }
+    public string? BudgetSetAt { get; set; }
+    public string? Schedule { get; set; }
+    public string? Window { get; set; }
+
+    /// <summary>An OpenAI-compatible endpoint for the steps that need a model. The key is a secret.</summary>
+    public AiConfig? Ai { get; set; }
+
+    /// <summary>When false the node never downloads models by itself: a step whose model files are missing is not advertised and its jobs are not claimed.</summary>
+    public bool ModelsAutoDownload { get; set; } = true;
+
     [JsonIgnore] public static JsonSerializerOptions Json { get; } = new() { WriteIndented = true, PropertyNameCaseInsensitive = true, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
 
     public static string ConfigDir()
@@ -37,6 +49,8 @@ public sealed class NodeConfig
         var c = File.Exists(p) ? JsonSerializer.Deserialize<NodeConfig>(File.ReadAllText(p), Json) ?? new() : new();
         var envSas = Environment.GetEnvironmentVariable("INDEXNODE_SAS_URL");
         if (!string.IsNullOrWhiteSpace(envSas)) c.Sas = envSas.Trim();
+        Redact.Register(c.Ai?.Key);
+        Redact.Register(Environment.GetEnvironmentVariable("INDEXNODE_AI_KEY"));
         return c;
     }
 
@@ -119,10 +133,39 @@ public sealed class NodeConfig
     public int EffectiveThreads => Threads is > 0 ? Threads.Value : PhysicalCores();
 }
 
+public sealed class AiConfig
+{
+    public string? BaseUrl { get; set; }
+    public string? Key { get; set; }
+    public string? TextModel { get; set; }
+    public string? VisionModel { get; set; }
+
+    public bool Configured => !string.IsNullOrWhiteSpace(BaseUrl) && !string.IsNullOrWhiteSpace(TextModel);
+
+    /// <summary>flag > environment (INDEXNODE_AI_BASE_URL, _KEY, _TEXT_MODEL, _VISION_MODEL) > config file, field by field.</summary>
+    public static AiConfig Resolve(AiConfig? file, Func<string, string?> flag, Func<string, string?> env)
+    {
+        static string? Pick(params string?[] v) => v.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s))?.Trim();
+        return new AiConfig
+        {
+            BaseUrl = Pick(flag("ai-base-url"), env("INDEXNODE_AI_BASE_URL"), file?.BaseUrl),
+            Key = Pick(flag("ai-key"), env("INDEXNODE_AI_KEY"), file?.Key),
+            TextModel = Pick(flag("ai-text-model"), env("INDEXNODE_AI_TEXT_MODEL"), file?.TextModel),
+            VisionModel = Pick(flag("ai-vision-model"), env("INDEXNODE_AI_VISION_MODEL"), file?.VisionModel),
+        };
+    }
+
+    /// <summary>One-line description that never contains the key.</summary>
+    public string Describe() => $"base-url={BaseUrl ?? "(none)"} text-model={TextModel ?? "(none)"} vision-model={VisionModel ?? "(none)"} key={(string.IsNullOrEmpty(Key) ? "(none)" : "set")}";
+}
+
 public sealed class YtDlpConfig
 {
     /// <summary>A full command prefix, e.g. ["python", ".../yt-dlp.pyz"]. Null: the downloaded yt-dlp executable.</summary>
     public string[]? Command { get; set; }
+
+    /// <summary>yt-dlp's --js-runtimes value ("node", "deno:/path/to/deno"). Null: node on PATH, else deno.</summary>
+    public string? JsRuntime { get; set; }
 }
 
 public sealed class BrowserConfig

@@ -43,7 +43,7 @@ public class LauncherTests
         File.WriteAllText(script, "echo \"args: $@\"\n");
         // Windows has no bash for a Windows-path script; cmd echoes the same line there.
         string[] prefix = OperatingSystem.IsWindows() ? ["cmd", "/c", "echo args:"] : ["bash", script];
-        var tools = new Tools(new HttpClient(), new NodeConfig { Ytdlp = new YtDlpConfig { Command = prefix } });
+        var tools = new Tools(new HttpClient(), new NodeConfig { Ytdlp = new YtDlpConfig { Command = prefix, JsRuntime = "none" } });
         var r = await tools.RunYtDlpAsync(["--version", "u"], default);
         Assert.Equal("args: --version u", r.Stdout.Trim());
 

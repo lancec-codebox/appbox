@@ -9,8 +9,10 @@ namespace IndexNode;
 public static partial class Protocol
 {
     public const string ApiVersion = "2021-12-02";
-    public static readonly string[] Stages = ["download", "process", "comments"];
-    public static readonly string[] DefaultSteps = ["frames", "sscd", "compress"];
+    public static readonly string[] Stages = ["download", "process", "comments", "watch"];
+    /// <summary>What a desktop node runs by default: downloads go to the phone, so download is opt-in (--stages).</summary>
+    public static readonly string[] DefaultNodeStages = ["watch", "process", "comments"];
+    public static readonly string[] DefaultSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs"];
     public const int LeaseSeconds = 60;
     public const int MaxAttempts = 3;
 
@@ -47,6 +49,7 @@ public sealed class Paths(string prefix)
     public string VideoDir(string id) => $"{Prefix}videos/{id}/";
     public string Control => $"{Prefix}control.json";
     public string Node(string nodeId) => $"{Prefix}nodes/{nodeId}.json";
+    public string Seed(string file) => $"{Prefix}seeds/{file}";
     public string NodesDir => $"{Prefix}nodes/";
 }
 
@@ -90,12 +93,36 @@ public sealed class JobDescriptor
     public string? NodeId { get; set; }
     public double? ElapsedSeconds { get; set; }
 
+    // ---- watch (a followed source) and the download jobs it creates
+    /// <summary>"playlist" or "channel".</summary>
+    public string? Kind { get; set; }
+    /// <summary>Playlist id, or channel id (UC...).</summary>
+    public string? Id { get; set; }
+    public string? Name { get; set; }
+    public string? Every { get; set; }
+    public string[]? Tabs { get; set; }
+    public bool? FollowChannels { get; set; }
+    public int? Backfill { get; set; }
+    public string? LastPolled { get; set; }
+    /// <summary>Video ids already seen in this source, newest first, capped at 500. Null until the first poll.</summary>
+    public List<string>? Seen { get; set; }
+    /// <summary>How many new videos this source has produced so far.</summary>
+    public int? Found { get; set; }
+    /// <summary>On a download job: the watch job that found the video.</summary>
+    public string? Source { get; set; }
+
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static JobDescriptor Parse(byte[] b) => JsonSerializer.Deserialize<JobDescriptor>(b, Protocol.Json) ?? throw new InvalidDataException("empty job");
 
     public static JobDescriptor NewDownload(string url, int maxHeight, string? format) => new()
     {
         Stage = "download", JobId = Protocol.JobIdFor(url), Url = url, MaxHeight = maxHeight, Format = format, Subs = true, AddedAt = Protocol.NowUtc(),
+    };
+
+    public static JobDescriptor NewWatch(string kind, string id, string name, string every, string[] tabs, bool followChannels, int backfill, int maxHeight) => new()
+    {
+        Stage = "watch", JobId = (kind == "playlist" ? "pl-" : "ch-") + id, Kind = kind, Id = id, Name = name, Every = every, Tabs = tabs,
+        FollowChannels = followChannels, Backfill = backfill, MaxHeight = maxHeight, AddedAt = Protocol.NowUtc(), Attempts = 0,
     };
 
     public static JobDescriptor NewComments(string jobId, string url) => new()
@@ -105,7 +132,7 @@ public sealed class JobDescriptor
 
     public static JobDescriptor NewProcess(string jobId) => new()
     {
-        Stage = "process", JobId = jobId, Steps = Protocol.DefaultSteps, Compress = new CompressSettings(), AddedAt = Protocol.NowUtc(),
+        Stage = "process", JobId = jobId, Steps = Protocol.DefaultSteps, AddedAt = Protocol.NowUtc(),
     };
 }
 
@@ -128,6 +155,8 @@ public sealed class ControlFile
     public string? Message { get; set; }
     public string? ChangedAt { get; set; }
     public string? ChangedBy { get; set; }
+    /// <summary>Per-node run limits; they win over the node's own settings.</summary>
+    public Dictionary<string, NodeLimits>? Nodes { get; set; }
 
     public static Level ParseLevel(string? s) => s?.ToLowerInvariant() switch
     {
@@ -144,6 +173,13 @@ public sealed class ControlFile
 
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static ControlFile Parse(byte[]? b) => b == null || b.Length == 0 ? new() : JsonSerializer.Deserialize<ControlFile>(b, Protocol.Json) ?? new();
+}
+
+public sealed class NodeLimits
+{
+    public int? Budget { get; set; }
+    public string? Schedule { get; set; }
+    public string? Window { get; set; }
 }
 
 public sealed class RunningJob
@@ -167,6 +203,8 @@ public sealed class NodeInfo
     public Dictionary<string, int> Jobs { get; set; } = new();
     public int Threads { get; set; }
     public string? Conditions { get; set; }
+    /// <summary>Process steps the node can run; a job needing another step is never claimed by it.</summary>
+    public string[]? Steps { get; set; }
     public string State { get; set; } = "idle";
     public string Control { get; set; } = "run";
     public List<RunningJob> Running { get; set; } = new();
