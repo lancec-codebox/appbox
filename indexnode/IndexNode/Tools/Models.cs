@@ -13,6 +13,8 @@ public static class Models
     public const string ClipModelId = "onnx-community/siglip2-base-patch16-224-ONNX";
 
     public static readonly ModelFile ClipVision = new("clip-vision", "siglip2-base-patch16-224.vision_model.onnx", Siglip + "onnx/vision_model.onnx", "c0573e3f4140c3a7c4e9cc5912bd6b26a033b46a6a8e8af26cbea262b163bcad", 371_807_752, "Apache-2.0");
+    /// <summary>The fp16 vision tower for the CUDA provider (inputs and outputs stay float32, so the tensor code is the same); halves the memory traffic on a GPU.</summary>
+    public static readonly ModelFile ClipVisionFp16 = new("clip-vision-fp16", "siglip2-base-patch16-224.vision_model_fp16.onnx", Siglip + "onnx/vision_model_fp16.onnx", "a1959f7bd3993a607e48839f6d01e25b876fe76afda301b028b78eef68aabd95", 186_039_516, "Apache-2.0");
     public static readonly ModelFile ClipText = new("clip-text", "siglip2-base-patch16-224.text_model_int8.onnx", Siglip + "onnx/text_model_int8.onnx", "3a0603d3a00c05a80a6ded4743c16aaac7b1e62cdcc7e362e7ce418659b96400", 283_438_275, "Apache-2.0");
     public static readonly ModelFile ClipTokenizer = new("clip-tokenizer", "siglip2-base-patch16-224.tokenizer.model", Siglip + "tokenizer.model", "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2", 4_241_003, "Apache-2.0");
 
@@ -35,13 +37,18 @@ public static class Models
     public const string SscdInt8Url = "https://github.com/refops-analysis/refops/releases/download/vidtest/sscd_int8_static.onnx";
     public static readonly ModelFile SscdInt8 = new("sscd-int8", "sscd_disc_mixup_int8_static.onnx", SscdInt8Url, "bb79ea725a6ca075ac0395b388d62134040b63f55be7e823bdd26512c77132cf", 25_102_615, "SSCD (CC-BY-NC 4.0, Meta), int8 static QDQ export");
 
+    /// <summary>The fp32 SSCD for the GPU (the static int8 QDQ model is a CPU model: its quantised ops are not all on the CUDA provider).</summary>
+    public static readonly ModelFile SscdFp32 = new("sscd-fp32", "sscd_disc_mixup.onnx", "https://github.com/refops-analysis/refops/releases/download/vidtest/sscd.onnx", "37971c6f6bbe318009f886e438458e3ddadbe1fd12958558238044adcf549bda", 98_158_430, "SSCD (CC-BY-NC 4.0, Meta), fp32 export");
+
+    public static ModelFile ClipVisionFor => OrtOptions.Cuda ? ClipVisionFp16 : ClipVision;
+
     public static readonly ModelFile[] Clip = [ClipVision, ClipText, ClipTokenizer];
     public static readonly ModelFile[] FaceYuNet = [YuNetDet, SFaceRec];
     public static readonly ModelFile[] FaceDefault = [ScrfdDet, ArcFaceRec];
     public static readonly ModelFile[] Ocr = [OcrDet, OcrRec, OcrDict];
     public static readonly ModelFile[] Asr = [AsrModel, AsrTokens, Vad];
     /// <summary>Everything a node needs for every step (the default face models included).</summary>
-    public static readonly ModelFile[] All = [SscdInt8, .. Clip, .. Ocr, .. Asr, .. FaceDefault];
+    public static readonly ModelFile[] All = [SscdInt8, SscdFp32, ClipVisionFp16, .. Clip, .. Ocr, .. Asr, .. FaceDefault];
 
     /// <summary>The steps a node can run with the model files it has: a node never claims a job that needs a step it cannot run.</summary>
     public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["ocrsubs"] = Ocr, ["transcribe"] = Asr, ["cast"] = FaceDefault };

@@ -152,7 +152,7 @@ public static class CastStage
                 progress("merge"); using var mergePhase = stats.Phase("merge-probe");
                 var pt = probe.GroupBy(f => f.T).ToDictionary(g => g.Key, g => g.ToList()); var pcrop = new Dictionary<FaceRec, Rgb>();
                 await Each((t, im, _) => { if (pt.TryGetValue(Math.Round(t, 3), out var fs)) foreach (var f in fs) pcrop[f] = HeadShoulders(im, f); return Task.CompletedTask; });
-                ScoreMasks(probe.Where(pcrop.ContainsKey).ToList(), f => Imaging.CropResize(pcrop[f], pcrop[f].W * 0.2, pcrop[f].H * 0.12, pcrop[f].W * 0.6, pcrop[f].H * 0.5, 224, 224), Models.PathOf(Models.ClipVision, modelsDir), Models.PathOf(Models.ClipText, modelsDir), Models.PathOf(Models.ClipTokenizer, modelsDir), opt.Threads, progress, ct);
+                ScoreMasks(probe.Where(pcrop.ContainsKey).ToList(), f => Imaging.CropResize(pcrop[f], pcrop[f].W * 0.2, pcrop[f].H * 0.12, pcrop[f].W * 0.6, pcrop[f].H * 0.5, 224, 224), Models.PathOf(Models.ClipVisionFor, modelsDir), Models.PathOf(Models.ClipText, modelsDir), Models.PathOf(Models.ClipTokenizer, modelsDir), opt.Threads, progress, ct);
                 foreach (var bp in CastLogic.BorderPairs(faces, mergeAt, borderAt)) Log.Info($"cast: borderline pair {bp.A}/{bp.B}: face distance {bp.Dist}, SigLIP cosine {bp.Vis}{(bp.Dist <= borderAt && bp.Vis >= CastLogic.VisAgree ? " -> merge" : "")}");
                 merges.AddRange(CastLogic.MergeClusters(faces, mergeAt, borderAt));
             }

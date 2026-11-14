@@ -15,7 +15,7 @@ public static class Clip
 
     public static byte[] InfoJson() => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
     {
-        v = 1, model = ModelId, vision = Models.ClipVision.File, inputSize = Size, dim = Dim, dtype = "float16", normalised = true, preprocessing = Preprocessing,
+        v = 1, model = ModelId, vision = Models.ClipVisionFor.File, inputSize = Size, dim = Dim, dtype = "float16", normalised = true, preprocessing = Preprocessing,
         rows = "row i matches frames.json[i]",
     });
 

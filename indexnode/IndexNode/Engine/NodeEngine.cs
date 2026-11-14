@@ -86,6 +86,17 @@ public sealed class NodeEngine
         public bool StopRequested;
         public bool LeaseLost;
         public JobContext? Ctx;
+        public readonly StepTimer Timer = new();
+    }
+
+    /// <summary>Wall time per step of one job (fetch, frames, sscd, ...): one line when the job ends, so a slow phase shows without a profiler.</summary>
+    internal sealed class StepTimer
+    {
+        private readonly List<(string Step, TimeSpan Time)> done = new();
+        private string? current; private readonly System.Diagnostics.Stopwatch sw = new();
+        public void Enter(string step) { lock (done) { Close(); current = step; sw.Restart(); } }
+        private void Close() { if (current != null) { done.Add((current, sw.Elapsed)); current = null; } }
+        public string Line(string device) { lock (done) { Close(); return done.Count == 0 ? "" : string.Join(", ", done.GroupBy(d => d.Step).Select(g => $"{g.Key} {g.Sum(x => x.Time.TotalSeconds):F1}s")) + $" [{device}]"; } }
     }
 
     private readonly IStore store;
@@ -507,7 +518,7 @@ public sealed class NodeEngine
             {
                 Job = claim.Job, Stage = stage, BlobName = claim.BlobName, LeaseId = claim.LeaseId, Worker = worker,
                 Store = store, Paths = paths, NodeId = o.NodeId, Token = cts.Token, ThreadShare = () => Budget.Share,
-                Report = (step, progress) => { if (step != null && step != run.Info.Step) { run.Info.Step = step; run.Info.StartedAt = Protocol.NowUtc(); } run.Info.Progress = progress; },
+                Report = (step, progress) => { if (step != null && step != run.Info.Step) { run.Info.Step = step; run.Info.StartedAt = Protocol.NowUtc(); run.Timer.Enter(step); } run.Info.Progress = progress; },
             };
             run.Ctx = ctx;
             await handlers[stage].RunAsync(ctx);
@@ -529,6 +540,7 @@ public sealed class NodeEngine
 
         budget?.Dispose();
         running.TryRemove(run, out _);
+        if (run.Timer.Line(OrtOptions.Device) is { Length: > 0 } timing) Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: time by step: {timing}");
         RegistryChanged();
         Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: {outcome}{(error != null ? " (" + Redact.Sas(error) + ")" : "")} in {watch.Elapsed.TotalSeconds:F1}s");
         return outcome == Outcome.Done;

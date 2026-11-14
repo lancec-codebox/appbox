@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "follow-channels", "dry", "qr", "no-sas", "force", "json" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "force", "json" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -38,7 +38,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages watch,process,comments] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
@@ -47,6 +47,7 @@ public static class Program
         indexnode enqueue --from watch-later [--max-height 480]
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
+        indexnode gpu markers [--dry]
         indexnode status [--json]
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
         indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
@@ -80,6 +81,7 @@ public static class Program
                 "control" => await Commands.ControlAsync(a),
                 "config" => Commands.Config(a),
                 "browser" => await Commands.BrowserAsync(a),
+                "gpu" => await Commands.GpuAsync(a),
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
                 "ai" => await Commands.AiAsync(a),
@@ -120,11 +122,27 @@ public static class Commands
     public static async Task<int> RunAsync(Args a)
     {
         var (cfg, store, paths, http) = Open(a);
-        var stages = Protocol.ExpandStages((a.Get("stages") ?? string.Join(',', Protocol.DefaultNodeStages)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        // --gpu: a node that runs only the GPU stages (sscd, clip, cast, ocrsubs) on the CUDA provider and never falls back to the CPU
+        bool gpu = a.Has("gpu");
+        var device = OrtOptions.ParseDevice(gpu ? "cuda" : a.Get("device") ?? Environment.GetEnvironmentVariable("INDEXNODE_DEVICE") ?? cfg.Device);
+        OrtOptions.Device = device;
+        OrtOptions.DeviceId = int.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_CUDA_DEVICE"), out var cudaDev) ? cudaDev : 0;
+        if (gpu && OrtOptions.Device != "cuda") throw new ArgumentException("--gpu needs --device cuda");
+        var requested = (a.Get("stages") ?? (gpu ? string.Join(',', GpuRouting.MarkerStages) : string.Join(',', Protocol.DefaultNodeStages))).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var stages = Protocol.ExpandStages(requested);
         foreach (var s in stages) if (!Protocol.Stages.Contains(s)) throw new ArgumentException($"unknown stage '{s}'");
+        if (gpu)
+        {
+            stages = GpuRouting.GpuNodeStages(stages);
+            if (stages.Length == 0) throw new ArgumentException("--gpu runs only sscd, clip, cast and ocrsubs; --stages names none of them");
+        }
+        TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? WatchStage.ParseEvery(ew) : null;
+        int maxHeavy = a.Get("max-heavy") is { } mh ? int.Parse(mh) : cfg.MaxHeavy ?? 2;
+        if (gpu && a.Get("max-heavy") == null && cfg.MaxHeavy == null) maxHeavy = 1; // one GPU: one model step at a time, batched
         var jobs = new Dictionary<string, int> { ["download"] = cfg.JobsFor("download"), ["process"] = cfg.JobsFor("process"), ["comments"] = cfg.JobsFor("comments"), ["watch"] = cfg.JobsFor("watch") };
         foreach (var st in Protocol.StepStages) jobs[st] = cfg.Jobs != null && cfg.Jobs.TryGetValue(st, out var sn) ? sn : cfg.JobsFor("process");
         foreach (var kv in NodeConfig.ParseJobs(a.Get("jobs"))) jobs[kv.Key] = kv.Value;
+        if (gpu) foreach (var s in stages) if (a.Get("jobs") == null) jobs[s] = 1;
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         var (nodeId, nodeName) = cfg.ResolveIdentity(a.Get("node-name"), Environment.GetEnvironmentVariable(NodeConfig.NodeNameEnv));
 
@@ -149,7 +167,9 @@ public static class Commands
             NodeId = nodeId, Name = nodeName,
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
             Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
-            Stages = stages, Jobs = jobs, Threads = threads, Once = a.Has("once"),
+            Stages = stages, Jobs = jobs, Threads = threads, Once = a.Has("once"), Gpu = gpu, MaxHeavy = maxHeavy, ExitWhenIdle = exitIdle,
+            GpuFallback = a.Get("gpu-fallback") is { } gf ? WatchStage.ParseEvery(gf) : GpuRouting.CpuFallbackAfter,
+            Kind = gpu ? "gpu" : "desktop",
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
@@ -447,6 +467,32 @@ public static class Commands
         return 0;
     }
 
+    /// <summary>`indexnode gpu markers [--dry]`: writes the marker of every pending sscd/clip/cast job whose frames are done and that has none (videos framed before 0.6.0), so the GPU container starts for them.</summary>
+    public static async Task<int> GpuAsync(Args a)
+    {
+        var sub = a.Positional.FirstOrDefault();
+        if (sub != "markers") throw new ArgumentException("gpu markers [--dry]");
+        var (cfg, store, paths, http) = Open(a);
+        using var _ = http;
+        int made = 0, have = 0, waiting = 0;
+        foreach (var stage in GpuRouting.MarkerStages)
+        {
+            var pending = (await store.FindByTagsAsync(Tags.StateWhere(stage, "pending"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList();
+            foreach (var b in pending)
+            {
+                var id = Path.GetFileNameWithoutExtension(b.Name);
+                bool ready = true;
+                foreach (var need in Protocol.NeedsOf(stage)) if (await store.GetTagsAsync(paths.Video(id, need), default) == null) { ready = false; break; }
+                if (!ready) { waiting++; continue; }
+                if (await store.GetTagsAsync(GpuRouting.MarkerName(paths, stage, id), default) != null) { have++; continue; }
+                if (!a.Has("dry")) await GpuRouting.WriteMarkerAsync(store, paths, stage, id, default);
+                made++;
+            }
+        }
+        Console.WriteLine($"gpu markers: {(a.Has("dry") ? "would write" : "wrote")} {made}, {have} already there, {waiting} jobs still wait for their frames");
+        return 0;
+    }
+
     public static async Task<int> BrowserAsync(Args a)
     {
         var cfg = (LoadFileConfig().Browser ?? new BrowserConfig());
@@ -505,6 +551,8 @@ public static class Commands
                 case "ai.api": if (!AiConfig.ValidApi(val.ToLowerInvariant())) throw new ArgumentException("ai.api: chat, responses or auto"); (file.Ai ??= new()).Api = val.ToLowerInvariant(); break;
                 case "jobs": file.Jobs = NodeConfig.ParseJobs(val); break;
                 case "threads": file.Threads = int.Parse(val); break;
+                case "max-heavy": file.MaxHeavy = int.Parse(val); break;
+                case "device": file.Device = OrtOptions.ParseDevice(val); break;
                 case "cast.model": CastLogic.ModelFor(val); file.CastModel = val.ToLowerInvariant(); break;
                 case "frames.crf": file.FrameCrf = int.Parse(val); break;
                 case "prune.grid": file.PruneGrid = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;

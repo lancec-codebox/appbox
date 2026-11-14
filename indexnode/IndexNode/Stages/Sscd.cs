@@ -43,6 +43,7 @@ public static class Sscd
             if (!File.Exists(path)) throw new InvalidOperationException($"sscd model not found at configured modelPath {path}");
             return path;
         }
+        if (OrtOptions.Cuda) return await Models.EnsureAsync(Models.SscdFp32, http, ct); // the int8 model is for the CPU
         var int8 = Models.PathOf(Models.SscdInt8);
         if (File.Exists(int8)) return int8;
         var local = Path.Combine(NodeConfig.ToolsDir(), ModelName + ".onnx");

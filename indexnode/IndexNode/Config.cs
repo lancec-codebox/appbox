@@ -10,6 +10,10 @@ public sealed class NodeConfig
     public string? NodeName { get; set; }
     public Dictionary<string, int>? Jobs { get; set; }
     public int? Threads { get; set; }
+    /// <summary>Concurrent heavy (model) steps on this node (default 2); 0 = no limit.</summary>
+    public int? MaxHeavy { get; set; }
+    /// <summary>"cpu" (default) or "cuda".</summary>
+    public string? Device { get; set; }
 
     /// <summary>Face models of the cast step: "buffalo_l" (default) or "yunet-sface".</summary>
     public string? CastModel { get; set; }
