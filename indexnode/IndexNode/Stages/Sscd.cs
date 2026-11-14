@@ -79,7 +79,7 @@ public static class Sscd
         var wh = pr.Stdout.Trim().Split('x');
         var (tw, th) = TargetSize(int.Parse(wh[0]), int.Parse(wh[1]));
 
-        using var so = new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1 };
+        using var so = OrtOptions.Make(threads);
         using var session = new InferenceSession(modelPath, so);
         var inputName = session.InputMetadata.Keys.First();
 

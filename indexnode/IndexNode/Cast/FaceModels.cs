@@ -61,7 +61,7 @@ public sealed class YuNet : IFaceDetector
 {
     private const int Side = 640;
     private readonly InferenceSession s;
-    public YuNet(string path, int threads = 1) { s = new InferenceSession(path, new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1, LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR }); }
+    public YuNet(string path, int threads = 1) { s = new InferenceSession(path, OrtOptions.Make(threads, true)); }
 
     public List<FaceDet> Detect(Rgb im)
     {
@@ -99,7 +99,7 @@ public sealed class Scrfd : IFaceDetector
     /// <summary>false: the old 640x640 letterbox (kept for comparison runs).</summary>
     public static bool NativeSize = Environment.GetEnvironmentVariable("INDEXNODE_FACE_SQUARE") != "1";
     private readonly InferenceSession s;
-    public Scrfd(string path, int threads = 1) { s = new InferenceSession(path, new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1, LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR }); }
+    public Scrfd(string path, int threads = 1) { s = new InferenceSession(path, OrtOptions.Make(threads, true)); }
 
     public List<FaceDet> Detect(Rgb im)
     {
@@ -135,7 +135,7 @@ public sealed class SFace : IFaceEmbedder
 {
     private readonly InferenceSession s;
     public int Dim => 128;
-    public SFace(string path, int threads = 1) { s = new InferenceSession(path, new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1, LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR }); }
+    public SFace(string path, int threads = 1) { s = new InferenceSession(path, OrtOptions.Make(threads, true)); }
 
     public float[] Embed(Rgb f)
     {
@@ -153,7 +153,7 @@ public sealed class ArcFace : IFaceEmbedder
 {
     private readonly InferenceSession s;
     public int Dim => 512;
-    public ArcFace(string path, int threads = 1) { s = new InferenceSession(path, new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1, LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR }); }
+    public ArcFace(string path, int threads = 1) { s = new InferenceSession(path, OrtOptions.Make(threads, true)); }
 
     public float[] Embed(Rgb f)
     {

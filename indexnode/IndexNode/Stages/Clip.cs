@@ -49,7 +49,7 @@ public static class Clip
     public static async Task<byte[]> EmbedFramesAsync(Tools tools, string visionModel, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct)
     {
         var ffmpeg = await tools.FfmpegAsync(ct);
-        using var so = new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1 };
+        using var so = OrtOptions.Make(threads);
         using var session = new InferenceSession(visionModel, so);
         var inputName = session.InputMetadata.Keys.First();
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
@@ -106,7 +106,7 @@ public static class Clip
 
     public static float[] EmbedText(string textModel, SentencePieceTokenizer tok, string text, int threads = 0)
     {
-        using var so = new SessionOptions(); if (threads > 0) so.IntraOpNumThreads = threads;
+        using var so = OrtOptions.Make(Math.Max(1, threads));
         using var s = new InferenceSession(textModel, so);
         var ids = Tokenize(tok, text);
         var t = new DenseTensor<long>(ids.Select(i => (long)i).ToArray(), [1, ids.Length]);

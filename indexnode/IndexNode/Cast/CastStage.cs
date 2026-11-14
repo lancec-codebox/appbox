@@ -85,7 +85,7 @@ public static class CastStage
     {
         var tok = Clip.LoadTokenizer(tokenizer);
         var tm = Clip.EmbedText(textModel, tok, MaskPrompt, threads); var tb = Clip.EmbedText(textModel, tok, BarePrompt, threads);
-        using var so = new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1, LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR };
+        using var so = OrtOptions.Make(threads, true);
         using var s = new InferenceSession(visionModel, so); var name = s.InputMetadata.Keys.First();
         int S = Clip.Size, i = 0;
         foreach (var f in faces)

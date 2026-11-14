@@ -56,9 +56,9 @@ public static class OcrSubs
         return BandFinder.Find(boxes, h) is { } r ? (r.Y, r.Height) : null;
     }
 
-    /// <summary>OCR is the long pole: it takes max(thread share, cores/2) segments, each with <see cref="IntraThreads"/> intra-op threads, even when that is more than its share (the other steps can wait).</summary>
-    public const int IntraThreads = 2;
-    public static int Segments(int share, int cores) => Math.Max(Math.Max(1, share), Math.Max(1, cores / 2));
+    /// <summary>One segment per core of the step's share, each with one intra-op thread (two threads gave 1.17x per segment, and more threads than cores with spinning halved the throughput): the sum of the OCR threads is the share.</summary>
+    public const int IntraThreads = 1;
+    public static int Segments(int share, int cores) => Math.Max(1, share);
 
     /// <summary>The segments for the parallel read: equal parts whose boundaries are snapped to the sampling grid (multiples of 1/fps from the start), so every segment samples exactly the instants the serial read would, and the merged frames are identical to it.</summary>
     public static List<(double Start, double End)> PlanSegments(double duration, int workers, double fps = OcrCues.Fps)
@@ -94,14 +94,16 @@ public static class OcrSubs
             using var p = Process.Start(psi)!;
             using var reg = ct.Register(() => Proc.Kill(p));
             _ = p.StandardError.ReadToEndAsync();
-            var buf = new byte[frameBytes];
+            var buf = new byte[frameBytes]; var prev = new byte[frameBytes]; List<OcrBox>? prevLines = null;
             for (int i = 0; ; i++)
             {
                 int off = 0;
                 while (off < frameBytes) { int n = await p.StandardOutput.BaseStream.ReadAsync(buf.AsMemory(off, frameBytes - off), ct); if (n == 0) break; off += n; }
                 if (off < frameBytes) break;
                 ct.ThrowIfCancellationRequested();
-                var lines = eng.Recognize(buf, w, bandH).Select(l => new OcrBox(l.X0, l.Y0 + bandY, l.X1, l.Y1 + bandY, l.Text, l.Score)).ToList();
+                // a band byte-identical to the previous sampled one reads the same: reuse its lines (exact match only, so no cue is lost)
+                var lines = prevLines != null && buf.AsSpan().SequenceEqual(prev) ? prevLines : eng.Recognize(buf, w, bandH).Select(l => new OcrBox(l.X0, l.Y0 + bandY, l.X1, l.Y1 + bandY, l.Text, l.Score)).ToList();
+                Buffer.BlockCopy(buf, 0, prev, 0, frameBytes); prevLines = lines;
                 list.Add(new FrameText(Math.Round(seg.Start + i / OcrCues.Fps, 3), lines));
                 var n2 = Interlocked.Increment(ref total);
                 if (n2 % 200 == 0) progress($"{n2} frames");
