@@ -63,6 +63,12 @@ public static class Sscd
         return local;
     }
 
+    static void Fill(DenseTensor<float> t, int row, byte[] rgb, int plane)
+    {
+        var tb = t.Buffer.Span; int baseI = row * 3 * plane;
+        for (int i = 0; i < plane; i++) for (int c = 0; c < 3; c++) tb[baseI + c * plane + i] = (rgb[i * 3 + c] / 255f - Mean[c]) / Std[c];
+    }
+
     /// <summary>Descriptors for frames/000000.jpg ... : short side 288, ImageNet normalisation, L2-normalised, float16.</summary>
     public static async Task<byte[]> DescribeAsync(Tools tools, string modelPath, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct)
     {
@@ -84,7 +90,7 @@ public static class Sscd
         using var reg = ct.Register(() => Proc.Kill(p));
         var err = p.StandardError.ReadToEndAsync();
         var rows = new List<float[]>(count);
-        int frameBytes = tw * th * 3, batch = 8;
+        var stats = new StepStats("sscd"); int frameBytes = tw * th * 3, batch = 32;
         var buf = new byte[frameBytes];
         var stream = p.StandardOutput.BaseStream;
         int read = 0;
@@ -92,21 +98,19 @@ public static class Sscd
         {
             int n = Math.Min(batch, count - read);
             var tensor = new DenseTensor<float>([n, 3, th, tw]);
-            int got = 0;
+            int got = 0; int plane = th * tw;
+            using (stats.Phase("decode+prep"))
             for (; got < n; got++)
             {
                 int off = 0;
                 while (off < frameBytes) { int k = await stream.ReadAsync(buf.AsMemory(off, frameBytes - off), ct); if (k == 0) break; off += k; }
                 if (off < frameBytes) break;
-                for (int y = 0; y < th; y++)
-                    for (int x = 0; x < tw; x++)
-                        for (int c = 0; c < 3; c++)
-                            tensor[got, c, y, x] = (buf[(y * tw + x) * 3 + c] / 255f - Mean[c]) / Std[c];
+                Fill(tensor, got, buf, plane);
             }
             if (got == 0) break;
             if (got < n) tensor = new DenseTensor<float>(tensor.Buffer.Slice(0, got * 3 * th * tw), [got, 3, th, tw]);
             ct.ThrowIfCancellationRequested();
-            using var results = session.Run([NamedOnnxValue.CreateFromTensor(inputName, tensor)]);
+            using var results = stats.Time("model", () => session.Run([NamedOnnxValue.CreateFromTensor(inputName, tensor)]));
             var outT = results.First().AsTensor<float>();
             for (int i = 0; i < got; i++)
             {
@@ -122,6 +126,7 @@ public static class Sscd
         await p.WaitForExitAsync(CancellationToken.None);
         ct.ThrowIfCancellationRequested();
         if (rows.Count != count) throw new InvalidOperationException($"sscd: expected {count} frames, decoded {rows.Count}. {(await err).Trim()}");
+        stats.Log(rows.Count, "frames", Math.Max(1, threads));
         return ToF16Bytes(rows);
     }
 }

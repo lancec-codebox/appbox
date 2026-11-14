@@ -39,6 +39,12 @@ public static class Clip
     /// <summary>The video filter that resizes a frame to 224x224 (squashed, not padded: what SiglipImageProcessor does for this checkpoint).</summary>
     public static string Filter() => "scale=224:224:flags=bilinear";
 
+    static void Fill(DenseTensor<float> t, int row, byte[] rgb)
+    {
+        var tb = t.Buffer.Span; int plane = Size * Size, baseI = row * 3 * plane;
+        for (int i = 0; i < plane; i++) for (int c = 0; c < 3; c++) tb[baseI + c * plane + i] = rgb[i * 3 + c] / 127.5f - 1f;
+    }
+
     /// <summary>Embeds the frames already extracted by the frames step (frames/000000.jpg ...): they are not decoded from the video again.</summary>
     public static async Task<byte[]> EmbedFramesAsync(Tools tools, string visionModel, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct)
     {
@@ -53,24 +59,24 @@ public static class Clip
         using var reg = ct.Register(() => Proc.Kill(p));
         var err = p.StandardError.ReadToEndAsync();
         var rows = new List<float[]>(count);
-        int fb = Size * Size * 3, batch = 8; var buf = new byte[fb];
+        var stats = new StepStats("clip"); int fb = Size * Size * 3, batch = 32; var buf = new byte[fb];
         var stream = p.StandardOutput.BaseStream;
         while (rows.Count < count)
         {
             int n = Math.Min(batch, count - rows.Count), got = 0;
             var t = new DenseTensor<float>([n, 3, Size, Size]);
+            using (stats.Phase("decode+prep"))
             for (; got < n; got++)
             {
                 int off = 0;
                 while (off < fb) { int k = await stream.ReadAsync(buf.AsMemory(off, fb - off), ct); if (k == 0) break; off += k; }
                 if (off < fb) break;
-                for (int y = 0; y < Size; y++) for (int x = 0; x < Size; x++) for (int c = 0; c < 3; c++)
-                    t[got, c, y, x] = buf[(y * Size + x) * 3 + c] / 127.5f - 1f;
+                Fill(t, got, buf);
             }
             if (got == 0) break;
             if (got < n) t = new DenseTensor<float>(t.Buffer.Slice(0, got * 3 * Size * Size), [got, 3, Size, Size]);
             ct.ThrowIfCancellationRequested();
-            using var res = session.Run([NamedOnnxValue.CreateFromTensor(inputName, t)]);
+            using var res = stats.Time("model", () => session.Run([NamedOnnxValue.CreateFromTensor(inputName, t)]));
             var o = res.First(r => r.Name == "pooler_output").AsTensor<float>();
             for (int i = 0; i < got; i++) { var row = new float[Dim]; for (int d = 0; d < Dim; d++) row[d] = o[i, d]; Sscd.L2Normalize(row); rows.Add(row); }
             progress($"{rows.Count}/{count} frames");
@@ -78,6 +84,7 @@ public static class Clip
         }
         await p.WaitForExitAsync(CancellationToken.None);
         ct.ThrowIfCancellationRequested();
+        stats.Log(rows.Count, "frames", Math.Max(1, threads));
         if (rows.Count != count) throw new InvalidOperationException($"clip: expected {count} frames, decoded {rows.Count}. {(await err).Trim()}");
         return ToF16Bytes(rows);
     }
