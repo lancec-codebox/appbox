@@ -129,6 +129,8 @@ public static class Commands
         var (nodeId, nodeName) = cfg.ResolveIdentity(a.Get("node-name"), Environment.GetEnvironmentVariable(NodeConfig.NodeNameEnv));
 
         var tools = new Tools(http, cfg);
+        try { await tools.CheckFfmpegAsync(stages, default); }
+        catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 2; }
         var gate = new DownloadGate();
         var handlers = new Dictionary<string, IStageHandler>
         {

@@ -53,8 +53,8 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         var cmd = config?.Ytdlp?.Command;
         lines.Add("yt-dlp:     " + (cmd is { Length: > 0 } ? string.Join(' ', cmd) + " (configured)" : OnPath("yt-dlp") ?? InTools("yt-dlp") ?? "not installed (downloaded on first use)") + $"  [pinned {YtDlpVersion}]");
         lines.Add("js runtime: " + (JsRuntime is { } js ? js + (string.IsNullOrWhiteSpace(config?.Ytdlp?.JsRuntime) ? " (found on PATH)" : " (configured)") : "NONE: YouTube downloads need node or deno on PATH, or: indexnode config set ytdlp.js-runtime node:/path/to/node"));
-        lines.Add("ffmpeg:      " + (OnPath("ffmpeg") ?? InTools("ffmpeg") ?? $"not installed (indexnode tools install --ffmpeg fetches the pinned build {FfmpegVersion})"));
-        lines.Add("ffprobe:     " + (OnPath("ffprobe") ?? InTools("ffprobe") ?? "not installed"));
+        lines.Add("ffmpeg:      " + (InTools("ffmpeg") ?? OnPath("ffmpeg") ?? $"not installed (indexnode tools install --ffmpeg fetches the pinned build {FfmpegVersion})"));
+        lines.Add("ffprobe:     " + (InTools("ffprobe") ?? OnPath("ffprobe") ?? "not installed"));
         return lines;
     }
     private string? ytdlp, ffmpeg, ffprobe;
@@ -114,6 +114,29 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         finally { gate.Release(); }
     }
 
+    /// <summary>What the selected stages need from ffmpeg: the libsvtav1 encoder (frames, keyframes, compress) and an AV1 decoder (stages that read those chunks).</summary>
+    public static IReadOnlyList<string> MissingFfmpegCapabilities(IEnumerable<string> stages, string encoders, string decoders)
+    {
+        var st = stages.ToHashSet(); var missing = new List<string>();
+        bool Has(string text, string name) => text.Split('\n').Any(l => l.Split(' ', StringSplitOptions.RemoveEmptyEntries) is { Length: > 1 } p && p[1] == name);
+        if ((st.Contains("frames") || st.Contains("process")) && !Has(encoders, "libsvtav1")) missing.Add("encoder libsvtav1");
+        if (st.Any(x => x is "process" or "frames" or "sscd" or "clip" or "cast" or "ocrsubs") && !(Has(decoders, "libdav1d") || Has(decoders, "libaom-av1") || Has(decoders, "av1"))) missing.Add("an AV1 decoder (libdav1d)");
+        return missing;
+    }
+
+    /// <summary>Startup check: the resolved ffmpeg must have what the selected stages need; otherwise fail now, naming the path, instead of failing jobs and burning retries.</summary>
+    public async Task CheckFfmpegAsync(IEnumerable<string> stages, CancellationToken ct)
+    {
+        var st = stages.ToList();
+        if (!st.Any(x => x is "process" or "frames" or "sscd" or "clip" or "cast" or "ocrsubs")) return;
+        var ff = await FfmpegAsync(ct);
+        var enc = await Proc.RunAsync(ff, ["-hide_banner", "-encoders"], ct);
+        var dec = await Proc.RunAsync(ff, ["-hide_banner", "-decoders"], ct);
+        var missing = MissingFfmpegCapabilities(st, enc.Stdout, dec.Stdout);
+        if (missing.Count > 0)
+            throw new InvalidOperationException($"ffmpeg at {ff} lacks {string.Join(" and ", missing)}, which the selected stages ({string.Join(',', st)}) need. Run: indexnode tools install --ffmpeg (IndexNode's own build in {NodeConfig.ToolsDir()} is preferred over PATH), or remove the stages that need it.");
+    }
+
     public async Task<string> FfmpegAsync(CancellationToken ct) { await EnsureFfAsync(ct); return ffmpeg!; }
     public async Task<string> FfprobeAsync(CancellationToken ct) { await EnsureFfAsync(ct); return ffprobe!; }
 
@@ -123,8 +146,9 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         await gate.WaitAsync(ct);
         try
         {
-            ffmpeg = OnPath("ffmpeg") ?? InTools("ffmpeg");
-            ffprobe = OnPath("ffprobe") ?? InTools("ffprobe");
+            // IndexNode's own installed tools (indexnode tools install) win over whatever ffmpeg happens to be on PATH (e.g. a chocolatey essentials build without libsvtav1)
+            ffmpeg = InTools("ffmpeg") ?? OnPath("ffmpeg");
+            ffprobe = InTools("ffprobe") ?? OnPath("ffprobe");
             if (ffmpeg == null || ffprobe == null) { await InstallFfmpegAsync(ct); ffmpeg = InTools("ffmpeg"); ffprobe = InTools("ffprobe"); }
             if (ffmpeg == null || ffprobe == null) throw new InvalidOperationException("ffmpeg/ffprobe not found and could not be installed");
         }
