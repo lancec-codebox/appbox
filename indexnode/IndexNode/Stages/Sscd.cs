@@ -8,9 +8,15 @@ namespace IndexNode;
 public static class Sscd
 {
     public const string ModelName = "sscd_disc_mixup";
-    /// <summary>The static QDQ int8 model (per-channel, calibrated at 288x512): used when present next to the fp32 one; never dynamic quantization (11x slower on CPU).</summary>
+    /// <summary>Only recognised, never used by the pipeline: manifests written by 0.5.x/0.6.0 name this model, and the redo command resets them.</summary>
     public const string Int8Name = ModelName + "_int8_static";
     public static string ModelId(string modelPath) => Path.GetFileName(modelPath).Contains("int8", StringComparison.OrdinalIgnoreCase) ? Int8Name : ModelName;
+    /// <summary>True when an sscd/manifest.json was made by the int8 model (0.5.x and 0.6.0 did): its vectors do not match fp32, so the step is done again.</summary>
+    public static bool IsInt8Manifest(byte[] manifest)
+    {
+        try { return System.Text.Json.JsonDocument.Parse(manifest).RootElement.TryGetProperty("info", out var i) && i.TryGetProperty("model", out var m) && m.GetString() == Int8Name; }
+        catch (System.Text.Json.JsonException) { return false; }
+    }
     public const int Dim = 512;
     public const int ShortSide = 288;
     public static readonly float[] Mean = [0.485f, 0.456f, 0.406f];
@@ -35,33 +41,17 @@ public static class Sscd
 
     public static (int W, int H) TargetSize(int w, int h) => w >= h ? ((int)Math.Round(w * (double)ShortSide / h), ShortSide) : (ShortSide, (int)Math.Round(h * (double)ShortSide / w));
 
+    /// <summary>SSCD is fp32 everywhere (CPU and GPU): the pinned fp32 model. The static int8 model gave fingerprints that do not match fp32 (mean cosine 0.98, p1 0.83, min 0.09 on an A100 check), and the browser screenshot search embeds with fp32. A configured model-path / --model is a dev override only.</summary>
     public static async Task<string> EnsureModelAsync(NodeConfig cfg, HttpClient http, CancellationToken ct)
     {
         var path = cfg.ModelPath;
         if (!string.IsNullOrEmpty(path))
         {
             if (!File.Exists(path)) throw new InvalidOperationException($"sscd model not found at configured modelPath {path}");
+            if (Path.GetFileName(path).Contains("int8", StringComparison.OrdinalIgnoreCase)) Log.Info("WARNING: sscd runs on an int8 model (dev override): its vectors do not match the fp32 index or the screenshot search");
             return path;
         }
-        if (OrtOptions.Cuda) return await Models.EnsureAsync(Models.SscdFp32, http, ct); // the int8 model is for the CPU
-        var int8 = Models.PathOf(Models.SscdInt8);
-        if (File.Exists(int8)) return int8;
-        var local = Path.Combine(NodeConfig.ToolsDir(), ModelName + ".onnx");
-        if (File.Exists(local)) return local;
-        if (string.IsNullOrEmpty(cfg.ModelUrl)) return await Models.EnsureAsync(Models.SscdInt8, http, ct); // the pinned static int8 model
-        if (string.IsNullOrEmpty(cfg.ModelUrl)) throw new InvalidOperationException("sscd model missing: set modelUrl or modelPath in the config (see tools/export_sscd_onnx.py)");
-        Log.Info("sscd: downloading the ONNX model");
-        Directory.CreateDirectory(NodeConfig.ToolsDir());
-        var tmp = local + ".part";
-        using (var r = await http.GetAsync(cfg.ModelUrl, HttpCompletionOption.ResponseHeadersRead, ct))
-        {
-            if (!r.IsSuccessStatusCode) throw new InvalidOperationException($"model download failed: HTTP {(int)r.StatusCode}");
-            await using var fs = File.Create(tmp);
-            await r.Content.CopyToAsync(fs, ct);
-            Traffic.Current.Add(Traffic.OtherIn, fs.Length);
-        }
-        File.Move(tmp, local, true);
-        return local;
+        return await Models.EnsureAsync(Models.SscdFp32, http, ct);
     }
 
     static void Fill(DenseTensor<float> t, int row, byte[] rgb, int plane)

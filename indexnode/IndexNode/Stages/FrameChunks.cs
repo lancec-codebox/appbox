@@ -141,6 +141,7 @@ public static class FrameChunks
     public static async Task ApplySscdPassAsync(IStore store, Paths paths, string id, ChunkDir frames, int[] rep, List<int> keep, double cosine, double lookback, CancellationToken ct)
     {
         var all = frames.Chunks.SelectMany(c => c.Frames).ToList();
+        all = ResetSscdSpans(all);
         for (int i = 0; i < all.Count; i++)
         {
             if (rep[i] == i) continue;
@@ -157,6 +158,16 @@ public static class FrameChunks
             await store.PutAsync(paths.Video(id, $"frames/{c.Chunk}.json"), IndexJson(c.Chunk, c.Start, frames.W, frames.H, j.GetProperty("crf").GetInt32(), j.GetProperty("gop").GetInt32(), list, true), null, null, false, ct);
         }
         await store.PutAsync(paths.Video(id, "sscd/keep.json"), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, cosine, lookback, rows = all.Count, kept = keep.Count, keep, rep }), null, null, false, ct);
+    }
+
+    /// <summary>A frame set that already went through an SSCD pass (a redo) gets its pre-pass spans back: each stored frame stands for [its time, the next stored frame's time), the last one up to the end of the covered time. Frames that were never merged are returned as they are.</summary>
+    public static List<ChunkFrame> ResetSscdSpans(List<ChunkFrame> all)
+    {
+        if (!all.Any(f => f.Rep != null)) return all;
+        double end = all.Max(f => f.Spans.Count == 0 ? f.T : f.Spans.Max(s => s[1]));
+        var res = new List<ChunkFrame>(all.Count);
+        for (int i = 0; i < all.Count; i++) res.Add(all[i] with { Rep = null, Spans = [[all[i].T, i + 1 < all.Count ? all[i + 1].T : Math.Max(end, all[i].T)]] });
+        return res;
     }
 
     /// <summary>The second pruning pass: over the time-ordered rows, a row whose cosine to a kept row of the last <paramref name="lookback"/> seconds is at least <paramref name="cosine"/> is dropped. Returns the kept row numbers and, per row, the kept row it stands for.</summary>
