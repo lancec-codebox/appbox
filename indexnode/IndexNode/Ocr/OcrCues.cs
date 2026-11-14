@@ -24,7 +24,7 @@ public sealed class Cue
 /// <summary>Merging per-frame OCR into timed cues (port of the tested post.py).</summary>
 public static partial class OcrCues
 {
-    public const double Fps = 4;
+    public const double Fps = 2; // owner 2026-11-14: every 0.5 s (every cue lasts >= 0.5 s: none shorter in 139,331 measured cues)
     public const int MaxEdit = 2;
 
     [GeneratedRegex(@"[\u3400-\u9fff]")] private static partial Regex Cjk();
@@ -72,7 +72,10 @@ public static partial class OcrCues
         {
             var (zh, en) = Split(f.Lines);
             var v = english ? en : zh;
-            if (v != null && cur != null && Levenshtein(v.Text, cur[^1].P.Text) <= MaxEdit && gap <= 1) { cur.Add((f.T, v)); gap = 0; continue; }
+            // same cue when the text differs by at most 2 edits AND at most a quarter of its length: short lines ("什么" vs "你说什么") stay apart
+            // or when one reading holds the other (a line read while fading in or out: "换" next to "换一个")
+            if (v != null && cur != null && gap <= 1 && (Levenshtein(v.Text, cur[^1].P.Text) <= Math.Min(MaxEdit, Math.Max(v.Text.Length, cur[^1].P.Text.Length) / 4)
+                || v.Text.Contains(cur[^1].P.Text) || cur[^1].P.Text.Contains(v.Text))) { cur.Add((f.T, v)); gap = 0; continue; }
             if (v != null)
             {
                 if (cur != null) done.Add(cur);
@@ -89,9 +92,9 @@ public static partial class OcrCues
         var cues = new List<Cue>();
         foreach (var c in done)
         {
-            if (c.Count < 2) continue; // a single frame is flicker
+            // at 0.5 s sampling a single sample is a real cue (cues last >= 0.5 s); flicker is what the reads disagree on, not one sample
             var groups = c.GroupBy(x => x.P.Text).Select(g => (Text: g.Key, Count: g.Count(), Conf: g.Sum(x => x.P.Conf), First: g.First().P)).ToList();
-            var best = groups.OrderByDescending(g => g.Count).ThenByDescending(g => g.Conf).First();
+            var best = groups.OrderByDescending(g => g.Count).ThenByDescending(g => g.Text.Length).ThenByDescending(g => g.Conf).First();
             cues.Add(new Cue
             {
                 Start = Math.Round(c[0].T, 2), End = Math.Round(c[^1].T + 1 / Fps, 2), Text = best.Text, Conf = Math.Round(c.Average(x => x.P.Conf), 3),

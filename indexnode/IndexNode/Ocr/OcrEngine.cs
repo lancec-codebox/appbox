@@ -61,13 +61,42 @@ public sealed class OcrEngine : IDisposable
         long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         var crops = boxes.Select(b => Crop(bgr, w, h, b.Corners)).ToList();
         long t4 = System.Diagnostics.Stopwatch.GetTimestamp(); TCrop += t4 - t3;
-        long t5 = System.Diagnostics.Stopwatch.GetTimestamp(); TRecPre += 0;
-        var order = Enumerable.Range(0, crops.Count).OrderBy(i => crops[i].W / (double)crops[i].H).ToList();
-        var results = new (string, double)[crops.Count];
+        var results = new (string Text, double Score)[crops.Count];
+        ReadCrops(crops, Enumerable.Range(0, crops.Count).ToList(), Squeeze, results);
+        if (Squeeze < 1 && Reread)
+        {
+            // squeezed reads keep Chinese (wide, square characters) but lose spaces and letters in Latin text: re-read at full width every line that did not come back as Chinese
+            var again = Enumerable.Range(0, crops.Count).Where(i => results[i].Text.Length == 0 || results[i].Score < TextScore || !OcrCues.IsChinese(results[i].Text)).ToList();
+            if (again.Count > 0) { ReadCrops(crops, again, 1.0, results); FullRereads += again.Count; }
+        }
+        if (Squeeze < 1) SqueezedReads += crops.Count;
+        var lines = new List<OcrLine>();
+        for (int i = 0; i < crops.Count; i++)
+        {
+            var (text, score) = results[i];
+            if (text.Length == 0 || score < TextScore) continue;
+            var bx = boxes[i];
+            lines.Add(new OcrLine((int)bx.MinX, (int)bx.MinY, (int)bx.MaxX, (int)bx.MaxY, text, score));
+        }
+        return lines;
+    }
+
+    /// <summary>Reader input width = natural width (height 48, aspect kept) times this. 1 = as trained; the subtitle stage uses less (see OcrSubs.Squeeze).</summary>
+    public double Squeeze { get; set; } = 1.0;
+    public int SqueezedReads, FullRereads;
+    /// <summary>With a squeeze: read again at full width every line that did not come back as Chinese.</summary>
+    public bool Reread { get; set; } = true;
+
+    /// <summary>Reads crops[which] in batches sorted by aspect, at <paramref name="sq"/> times the natural width, into results.</summary>
+    private void ReadCrops(List<(byte[] Data, int W, int H)> crops, List<int> which, double sq, (string Text, double Score)[] results)
+    {
+        int Rw(int i) => Math.Max(RecMinWidth / 3, (int)Math.Ceiling(RecWidth(crops[i].W, crops[i].H) * sq));
+        long t5 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var order = which.OrderBy(i => crops[i].W / (double)crops[i].H).ToList();
         for (int g = 0; g < order.Count; g += RecBatch)
         {
             var idx = order.Skip(g).Take(RecBatch).ToList();
-            int maxW = Math.Min(RecMaxWidth, idx.Max(i => RecWidth(crops[i].W, crops[i].H)));
+            int maxW = Math.Min(RecMaxWidth, idx.Max(Rw));
             maxW = Math.Max(RecMinWidth, maxW);
             int plane = RecHeight * maxW, need = idx.Count * 3 * plane;
             if (recBuf.Length < need) recBuf = new float[need];
@@ -75,7 +104,7 @@ public sealed class OcrEngine : IDisposable
             for (int k = 0; k < idx.Count; k++)
             {
                 var (cb, cw, ch) = crops[idx[k]];
-                int rw = Math.Min(RecWidth(cw, ch), maxW);
+                int rw = Math.Min(Rw(idx[k]), maxW);
                 ResizeNorm(cb, cw, ch, rw, RecHeight, recBuf, k * 3 * plane, maxW, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f);
             }
             long t5b = System.Diagnostics.Stopwatch.GetTimestamp(); TRecPre += t5b - t5;
@@ -88,15 +117,6 @@ public sealed class OcrEngine : IDisposable
             TCtc += System.Diagnostics.Stopwatch.GetTimestamp() - t6b;
             t5 = System.Diagnostics.Stopwatch.GetTimestamp();
         }
-        var lines = new List<OcrLine>();
-        for (int i = 0; i < crops.Count; i++)
-        {
-            var (text, score) = results[i];
-            if (text.Length == 0 || score < TextScore) continue;
-            var bx = boxes[i];
-            lines.Add(new OcrLine((int)bx.MinX, (int)bx.MinY, (int)bx.MaxX, (int)bx.MaxY, text, score));
-        }
-        return lines;
     }
 
     private float[] recBuf = [];

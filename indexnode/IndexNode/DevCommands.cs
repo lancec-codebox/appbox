@@ -149,12 +149,15 @@ public static class DevCommands
             {
                 var det = await Models.EnsureAsync(Models.OcrDet, http, ct); var rec = await Models.EnsureAsync(Models.OcrRec, http, ct); var dict = await Models.EnsureAsync(Models.OcrDict, http, ct);
                 var duration = await Frames.DurationAsync(tools, video!, ct);
+                double from = a.Get("from") is { } fr0 ? double.Parse(fr0, CultureInfo.InvariantCulture) : 0, to = a.Get("to") is { } to0 ? double.Parse(to0, CultureInfo.InvariantCulture) : duration;
                 var (w, h) = await OcrSubs.SizeAsync(tools, video!, ct);
-                var band = await OcrSubs.FindBandAsync(tools, det, rec, dict, video!, w, h, 0, duration, threads, _ => { }, ct);
+                var band = a.Get("band") != null ? (0, 0) : await OcrSubs.FindBandAsync(tools, det, rec, dict, video!, w, h, from, to - from, threads, _ => { }, ct); // --band y,h skips the search
                 Console.WriteLine($"band: {(band == null ? "none" : $"y={band.Value.Y} h={band.Value.H}")}  ({sw.Elapsed.TotalSeconds:F1}s)");
                 if (band == null) return 1;
                 if (a.Get("band") is { } bs) { var p = bs.Split(','); band = (int.Parse(p[0]), int.Parse(p[1])); }
-                var r = await OcrSubs.ReadAsync(tools, video!, det, rec, dict, w, h, band.Value.Y, band.Value.H, 0, duration, threads, _ => { }, ct);
+                var bandSecs = sw.Elapsed.TotalSeconds;
+                var r = await OcrSubs.ReadAsync(tools, video!, det, rec, dict, w, h, band.Value.Y, band.Value.H, from, to - from, threads, m => Console.Error.WriteLine($"{sw.Elapsed.TotalSeconds:F1}s {m}"), ct, exactSegments: true, useGate: !a.Has("no-gate"), preCrop: a.Has("crop"), squeeze: a.Get("squeeze") is { } sq0 ? double.Parse(sq0, CultureInfo.InvariantCulture) : OcrSubs.Squeeze, reread: a.Has("reread"));
+                File.WriteAllText(Path.Combine(outDir, "frames.json"), System.Text.Json.JsonSerializer.Serialize((r.Frames ?? []).Select(f => new { t = f.T, lines = f.Lines.Select(l => l.Text) })));
                 // shift to the position in the full video
                 foreach (var c in r.Zh.Concat(r.En)) { c.Start = Math.Round(c.Start + offset, 2); c.End = Math.Round(c.End + offset, 2); }
                 File.WriteAllText(Path.Combine(outDir, "subs.zh.vtt"), OcrCues.ToVtt(r.Zh, false));
