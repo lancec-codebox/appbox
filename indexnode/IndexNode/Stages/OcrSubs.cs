@@ -56,13 +56,28 @@ public static class OcrSubs
         return BandFinder.Find(boxes, h) is { } r ? (r.Y, r.Height) : null;
     }
 
+    /// <summary>The segments for the parallel read: equal parts whose boundaries are snapped to the sampling grid (multiples of 1/fps from the start), so every segment samples exactly the instants the serial read would, and the merged frames are identical to it.</summary>
+    public static List<(double Start, double End)> PlanSegments(double duration, int workers, double fps = OcrCues.Fps)
+    {
+        var raw = FrameMath.Plan(duration, workers, 4);
+        var list = new List<(double Start, double End)>();
+        double prev = 0;
+        for (int i = 0; i < raw.Count; i++)
+        {
+            double end = i == raw.Count - 1 ? duration : Math.Round(raw[i].End * fps) / fps;
+            if (end <= prev) continue;
+            list.Add((prev, end)); prev = end;
+        }
+        return list;
+    }
+
     /// <summary>Every frame of the band at 4 fps, in parallel segments (ffmpeg -threads 1 each, one OCR worker per segment).</summary>
     public static async Task<OcrResult> ReadAsync(Tools tools, string video, string ocrDet, string ocrRec, string dict, int w, int h, int bandY, int bandH,
         double start, double duration, int workers, Action<string> progress, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
         var ffmpeg = await tools.FfmpegAsync(ct);
-        var plan = FrameMath.Plan(duration, workers, 4).Select(s => (Start: start + s.Start, End: start + s.End)).ToList();
+        var plan = PlanSegments(duration, workers).Select(s => (Start: start + s.Start, End: start + s.End)).ToList();
         var perSeg = new List<FrameText>[plan.Count];
         int frameBytes = w * bandH * 3, total = 0;
         await Task.WhenAll(plan.Select((seg, k) => Task.Run(async () =>
@@ -90,6 +105,7 @@ public static class OcrSubs
             await p.WaitForExitAsync(CancellationToken.None);
         }, ct)).ToArray());
 
+        Log.Info($"ocrsubs: {total} frames in {sw.Elapsed.TotalSeconds:F0}s = {total / Math.Max(0.001, sw.Elapsed.TotalSeconds):F1} frames/s on {plan.Count} segments (ffmpeg decodes the full frame, the band is cropped in the filter)");
         var frames = perSeg.SelectMany(x => x).OrderBy(f => f.T).ToList();
         var zh = OcrCues.Merge(frames, false);
         var en = OcrCues.Merge(frames, true);

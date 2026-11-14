@@ -219,6 +219,8 @@ public sealed class RunningJob
     public string? Step { get; set; }
     public string? Progress { get; set; }
     public int? Worker { get; set; }
+    /// <summary>When the job started (UTC), so the admin page can show how long a node has been on it; reset when the step changes.</summary>
+    public string? StartedAt { get; set; }
 }
 
 public sealed class NodeInfo

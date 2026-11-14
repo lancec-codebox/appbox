@@ -132,7 +132,7 @@ public sealed class NodeEngine
         Threads = o.Threads, Conditions = o.Conditions, Steps = o.Steps,
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
-        Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker }).ToList(),
+        Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker, StartedAt = r.Info.StartedAt }).ToList(),
         Traffic = traffic.Snapshot(), Placement = placement, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
         LastSeen = Protocol.NowUtc(), StartedAt = Protocol.Utc(startedAt),
     };
@@ -423,7 +423,7 @@ public sealed class NodeEngine
     {
         var watch = System.Diagnostics.Stopwatch.StartNew();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var run = new Running { Info = new RunningJob { JobId = claim.Job.JobId, Stage = stage, Worker = worker }, Cts = cts };
+        var run = new Running { Info = new RunningJob { JobId = claim.Job.JobId, Stage = stage, Worker = worker, StartedAt = Protocol.NowUtc() }, Cts = cts };
         running[run] = 0;
         IDisposable? budget = Protocol.HeavyStages.Contains(stage) ? Budget.Enter() : null;
         RegistryChanged();
@@ -437,7 +437,7 @@ public sealed class NodeEngine
             {
                 Job = claim.Job, Stage = stage, BlobName = claim.BlobName, LeaseId = claim.LeaseId, Worker = worker,
                 Store = store, Paths = paths, NodeId = o.NodeId, Token = cts.Token, ThreadShare = () => Budget.Share,
-                Report = (step, progress) => { if (step != null) run.Info.Step = step; run.Info.Progress = progress; },
+                Report = (step, progress) => { if (step != null && step != run.Info.Step) { run.Info.Step = step; run.Info.StartedAt = Protocol.NowUtc(); } run.Info.Progress = progress; },
             };
             run.Ctx = ctx;
             await handlers[stage].RunAsync(ctx);

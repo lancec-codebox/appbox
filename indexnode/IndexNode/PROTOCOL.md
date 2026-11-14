@@ -250,7 +250,7 @@ Write it with `indexnode control run|drain|stop [--stage download|process] [--me
   "version": "0.1.0", "platform": "windows-x64", "stages": ["download", "process"],
   "jobs": { "download": 1, "process": 2 }, "threads": 16, "conditions": "wifi+charging",
   "state": "working" | "idle" | "draining" | "stopped" | "backoff" | "offline",
-  "control": "run", "running": [ { "jobId": "...", "stage": "process", "step": "sscd", "progress": "42%" } ],
+  "control": "run", "running": [ { "jobId": "...", "stage": "process", "step": "sscd", "progress": "42%", "startedAt": "2026-11-13T20:00:00Z" } ],
   "traffic": { "totals": { "youtubeIn": 0, "storageRead": 0, "storageWrite": 0, "aiOut": 0, "aiIn": 0, "otherIn": 0 },
                "hours": [ { "hour": "2026-11-14T06:00Z", "youtubeIn": 0, "storageRead": 0, "storageWrite": 0, "aiOut": 0, "aiIn": 0, "otherIn": 0 } ] },
   "lastSeen": "2026-11-13T20:00:30Z", "startedAt": "..." }
