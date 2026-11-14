@@ -55,6 +55,10 @@ Big blobs may be Nexis ghosts. [`IndexNode/Tools/NexisGhost.cs`](IndexNode/Tools
 - Limits: `--budget N`, `--schedule "<cron>" --window 3h` (or `config set budget|schedule|window`); `control.json` → `nodes.<nodeId>` overrides. Own cron parser. The registry shows `budget spent` / `next window <time>`.
 - AI: `config set ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api` (`ai.api`: chat, responses or auto; auto retries a model on the Responses API when chat says unsupported_api_for_model), `--ai-*` flags or `INDEXNODE_AI_*` (flag > env > config); `indexnode ai test`. The key is redacted. No pipeline step uses it yet; `processed.json` lists `skipped`.
 
+## Cast (faces)
+
+`cast` finds the main characters without AI (buffalo_l: average linkage cut 0.65, centroid merge 0.5, main = at least 20 faces; `describe` returns `samePerson` groups that publish merges, so a character split over two clusters is harmless): face detection on the keyframes, clustering, a second merge pass, portraits, contact sheets (`cast/sheet_<cluster>.jpg`, 12 faces of each main cluster) and poster two-shot candidates. `cast.model` is `buffalo_l` (default) or `yunet-sface`. Licence: the InsightFace `buffalo_l` weights are non-commercial (research) licence; used here for internal data processing; YuNet and SFace are permissive and stay selectable. Real-data run on a processed job: `indexnode process --job <id> --steps cast,describe`, then `indexnode publish --job <id>`.
+
 ## Model checks
 
 `scripts/check-models.sh` (set `REF` to the unpacked drama-ref pack) reruns the real-model checks on short cuts of the test drama. Last run, 4-core AMD EPYC runner:

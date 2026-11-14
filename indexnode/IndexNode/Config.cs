@@ -10,6 +10,14 @@ public sealed class NodeConfig
     public string? NodeName { get; set; }
     public Dictionary<string, int>? Jobs { get; set; }
     public int? Threads { get; set; }
+
+    /// <summary>Face models of the cast step: "buffalo_l" (default) or "yunet-sface".</summary>
+    public string? CastModel { get; set; }
+    /// <summary>Frame storage: AV1 CRF of the stored frames and keyframes (default 22); colour-grid prune distance (0.08), SSCD prune cosine (0.9), look-back seconds (30).</summary>
+    public int? FrameCrf { get; set; }
+    public double? PruneGrid { get; set; }
+    public double? PruneSscd { get; set; }
+    public double? PruneLookback { get; set; }
     public string? ModelUrl { get; set; }
     public string? ModelPath { get; set; }
     public BrowserConfig? Browser { get; set; }
@@ -122,7 +130,7 @@ public sealed class NodeConfig
         foreach (var part in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var kv = part.Split('=');
-            if (kv.Length == 1 && int.TryParse(kv[0], out var all)) { d["download"] = all; d["process"] = all; }
+            if (kv.Length == 1 && int.TryParse(kv[0], out var all)) { d["download"] = all; foreach (var st in Protocol.Stages.Where(x => x == "process" || Protocol.IsStep(x))) d[st] = all; }
             else if (kv.Length == 2 && Protocol.Stages.Contains(kv[0]) && int.TryParse(kv[1], out var n) && n >= 0) d[kv[0]] = n;
             else throw new ArgumentException($"bad --jobs entry '{part}' (use e.g. process=2,download=1)");
         }

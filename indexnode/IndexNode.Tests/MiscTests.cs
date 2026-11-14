@@ -71,7 +71,7 @@ public class FrameMathTests
     public void Select_filter_scales_to_288_and_uses_scene_threshold_and_one_second_tick()
     {
         var f = FrameMath.SelectFilter();
-        Assert.Contains("scale=288:-2", f);
+        Assert.Contains("(iw,ih),360,-2)", f);
         Assert.Contains("gt(scene,0.3)", f);
         Assert.Contains("gte(t-prev_selected_t,1)", f);
     }

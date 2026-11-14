@@ -7,13 +7,19 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
     /// <summary>Set by `run` from flag > environment > config; null or unconfigured means AI steps are skipped.</summary>
     public static AiConfig? Ai { get; set; }
 
+    /// <summary>`indexnode process --job`: redo the listed steps of an already processed job (their existing outputs are replaced; processed.json and the video are left alone).</summary>
+    public bool Redo { get; init; }
+
     /// <summary>Steps that need a model. None exist yet (merging subtitle text and transcript, naming the cast and checking doubtful OCR lines come later); each will be listed here.</summary>
-    public static readonly string[] AiSteps = [];
+    public static readonly string[] AiSteps = ["describe"];
 
     /// <summary>The AI steps this run cannot do for lack of an endpoint; they go under "skipped" in processed.json, they do not fail the job.</summary>
     public static string[] SkippedAiSteps(AiConfig? ai) => ai is { Configured: true } ? [] : AiSteps;
 
-    public static readonly string[] KnownSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "compress"];
+    public static readonly string[] KnownSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "sync"];
+
+    /// <summary>The outputs that make a video fully processed, per step: the node that writes the last one also writes processed.json.</summary>
+    static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("clip", "clip/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json")];
 
     /// <summary>The steps this node can run: the ones without models always, the model steps when their files are installed or may be downloaded.</summary>
     public static string[] SupportedSteps(NodeConfig cfg, string? modelsDir = null) =>
@@ -30,7 +36,8 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
     {
         var ct = ctx.Token;
         var job = ctx.Job; var id = job.JobId; var paths = ctx.Paths;
-        var steps = job.Steps is { Length: > 0 } ? job.Steps : Protocol.DefaultSteps;
+        bool stepJob = Protocol.IsStep(job.Stage);
+        var steps = stepJob ? [job.Stage] : job.Steps is { Length: > 0 } ? job.Steps : Protocol.DefaultSteps;
         var supported = SupportedSteps(config);
         var unsupported = steps.Where(s => !supported.Contains(s)).ToArray();
         if (unsupported.Length > 0)
@@ -38,28 +45,43 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             Log.Info($"process {id}: this node cannot run step(s) {string.Join(',', unsupported)}: skipping the job, released without an attempt");
             throw new JobSkipped("unsupported step: " + string.Join(',', unsupported));
         }
+        if (!stepJob && job.Stage == "process" && !steps.Contains("compress") && !Redo)
+        {
+            // compatibility path: a legacy process job fans out into step jobs (only where they do not exist yet) and is done
+            var made = new List<string>();
+            foreach (var step in Protocol.StepStages.Where(x => steps.Contains(x) || x is "sync" or "describe" or "cast"))
+            {
+                var sj = JobDescriptor.NewStep(step, id);
+                if (await ctx.Store.PutAsync(paths.Job(step, id), sj.ToBytes(), Tags.Job(step, "pending", sj.AddedAt), null, true, ct)) made.Add(step);
+            }
+            Log.Info($"process {id}: fanned out into step jobs ({(made.Count == 0 ? "all exist" : string.Join(',', made))})");
+            return;
+        }
         var compress = job.Compress ?? new CompressSettings();
         var watch = System.Diagnostics.Stopwatch.StartNew();
 
         var listing = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).ToDictionary(b => b.Name, b => b.Size);
-        bool Has(string file) => listing.ContainsKey(paths.Video(id, file));
-        if (Has("processed.json")) return;
+        bool Has(string file) => !Redo && listing.ContainsKey(paths.Video(id, file));
+        bool HasAny(string file) => listing.ContainsKey(paths.Video(id, file));
+        if (Has("processed.json") && !Redo && !stepJob) return;
         var downloaded = await store.GetAsync(paths.Video(id, "downloaded.json"), ct)
             ?? throw new InvalidOperationException($"{id} has no downloaded.json yet");
         double duration = JsonDocument.Parse(downloaded.Data).RootElement.TryGetProperty("durationSeconds", out var dEl) ? dEl.GetDouble() : 0;
 
         var need = new Dictionary<string, bool>
         {
-            ["frames"] = steps.Contains("frames") && !Has("frames.json"),
-            ["sscd"] = steps.Contains("sscd") && !Has("sscd.f16"),
-            ["clip"] = steps.Contains("clip") && !Has("clip.f16"),
+            ["frames"] = steps.Contains("frames") && !Has("frames/manifest.json"),
+            ["sscd"] = steps.Contains("sscd") && !Has("sscd/manifest.json"),
+            ["clip"] = steps.Contains("clip") && !Has("clip/manifest.json"),
             ["transcribe"] = steps.Contains("transcribe") && !Has("asr/" + Transcribe.ModelName + ".zh.json"),
             ["ocrsubs"] = steps.Contains("ocrsubs") && !Has("ocr/lines.json"),
             ["compress"] = steps.Contains("compress") && !Has("compact.mp4"),
+            ["cast"] = steps.Contains("cast") && !Has("cast/clusters.json"),
+            ["describe"] = steps.Contains("describe") && !Has("describe.json") && Ai is { Configured: true },
+            ["sync"] = stepJob && job.Stage == "sync",
         };
-        // sscd and clip work on the extracted frames, so they are (re)extracted locally when only those are missing
-        bool extractFrames = need["frames"] || need["sscd"] || need["clip"];
-        bool needVideo = extractFrames || need["transcribe"] || need["ocrsubs"] || need["compress"];
+        // sscd, clip and cast read the stored frames/keyframes chunks; only the frames step (and transcribe, ocrsubs, compress, the cast credits) decode the video
+        bool needVideo = need["frames"] || need["transcribe"] || need["ocrsubs"] || need["compress"] || need["cast"];
 
         var work = Path.Combine(Path.GetTempPath(), "indexnode", "p-" + id);
         if (Directory.Exists(work)) Directory.Delete(work, true);
@@ -67,6 +89,7 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
         try
         {
             var videoBlob = paths.Video(id, "video.mp4");
+            if (needVideo && !HasAny("video.mp4") && HasAny("compact.mp4")) { videoBlob = paths.Video(id, "compact.mp4"); Log.Info($"process {id}: video.mp4 is gone, working from compact.mp4"); }
             var video = Path.Combine(work, "video.mp4");
             long originalBytes = 0;
             if (needVideo)
@@ -80,30 +103,39 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             }
             else originalBytes = listing.GetValueOrDefault(videoBlob);
 
-            var framesDir = Path.Combine(work, "frames");
-            List<FrameEntry>? frames = null;
-            if (extractFrames)
+            int frameCount = 0;
+            if (need["frames"])
             {
                 ctx.Report("frames", null);
                 int segs = ctx.ThreadShare();
-                frames = await Frames.ExtractAsync(tools, video, work, framesDir, segs, duration, p => ctx.Report("frames", p), ct);
-                if (need["frames"]) await ctx.Store.PutAsync(paths.Video(id, "frames.json"), Frames.ToJson(frames), null, null, false, ct);
-                Log.Info($"process {id}: {frames.Count} frames in {segs} segment(s)");
+                var r = await Frames.ProduceAsync(tools, video, work, FrameSettings.From(config), segs, duration, p => ctx.Report("frames", p), (name, bytes, type) => ctx.Store.PutAsync(paths.Video(id, name), bytes, null, null, false, ct, type), ct);
+                frameCount = r.Kept;
+                Log.Info($"process {id}: {r.Kept} frames kept of {r.Sampled} sampled ({r.FrameBytes / 1048576.0:F1} MB AV1) and {r.Keyframes} keyframes ({r.KeyframeBytes / 1048576.0:F1} MB all-intra AV1)");
             }
+            // the stored frames, fetched (and hydrated) once for the steps that embed them
+            ChunkDir? frameSet = null;
+            async Task<ChunkDir> FrameSet() => frameSet ??= await FrameChunks.DownloadAsync(store, paths, id, "frames", Path.Combine(work, "framechunks"), ct) ?? throw new InvalidOperationException($"{id} has no frames/ chunks yet (run the frames step)");
+            async Task<string> FramesDir() { var d = Path.Combine(work, "frames"); if (!Directory.Exists(d)) await (await FrameSet()).ExtractAsync(tools, d, ct); return d; }
             if (need["sscd"])
             {
                 ctx.Report("sscd", null);
                 var model = await Sscd.EnsureModelAsync(config, http, ct);
-                var bytes = await Sscd.DescribeAsync(tools, model, framesDir, frames!.Count, ctx.ThreadShare(), p => ctx.Report("sscd", p), ct);
-                await ctx.Store.PutAsync(paths.Video(id, "sscd.f16"), bytes, null, null, false, ct, "application/octet-stream");
+                var fs = await FrameSet();
+                var bytes = await Sscd.DescribeAsync(tools, model, await FramesDir(), fs.Count, ctx.ThreadShare(), p => ctx.Report("sscd", p), ct);
+                await FrameChunks.PutVectorsAsync(ctx.Store, paths, id, "sscd", fs, bytes, Sscd.Dim, new { model = Sscd.ModelId(model), inputSize = Sscd.ShortSide, prune = new { cosine = FrameSettings.From(config).SscdCosine, lookback = FrameSettings.From(config).LookbackSeconds } }, ct);
+                // second pruning pass: SSCD cosine over the same look-back window; the pruned frames stay stored, sscd/keep.json and the spans say which stand for which
+                var fset = FrameSettings.From(config);
+                var (keep, rep) = FrameChunks.SscdPass(fs.Times, bytes, Sscd.Dim, fset.SscdCosine, fset.LookbackSeconds);
+                await FrameChunks.ApplySscdPassAsync(ctx.Store, paths, id, fs, rep, keep, fset.SscdCosine, fset.LookbackSeconds, ct);
+                Log.Info($"process {id}: sscd pass kept {keep.Count} of {rep.Length} frames");
             }
             if (need["clip"])
             {
                 ctx.Report("clip", null);
                 var vision = await Models.EnsureAsync(Models.ClipVision, http, ct);
-                var bytes = await Clip.EmbedFramesAsync(tools, vision, framesDir, frames!.Count, ctx.ThreadShare(), p => ctx.Report("clip", p), ct);
-                await ctx.Store.PutAsync(paths.Video(id, "clip.f16"), bytes, null, null, false, ct, "application/octet-stream");
-                await ctx.Store.PutAsync(paths.Video(id, "clip.json"), Clip.InfoJson(), null, null, false, ct);
+                var fs = await FrameSet();
+                var bytes = await Clip.EmbedFramesAsync(tools, vision, await FramesDir(), fs.Count, ctx.ThreadShare(), p => ctx.Report("clip", p), ct);
+                await FrameChunks.PutVectorsAsync(ctx.Store, paths, id, "clip", fs, bytes, Clip.Dim, System.Text.Json.Nodes.JsonNode.Parse(Clip.InfoJson())!, ct);
             }
             if (need["transcribe"])
             {
@@ -144,6 +176,23 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
                 await ctx.Store.PutAsync(paths.Video(id, "ocr/lines.json"), OcrCues.ToJson(res.Zh, res.En, res.BandY, res.BandH, res.Width), null, null, false, ct);
                 if (res.En.Count > 0) await ctx.Store.PutAsync(paths.Video(id, "ocr/subs.en.vtt"), enc.GetBytes(OcrCues.ToVtt(res.En, false)), null, null, false, ct, "text/vtt");
             }
+            if (need["cast"])
+            {
+                ctx.Report("cast", null);
+                var castDir = Path.Combine(work, "castout");
+                var kfs = await FrameChunks.DownloadAsync(store, paths, id, "keyframes", Path.Combine(work, "kfchunks"), ct) ?? throw new InvalidOperationException($"{id} has no keyframes/ chunks yet (run the frames step)");
+                var msg = await CastStage.RunAsync(tools, http, video, duration, castDir, new CastStage.Options(config.CastModel ?? "buffalo_l", ctx.ThreadShare()), s => ctx.Report("cast", s), ct, null, kfs);
+                Log.Info($"process {id}: cast {msg}");
+                foreach (var f in Directory.GetFiles(Path.Combine(castDir, "cast")))
+                    await ctx.Store.PutAsync(paths.Video(id, "cast/" + Path.GetFileName(f)), await File.ReadAllBytesAsync(f, ct), null, null, false, ct, f.EndsWith(".jpg") ? "image/jpeg" : f.EndsWith(".f16") ? "application/octet-stream" : "application/json");
+            }
+            if (need["describe"])
+            {
+                ctx.Report("describe", null);
+                var d = await DescribeJob.GatherAsync(new StoreJob(store, paths, id), Path.Combine(work, "describe"), ct);
+                var bytes = await DescribeJob.RunAsync(new AiClient(http, Ai!), Ai, d, ct);
+                if (bytes != null) await ctx.Store.PutAsync(paths.Video(id, "describe.json"), bytes, null, null, false, ct);
+            }
             long compactBytes = 0;
             if (need["compress"])
             {
@@ -156,25 +205,30 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             }
             else if (steps.Contains("compress")) compactBytes = listing.GetValueOrDefault(paths.Video(id, "compact.mp4"));
 
-            int frameCount = frames?.Count ?? 0;
-            if (frames == null && steps.Contains("frames"))
+            if (stepJob)
             {
-                var fj = await store.GetAsync(paths.Video(id, "frames.json"), ct);
-                if (fj != null) frameCount = JsonDocument.Parse(fj.Data).RootElement.GetArrayLength();
+                // the node that finishes the last step writes processed.json
+                var after = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Select(b => b.Name).ToHashSet();
+                bool aiOff = !after.Contains(paths.Video(id, "describe.json")) && Ai is not { Configured: true };
+                if (Outputs.Any(o => !(o.Step == "describe" && aiOff) && !after.Contains(paths.Video(id, o.File)))) { Log.Info($"process {id}: step {job.Stage} done"); return; }
+                steps = Protocol.DefaultSteps.Concat(["cast", "sync", "describe"]).ToArray();
+                Log.Info($"process {id}: step {job.Stage} was the last one");
             }
+            if (frameCount == 0 && steps.Contains("frames") && await store.GetAsync(paths.Video(id, "frames/manifest.json"), ct) is { } fm)
+                frameCount = JsonDocument.Parse(fm.Data).RootElement.GetProperty("count").GetInt32();
             // speech language and OCR cue count come from the outputs, whether this run made them or an earlier one did
             string? speechLanguage = null; bool? dubbed = null; int? ocrCues = null;
-            if (steps.Contains("transcribe") && await store.GetAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), ct) is { } asr)
+            if (!stepJob && steps.Contains("transcribe") && await store.GetAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), ct) is { } asr)
             {
                 var root = JsonDocument.Parse(asr.Data).RootElement;
                 speechLanguage = root.TryGetProperty("language", out var l) ? l.GetString() : null;
                 dubbed = root.TryGetProperty("dubbed", out var d) && d.ValueKind == JsonValueKind.True;
             }
-            if (steps.Contains("ocrsubs") && await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct) is { } ocr)
+            if (!stepJob && steps.Contains("ocrsubs") && await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct) is { } ocr)
                 ocrCues = JsonDocument.Parse(ocr.Data).RootElement.GetProperty("zh").GetArrayLength();
             // sync.json, once transcribe and ocrsubs have both run for the job
             double? avOffset = null; bool? avSuspect = null;
-            if (steps.Contains("transcribe") && steps.Contains("ocrsubs"))
+            if ((steps.Contains("transcribe") && steps.Contains("ocrsubs")) || need["sync"])
             {
                 var lines = await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct);
                 var asrFile = await store.GetAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), ct);
@@ -187,7 +241,7 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             }
             var marker = JsonSerializer.SerializeToUtf8Bytes(new
             {
-                v = 1, steps, frames = frameCount, model = Sscd.ModelName, asrModel = steps.Contains("transcribe") ? Transcribe.ModelName : null,
+                v = 1, steps, frames = frameCount, model = Sscd.ModelId(config.ModelPath ?? ""), asrModel = steps.Contains("transcribe") ? Transcribe.ModelName : null,
                 speechLanguage, dubbed, ocrCues, avOffset, avSuspect, originalBytes, compactBytes, skipped = SkippedAiSteps(Ai),
                 nodeId = ctx.NodeId, seconds = Math.Round(watch.Elapsed.TotalSeconds, 1), at = Protocol.NowUtc(),
             });

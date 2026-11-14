@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "follow-channels" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "follow-channels", "dry", "qr", "no-sas", "force", "json" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -39,7 +39,7 @@ public static class Program
 {
     public const string Usage = """
         indexnode run [--stages watch,process,comments] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N]
-                      [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
+                      [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
         indexnode ai test [--ai-base-url ...]
@@ -47,7 +47,12 @@ public static class Program
         indexnode enqueue --from watch-later [--max-height 480]
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
-        indexnode status
+        indexnode status [--json]
+        indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
+        indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
+        indexnode publish [--out <dir>] [--job <id>] [--since <time>] [--local <dir>] [--force]   (site packs per PACK.md; default out: %LOCALAPPDATA%\indexnode\site)
+        indexnode medusa-setup [--qr] [--file <path>.medusa-node.json] [--name N] [--conditions wifi+charging|wifi] [--daily-cap N] [--budget N] [--schedule C] [--window W] [--no-sas]
+        indexnode dev cast --video <file> --out <dir> [--model buffalo_l|yunet-sface] [--threshold D] [--merge D] [--border D]
         indexnode requeue [--stage S]
         indexnode control run|drain|stop [--stage download|process|comments] [--message M]
         indexnode config set-sas <url>
@@ -78,6 +83,10 @@ public static class Program
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
                 "ai" => await Commands.AiAsync(a),
+                "publish" => await SiteCommands.PublishAsync(a),
+                "describe" => await SiteCommands.DescribeAsync(a),
+                "process" => await SiteCommands.ProcessAsync(a),
+                "medusa-setup" => SiteCommands.MedusaSetup(a),
                 _ => Fail($"unknown command '{cmd}'"),
             };
         }
@@ -111,9 +120,10 @@ public static class Commands
     public static async Task<int> RunAsync(Args a)
     {
         var (cfg, store, paths, http) = Open(a);
-        var stages = (a.Get("stages") ?? string.Join(',', Protocol.DefaultNodeStages)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
+        var stages = Protocol.ExpandStages((a.Get("stages") ?? string.Join(',', Protocol.DefaultNodeStages)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         foreach (var s in stages) if (!Protocol.Stages.Contains(s)) throw new ArgumentException($"unknown stage '{s}'");
         var jobs = new Dictionary<string, int> { ["download"] = cfg.JobsFor("download"), ["process"] = cfg.JobsFor("process"), ["comments"] = cfg.JobsFor("comments"), ["watch"] = cfg.JobsFor("watch") };
+        foreach (var st in Protocol.StepStages) jobs[st] = cfg.Jobs != null && cfg.Jobs.TryGetValue(st, out var sn) ? sn : cfg.JobsFor("process");
         foreach (var kv in NodeConfig.ParseJobs(a.Get("jobs"))) jobs[kv.Key] = kv.Value;
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         var nodeId = cfg.EnsureNodeId();
@@ -127,6 +137,7 @@ public static class Commands
             ["comments"] = new CommentsStage(tools, store, gate),
             ["watch"] = new WatchStage(tools, store),
         };
+        foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
         var limits = BuildLimits(a, cfg, nodeId);
         var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
         Redact.Register(ai.Key);
@@ -135,7 +146,7 @@ public static class Commands
         {
             NodeId = nodeId, Name = cfg.NodeName ?? NodeConfig.SanitizeName(Environment.MachineName),
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
-            Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => job.Stage != "process" || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
+            Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
             Stages = stages, Jobs = jobs, Threads = threads, Once = a.Has("once"),
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
         };
@@ -148,8 +159,24 @@ public static class Commands
         var budgetText = limits.Budget is { } bd ? $" budget={limits.Remaining}/{bd}" : "";
         var schedText = (a.Get("schedule") ?? cfg.Schedule) is { } sc ? " schedule=" + sc.Replace(' ', '_') + " window=" + (a.Get("window") ?? cfg.Window ?? "1h") : "";
         Log.Info($"node {nodeId}: stages={string.Join(',', stages)} jobs={string.Join(',', jobs.Where(j => stages.Contains(j.Key)).Select(j => j.Key + "=" + j.Value))} threads={threads} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
+        Task? statusLoop = null;
+        if (a.Get("status-out") is { } statusOut)
+        {
+            var every = StatusSnapshot.ParseEvery(a.Get("status-every"));
+            statusLoop = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    try { StatusSnapshot.WriteAtomic(statusOut, StatusSnapshot.Serialize(await StatusSnapshot.BuildAsync(store, paths, DateTimeOffset.UtcNow, cts.Token))); }
+                    catch (OperationCanceledException) { }
+                    catch (Exception e) { Log.Info("status snapshot failed: " + Redact.Sas(e.Message)); }
+                    try { await Task.Delay(every, cts.Token); } catch (OperationCanceledException) { }
+                }
+            });
+        }
         await engine.RunAsync(cts.Token);
         cts.Cancel();
+        if (statusLoop != null) await statusLoop;
         Log.Info("node stopped");
         return 0;
     }
@@ -304,6 +331,7 @@ public static class Commands
     {
         var (cfg, store, paths, _) = Open(a);
         var now = DateTimeOffset.UtcNow;
+        if (a.Has("json")) { Console.WriteLine(StatusSnapshot.Serialize(await StatusSnapshot.BuildAsync(store, paths, now, default))); return 0; }
         Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  jobs download={cfg.JobsFor("download")} process={cfg.JobsFor("process")}  threads={cfg.EffectiveThreads}");
 
         Console.WriteLine("\nNodes");
@@ -355,11 +383,11 @@ public static class Commands
         if (text.Length == 0) throw new ArgumentException("search needs a text");
         int top = a.Get("top") is { } tp ? int.Parse(tp) : 8;
         var (cfg, store, paths, http) = Open(a);
-        var f16 = await store.GetAsync(paths.Video(job, "clip.f16"), default) ?? throw new InvalidOperationException($"{job} has no clip.f16 yet (run the clip step)");
-        var fj = await store.GetAsync(paths.Video(job, "frames.json"), default) ?? throw new InvalidOperationException($"{job} has no frames.json");
-        var times = System.Text.Json.JsonDocument.Parse(fj.Data).RootElement.EnumerateArray().Select(e => e.GetProperty("t").GetDouble()).ToList();
-        var rows = Clip.FromF16Bytes(f16.Data);
-        if (rows.Length != times.Count) throw new InvalidOperationException($"clip.f16 has {rows.Length} rows but frames.json has {times.Count}");
+        var sj = new StoreJob(store, paths, job);
+        var f16 = await FrameChunks.VectorsAsync(sj, "clip", default) ?? throw new InvalidOperationException($"{job} has no clip vectors yet (run the clip step)");
+        var times = await FrameChunks.TimesAsync(sj, default) ?? throw new InvalidOperationException($"{job} has no frames");
+        var rows = Clip.FromF16Bytes(f16);
+        if (rows.Length != times.Count) throw new InvalidOperationException($"clip vectors have {rows.Length} rows but the frames list has {times.Count}");
         var textModel = await Models.EnsureAsync(Models.ClipText, http, default);
         var tok = Clip.LoadTokenizer(await Models.EnsureAsync(Models.ClipTokenizer, http, default));
         var q = Clip.EmbedText(textModel, tok, text);
@@ -468,6 +496,11 @@ public static class Commands
                 case "ai.api": if (!AiConfig.ValidApi(val.ToLowerInvariant())) throw new ArgumentException("ai.api: chat, responses or auto"); (file.Ai ??= new()).Api = val.ToLowerInvariant(); break;
                 case "jobs": file.Jobs = NodeConfig.ParseJobs(val); break;
                 case "threads": file.Threads = int.Parse(val); break;
+                case "cast.model": CastLogic.ModelFor(val); file.CastModel = val.ToLowerInvariant(); break;
+                case "frames.crf": file.FrameCrf = int.Parse(val); break;
+                case "prune.grid": file.PruneGrid = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "prune.sscd": file.PruneSscd = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "prune.lookback": file.PruneLookback = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
                 case "node-name": file.NodeName = NodeConfig.SanitizeName(val); break;

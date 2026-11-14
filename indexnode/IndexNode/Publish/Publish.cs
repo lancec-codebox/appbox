@@ -1,0 +1,245 @@
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+namespace IndexNode;
+
+/// <summary>Where a job's files come from: a local job folder or the blob store (names relative to videos/&lt;id&gt;/).</summary>
+public interface IJobSource
+{
+    string JobId { get; }
+    Task<byte[]?> ReadAsync(string file, CancellationToken ct);
+}
+
+public sealed class LocalJob(string dir, string id) : IJobSource
+{
+    public string JobId => id;
+    public Task<byte[]?> ReadAsync(string file, CancellationToken ct)
+    {
+        var p = Path.Combine(dir, file.Replace('/', Path.DirectorySeparatorChar));
+        return Task.FromResult(File.Exists(p) ? File.ReadAllBytes(p) : null);
+    }
+}
+
+public sealed class StoreJob(IStore store, Paths paths, string id) : IJobSource
+{
+    public string JobId => id;
+    public async Task<byte[]?> ReadAsync(string file, CancellationToken ct) => await FrameChunks.ReadAsync(store, paths.Video(id, file), ct, file.EndsWith(".f16") || file.EndsWith(".jpgs"));
+}
+
+/// <summary>Site packs (PACK.md): only what the site needs, never videos, frames or raw per-frame data beyond the 1 fps rows.</summary>
+public static class Publish
+{
+    public const string Version = "publish-1";
+    public const int Sscd = 512;
+
+    public static string DefaultOut() => OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "indexnode", "site")
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "indexnode", "site");
+
+    static readonly JsonSerializerOptions Opt = new() { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
+    /// <summary>Row index of the stored frame nearest to each whole second, one row per second (1 fps).</summary>
+    public static List<int> OneFps(IReadOnlyList<double> times)
+    {
+        var rows = new List<int>(); if (times.Count == 0) return rows;
+        int j = 0; int last = (int)Math.Floor(times[^1]);
+        for (int s = 0; s <= last; s++)
+        {
+            while (j + 1 < times.Count && Math.Abs(times[j + 1] - s) <= Math.Abs(times[j] - s)) j++;
+            if (rows.Count == 0 || rows[^1] != j) rows.Add(j); // a gap in the frames must not repeat a row: frames.json lists each stored frame once
+        }
+        return rows;
+    }
+
+    /// <summary>One row per shot (the clip search's shot rule: a cut where neighbouring cosine falls below 0.92): the frame nearest the shot's middle in time.</summary>
+    public static List<int> ShotMiddles(IReadOnlyList<float[]> rows, IReadOnlyList<double> times)
+    {
+        var ids = Clip.ShotIds(rows); var res = new List<int>(); int i = 0;
+        while (i < rows.Count)
+        {
+            int k = i; while (k + 1 < rows.Count && ids[k + 1] == ids[i]) k++;
+            double mid = (times[i] + times[k]) / 2; int best = i;
+            for (int r = i; r <= k; r++) if (Math.Abs(times[r] - mid) < Math.Abs(times[best] - mid)) best = r;
+            res.Add(best); i = k + 1;
+        }
+        return res;
+    }
+
+    static byte[] Rows(byte[] f16, IReadOnlyList<int> rows, int dim)
+    {
+        var o = new byte[rows.Count * dim * 2];
+        for (int i = 0; i < rows.Count; i++) Buffer.BlockCopy(f16, rows[i] * dim * 2, o, i * dim * 2, dim * 2);
+        return o;
+    }
+
+    static List<ShapeCue> Vtt(byte[]? b) => b == null ? [] : CueShaper.ParseVtt(Encoding.UTF8.GetString(b));
+
+    public static string Id(int cluster) => "c" + cluster;
+
+    /// <summary>describe's samePerson groups: kept cluster id to every cluster id of that person (the kept one first).</summary>
+    public static Dictionary<int, List<int>> Groups(JsonObject describe)
+    {
+        var res = new Dictionary<int, List<int>>();
+        foreach (var g in (describe["samePerson"] as JsonArray) ?? [])
+        {
+            var ids = ((g as JsonArray) ?? []).Select(x => x!.GetValue<int>()).ToList(); if (ids.Count > 1) res[ids[0]] = ids;
+        }
+        return res;
+    }
+
+    /// <summary>drama.json: describe.json plus the facts (youtubeId, embeddable, channel, duration, sources) and the cluster facts of the cast.</summary>
+    public static JsonObject BuildDrama(JsonObject describe, JsonObject? info, JsonObject? downloaded, JsonObject? clusters, JsonObject? processed, string jobId, string textSource, bool hasOcr, IReadOnlyDictionary<int, List<(string File, double T, bool Spoiler)>> stills, string by)
+    {
+        double dur = downloaded?["durationSeconds"]?.GetValue<double>() ?? info?["duration"]?.GetValue<double>() ?? 0;
+        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? Describe.Cutoff(dur);
+        var cl = (clusters?["clusters"] as JsonArray)?.OfType<JsonObject>().ToDictionary(c => c["id"]!.GetValue<int>()) ?? [];
+        var cast = new JsonArray();
+        foreach (var c in (describe["cast"] as JsonArray) ?? [])
+        {
+            int id = c!["cluster"]!.GetValue<int>(); cl.TryGetValue(id, out var f); var grp = Groups(describe).GetValueOrDefault(id) ?? [id];
+            var fs = grp.Where(cl.ContainsKey).Select(x => cl[x]).ToList();
+            var st = new JsonArray(); foreach (var s in stills.GetValueOrDefault(id) ?? []) st.Add(new JsonObject { ["file"] = s.File, ["t"] = s.T, ["spoiler"] = s.Spoiler });
+            cast.Add(new JsonObject
+            {
+                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = c["roleAtStart"]?.DeepClone(), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
+                ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
+            });
+        }
+        var rel = new JsonArray();
+        foreach (var r in (describe["relations"] as JsonArray) ?? [])
+            rel.Add(new JsonObject { ["from"] = Id(r!["from"]!.GetValue<int>()), ["to"] = Id(r["to"]!.GetValue<int>()), ["type"] = r["type"]!.DeepClone(), ["label"] = r["label"]!.DeepClone(), ["since"] = r["since"]!.DeepClone(), ["until"] = r["until"]?.DeepClone(), ["spoiler"] = r["spoiler"]!.DeepClone(), ["implied"] = r["implied"]!.DeepClone() });
+        return new JsonObject
+        {
+            ["v"] = 0, ["packId"] = jobId, ["youtubeId"] = info?["id"]?.GetValue<string>() ?? jobId, ["embeddable"] = downloaded?["embeddable"]?.GetValue<bool>() ?? false,
+            ["channel"] = info?["channel"]?.GetValue<string>() ?? info?["uploader"]?.GetValue<string>() ?? "", ["durationSeconds"] = dur,
+            ["originalTitle"] = info?["title"]?.GetValue<string>() ?? "",
+            ["title"] = describe["title"]!.DeepClone(), ["fullTitle"] = describe["fullTitle"]!.DeepClone(), ["teaser"] = describe["teaser"]!.DeepClone(), ["synopsis"] = describe["synopsis"]!.DeepClone(),
+            ["era"] = describe["era"]?.DeepClone(), ["fantasy"] = describe["fantasy"]?.DeepClone() ?? false, ["tags"] = describe["tags"]!.DeepClone(),
+            ["cast"] = cast, ["relations"] = rel, ["cutoffSeconds"] = cut,
+            ["sources"] = new JsonObject { ["text"] = textSource, ["asrModel"] = processed?["asrModel"]?.DeepClone(), ["ocr"] = hasOcr },
+            ["made"] = new JsonObject { ["at"] = Protocol.NowUtc(), ["by"] = by, ["notes"] = $"describe {describe["promptVersion"]}, models {describe["models"]?.ToJsonString()}" },
+        };
+    }
+
+    /// <summary>The fingerprint of a pack's inputs: when it is unchanged the pack is up to date.</summary>
+    public static string Stamp(byte[]? processed, byte[]? describe) =>
+        Version + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(processed ?? [])) + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(describe ?? []));
+
+    public sealed record Result(string Id, bool Written, string? Skipped);
+
+    public static async Task<Result> PublishOneAsync(Tools tools, IJobSource src, string outDir, bool force, CancellationToken ct, string by = "indexnode")
+    {
+        var id = src.JobId;
+        var processedB = await src.ReadAsync("processed.json", ct); var describeB = await src.ReadAsync("describe.json", ct);
+        if (processedB == null) return new(id, false, "no processed.json");
+        if (describeB == null) return new(id, false, "no describe.json");
+        var dir = Path.Combine(outDir, id); var stampFile = Path.Combine(dir, ".stamp"); var stamp = Stamp(processedB, describeB);
+        if (!force && File.Exists(stampFile) && File.ReadAllText(stampFile) == stamp) return new(id, false, "up to date");
+        var tmp = dir + ".tmp"; if (Directory.Exists(tmp)) Directory.Delete(tmp, true); Directory.CreateDirectory(Path.Combine(tmp, "cast"));
+        async Task<JsonObject?> J(string f) => await src.ReadAsync(f, ct) is { } b && JsonNode.Parse(b) is JsonObject o ? o : null;
+        async Task<JsonNode?> JN(string f) => await src.ReadAsync(f, ct) is { } b ? JsonNode.Parse(b) : null;
+        var describe = JsonNode.Parse(describeB)!.AsObject(); var processed = JsonNode.Parse(processedB)!.AsObject();
+        var info = await J("info.json"); var downloaded = await J("downloaded.json"); var clusters = await J("cast/clusters.json");
+
+        // frames.json + sscd.f16 at 1 fps; clip.f16 + clipFrames.json one row per shot
+        var times = await FrameChunks.TimesAsync(src, ct);
+        if (times != null)
+        {
+            if (await FrameChunks.VectorsAsync(src, "sscd", ct) is { } sscd && sscd.Length >= times.Count * Sscd * 2)
+            {
+                var rows = OneFps(times);
+                File.WriteAllBytes(Path.Combine(tmp, "sscd.f16"), Rows(sscd, rows, Sscd));
+                File.WriteAllText(Path.Combine(tmp, "frames.json"), JsonSerializer.Serialize(rows.Select(r => Math.Round(times[r], 2))));
+            }
+            if (await FrameChunks.VectorsAsync(src, "clip", ct) is { } clipB)
+            {
+                var crow = Clip.FromF16Bytes(clipB); var n = Math.Min(crow.Length, times.Count);
+                var pick = ShotMiddles(crow.Take(n).ToList(), times.Take(n).ToList());
+                File.WriteAllBytes(Path.Combine(tmp, "clip.f16"), Rows(clipB, pick, Clip.Dim));
+                File.WriteAllText(Path.Combine(tmp, "clipFrames.json"), JsonSerializer.Serialize(pick.Select(r => Math.Round(times[r], 2))));
+            }
+        }
+        // subtitles: OCR first, transcript filling gaps; English: uploaded, else burned-in OCR
+        var ocrZh = Vtt(await src.ReadAsync("ocr/subs.zh.vtt", ct)); var asr = Vtt(await src.ReadAsync("asr/" + Transcribe.ModelName + ".zh.vtt", ct));
+        var merged = TextTrack.Merge(ocrZh, asr);
+        File.WriteAllText(Path.Combine(tmp, "subs.zh.vtt"), CueShaper.ToVtt(merged));
+        byte[]? en = null; foreach (var f in new[] { "subs.en.vtt", "subs.en.srt", "ocr/subs.en.vtt" }) { en = await src.ReadAsync(f, ct); if (en != null) { if (f.EndsWith(".srt")) en = Encoding.UTF8.GetBytes(Srt2Vtt(Encoding.UTF8.GetString(en))); break; } }
+        if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en))));
+        // pictures: portraits, stills (spoiler after the cutoff), thumb
+        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject;
+        foreach (var c in (describe["cast"] as JsonArray) ?? [])
+        {
+            int cid = c!["cluster"]!.GetValue<int>();
+            if (await src.ReadAsync($"cast/portrait_{cid}.jpg", ct) is { } pb) File.WriteAllBytes(Path.Combine(tmp, "cast", $"{Id(cid)}.jpg"), pb);
+            var cand = await JN($"cast/cand_{cid}.json"); var list = new List<(string, double, bool)>(); int n = 0;
+            foreach (var s in (picks?[cid.ToString()]?["stills"] as JsonArray) ?? [])
+            {
+                if (n >= 3 || s is not JsonValue sv || !sv.TryGetValue<int>(out var k)) continue;
+                if (await src.ReadAsync($"cast/cand_{cid}_{k}.jpg", ct) is not { } jb) continue;
+                double t = (cand as JsonNode)?.AsArray().FirstOrDefault(x => x?["k"]?.GetValue<int>() == k)?["t"]?.GetValue<double>() ?? 0;
+                n++; var name = $"cast/{Id(cid)}_s{n}.jpg"; File.WriteAllBytes(Path.Combine(tmp, name), jb); list.Add((name, t, t > cut));
+            }
+            stills[cid] = list;
+        }
+        if (await src.ReadAsync("thumb.jpg", ct) is { } th) File.WriteAllBytes(Path.Combine(tmp, "thumb.jpg"), th);
+        await PosterAsync(tools, src, describe, tmp, ct);
+        var drama = BuildDrama(describe, info, downloaded, clusters, processed, id, ocrZh.Count > 0 ? "ocr" : "transcript", ocrZh.Count > 0, stills, by);
+        File.WriteAllText(Path.Combine(tmp, "drama.json"), drama.ToJsonString(Opt));
+        File.WriteAllText(Path.Combine(tmp, ".stamp"), stamp);
+        if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        Directory.Move(tmp, dir);
+        return new(id, true, null);
+    }
+
+    static string Srt2Vtt(string srt) => "WEBVTT\n\n" + System.Text.RegularExpressions.Regex.Replace(srt.Replace("\r", ""), @"(\d\d:\d\d:\d\d),(\d\d\d)", "$1.$2");
+
+    /// <summary>The two-shot for the poster: only candidates that show both lead clusters; describe's pick if it is one of them, else the best-scoring one (the list is ordered by score). Null: no candidate has both leads.</summary>
+    public static int? PickTwoShot(JsonArray? cands, int a, int b, int? chosen) => PickTwoShot(cands, [a], [b], chosen);
+
+    public static int? PickTwoShot(JsonArray? cands, IReadOnlyCollection<int> a, IReadOnlyCollection<int> b, int? chosen)
+    {
+        if (cands == null) return null;
+        var ok = cands.OfType<JsonObject>().Where(c => c["clusters"] is JsonArray cl && cl.Select(x => x!.GetValue<int>()).Any(a.Contains) && cl.Select(x => x!.GetValue<int>()).Any(b.Contains) && !cl.Select(x => x!.GetValue<int>()).All(x => a.Contains(x) && b.Contains(x))).Select(c => c["k"]!.GetValue<int>()).ToList();
+        if (ok.Count == 0) return null;
+        return chosen is { } k && ok.Contains(k) ? k : ok[0];
+    }
+
+    /// <summary>poster.jpg, 600x800, no text: top 40% the two leads' portraits, bottom 60% the chosen two-shot (cast/poster_&lt;k&gt;.jpg), thin dark gutters; with no two-shot the two portraits fill it.</summary>
+    static async Task PosterAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, CancellationToken ct)
+    {
+        var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
+        var f = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "female lead"); var m = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "male lead");
+        if (f == null || m == null) return;
+        var a = Path.Combine(tmp, "cast", Id(f["cluster"]!.GetValue<int>()) + ".jpg"); var b = Path.Combine(tmp, "cast", Id(m["cluster"]!.GetValue<int>()) + ".jpg");
+        if (!File.Exists(a) || !File.Exists(b)) return;
+        string? two = null; int fc0 = f["cluster"]!.GetValue<int>(), mc0 = m["cluster"]!.GetValue<int>();
+        var cands = await src.ReadAsync("cast/poster_cands.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
+        var gr = Groups(describe); var k = PickTwoShot(cands, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null);
+        if (k != null && await src.ReadAsync($"cast/poster_{k}.jpg", ct) is { } pb) { two = Path.Combine(tmp, "poster_two.tmp.jpg"); File.WriteAllBytes(two, pb); }
+        string P(string inp, string o, int w, int h) => $"[{inp}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}[{o}]";
+        var ff = await tools.FfmpegAsync(ct); var outp = Path.Combine(tmp, "poster.jpg");
+        var args = new List<string> { "-v", "error", "-y", "-i", a, "-i", b };
+        string fc;
+        if (two == null) fc = P("0:v", "l", 297, 800) + ";" + P("1:v", "r", 297, 800) + ";color=c=0x101010:s=6x800[g];[l][g][r]hstack=inputs=3";
+        else { args.AddRange(["-i", two]); fc = P("0:v", "l", 297, 317) + ";" + P("1:v", "r", 297, 317) + ";color=c=0x101010:s=6x317[g];[l][g][r]hstack=inputs=3[top];" + P("2:v", "bot", 600, 477) + ";color=c=0x101010:s=600x6[g2];[top][g2][bot]vstack=inputs=3"; }
+        args.AddRange(["-filter_complex", fc, "-frames:v", "1", "-q:v", "3", outp]);
+        var r = await Proc.RunAsync(ff, args, ct);
+        if (two != null) File.Delete(two);
+        if (r.ExitCode != 0) throw new InvalidOperationException("poster: ffmpeg failed: " + Redact.Sas(r.Stderr.Length > 300 ? r.Stderr[..300] : r.Stderr));
+    }
+
+    /// <summary>packs.json at the top: one entry per pack folder present.</summary>
+    public static void WriteIndex(string outDir)
+    {
+        var packs = new JsonArray();
+        foreach (var d in Directory.GetDirectories(outDir).OrderBy(x => x))
+        {
+            var f = Path.Combine(d, "drama.json"); if (!File.Exists(f)) continue;
+            var j = JsonNode.Parse(File.ReadAllText(f))!.AsObject();
+            packs.Add(new JsonObject { ["packId"] = Path.GetFileName(d), ["title"] = j["title"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["durationSeconds"] = j["durationSeconds"]?.DeepClone(), ["madeAt"] = j["made"]?["at"]?.DeepClone() });
+        }
+        File.WriteAllText(Path.Combine(outDir, "packs.json"), new JsonObject { ["v"] = 0, ["packs"] = packs }.ToJsonString(Opt));
+    }
+}

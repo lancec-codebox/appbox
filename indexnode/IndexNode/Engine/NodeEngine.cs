@@ -313,6 +313,15 @@ public sealed class NodeEngine
                 var body = await store.GetAsync(b.Name, ct);
                 if (body == null) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); continue; }
                 var job = JobDescriptor.Parse(body.Data);
+                if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct) is { } missing)
+                {
+                    // an earlier step has not finished: leave it pending, due a little later
+                    var later = Protocol.Utc(DateTimeOffset.UtcNow + Protocol.NeedsRetry);
+                    await store.SetTagsAsync(b.Name, Tags.Job(stage, "pending", tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, later), lease, ct);
+                    await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
+                    Log.Info($"[{stage}] {job.JobId} waits for {missing}");
+                    continue;
+                }
                 if (o.CanRun != null && !o.CanRun(job))
                 {
                     // this node lacks a step the job needs: leave it to another node, and look again later
@@ -331,6 +340,12 @@ public sealed class NodeEngine
         return null;
     }
 
+    private async Task<string?> MissingNeedAsync(JobDescriptor job, string[] needs, CancellationToken ct)
+    {
+        foreach (var n in needs) if (await store.GetTagsAsync(paths.Video(job.JobId, n), ct) == null) return n;
+        return null;
+    }
+
     // ---------------------------------------------------------------- run one job
 
     private enum Outcome { Done, Permanent, Bot, Transient, Released, LeaseLost, Skipped }
@@ -341,7 +356,7 @@ public sealed class NodeEngine
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var run = new Running { Info = new RunningJob { JobId = claim.Job.JobId, Stage = stage, Worker = worker }, Cts = cts };
         running[run] = 0;
-        IDisposable? budget = stage == "process" ? Budget.Enter() : null;
+        IDisposable? budget = Protocol.HeavyStages.Contains(stage) ? Budget.Enter() : null;
         RegistryChanged();
         Log.Info($"[{stage}#{worker}] claimed {claim.Job.JobId}");
 

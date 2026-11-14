@@ -11,7 +11,7 @@ namespace IndexNode;
 /// pipeline yet; `indexnode ai test` is its only user. In auto mode a model that answers "unsupported_api_for_model" on chat is retried once on
 /// Responses, and the choice is remembered per model for the life of the client.
 /// </summary>
-public sealed class AiClient(HttpClient http, AiConfig cfg)
+public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
 {
     /// <summary>A 64x64 PNG: a red disc on white, which `ai test` asks the vision model to name the colour of.</summary>
     public static readonly byte[] TestPng = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAq0lEQVR42u3ZwQ2AQAgFUYrwbP9F2YtaAq4b+MAQC5iXeFCwu/gYAAAAAAAAAACAMOA6zkqAN9fzKAKc6dsZlpK+kWGJ6VsYplD/x2Ai9csG06lfM5hU/YJhGCCg/qthEiCs/pNhDCC43m8AAADABEBKvdPAKwQAAIAaAD6nBQD8UgoAWKsIAMpv5jrsRjtspzvcBzpcaJrcyJpcKZvcieMHAAAAAAAAAJA5DzBSU7R9DBxDAAAAAElFTkSuQmCC");

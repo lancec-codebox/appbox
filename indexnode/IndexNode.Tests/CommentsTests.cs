@@ -265,14 +265,15 @@ public class CommentsTests
             (marker.GetProperty("vcodec").GetString(), marker.GetProperty("acodec").GetString(), marker.GetProperty("formatId").GetString(), marker.GetProperty("audioLanguage").GetString(), marker.GetProperty("audioNote").GetString()));
         Assert.Equal(["zh-Hans", "en-US"], marker.GetProperty("audioTracks").EnumerateArray().Select(t => t.GetProperty("language").GetString()!));
         Assert.True(marker.GetProperty("embeddable").GetBoolean());
-        Assert.Equal(["frames", "sscd", "clip", "transcribe", "ocrsubs"], s.Job(P.Job("process", id)).Steps);
-        Assert.Null(s.Job(P.Job("process", id)).Compress);
+        foreach (var step in Protocol.StepStages) { Assert.Equal("pending", s.State(P.Job(step, id))); Assert.Equal([step], s.Job(P.Job(step, id)).Steps); }
+        Assert.Equal(Protocol.NeedsOf("describe"), s.Job(P.Job("describe", id)).Needs);
+        Assert.False(s.Exists(P.Job("process", id))); // step jobs replace the all-in-one process job
 
         var cn = P.Job("comments", id);
         Assert.Equal("pending", s.State(cn));
         Assert.Equal(s[cn].Tags[Tags.Added], s[cn].Tags[Tags.Due]); // due at once
         Assert.Equal(0, s.Job(cn).Round);
-        Assert.True(s.Exists(P.Job("process", id)));
+        Assert.True(s.Exists(P.Job("sscd", id)));
 
         // two subtitle passes with the language list; no cookies anywhere
         var calls = File.ReadAllLines(Path.Combine(dir, "calls.log"));

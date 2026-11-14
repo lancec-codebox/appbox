@@ -3,7 +3,7 @@ using Nexis.Azure.Utilities;
 
 namespace IndexNode;
 
-/// <summary>Big blobs (video.mp4, compact.mp4, sscd.f16) may be Nexis ghosts: touch them, hydrate them, keep touching.</summary>
+/// <summary>Big blobs (video.mp4, compact.mp4, the frames/keyframes .jpgs and the sscd/clip .f16 chunks) may be Nexis ghosts: touch them, hydrate them, keep touching.</summary>
 public static class NexisAccess
 {
     /// <summary>Sets the Nexis tag last_access to now (Nexis Timestamp format), keeping every other tag.</summary>

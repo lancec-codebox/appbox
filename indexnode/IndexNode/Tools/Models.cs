@@ -24,13 +24,22 @@ public static class Models
     public static readonly ModelFile AsrTokens = new("asr-tokens", "sensevoice-small.tokens.txt", SenseVoice + "tokens.txt", "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc", 315_894, "FunASR Model Open Source License 1.1");
     public static readonly ModelFile Vad = new("silero-vad", "silero_vad.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6", 643_854, "MIT");
 
+    private const string Zoo = "https://github.com/opencv/opencv_zoo/raw/main/models/";
+    public static readonly ModelFile YuNetDet = new("face-det", "face_detection_yunet_2023mar.onnx", Zoo + "face_detection_yunet/face_detection_yunet_2023mar.onnx", "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4", 232_589, "MIT (OpenCV zoo YuNet)");
+    public static readonly ModelFile SFaceRec = new("face-rec", "face_recognition_sface_2021dec.onnx", Zoo + "face_recognition_sface/face_recognition_sface_2021dec.onnx", "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79", 38_696_353, "Apache-2.0 (OpenCV zoo SFace)");
+    private const string Buffalo = "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/";
+    public static readonly ModelFile ScrfdDet = new("face-det-buffalo", "buffalo_l.det_10g.onnx", Buffalo + "det_10g.onnx", "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91", 16_923_827, "NON-COMMERCIAL (InsightFace buffalo_l)");
+    public static readonly ModelFile ArcFaceRec = new("face-rec-buffalo", "buffalo_l.w600k_r50.onnx", Buffalo + "w600k_r50.onnx", "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43", 174_383_860, "NON-COMMERCIAL (InsightFace buffalo_l)");
+
     public static readonly ModelFile[] Clip = [ClipVision, ClipText, ClipTokenizer];
+    public static readonly ModelFile[] FaceYuNet = [YuNetDet, SFaceRec];
+    public static readonly ModelFile[] FaceDefault = [ScrfdDet, ArcFaceRec];
     public static readonly ModelFile[] Ocr = [OcrDet, OcrRec, OcrDict];
     public static readonly ModelFile[] Asr = [AsrModel, AsrTokens, Vad];
     public static readonly ModelFile[] All = [.. Clip, .. Ocr, .. Asr];
 
     /// <summary>The steps a node can run with the model files it has: a node never claims a job that needs a step it cannot run.</summary>
-    public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["ocrsubs"] = Ocr, ["transcribe"] = Asr };
+    public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["ocrsubs"] = Ocr, ["transcribe"] = Asr, ["cast"] = FaceDefault };
 
     public static string PathOf(ModelFile m, string? dir = null) => Path.Combine(dir ?? NodeConfig.ToolsDir(), "models", m.File);
 

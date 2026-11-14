@@ -192,8 +192,13 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
 
     private static async Task EnsureProcessJob(JobContext ctx)
     {
-        var p = JobDescriptor.NewProcess(ctx.Job.JobId);
-        var created = await ctx.Store.PutAsync(ctx.Paths.Job("process", ctx.Job.JobId), p.ToBytes(), Tags.Job("process", "pending", p.AddedAt), null, true, ctx.Token);
-        Log.Info($"download {ctx.Job.JobId}: process job {(created ? "created" : "already exists")}");
+        // one job per step; the dependent ones (sync, describe) carry "needs" and wait for those outputs
+        var made = new List<string>();
+        foreach (var step in Protocol.StepStages)
+        {
+            var p = JobDescriptor.NewStep(step, ctx.Job.JobId);
+            if (await ctx.Store.PutAsync(ctx.Paths.Job(step, ctx.Job.JobId), p.ToBytes(), Tags.Job(step, "pending", p.AddedAt), null, true, ctx.Token)) made.Add(step);
+        }
+        Log.Info($"download {ctx.Job.JobId}: step jobs created: {(made.Count == 0 ? "none (all exist)" : string.Join(',', made))}");
     }
 }

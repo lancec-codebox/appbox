@@ -9,9 +9,29 @@ namespace IndexNode;
 public static partial class Protocol
 {
     public const string ApiVersion = "2021-12-02";
-    public static readonly string[] Stages = ["download", "process", "comments", "watch"];
+    /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
+    public static readonly string[] StepStages = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe"];
+    /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
+    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch"];
+    /// <summary>Stages that decode or run models and so share the thread budget.</summary>
+    public static readonly string[] HeavyStages = ["process", "frames", "sscd", "clip", "transcribe", "ocrsubs", "cast"];
+    public static bool IsStep(string stage) => StepStages.Contains(stage);
+    /// <summary>Files (relative to videos/&lt;id&gt;/) a step job waits for before a node claims it.</summary>
+    public static string[] NeedsOf(string step) => step switch
+    {
+        "sscd" or "clip" => ["frames/manifest.json"],
+        "cast" => ["frames/manifest.json", "keyframes/manifest.json"],
+        "sync" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json"],
+        "describe" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json", "cast/clusters.json"],
+        _ => [],
+    };
+    public static readonly TimeSpan NeedsRetry = TimeSpan.FromMinutes(2);
     /// <summary>What a desktop node runs by default: downloads go to the phone, so download is opt-in (--stages).</summary>
-    public static readonly string[] DefaultNodeStages = ["watch", "process", "comments"];
+    public static readonly string[] DefaultNodeStages = ["watch", "process", "comments"]; // "process" stands for every step stage too (see ExpandStages)
+
+    /// <summary>"process" means the legacy stage and all step stages.</summary>
+    public static string[] ExpandStages(IEnumerable<string> stages) =>
+        stages.SelectMany(s => s == "process" ? new[] { "process" }.Concat(StepStages) : [s]).Distinct().ToArray();
     public static readonly string[] DefaultSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs"];
     public const int LeaseSeconds = 60;
     public const int MaxAttempts = 3;
@@ -81,6 +101,8 @@ public sealed class JobDescriptor
     public string? Format { get; set; }
     public bool? Subs { get; set; }
     public string[]? Steps { get; set; }
+    /// <summary>Step jobs: video files that must exist before a node claims the job.</summary>
+    public string[]? Needs { get; set; }
     public CompressSettings? Compress { get; set; }
     public string AddedAt { get; set; } = "";
     public int Attempts { get; set; }
@@ -130,6 +152,11 @@ public sealed class JobDescriptor
         Stage = "comments", JobId = jobId, Url = url, MaxComments = 1000, Sort = "top", Round = 0, AddedAt = Protocol.NowUtc(),
     };
 
+    public static JobDescriptor NewStep(string step, string jobId) => new()
+    {
+        Stage = step, JobId = jobId, Steps = [step], Needs = Protocol.NeedsOf(step) is { Length: > 0 } n ? n : null, AddedAt = Protocol.NowUtc(),
+    };
+
     public static JobDescriptor NewProcess(string jobId) => new()
     {
         Stage = "process", JobId = jobId, Steps = Protocol.DefaultSteps, AddedAt = Protocol.NowUtc(),
@@ -167,7 +194,8 @@ public sealed class ControlFile
     public Level Effective(string stage)
     {
         var g = ParseLevel(Mode);
-        var s = Stages != null && Stages.TryGetValue(stage, out var v) ? ParseLevel(v) : Level.Run;
+        var s = Stages != null && Stages.TryGetValue(stage, out var v) ? ParseLevel(v)
+            : Protocol.IsStep(stage) && Stages != null && Stages.TryGetValue("process", out var pv) ? ParseLevel(pv) : Level.Run; // a step follows "process" unless set itself
         return (Level)Math.Max((int)g, (int)s);
     }
 

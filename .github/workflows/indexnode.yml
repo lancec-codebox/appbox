@@ -62,4 +62,4 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#indexnode-v}"
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "IndexNode $VERSION" --generate-notes
+            --title "IndexNode $VERSION" --generate-notes --latest=false

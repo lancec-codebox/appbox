@@ -19,6 +19,100 @@ public static class DevCommands
         var sw = Stopwatch.StartNew();
         switch (sub)
         {
+            case "frames":
+            {
+                var duration = await Frames.DurationAsync(tools, video!, ct);
+                var dir = Path.Combine(outDir, "chunks");
+                var r = await Frames.ProduceAsync(tools, video!, outDir, FrameSettings.From(cfg), threads, duration, p => Console.Error.WriteLine(p), (n, b, _) => { var f = Path.Combine(dir, n.Replace('/', Path.DirectorySeparatorChar)); Directory.CreateDirectory(Path.GetDirectoryName(f)!); File.WriteAllBytes(f, b); return Task.CompletedTask; }, ct);
+                Console.WriteLine($"frames: {r.Kept}/{r.Sampled} frames {r.FrameBytes / 1048576.0:F1} MB, {r.Keyframes} keyframes {r.KeyframeBytes / 1048576.0:F1} MB, {duration:F0}s of video, {sw.Elapsed.TotalSeconds:F0}s");
+                break;
+            }
+            case "prune-stats":
+            {
+                // prune rate of the colour-grid gate over the whole video at 1 fps (36x64 area-scaled), for a range of thresholds
+                var raw = Path.Combine(outDir, "grid.rgb");
+                var rr = await Proc.RunAsync(await tools.FfmpegAsync(ct), ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", video!, "-an", "-vf", "fps=1,scale=36:64:flags=area", "-pix_fmt", "rgb24", "-f", "rawvideo", raw], ct);
+                var bytes = File.ReadAllBytes(raw); int fbs = 36 * 64 * 3; var feats = new List<float[]>();
+                for (int off = 0; off + fbs <= bytes.Length; off += fbs) feats.Add(ColorGrid.Compute(new Rgb(bytes[off..(off + fbs)], 36, 64)));
+                foreach (var thr in new[] { 0.01, 0.02, 0.03, 0.04, 0.045, 0.05, 0.06, 0.08, 0.1, 0.15 })
+                {
+                    var pr = new FramePruner(new FrameSettings(GridThreshold: thr)); int pruned = 0, k = 0;
+                    for (int i = 0; i < feats.Count; i++) { if (pr.Offer(i, feats[i]) >= 0) pruned++; else pr.Keep(k++, i, feats[i]); }
+                    Console.WriteLine($"grid {thr:F3}: pruned {pruned} of {feats.Count} = {100.0 * pruned / feats.Count:F1}%");
+                }
+                break;
+            }
+            case "embed":
+            {
+                // dev embed --step sscd|clip --out <dir with chunks/frames>: vectors from the stored chunks (no video decode), written as <out>/<step>.f16 plus timing
+                var set = ChunkDir.Open(Path.Combine(outDir, "chunks", "frames")); var dir = Path.Combine(outDir, "jpg");
+                var t0 = sw.Elapsed.TotalSeconds; await set.ExtractAsync(tools, dir, ct); var t1 = sw.Elapsed.TotalSeconds;
+                byte[] rows;
+                if ((a.Get("step") ?? "sscd") == "sscd") rows = await Sscd.DescribeAsync(tools, a.Get("model") ?? await Sscd.EnsureModelAsync(cfg, http, ct), dir, set.Count, threads, _ => { }, ct);
+                else rows = await Clip.EmbedFramesAsync(tools, await Models.EnsureAsync(Models.ClipVision, http, ct), dir, set.Count, threads, _ => { }, ct);
+                File.WriteAllBytes(Path.Combine(outDir, (a.Get("step") ?? "sscd") + ".f16"), rows);
+                Console.WriteLine($"{a.Get("step") ?? "sscd"}: {set.Count} frames, decode {t1 - t0:F0}s, embed {sw.Elapsed.TotalSeconds - t1:F0}s");
+                break;
+            }
+            case "sscd-cmp":
+            {
+                // dev sscd-cmp --video <orig> --out <dir with chunks/frames> --n 300: SSCD of the stored frame vs the original frame at the same second, int8 and fp32
+                int n = int.Parse(a.Get("n") ?? "300");
+                var set = ChunkDir.Open(Path.Combine(outDir, "chunks", "frames")); var all = set.Chunks.SelectMany(c => c.Frames).ToList();
+                var dS = Path.Combine(outDir, "cmp-stored"); var dO = Path.Combine(outDir, "cmp-orig"); Directory.CreateDirectory(dS); Directory.CreateDirectory(dO);
+                var jpgs = Path.Combine(outDir, "jpg"); if (!Directory.Exists(jpgs)) await set.ExtractAsync(tools, jpgs, ct);
+                // the original through the same sampler (fps=1, same scale), at the sampled seconds: one ffmpeg over the whole video
+                var ff = await tools.FfmpegAsync(ct); var allOrig = Path.Combine(outDir, "cmp-all"); Directory.CreateDirectory(allOrig);
+                if (Directory.GetFiles(allOrig).Length == 0) { var r2 = await Proc.RunAsync(ff, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", video!, "-an", "-vf", "fps=1,scale=" + set.W + ":" + set.H + ":flags=bicubic", "-q:v", "1", Path.Combine(allOrig, "%06d.jpg")], ct); if (r2.ExitCode != 0) throw new InvalidOperationException(r2.Stderr); }
+                for (int k = 0; k < n; k++)
+                {
+                    int i = (int)((long)k * all.Count / n);
+                    File.Copy(Path.Combine(jpgs, $"{i:D6}.jpg"), Path.Combine(dS, $"{k:D6}.jpg"), true);
+                    File.Copy(Path.Combine(allOrig, $"{(int)all[i].T + 1:D6}.jpg"), Path.Combine(dO, $"{k:D6}.jpg"), true);
+                }
+                foreach (var model in new[] { a.Get("model"), a.Get("model2") }.Where(m => m != null))
+                {
+                    float[][] Rows(byte[] b) => Enumerable.Range(0, b.Length / (Sscd.Dim * 2)).Select(i => Enumerable.Range(0, Sscd.Dim).Select(d => (float)BitConverter.ToHalf(b, (i * Sscd.Dim + d) * 2)).ToArray()).ToArray();
+                    var vs = Rows(await Sscd.DescribeAsync(tools, model!, dS, n, threads, _ => { }, ct)); var vo = Rows(await Sscd.DescribeAsync(tools, model!, dO, n, threads, _ => { }, ct));
+                    var cos = Enumerable.Range(0, n).Select(i => (double)Clip.Dot(vs[i], vo[i])).OrderBy(x => x).ToArray();
+                    Console.WriteLine($"{Path.GetFileName(model!)} (512-dim rows): stored vs original, {n} frames: median {cos[n / 2]:F3}, p1 {cos[(int)(n * 0.01)]:F3}, min {cos[0]:F3}");
+                }
+                break;
+            }
+            case "crf-sweep":
+            {
+                // dev crf-sweep --out <dir with cmp-all/%06d.jpg> --n 600 --crfs 26,30,34 --model <sscd onnx>: encode the first n 1 fps frames as the frames chunk (SVT-AV1 preset 8, -g 10) at each CRF,
+                // decode them back, and compare SSCD and SigLIP of the decoded frame with the same frame from the original; prints bytes per chunk and cosine median / p1 / min
+                int n = int.Parse(a.Get("n") ?? "600"); var src = Path.Combine(outDir, "cmp-all"); var ff = await tools.FfmpegAsync(ct);
+                var first = Path.Combine(src, "000001.jpg"); var (sw0, sh0) = await OcrSubs.SizeAsync(tools, first, ct);
+                float[][] Rows(byte[] b, int dim) => Enumerable.Range(0, b.Length / (dim * 2)).Select(i => Enumerable.Range(0, dim).Select(d => (float)BitConverter.ToHalf(b, (i * dim + d) * 2)).ToArray()).ToArray();
+                var orig = Path.Combine(outDir, "sweep-orig"); Directory.CreateDirectory(orig);
+                for (int k = 0; k < n; k++) File.Copy(Path.Combine(src, $"{k + 1:D6}.jpg"), Path.Combine(orig, $"{k:D6}.jpg"), true);
+                var model = a.Get("model") ?? await Sscd.EnsureModelAsync(cfg, http, ct); var vision = await Models.EnsureAsync(Models.ClipVision, http, ct);
+                var so = Rows(await Sscd.DescribeAsync(tools, model, orig, n, threads, _ => { }, ct), Sscd.Dim); var co = Clip.FromF16Bytes(await Clip.EmbedFramesAsync(tools, vision, orig, n, threads, _ => { }, ct));
+                string Stat(double[] v) { var o = v.OrderBy(x => x).ToArray(); return $"median {o[o.Length / 2]:F3}, p1 {o[(int)(o.Length * 0.01)]:F3}, min {o[0]:F3}"; }
+                foreach (var crf in (a.Get("crfs") ?? "26,30,34").Split(',').Select(int.Parse))
+                {
+                    var mp4 = Path.Combine(outDir, $"sweep{crf}.mp4"); var dec = Path.Combine(outDir, $"sweep-dec{crf}"); if (Directory.Exists(dec)) Directory.Delete(dec, true); Directory.CreateDirectory(dec);
+                    var e1 = await Proc.RunAsync(ff, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-framerate", "1", "-i", Path.Combine(orig, "%06d.jpg"), "-c:v", "libsvtav1", "-preset", "8", "-crf", crf.ToString(), "-g", "10", "-pix_fmt", "yuv420p", mp4], ct);
+                    if (e1.ExitCode != 0) throw new InvalidOperationException(e1.Stderr);
+                    var e2 = await Proc.RunAsync(ff, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", mp4, "-q:v", "1", Path.Combine(dec, "%06d.jpg")], ct);
+                    if (e2.ExitCode != 0) throw new InvalidOperationException(e2.Stderr);
+                    for (int k = 0; k < n; k++) File.Move(Path.Combine(dec, $"{k + 1:D6}.jpg"), Path.Combine(dec, $"{k:D6}.jpg"), true);
+                    var sd = Rows(await Sscd.DescribeAsync(tools, model, dec, n, threads, _ => { }, ct), Sscd.Dim); var cd = Clip.FromF16Bytes(await Clip.EmbedFramesAsync(tools, vision, dec, n, threads, _ => { }, ct));
+                    var cs = Enumerable.Range(0, n).Select(i => (double)Clip.Dot(sd[i], so[i])).ToArray(); var cc = Enumerable.Range(0, n).Select(i => (double)Clip.Dot(cd[i], co[i])).ToArray();
+                    Console.WriteLine($"crf {crf}: {new FileInfo(mp4).Length / 1048576.0:F1} MB for {n} frames; SSCD {Stat(cs)}; SigLIP {Stat(cc)}");
+                }
+                break;
+            }
+            case "cast":
+            {
+                var duration = await Frames.DurationAsync(tools, video!, ct);
+                var thr = a.Get("threshold") is { } th ? double.Parse(th, CultureInfo.InvariantCulture) : (double?)null;
+                var msg = await CastStage.RunAsync(tools, http, video!, duration, outDir, new CastStage.Options(a.Get("model") ?? cfg.CastModel ?? "buffalo_l", threads, thr), s => Console.Error.WriteLine(s), ct);
+                Console.WriteLine($"cast: {msg} in {sw.Elapsed.TotalSeconds:F0}s");
+                break;
+            }
             case "clip":
             {
                 var duration = await Frames.DurationAsync(tools, video!, ct);

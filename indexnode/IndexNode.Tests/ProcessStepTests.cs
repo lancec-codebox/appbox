@@ -266,7 +266,7 @@ public class StepAdvertisingTests
         var cfg = new NodeConfig { ModelsAutoDownload = false };
         var dir = Dir();
         var none = ProcessStage.SupportedSteps(cfg, dir);
-        Assert.Equal(["frames", "sscd", "compress"], none);
+        Assert.Equal(["frames", "sscd", "compress", "describe", "sync"], none);
         var job = JobDescriptor.NewProcess("abcdefghij1");
         Assert.False(ProcessStage.CanRun(job, none));
         // install the clip model files: clip appears, transcribe and ocrsubs still do not

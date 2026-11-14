@@ -8,6 +8,9 @@ namespace IndexNode;
 public static class Sscd
 {
     public const string ModelName = "sscd_disc_mixup";
+    /// <summary>The static QDQ int8 model (per-channel, calibrated at 288x512): used when present next to the fp32 one; never dynamic quantization (11x slower on CPU).</summary>
+    public const string Int8Name = ModelName + "_int8_static";
+    public static string ModelId(string modelPath) => Path.GetFileName(modelPath).Contains("int8", StringComparison.OrdinalIgnoreCase) ? Int8Name : ModelName;
     public const int Dim = 512;
     public const int ShortSide = 288;
     public static readonly float[] Mean = [0.485f, 0.456f, 0.406f];
@@ -40,6 +43,8 @@ public static class Sscd
             if (!File.Exists(path)) throw new InvalidOperationException($"sscd model not found at configured modelPath {path}");
             return path;
         }
+        var int8 = Path.Combine(NodeConfig.ToolsDir(), Int8Name + ".onnx");
+        if (File.Exists(int8)) return int8;
         var local = Path.Combine(NodeConfig.ToolsDir(), ModelName + ".onnx");
         if (File.Exists(local)) return local;
         if (string.IsNullOrEmpty(cfg.ModelUrl)) throw new InvalidOperationException("sscd model missing: set modelUrl or modelPath in the config (see tools/export_sscd_onnx.py)");
