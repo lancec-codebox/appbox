@@ -22,6 +22,24 @@ public class RestStoreTests
     private static string Header(HttpRequestMessage r, string name) => r.Headers.TryGetValues(name, out var v) ? v.First() : "";
 
     [Fact]
+    public async Task Reads_of_a_transitioning_blob_go_to_its_snapshot_and_other_blobs_and_writes_are_untouched()
+    {
+        var h = new Handler((r, _) => new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([1, 2, 3]) });
+        var store = Store(h);
+        store.ReadSnapshots["a/video.mp4"] = "2026-11-14T07:31:00.0000000Z";
+        var got = await store.GetAsync("a/video.mp4", default);
+        Assert.Equal([1, 2, 3], got!.Data);
+        var tmp = Path.Combine(Path.GetTempPath(), "snapdl-" + Guid.NewGuid().ToString("N")); await store.DownloadToFileAsync("a/video.mp4", tmp, default);
+        await store.GetAsync("a/other.mp4", default);
+        await store.PutAsync("a/video.mp4", [9], null, null, false, default);
+        File.Delete(tmp);
+        Assert.Contains("snapshot=2026-11-14T07%3A31%3A00.0000000Z", h.Seen[0].Req.RequestUri!.Query);
+        Assert.Contains("snapshot=", h.Seen[1].Req.RequestUri!.Query);
+        Assert.DoesNotContain("snapshot=", h.Seen[2].Req.RequestUri!.Query);
+        Assert.Equal(HttpMethod.Put, h.Seen[3].Req.Method); Assert.DoesNotContain("snapshot=", h.Seen[3].Req.RequestUri!.Query);
+    }
+
+    [Fact]
     public async Task AcquireLease_sends_action_duration_and_version_and_returns_lease_id()
     {
         var h = new Handler((r, _) =>

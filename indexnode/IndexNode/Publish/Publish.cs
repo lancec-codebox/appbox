@@ -25,7 +25,7 @@ public sealed class LocalJob(string dir, string id) : IJobSource
 public sealed class StoreJob(IStore store, Paths paths, string id) : IJobSource
 {
     public string JobId => id;
-    public async Task<byte[]?> ReadAsync(string file, CancellationToken ct) => await FrameChunks.ReadAsync(store, paths.Video(id, file), ct, file.EndsWith(".f16") || file.EndsWith(".jpgs"));
+    public async Task<byte[]?> ReadAsync(string file, CancellationToken ct) => await FrameChunks.ReadAsync(store, paths.Video(id, file), ct, file.EndsWith(".f16") || file.EndsWith(".jpgs") || file.EndsWith(".mp4"));
 }
 
 /// <summary>Site packs (PACK.md): only what the site needs, never videos, frames or raw per-frame data beyond the 1 fps rows.</summary>

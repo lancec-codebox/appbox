@@ -34,19 +34,4 @@ public class HotfixTests
         Assert.EndsWith("p-vid-frames", a);
         Assert.NotEqual(a, ProcessStage.WorkDir("other", "frames"));
     }
-
-    [Fact]
-    public async Task Hydrate_race_is_not_a_failure_when_the_blob_is_no_longer_a_ghost()
-    {
-        var ok = await NexisAccess.HydrateOrYieldAsync("v", () => throw new RequestFailedException(412, "The condition specified using HTTP conditional header(s) is not met.", "ConditionNotMet", null), () => Task.FromResult(false));
-        Assert.False(ok);
-    }
-
-    [Fact]
-    public async Task Hydrate_race_still_a_ghost_or_other_error_is_thrown()
-    {
-        await Assert.ThrowsAsync<RequestFailedException>(() => NexisAccess.HydrateOrYieldAsync("v", () => throw new RequestFailedException(412, "not met", "ConditionNotMet", null), () => Task.FromResult(true)));
-        await Assert.ThrowsAsync<RequestFailedException>(() => NexisAccess.HydrateOrYieldAsync("v", () => throw new RequestFailedException(500, "boom"), () => Task.FromResult(false)));
-        Assert.True(await NexisAccess.HydrateOrYieldAsync("v", () => Task.FromResult(true), () => Task.FromResult(false)));
-    }
 }

@@ -43,6 +43,11 @@ public sealed class RestStore : IStore
         return null;
     }
 
+    /// <summary>Blobs Nexis caught mid-dehydrate: reads (Get Blob, download) of these names go to this snapshot of the blob; nothing is written to the blob.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, string> ReadSnapshots { get; } = new();
+
+    private Uri ReadUri(string name) => BlobUri(name, ReadSnapshots.TryGetValue(name, out var snap) ? "snapshot=" + Uri.EscapeDataString(snap) : null);
+
     public Uri BlobUri(string name, string? extra = null)
     {
         var path = string.Join('/', name.Split('/').Select(Uri.EscapeDataString));
@@ -150,7 +155,7 @@ public sealed class RestStore : IStore
 
     public async Task<BlobContent?> GetAsync(string name, CancellationToken ct)
     {
-        using var r = await SendAsync(() => Req(HttpMethod.Get, BlobUri(name)), ct);
+        using var r = await SendAsync(() => Req(HttpMethod.Get, ReadUri(name)), ct);
         if (r.StatusCode == HttpStatusCode.NotFound) return null;
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
         return new BlobContent(await r.Content.ReadAsByteArrayAsync(ct), r.Headers.ETag?.Tag);
@@ -259,7 +264,7 @@ public sealed class RestStore : IStore
 
     public async Task DownloadToFileAsync(string name, string path, CancellationToken ct)
     {
-        using var r = await SendAsync(() => Req(HttpMethod.Get, BlobUri(name)), ct, opt: HttpCompletionOption.ResponseHeadersRead);
+        using var r = await SendAsync(() => Req(HttpMethod.Get, ReadUri(name)), ct, opt: HttpCompletionOption.ResponseHeadersRead);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         await using var fs = File.Create(path);
