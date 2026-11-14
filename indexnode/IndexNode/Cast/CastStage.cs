@@ -10,6 +10,8 @@ namespace IndexNode;
 public static class CastStage
 {
     public const int PortraitW = 320, PortraitH = 400, SheetTile = 160, MaxCluster = 3000, Candidates = 12, PosterShortlist = 24, PosterCandidates = 60, PerPair = 3;
+    /// <summary>GPU: keyframes per detection group, and how many run at once (the SCRFD model has a fixed batch of 1, so groups overlap the model runs and the CPU pre/post-processing instead of batching one tensor).</summary>
+    public const int DetectGroup = 16, DetectParallel = 4;
     public const string MaskPrompt = "a person wearing a metal mask over the eyes", BarePrompt = "a bare face";
     public sealed record Options(string Model, int Threads, double? Threshold = null, int MinFaces = 20, double? MergeAt = null, double? Border = null);
 
@@ -113,22 +115,41 @@ public static class CastStage
             Task Each(Func<double, Rgb, bool, Task> each) => keyframes != null ? keyframes.DecodeAsync(tools, (_, t, im) => each(t, im, true), ct) : DecodeAsync(tools, kf, w, h, each, null, ct);
             var (det, emb) = Open(opt.Model, modelsDir ?? NodeConfig.ToolsDir(), opt.Threads);
             var faces = new List<FaceRec>(); var kfTimes = new List<double>(); int nkf = 0, rawDet = 0;
-            using (det) using (emb) using (stats.Phase("pass1-wall"))
-                await Each((t, im, _) =>
+            // keyframes go through in groups: the detector (batch 1 by construction) runs on several keyframes at once on the GPU, and the faces that pass the filters of a group are embedded in one batch
+            int group = OrtOptions.Cuda ? DetectGroup : 1, par = OrtOptions.Cuda ? DetectParallel : 1;
+            var pend = new List<(double T, Rgb Im)>();
+            void Flush()
+            {
+                if (pend.Count == 0) return;
+                var dets = new List<FaceDet>[pend.Count];
+                stats.Time("detect", () => { Parallel.For(0, pend.Count, new ParallelOptions { MaxDegreeOfParallelism = par, CancellationToken = ct }, i => dets[i] = det.Detect(pend[i].Im)); return 0; });
+                var keep = new List<(FaceRec F, Rgb Aligned)>();
+                for (int i = 0; i < pend.Count; i++)
                 {
-                    kfTimes.Add(t); nkf++;
-                    foreach (var d in stats.Time("detect", () => det.Detect(im)))
+                    var (t, im) = pend[i];
+                    foreach (var d in dets[i])
                     {
                         rawDet++;
                         if (d.H < CastLogic.MinHeight || d.Score < CastLogic.MinScore) continue;
                         var (yaw, roll) = FaceMath.Pose(d.Kps);
                         FaceRec f; using (stats.Phase("blur+pose")) f = new FaceRec { T = Math.Round(t, 3), X = d.X, Y = d.Y, W = d.W, H = d.H, Score = d.Score, Yaw = Math.Round(yaw, 3), Roll = Math.Round(roll, 1), Kps = d.Kps, Blur = Math.Round(FaceBlur(im, d), 1) };
                         if (!CastLogic.Passes(f)) continue;
-                        f.Emb = stats.Time("embed", () => emb.Embed(Imaging.AlignFace(im, d.Kps))); f.Quality = CastLogic.QualityOf(f, h); faces.Add(f);
+                        keep.Add((f, Imaging.AlignFace(im, d.Kps)));
                     }
-                    if (nkf % 100 == 0) progress($"faces {nkf} keyframes, {faces.Count} kept");
-                    return Task.CompletedTask;
-                });
+                }
+                if (keep.Count > 0)
+                {
+                    var embs = stats.Time("embed", () => emb.EmbedBatch(keep.Select(k => k.Aligned).ToList()));
+                    for (int i = 0; i < keep.Count; i++) { keep[i].F.Emb = embs[i]; keep[i].F.Quality = CastLogic.QualityOf(keep[i].F, h); faces.Add(keep[i].F); }
+                }
+                pend.Clear();
+                progress($"faces {nkf} keyframes, {faces.Count} kept");
+            }
+            using (det) using (emb) using (stats.Phase("pass1-wall"))
+            {
+                await Each((t, im, _) => { kfTimes.Add(t); nkf++; pend.Add((t, im)); if (pend.Count >= group) Flush(); return Task.CompletedTask; });
+                Flush();
+            }
             Log.Info($"cast: {nkf} keyframes, {rawDet} detections, {faces.Count} faces kept");
 
             // cluster the best MaxCluster faces exactly; attach the rest to the nearest centroid within the threshold
@@ -223,16 +244,22 @@ public static class CastStage
         finally { try { Directory.Delete(work, true); } catch { } }
     }
 
-    /// <summary>Credits OCR: full frames at 1 fps over the first and last 3 minutes; lines with 主演, 饰 or 领衔, merged over time.</summary>
+    /// <summary>Seconds between the credits frames: 1 on the CPU (as before), 2 on the GPU (a credit line stays on screen for several seconds; the window is the same, the work halves).</summary>
+    public static int CreditsStep => OrtOptions.Cuda ? 2 : 1;
+
+    /// <summary>Credits OCR: full frames over the first and last 3 minutes (every <see cref="CreditsStep"/> seconds); lines with 主演, 饰 or 领衔, merged over time. On the GPU the two windows run at the same time, each with its own OCR sessions (det + rec on the CUDA provider).</summary>
     public static async Task<List<(double Start, double End, string Text)>> CreditsAsync(Tools tools, string video, int w, int h, double duration, int threads, string? modelsDir, CancellationToken ct)
     {
-        using var eng = new OcrEngine(Models.PathOf(Models.OcrDet, modelsDir), Models.PathOf(Models.OcrRec, modelsDir), Models.PathOf(Models.OcrDict, modelsDir), Math.Max(1, threads));
         var spans = duration > 360 ? new[] { (0.0, 180.0), (duration - 180, 180.0) } : new[] { (0.0, duration) };
-        var seen = new Dictionary<string, (double S, double E)>(); int fb = w * h * 3;
-        foreach (var (start, len) in spans)
+        int step = CreditsStep;
+        var hits = new List<(double T, string Key)>[spans.Length];
+        async Task Window(int n)
         {
+            var (start, len) = spans[n]; var list = hits[n] = [];
+            using var eng = new OcrEngine(Models.PathOf(Models.OcrDet, modelsDir), Models.PathOf(Models.OcrRec, modelsDir), Models.PathOf(Models.OcrDict, modelsDir), Math.Max(1, threads));
+            int fb = w * h * 3;
             var psi = new ProcessStartInfo(await tools.FfmpegAsync(ct)) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-            foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", start.ToString("F3", CultureInfo.InvariantCulture), "-t", len.ToString("F3", CultureInfo.InvariantCulture), "-i", video, "-an", "-vf", "fps=1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-" }) psi.ArgumentList.Add(a);
+            foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", start.ToString("F3", CultureInfo.InvariantCulture), "-t", len.ToString("F3", CultureInfo.InvariantCulture), "-i", video, "-an", "-vf", step == 1 ? "fps=1" : "fps=1/" + step, "-f", "rawvideo", "-pix_fmt", "bgr24", "-" }) psi.ArgumentList.Add(a);
             using var p = Process.Start(psi)!; using var reg = ct.Register(() => Proc.Kill(p)); _ = p.StandardError.ReadToEndAsync();
             var buf = new byte[fb];
             for (int i = 0; ; i++)
@@ -240,14 +267,14 @@ public static class CastStage
                 int off = 0; while (off < fb) { int k = await p.StandardOutput.BaseStream.ReadAsync(buf.AsMemory(off, fb - off), ct); if (k == 0) break; off += k; }
                 if (off < fb) break;
                 foreach (var l in eng.Recognize(buf, w, h))
-                {
-                    if (!CastLogic.CreditWords.Any(c => l.Text.Contains(c))) continue;
-                    double t = start + i; var key = OpenCc.T2S.Convert(l.Text);
-                    seen[key] = seen.TryGetValue(key, out var e) ? (e.S, t + 1) : (t, t + 1);
-                }
+                    if (CastLogic.CreditWords.Any(c => l.Text.Contains(c))) list.Add((start + (double)i * step, OpenCc.T2S.Convert(l.Text)));
             }
             await p.WaitForExitAsync(CancellationToken.None);
         }
+        if (OrtOptions.Cuda) await Task.WhenAll(spans.Select((_, n) => Task.Run(() => Window(n), ct)));
+        else for (int n = 0; n < spans.Length; n++) await Window(n);
+        var seen = new Dictionary<string, (double S, double E)>();
+        foreach (var (t, key) in hits.SelectMany(x => x).OrderBy(x => x.T)) seen[key] = seen.TryGetValue(key, out var e) ? (e.S, t + step) : (t, t + step);
         return seen.Select(kv => (kv.Value.S, kv.Value.E, kv.Key)).OrderBy(x => x.S).ToList();
     }
 }

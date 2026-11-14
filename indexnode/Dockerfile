@@ -1,4 +1,4 @@
-# IndexNode GPU node (0.6.0): CUDA 12.x + cuDNN 9, which is what Microsoft.ML.OnnxRuntime.Gpu.Linux 1.23.x is built for
+# IndexNode GPU node (0.6.1): CUDA 12.x + cuDNN 9, which is what Microsoft.ML.OnnxRuntime.Gpu.Linux 1.23.x is built for
 # (ONNX Runtime 1.23/1.24 wants CUDA 12.8 + cuDNN 9; CUDA 13 builds start with ORT 1.27, so do not move the base image to CUDA 13 without moving the package).
 #
 #   docker build -t indexnode-gpu -f indexnode/Dockerfile indexnode
@@ -12,7 +12,7 @@ WORKDIR /src
 COPY IndexNode/IndexNode.csproj IndexNode/
 RUN dotnet restore IndexNode/IndexNode.csproj -r linux-x64 -p:IndexNodeGpu=true
 COPY IndexNode/ IndexNode/
-ARG VERSION=0.6.0
+ARG VERSION=0.6.1
 RUN dotnet publish IndexNode/IndexNode.csproj -c Release -r linux-x64 --self-contained false -p:IndexNodeGpu=true -p:Version=${VERSION} -o /out
 
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04

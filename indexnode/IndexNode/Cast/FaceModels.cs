@@ -7,7 +7,13 @@ namespace IndexNode;
 public sealed record FaceDet(float X, float Y, float W, float H, float Score, float[] Kps);
 
 public interface IFaceDetector : IDisposable { List<FaceDet> Detect(Rgb im); }
-public interface IFaceEmbedder : IDisposable { int Dim { get; } float[] Embed(Rgb alignedFace112); }
+public interface IFaceEmbedder : IDisposable
+{
+    int Dim { get; }
+    float[] Embed(Rgb alignedFace112);
+    /// <summary>Many aligned faces in one call (one model run per batch where the model allows it); the rows are the same as Embed gives, in order.</summary>
+    float[][] EmbedBatch(IReadOnlyList<Rgb> faces) => faces.Select(Embed).ToArray();
+}
 
 public static class FaceMath
 {
@@ -154,6 +160,23 @@ public sealed class ArcFace : IFaceEmbedder
     private readonly InferenceSession s;
     public int Dim => 512;
     public ArcFace(string path, int threads = 1) { s = OrtOptions.Session(path, threads, true); }
+    public const int MaxBatch = 64;
+
+    /// <summary>The model's input has a dynamic batch dimension (the output is declared [1,512] but follows it): one run per up to 64 faces.</summary>
+    public float[][] EmbedBatch(IReadOnlyList<Rgb> faces)
+    {
+        var res = new float[faces.Count][];
+        for (int g = 0; g < faces.Count; g += MaxBatch)
+        {
+            int n = Math.Min(MaxBatch, faces.Count - g); var t = new DenseTensor<float>([n, 3, 112, 112]);
+            for (int k = 0; k < n; k++) { var f = faces[g + k]; for (int y = 0; y < 112; y++) for (int x = 0; x < 112; x++) for (int c = 0; c < 3; c++) t[k, c, y, x] = (f.Data[(y * 112 + x) * 3 + c] - 127.5f) / 127.5f; }
+            using var r = s.Run([NamedOnnxValue.CreateFromTensor(s.InputMetadata.Keys.First(), t)]);
+            var flat = r.First().AsTensor<float>().ToArray();
+            if (flat.Length != n * Dim) throw new InvalidOperationException($"face embedder returned {flat.Length} values for {n} faces");
+            for (int k = 0; k < n; k++) { var v = flat.AsSpan(k * Dim, Dim).ToArray(); FaceMath.L2(v); res[g + k] = v; }
+        }
+        return res;
+    }
 
     public float[] Embed(Rgb f)
     {

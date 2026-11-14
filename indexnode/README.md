@@ -81,14 +81,16 @@ Big blobs may be Nexis ghosts. [`IndexNode/Tools/NexisGhost.cs`](IndexNode/Tools
 - Sync 20:00-30:00: +0.130 s (reference OCR with the reference transcript: +0.106 s). Accepted as is.
 
 
-## GPU node (0.6.0)
+## GPU node (0.6.1)
 
 `indexnode run --gpu --node-name gpu-a100-westus3 --exit-when-idle 10m` runs only the GPU stages (sscd, clip, cast; ocrsubs when listed in `--stages`) on the ONNX Runtime **CUDA** provider.
 
 - **No silent CPU fallback.** If the CUDA provider cannot load or is not registered, the step fails with an explicit message. Small shape operations may run on the CPU (ONNX Runtime places them there on purpose); `INDEXNODE_CUDA_STRICT=1` refuses any CPU node. Every session logs its provider.
-- **Models and batches.** SigLIP uses the fp16 vision model (186 MB), SSCD the fp32 model (the int8 QDQ model is a CPU model). Batches are 64 (SSCD) and 128 (SigLIP) frames; the CPU keeps 32. Frame chunks are read from blob as before.
+- **Models and batches.** SigLIP uses the fp16 vision model (186 MB), SSCD the fp32 model (SSCD is fp32 on the CPU nodes too: the int8 model was removed in 0.6.1, its fingerprints do not match fp32 or the screenshot search; `--model`/`modelPath` stay as a dev override). Batches are 64 (SSCD) and 128 (SigLIP) frames; the CPU keeps 32. Frame chunks are read from blob as before.
 - **Only videos whose frames are done.** When the `frames` step finishes, it writes `index/gpu-ready/<step>.<jobId>` for each pending sscd/clip/cast job. The GPU node deletes the marker when the job is done or fails for good (not when it is released). `indexnode gpu markers [--dry]` writes the markers for jobs whose frames were made before 0.6.0.
 - **CPU fallback.** A CPU node takes an sscd/clip/cast job only after it has been ready for 30 minutes (marker `readyAt`; without a marker the later of `idx_added` and `idx_due`), so nothing stalls when the GPU is off. `--gpu-fallback 30m` changes the wait.
+- **cast on the GPU.** Keyframes are detected in groups of 16 with 4 detector runs at once (the SCRFD model has a fixed batch of 1), and the faces of a group are embedded in one ArcFace batch (up to 64). The credits OCR runs on the GPU OCR sessions, the first and last 3-minute windows at the same time and every 2nd second (CPU nodes: every second, one after the other). Per-drama time: see the release notes for the measured value.
+- **Redo of int8 fingerprints.** `indexnode redo sscd-int8 [--dry]` finds sscd jobs whose `sscd/manifest.json` says `sscd_disc_mixup_int8_static`, sets them back to pending (attempts cleared; leased jobs are skipped and counted) and writes a fresh gpu-ready marker. The old vectors stay until the new ones are written. `--dry` prints the counts only.
 - **`--exit-when-idle <time>`** stops the node after that long with no job running (a container started for a marker leaves when the work is gone).
 - **`--max-heavy N`** (config `max-heavy`, default 2, 1 on a GPU node, 0 = no limit): concurrent model steps per node; each gets its share of the threads. Downloads, uploads, comments, watch and describe do not count.
 - **Timing.** Each job ends with `time by step: fetch 3.2s, sscd 41.0s [cuda]`, next to the existing per-phase throughput lines.

@@ -2,7 +2,7 @@
 //
 //   az deployment group create -g rg-lancec-oss -f indexnode/deploy/gpu-job.bicep \
 //     -p environmentId=<id of the ACA environment that has the A100 workload profile> workloadProfileName=<profile name> \
-//        image=ghcr.io/<owner>/indexnode-gpu:0.6.0 sasUrl='<container SAS URL>' blobConnectionString='<see below>'
+//        image=ghcr.io/<owner>/indexnode-gpu:0.6.1 sasUrl='<container SAS URL>' blobConnectionString='<see below>'
 //
 // Trigger: the KEDA azure-blob scaler counts the blobs under index/gpu-ready/ (written by the frames step when a video's frames are done);
 // one execution starts per scale poll while the count is at least blobCount, up to parallelism. The job runs
