@@ -31,11 +31,12 @@ public class OcrSegmentTests
     }
 
     [Theory]
-    [InlineData(1, 24, 1)]
-    [InlineData(4, 24, 4)]
+    [InlineData(1, 24, 12)]
+    [InlineData(3, 24, 12)]
     [InlineData(16, 24, 16)]
+    [InlineData(3, 12, 6)]
     [InlineData(0, 2, 1)]
-    public void Ocr_runs_one_single_thread_segment_per_core_of_its_share(int share, int cores, int expected) =>
+    public void Ocr_runs_max_of_its_share_and_half_the_cores_in_segments(int share, int cores, int expected) =>
         Assert.Equal(expected, OcrSubs.Segments(share, cores));
 
     [Fact]

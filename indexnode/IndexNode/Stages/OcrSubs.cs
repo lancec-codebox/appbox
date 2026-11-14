@@ -56,9 +56,9 @@ public static class OcrSubs
         return BandFinder.Find(boxes, h) is { } r ? (r.Y, r.Height) : null;
     }
 
-    /// <summary>One segment per core of the step's share, each with one intra-op thread (two threads gave 1.17x per segment, and more threads than cores with spinning halved the throughput): the sum of the OCR threads is the share.</summary>
+    /// <summary>Segments = max(the step's thread share, cores/2), each with one intra-op thread. OCR is the long pole, and with ORT spinning off mild oversubscription costs nothing (16 one-thread segments ran at full rate), whereas a small share (3 while seven heavy steps run) starved it: 21 fps against 50 fps on 0.5.2.</summary>
     public const int IntraThreads = 1;
-    public static int Segments(int share, int cores) => Math.Max(1, share);
+    public static int Segments(int share, int cores) => Math.Max(1, Math.Max(share, cores / 2));
 
     /// <summary>The segments for the parallel read: equal parts whose boundaries are snapped to the sampling grid (multiples of 1/fps from the start), so every segment samples exactly the instants the serial read would, and the merged frames are identical to it.</summary>
     public static List<(double Start, double End)> PlanSegments(double duration, int workers, double fps = OcrCues.Fps)
@@ -111,7 +111,7 @@ public static class OcrSubs
             await p.WaitForExitAsync(CancellationToken.None);
         }, ct)).ToArray());
 
-        Log.Info($"ocrsubs: {total} frames in {sw.Elapsed.TotalSeconds:F0}s = {total / Math.Max(0.001, sw.Elapsed.TotalSeconds):F1} frames/s on {plan.Count} segments (ffmpeg decodes the full frame, the band is cropped in the filter)");
+        Log.Info($"ocrsubs: {total} frames in {sw.Elapsed.TotalSeconds:F0}s = {total / Math.Max(0.001, sw.Elapsed.TotalSeconds):F1} frames/s on {plan.Count} segments (thread share {workers}, {Environment.ProcessorCount} cores, 1 intra-op thread each; ffmpeg decodes the full frame, the band is cropped in the filter)");
         var frames = perSeg.SelectMany(x => x).OrderBy(f => f.T).ToList();
         var zh = OcrCues.Merge(frames, false);
         var en = OcrCues.Merge(frames, true);
