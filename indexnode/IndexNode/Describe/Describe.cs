@@ -38,6 +38,16 @@ public static class Describe
 
     public static double Cutoff(double duration) => Math.Round(duration * CutoffFraction, 1);
 
+    /// <summary>The model's expression scores as { key: [0..10 or null] }: clamped, anything else null. Keys are cluster ids and "poster".</summary>
+    public static JsonObject CleanExpression(JsonNode? n)
+    {
+        var o = new JsonObject();
+        if (n is not JsonObject src) return o;
+        foreach (var (k, v) in src)
+            if (v is JsonArray a) o[k] = new JsonArray(a.Select(x => x is JsonValue jv && jv.TryGetValue<double>(out var d) ? (JsonNode?)JsonValue.Create((int)Math.Clamp(Math.Round(d), 0, 10)) : null).ToArray());
+        return o;
+    }
+
     public static AiCall BuildMain(DescribeInput d, string visionModel)
     {
         var cut = Cutoff(d.Duration);
@@ -59,7 +69,8 @@ public static class Describe
 - cast: one entry per cluster you can identify; exactly one 'female lead' and one 'male lead' when the story has them, others 'main' or 'supporting'. NEVER use the words villain or antagonist anywhere. Name a person only when subtitles, dialogue or credits support it; otherwise label them relative to a named character (""Gu Heng's grandmother""). actor only from the credits lines, else null. role is the final role, roleAtStart what the viewer knows in the opening; descriptions and labels describe the start, never later reveals.
 - relations: every cast member linked to at least one other. since/until in seconds; spoiler is true when since is after the cutoff or the relation is itself a reveal; implied true when not stated outright.
 - picks: for each cluster, the best portrait (most flattering, in-character, well lit, expressive, no other face dominating) and 1-3 stills as candidate indexes of its sheet; poster: the index of the single most poster-worthy 'together' frame (charged, iconic, cinematic; NOT a twist, death, blood, identity reveal or late-story costume), or null.
-JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""samePerson"":[[0,1]]}
+JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""expression"":{""0"":[0],""poster"":[0]},""samePerson"":[[0,1]]}
+- expression: score EVERY numbered head shot of EVERY cluster sheet, and every frame of the poster candidate sheet, for how flattering the face is, an integer 0-10. 8-10: eyes open and roughly toward the camera, mouth closed or a slight smile, relaxed or composed. 5-7: acceptable but flat or slightly off. 0-2: mid-speech (open mouth), shocked or startled, crying, grimacing, blinking, eyes closed, looking far away. For a poster frame score the weaker of the two faces. Arrays are in sheet order; ""poster"" is the poster sheet.
 from/to and picks keys are cluster ids.
 - samePerson: lists of cluster ids that show the SAME person (the face matcher sometimes splits one character across clusters, e.g. in another costume or mask). Compare the contact sheets carefully; only merge when you are sure; [] when none. Do not list such a cluster separately in cast: give the group once, the first id is kept.");
         var imgs = new List<(string, string)>();
@@ -164,6 +175,7 @@ from/to and picks keys are cluster ids.
         }
         o["relations"] = rels;
         o["picks"] = r["picks"] is JsonObject p ? JsonNode.Parse(p.ToJsonString()) : new JsonObject();
+        o["expression"] = CleanExpression(r["expression"]);
         o["poster"] = r["poster"] is JsonValue pv2 && pv2.TryGetValue<int>(out var pi) ? pi : null;
         return o;
     }

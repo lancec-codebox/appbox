@@ -197,7 +197,7 @@ public static class CastStage
                 if (cand.Count > 0)
                 {
                     await Imaging.WriteJpegAsync(tools, Imaging.Grid(cand.Select(f => Imaging.Resize(hs[f], SheetTile, SheetTile * 5 / 4)).ToList(), 4), Path.Combine(castDir, $"sheet_{g.Key}.jpg"), ct, 4);
-                    for (int k = 0; k < cand.Count; k++) if (full.TryGetValue(cand[k], out var fi)) await Imaging.WriteJpegAsync(tools, fi, Path.Combine(castDir, $"cand_{g.Key}_{k}.jpg"), ct, 5);
+                    for (int k = 0; k < cand.Count; k++) { if (full.TryGetValue(cand[k], out var fi)) await Imaging.WriteJpegAsync(tools, fi, Path.Combine(castDir, $"cand_{g.Key}_{k}.jpg"), ct, 5); if (hs.TryGetValue(cand[k], out var hh)) await Imaging.WriteJpegAsync(tools, hh, Path.Combine(castDir, $"cand_hs_{g.Key}_{k}.jpg"), ct, 4); }
                     await File.WriteAllTextAsync(Path.Combine(castDir, $"cand_{g.Key}.json"), JsonSerializer.Serialize(cand.Select((f, k) => new { k, t = f.T, quality = f.Quality, masked = f.Masked, box = new[] { f.X, f.Y, f.W, f.H } })), ct);
                 }
             }

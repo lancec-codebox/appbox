@@ -168,12 +168,18 @@ public static class Publish
         byte[]? en = null; foreach (var f in new[] { "subs.en.vtt", "subs.en.srt", "ocr/subs.en.vtt" }) { en = await src.ReadAsync(f, ct); if (en != null) { if (f.EndsWith(".srt")) en = Encoding.UTF8.GetBytes(Srt2Vtt(Encoding.UTF8.GetString(en))); break; } }
         if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en))));
         // pictures: portraits, stills (spoiler after the cutoff), thumb
-        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject;
+        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; double dur0 = info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject;
         foreach (var c in (describe["cast"] as JsonArray) ?? [])
         {
             int cid = c!["cluster"]!.GetValue<int>();
-            if (await src.ReadAsync($"cast/portrait_{cid}.jpg", ct) is { } pb) File.WriteAllBytes(Path.Combine(tmp, "cast", $"{Id(cid)}.jpg"), pb);
-            var cand = await JN($"cast/cand_{cid}.json"); var list = new List<(string, double, bool)>(); int n = 0;
+            var cand = await JN($"cast/cand_{cid}.json");
+            // portrait: the best expression-scored head shot before the late limit; else the cast stage's portrait
+            byte[]? pb = null;
+            if (ExpressionScores(describe, cid.ToString()) is { } sc && cand is JsonArray ca
+                && PickByExpression(ca, picks?[cid.ToString()]?["portrait"] is JsonValue ppv && ppv.TryGetValue<int>(out var ppk) ? ppk : null, cut, dur0, sc) is { } ps)
+                pb = await src.ReadAsync($"cast/cand_hs_{cid}_{ps.K}.jpg", ct);
+            pb ??= await src.ReadAsync($"cast/portrait_{cid}.jpg", ct);
+            if (pb != null) File.WriteAllBytes(Path.Combine(tmp, "cast", $"{Id(cid)}.jpg"), pb); var list = new List<(string, double, bool)>(); int n = 0;
             foreach (var s in (picks?[cid.ToString()]?["stills"] as JsonArray) ?? [])
             {
                 if (n >= 3 || s is not JsonValue sv || !sv.TryGetValue<int>(out var k)) continue;
@@ -200,16 +206,28 @@ public static class Publish
     /// <summary>The two-shot for the poster: only candidates that show both lead clusters; describe's pick if it is one of them, else the best-scoring one (the list is ordered by score). Null: no candidate has both leads.</summary>
     public static int? PickTwoShot(JsonArray? cands, int a, int b, int? chosen) => PickTwoShot(cands, [a], [b], chosen);
 
-    public static int? PickTwoShot(JsonArray? cands, IReadOnlyCollection<int> a, IReadOnlyCollection<int> b, int? chosen)
+    public static int? PickTwoShot(JsonArray? cands, IReadOnlyCollection<int> a, IReadOnlyCollection<int> b, int? chosen, IReadOnlyList<int?>? scores = null)
     {
         if (cands == null) return null;
         var ok = cands.OfType<JsonObject>().Where(c => c["clusters"] is JsonArray cl && cl.Select(x => x!.GetValue<int>()).Any(a.Contains) && cl.Select(x => x!.GetValue<int>()).Any(b.Contains) && !cl.Select(x => x!.GetValue<int>()).All(x => a.Contains(x) && b.Contains(x))).Select(c => c["k"]!.GetValue<int>()).ToList();
+        if (scores != null)   // the vision expression score decides: both faces flattering, best score first, ties to describe's pick then to the list's order
+        {
+            int S(int k) => k >= 0 && k < scores.Count ? scores[k] ?? -1 : -1;
+            ok = ok.Where(k => S(k) >= MinExpression).OrderByDescending(S).ThenByDescending(k => k == chosen).ToList();
+            return ok.Count == 0 ? null : ok[0];
+        }
         if (ok.Count == 0) return null;
-        return chosen is { } k && ok.Contains(k) ? k : ok[0];
+        return chosen is { } kk && ok.Contains(kk) ? kk : ok[0];
     }
 
     public const int CoverW = 360, CoverH = 640;
     public const double CoverLateFraction = 0.75;
+    /// <summary>A shot needs at least this vision expression score (0-10) to be a cover or a portrait: eyes open and toward the camera, mouth closed or a slight smile.</summary>
+    public const int MinExpression = 6;
+
+    /// <summary>The model's scores for a key ("0" for cluster 0, "poster"), by candidate index; null when it gave none (an older describe).</summary>
+    public static List<int?>? ExpressionScores(JsonObject describe, string key) =>
+        (describe["expression"] as JsonObject)?[key] is JsonArray a ? a.Select(x => x is JsonValue v && v.TryGetValue<int>(out var i) ? (int?)i : null).ToList() : null;
 
     /// <summary>Where cover shots may come from, in order: the start window (up to the spoiler cutoff, about the first 12%), then the first half. Never past 75% of the runtime.</summary>
     public static (string Name, double MaxT)[] CoverWindows(double cutoff, double duration)
@@ -220,8 +238,9 @@ public static class Publish
     }
 
     /// <summary>The first window with a usable shot (an unmasked one; a masked pick is a last resort within the window): its shot and the window's name. Null: none before the late limit.</summary>
-    public static (int K, double T, double[]? Box, string Window)? PickCoverShot(JsonArray? cands, int? picked, double cutoff, double duration)
+    public static (int K, double T, double[]? Box, string Window)? PickCoverShot(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?>? scores = null)
     {
+        if (scores != null) return PickByExpression(cands, picked, cutoff, duration, scores);
         foreach (var (name, maxT) in CoverWindows(cutoff, duration))
         {
             var inWin = new JsonArray(cands?.OfType<JsonObject>().Where(c => (c["t"]?.GetValue<double>() ?? 0) <= maxT && (c["t"]?.GetValue<double>() ?? 0) <= (duration > 0 ? duration * CoverLateFraction : double.MaxValue)).Select(c => (JsonNode)c.DeepClone()).ToArray() ?? []);
@@ -250,6 +269,26 @@ public static class Publish
         return (c["k"]!.GetValue<int>(), c["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null);
     }
 
+    /// <summary>Expression-scored pick: in each window (start, then first half; never the last 25%) the unmasked candidates scoring at least MinExpression compete; the best score wins, ties go to describe's pick, then to quality. No window with a flattering shot: null.</summary>
+    public static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores)
+    {
+        var all = cands?.OfType<JsonObject>().ToList() ?? [];
+        foreach (var (name, maxT) in CoverWindows(cutoff, duration))
+        {
+            var limit = Math.Min(maxT, duration > 0 ? duration * CoverLateFraction : double.MaxValue);
+            var best = all.Where(c => c["masked"]?.GetValue<bool>() != true && (c["t"]?.GetValue<double>() ?? 0) <= limit)
+                .Select(c => (C: c, K: c["k"]!.GetValue<int>()))
+                .Select(x => (x.C, x.K, S: x.K >= 0 && x.K < scores.Count ? scores[x.K] ?? -1 : -1))
+                .Where(x => x.S >= MinExpression)
+                .OrderByDescending(x => x.S).ThenByDescending(x => x.K == picked).ThenByDescending(x => x.C["quality"]?.GetValue<double>() ?? 0)
+                .Select(x => ((JsonObject C, int K, int S)?)x).FirstOrDefault();
+            if (best is not { } b) continue;
+            var box = (b.C["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
+            return (b.K, b.C["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null, name);
+        }
+        return null;
+    }
+
     static async Task<bool> CropAsync(Tools tools, byte[] jpg, string outPath, double? cx, double? cy, string tmp, CancellationToken ct)
     {
         var inp = Path.Combine(tmp, "cover_src.tmp.jpg"); File.WriteAllBytes(inp, jpg);
@@ -276,7 +315,7 @@ public static class Publish
             int cid = c["cluster"]!.GetValue<int>();
             var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
             int? pk = picks?[cid.ToString()]?["portrait"] is JsonValue pv && pv.TryGetValue<int>(out var p) ? p : null;
-            var shot = PickCoverShot(cands, pk, cutoff, dur);
+            var shot = PickCoverShot(cands, pk, cutoff, dur, ExpressionScores(describe, cid.ToString()));
             if (shot is not { } s || await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) is not { } img) return; // no shot before the late limit: no cover (the portrait has no known time)
             double? t = s.T; double[]? box = s.Box;
             var file = $"cover/{key}.jpg";
@@ -292,7 +331,7 @@ public static class Publish
             foreach (var (wn, maxT) in CoverWindows(cutoff, dur))
             {
                 var inWin = new JsonArray(cands?.OfType<JsonObject>().Where(c => (c["t"]?.GetValue<double>() ?? 0) <= Math.Min(maxT, dur > 0 ? dur * CoverLateFraction : double.MaxValue)).Select(c => (JsonNode)c.DeepClone()).ToArray() ?? []);
-                k = PickTwoShot(inWin, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null);
+                k = PickTwoShot(inWin, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null, ExpressionScores(describe, "poster"));
                 if (k != null) { win = wn; break; }
             }
             if (k != null && await src.ReadAsync($"cast/poster_{k}.jpg", ct) is { } pb)
