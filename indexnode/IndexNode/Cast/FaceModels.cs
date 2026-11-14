@@ -27,6 +27,16 @@ public static class FaceMath
 
     public static void L2(float[] v) { double s = 0; foreach (var x in v) s += x * x; s = Math.Sqrt(s); if (s > 0) for (int i = 0; i < v.Length; i++) v[i] = (float)(v[i] / s); }
 
+    /// <summary>Scale so the long side is at most longSide, then pad (top-left, black) to multiples of 32 instead of a square: a 360x640 frame runs as 384x640, not 640x640. Returns the scale.</summary>
+    public static (Rgb Img, float Scale) FitTo32(Rgb im, int longSide)
+    {
+        float s = Math.Min(1f, longSide / (float)Math.Max(im.W, im.H)); int nw = Math.Max(1, (int)Math.Round(im.W * s)), nh = Math.Max(1, (int)Math.Round(im.H * s));
+        int pw = (nw + 31) / 32 * 32, ph = (nh + 31) / 32 * 32;
+        var r = s == 1f ? im : Imaging.Resize(im, nw, nh); var o = Rgb.Blank(pw, ph, 0);
+        for (int y = 0; y < nh; y++) Buffer.BlockCopy(r.Data, y * nw * 3, o.Data, y * pw * 3, nw * 3);
+        return (o, s);
+    }
+
     /// <summary>Letterbox the image into a size x size square (top-left, grey padding); returns the scale from the image to the square.</summary>
     public static (Rgb Img, float Scale) Letterbox(Rgb im, int size)
     {
@@ -86,20 +96,23 @@ public sealed class YuNet : IFaceDetector
 public sealed class Scrfd : IFaceDetector
 {
     private const int Side = 640;
+    /// <summary>false: the old 640x640 letterbox (kept for comparison runs).</summary>
+    public static bool NativeSize = Environment.GetEnvironmentVariable("INDEXNODE_FACE_SQUARE") != "1";
     private readonly InferenceSession s;
     public Scrfd(string path, int threads = 1) { s = new InferenceSession(path, new SessionOptions { IntraOpNumThreads = Math.Max(1, threads), InterOpNumThreads = 1, LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR }); }
 
     public List<FaceDet> Detect(Rgb im)
     {
-        var (lb, scale) = FaceMath.Letterbox(im, Side);
-        var t = new DenseTensor<float>([1, 3, Side, Side]);
-        for (int y = 0; y < Side; y++) for (int x = 0; x < Side; x++) for (int c = 0; c < 3; c++) t[0, c, y, x] = (lb.Data[(y * Side + x) * 3 + c] - 127.5f) / 128f;
+        var (lb, scale) = NativeSize ? FaceMath.FitTo32(im, Side) : FaceMath.Letterbox(im, Side);
+        int W = lb.W, H = lb.H;
+        var t = new DenseTensor<float>([1, 3, H, W]);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 3; c++) t[0, c, y, x] = (lb.Data[(y * W + x) * 3 + c] - 127.5f) / 128f;
         using var r = s.Run([NamedOnnxValue.CreateFromTensor(s.InputMetadata.Keys.First(), t)]);
         var outs = r.Select(o => (Dims: o.AsTensor<float>().Dimensions.ToArray(), Data: o.AsTensor<float>().ToArray())).ToList();
         var res = new List<FaceDet>();
         foreach (int st in new[] { 8, 16, 32 })
         {
-            int n = (Side / st) * (Side / st) * 2, cols = Side / st;
+            int cols = W / st, n = (H / st) * cols * 2;
             var sc = outs.First(o => o.Dims[^1] == 1 && o.Dims[^2] == n).Data; var bb = outs.First(o => o.Dims[^1] == 4 && o.Dims[^2] == n).Data; var kp = outs.First(o => o.Dims[^1] == 10 && o.Dims[^2] == n).Data;
             for (int i = 0; i < n; i++)
             {

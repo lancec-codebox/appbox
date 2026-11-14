@@ -56,7 +56,7 @@ public static class CastStage
 
     public static (IFaceDetector, IFaceEmbedder) Open(string model, string dir, int threads)
     {
-        if (CastLogic.ModelFor(model).Id == "buffalo_l") return (new Scrfd(Models.PathOf(Models.ScrfdDet, dir), threads), new ArcFace(Models.PathOf(Models.ArcFaceRec, dir), threads));
+        if (CastLogic.ModelFor(model).Id == "buffalo_l") return (new Scrfd(Environment.GetEnvironmentVariable("INDEXNODE_FACE_DET") ?? Models.PathOf(Models.ScrfdDet, dir), threads), new ArcFace(Environment.GetEnvironmentVariable("INDEXNODE_FACE_REC") ?? Models.PathOf(Models.ArcFaceRec, dir), threads));
         return (new YuNet(Models.PathOf(Models.YuNetDet, dir), threads), new SFace(Models.PathOf(Models.SFaceRec, dir), threads));
     }
 
@@ -123,7 +123,7 @@ public static class CastStage
                         rawDet++;
                         if (d.H < CastLogic.MinHeight || d.Score < CastLogic.MinScore) continue;
                         var (yaw, roll) = FaceMath.Pose(d.Kps);
-                        using var prep = stats.Phase("blur+pose"); var f = new FaceRec { T = Math.Round(t, 3), X = d.X, Y = d.Y, W = d.W, H = d.H, Score = d.Score, Yaw = Math.Round(yaw, 3), Roll = Math.Round(roll, 1), Kps = d.Kps, Blur = Math.Round(FaceBlur(im, d), 1) };
+                        FaceRec f; using (stats.Phase("blur+pose")) f = new FaceRec { T = Math.Round(t, 3), X = d.X, Y = d.Y, W = d.W, H = d.H, Score = d.Score, Yaw = Math.Round(yaw, 3), Roll = Math.Round(roll, 1), Kps = d.Kps, Blur = Math.Round(FaceBlur(im, d), 1) };
                         if (!CastLogic.Passes(f)) continue;
                         f.Emb = stats.Time("embed", () => emb.Embed(Imaging.AlignFace(im, d.Kps))); f.Quality = CastLogic.QualityOf(f, h); faces.Add(f);
                     }
