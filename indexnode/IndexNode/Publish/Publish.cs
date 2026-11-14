@@ -184,7 +184,7 @@ public static class Publish
             stills[cid] = list;
         }
         if (await src.ReadAsync("thumb.jpg", ct) is { } th) File.WriteAllBytes(Path.Combine(tmp, "thumb.jpg"), th);
-        var cover = await CoversAsync(tools, src, describe, tmp, ct);
+        var cover = await CoversAsync(tools, src, describe, tmp, info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0, ct);
         await PosterAsync(tools, src, describe, tmp, ct); // poster.jpg stays for one release (compatibility)
         var drama = BuildDrama(describe, info, downloaded, clusters, processed, id, ocrZh.Count > 0 ? "ocr" : "transcript", ocrZh.Count > 0, stills, by);
         if (cover != null) drama["cover"] = cover;
@@ -209,6 +209,27 @@ public static class Publish
     }
 
     public const int CoverW = 360, CoverH = 640;
+    public const double CoverLateFraction = 0.75;
+
+    /// <summary>Where cover shots may come from, in order: the start window (up to the spoiler cutoff, about the first 12%), then the first half. Never past 75% of the runtime.</summary>
+    public static (string Name, double MaxT)[] CoverWindows(double cutoff, double duration)
+    {
+        if (duration <= 0) return [("any", double.MaxValue)];
+        var start = Math.Min(cutoff > 0 ? cutoff : duration * Describe.CutoffFraction, duration * 0.5);
+        return [("start", start), ("half", duration * 0.5)];
+    }
+
+    /// <summary>The first window with a usable shot (an unmasked one; a masked pick is a last resort within the window): its shot and the window's name. Null: none before the late limit.</summary>
+    public static (int K, double T, double[]? Box, string Window)? PickCoverShot(JsonArray? cands, int? picked, double cutoff, double duration)
+    {
+        foreach (var (name, maxT) in CoverWindows(cutoff, duration))
+        {
+            var inWin = new JsonArray(cands?.OfType<JsonObject>().Where(c => (c["t"]?.GetValue<double>() ?? 0) <= maxT && (c["t"]?.GetValue<double>() ?? 0) <= (duration > 0 ? duration * CoverLateFraction : double.MaxValue)).Select(c => (JsonNode)c.DeepClone()).ToArray() ?? []);
+            if (!inWin.OfType<JsonObject>().Any(c => c["masked"]?.GetValue<bool>() != true)) continue; // widen rather than show a masked face
+            if (PickLeadShot(inWin, picked) is { } s) return (s.K, s.T, s.Box, name);
+        }
+        return null;
+    }
 
     /// <summary>The ffmpeg filter for a 9:16 crop at 360x640 centred on (cx, cy) in source pixels (null: the middle), clamped inside the frame; no text, no compositing.</summary>
     public static string CoverFilter(double? cx, double? cy)
@@ -242,11 +263,12 @@ public static class Publish
     }
 
     /// <summary>cover/lead1.jpg (female lead), lead2.jpg (male lead) and together.jpg (the two-shot): three separate 9:16 crops at 360x640, no text. Same picks as the poster. together is omitted without a two-shot; a lead without a usable shot is omitted too. Returns the drama.json "cover" object, or null when there is none.</summary>
-    static async Task<JsonObject?> CoversAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, CancellationToken ct)
+    static async Task<JsonObject?> CoversAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, double dur, CancellationToken ct)
     {
         var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
         var f = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "female lead"); var m = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "male lead");
         var picks = describe["picks"] as JsonObject; var cover = new JsonObject();
+        double cutoff = describe["cutoffSeconds"]?.GetValue<double>() ?? Describe.Cutoff(dur);
         Directory.CreateDirectory(Path.Combine(tmp, "cover"));
         async Task Lead(JsonObject? c, string key)
         {
@@ -254,21 +276,25 @@ public static class Publish
             int cid = c["cluster"]!.GetValue<int>();
             var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
             int? pk = picks?[cid.ToString()]?["portrait"] is JsonValue pv && pv.TryGetValue<int>(out var p) ? p : null;
-            var shot = PickLeadShot(cands, pk);
-            byte[]? img = shot is { } s ? await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) : null;
-            double? t = shot?.T; double[]? box = shot?.Box;
-            if (img == null) { img = await src.ReadAsync($"cast/portrait_{cid}.jpg", ct); t = null; box = null; } // old packs: the head-and-shoulders portrait
-            if (img == null) return;
+            var shot = PickCoverShot(cands, pk, cutoff, dur);
+            if (shot is not { } s || await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) is not { } img) return; // no shot before the late limit: no cover (the portrait has no known time)
+            double? t = s.T; double[]? box = s.Box;
             var file = $"cover/{key}.jpg";
             await CropAsync(tools, img, Path.Combine(tmp, file), box == null ? null : box[0] + box[2] / 2, box == null ? null : box[1] + box[3] / 2, tmp, ct);
-            cover[key] = new JsonObject { ["file"] = file, ["t"] = t == null ? null : Math.Round(t.Value, 2), ["cast"] = Id(cid) };
+            cover[key] = new JsonObject { ["file"] = file, ["t"] = Math.Round(s.T, 2), ["window"] = s.Window, ["cast"] = Id(cid) };
         }
         await Lead(f, "lead1"); await Lead(m, "lead2");
         if (f != null && m != null)
         {
             int fc0 = f["cluster"]!.GetValue<int>(), mc0 = m["cluster"]!.GetValue<int>();
             var cands = await src.ReadAsync("cast/poster_cands.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
-            var gr = Groups(describe); var k = PickTwoShot(cands, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null);
+            var gr = Groups(describe); int? k = null; string win = "";
+            foreach (var (wn, maxT) in CoverWindows(cutoff, dur))
+            {
+                var inWin = new JsonArray(cands?.OfType<JsonObject>().Where(c => (c["t"]?.GetValue<double>() ?? 0) <= Math.Min(maxT, dur > 0 ? dur * CoverLateFraction : double.MaxValue)).Select(c => (JsonNode)c.DeepClone()).ToArray() ?? []);
+                k = PickTwoShot(inWin, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null);
+                if (k != null) { win = wn; break; }
+            }
             if (k != null && await src.ReadAsync($"cast/poster_{k}.jpg", ct) is { } pb)
             {
                 var cand = cands!.OfType<JsonObject>().First(x => x["k"]!.GetValue<int>() == k);
@@ -279,7 +305,7 @@ public static class Publish
                     cx = (rs.Min(r => r[0]) + rs.Max(r => r[0] + r[2])) / 2; cy = (rs.Min(r => r[1]) + rs.Max(r => r[1] + r[3])) / 2;
                 }
                 await CropAsync(tools, pb, Path.Combine(tmp, "cover", "together.jpg"), cx, cy, tmp, ct);
-                cover["together"] = new JsonObject { ["file"] = "cover/together.jpg", ["t"] = Math.Round(cand["t"]?.GetValue<double>() ?? 0, 2) };
+                cover["together"] = new JsonObject { ["file"] = "cover/together.jpg", ["t"] = Math.Round(cand["t"]?.GetValue<double>() ?? 0, 2), ["window"] = win };
             }
         }
         return cover.Count == 0 ? null : cover;

@@ -25,6 +25,23 @@ public class CoverTests
     }
 
     [Fact]
+    public void Cover_shots_come_from_the_start_window_then_the_first_half_never_the_last_quarter()
+    {
+        // 9080 s drama, cutoff 1089.6 s (12%)
+        var c = Cands("""[{"k":0,"t":8622.5,"quality":9,"masked":false},{"k":1,"t":900,"quality":2,"masked":false},{"k":2,"t":3000,"quality":8,"masked":false}]""");
+        var s = Publish.PickCoverShot(c, 0, 1089.6, 9080)!.Value;           // the late pick is outside every window
+        Assert.Equal(1, s.K); Assert.Equal("start", s.Window);
+        // nothing in the start window: widen to the first half (3000 s <= 4540 s)
+        s = Publish.PickCoverShot(Cands("""[{"k":0,"t":8622.5,"quality":9,"masked":false},{"k":2,"t":3000,"quality":8,"masked":false}]"""), 0, 1089.6, 9080)!.Value;
+        Assert.Equal(2, s.K); Assert.Equal("half", s.Window);
+        // only late shots: none (never the last 25%)
+        Assert.Null(Publish.PickCoverShot(Cands("""[{"k":0,"t":8622.5,"quality":9,"masked":false},{"k":1,"t":6900,"quality":9,"masked":false}]"""), 0, 1089.6, 9080));
+        // a masked start-window shot widens instead of being shown
+        s = Publish.PickCoverShot(Cands("""[{"k":0,"t":500,"quality":9,"masked":true},{"k":1,"t":2500,"quality":3,"masked":false}]"""), 0, 1089.6, 9080)!.Value;
+        Assert.Equal(1, s.K); Assert.Equal("half", s.Window);
+    }
+
+    [Fact]
     public async Task Cover_filter_gives_a_360x640_crop_centred_and_clamped()
     {
         var ff = Tools.OnPath("ffmpeg"); if (ff == null) return;
