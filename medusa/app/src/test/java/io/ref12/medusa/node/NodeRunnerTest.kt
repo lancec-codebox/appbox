@@ -50,6 +50,9 @@ class FakeBlobs : BlobApi {
     @Synchronized override fun releaseLease(path: String, leaseId: String) { if (blobs[path]?.lease == leaseId) blobs[path]!!.lease = null; log.add("release:" + path) }
     @Synchronized override fun setMetadata(path: String, leaseId: String?, meta: Map<String, String>) { log.add("meta:" + path) }
     @Synchronized override fun listNames(prefix: String, max: Int) = blobs.keys.filter { it.startsWith(prefix) }
+    @Synchronized override fun findAll(stage: String) = blobs.filter { it.key.startsWith("index/jobs/$stage/") && it.value.tags["idx_stage"] == stage }
+        .map { JobRef(it.key, it.value.tags) }.sortedBy { it.added }
+    @Synchronized override fun delete(path: String) { blobs.remove(path); log.add("delete:" + path) }
 }
 
 class MemState : NodeState {
@@ -60,6 +63,12 @@ class MemState : NodeState {
     override fun setBackoffUntil(t: Long) { backoff = t }
     override fun record(entry: JobLogEntry) { entries.add(entry) }
     override fun saveControl(text: String) { control = text }
+    var local = LocalLimits(null, null, null); var bKey: String? = null; var bLeft = 0; var limits = ""
+    override fun localLimits() = local
+    override fun budgetKey() = bKey
+    override fun budgetLeft() = bLeft
+    override fun setBudget(key: String?, left: Int) { bKey = key; bLeft = left }
+    override fun saveLimits(text: String) { limits = text }
 }
 
 const val SAMPLE_INFO = """{"format_id":"394+251","vcodec":"av01.0.00M.08","acodec":"opus","playable_in_embed":true,"description":"第一集 hello",

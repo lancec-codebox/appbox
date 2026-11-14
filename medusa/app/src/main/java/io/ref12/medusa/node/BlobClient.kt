@@ -26,6 +26,10 @@ class GetResult(val status: Int, val body: ByteArray, val etag: String?) { val t
 interface BlobApi {
     /** Pending jobs of [stage] (Find Blobs by Tags, else List Blobs with tags). */
     fun findJobs(stage: String): List<JobRef>
+    /** Every job of [stage] whatever its state (Find Blobs by Tags idx_stage, else List Blobs with tags). */
+    fun findAll(stage: String): List<JobRef>
+    /** Delete Blob; a missing blob is fine. */
+    fun delete(path: String)
     fun get(path: String, ifNoneMatch: String? = null): GetResult
     fun getTags(path: String): Map<String, String>
     /** Put Blob; [ifAbsent] sends If-None-Match: * and returns false when the blob exists. */
@@ -72,16 +76,19 @@ class BlobClient(val sas: SasUrl, private val retryDelayMs: Long = 1000, private
     private fun tagHeader(tags: Map<String, String>) =
         if (tags.isEmpty()) emptyMap() else mapOf("x-ms-tags" to tags.entries.joinToString("&") { urlEnc(it.key) + "=" + urlEnc(it.value) })
 
-    override fun findJobs(stage: String): List<JobRef> {
+    override fun findJobs(stage: String): List<JobRef> = find(stage, true)
+    override fun findAll(stage: String): List<JobRef> = find(stage, false)
+
+    private fun find(stage: String, pendingOnly: Boolean): List<JobRef> {
         val prefix = "$root/jobs/$stage/"
-        val where = "\"idx_stage\"='$stage' AND \"idx_state\"='pending'"
+        val where = "\"idx_stage\"='$stage'" + (if (pendingOnly) " AND \"idx_state\"='pending'" else "")
         var found: List<JobRef>? = null
         if (sas.can('f')) {
             try { found = paged("restype=container&comp=blobs&where=" + urlEnc(where)) }
             catch (e: BlobException) { if (e.status != 400 && e.status != 403) throw e }
         }
         if (found == null) found = paged("restype=container&comp=list&include=tags&prefix=" + urlEnc(prefix))
-        return found.filter { it.name.startsWith(prefix) && it.name.endsWith(".json") && it.tags["idx_stage"] == stage && it.tags["idx_state"] == "pending" }
+        return found.filter { it.name.startsWith(prefix) && it.name.endsWith(".json") && it.tags["idx_stage"] == stage && (!pendingOnly || it.tags["idx_state"] == "pending") }
             .sortedBy { it.added }
     }
 
@@ -201,8 +208,8 @@ class BlobClient(val sas: SasUrl, private val retryDelayMs: Long = 1000, private
         if (r.code != 200) fail(r, "Lease release $path")
     }
 
-    /** Delete Blob (the node itself never deletes; the live test cleans up with it). */
-    fun delete(path: String) {
+    /** Delete Blob (needs the SAS permission d). */
+    override fun delete(path: String) {
         val r = send("DELETE", sas.blobUrl(path))
         if (r.code != 202 && r.code != 404) fail(r, "Delete $path")
     }

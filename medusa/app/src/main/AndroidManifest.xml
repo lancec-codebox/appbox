@@ -81,6 +81,14 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ShareUrlActivity"
+            android:exported="false"
+            android:label="Follow in index"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.Dialog.NoActionBar" />
+
         <provider
             android:name=".ExportProvider"
             android:authorities="${applicationId}.files"

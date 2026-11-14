@@ -63,6 +63,18 @@ class NodeSettings(ctx: Context) : NodeState {
         set(v) { prefs.edit().putString("conditions", v.name).apply() }
     var dailyCap: Int get() = prefs.getInt("dailyCap", 20); set(v) { prefs.edit().putInt("dailyCap", v.coerceIn(1, 500)).apply() }
 
+    /** Run limits: budget (-1 unset), schedule (cron) and window, as typed; a remote override in control.json wins. */
+    var budget: Int? get() = prefs.getInt("budget", -1).takeIf { it >= 0 }; set(v) { prefs.edit().putInt("budget", v ?: -1).apply() }
+    var schedule: String get() = prefs.getString("schedule", "") ?: ""; set(v) { prefs.edit().putString("schedule", v.trim()).apply() }
+    var window: String get() = prefs.getString("window", "") ?: ""; set(v) { prefs.edit().putString("window", v.trim()).apply() }
+
+    override fun localLimits() = LocalLimits(budget, schedule.ifEmpty { null }, window.ifEmpty { null })
+    var lastLimits: String get() = prefs.getString("lastLimits", "") ?: ""; set(v) { prefs.edit().putString("lastLimits", v).apply() }
+    override fun saveLimits(text: String) { lastLimits = text }
+    override fun budgetKey() = prefs.getString("budgetKey", null)
+    override fun budgetLeft() = prefs.getInt("budgetLeft", 0)
+    override fun setBudget(key: String?, left: Int) { prefs.edit().putString("budgetKey", key).putInt("budgetLeft", left).apply() }
+
     /** Fixed for the install: the name at first use plus 6 random hex characters. */
     val nodeId: String get() = prefs.getString("nodeId", null) ?: run {
         val b = ByteArray(3).also { SecureRandom().nextBytes(it) }

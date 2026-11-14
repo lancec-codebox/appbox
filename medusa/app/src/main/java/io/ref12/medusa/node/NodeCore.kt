@@ -37,14 +37,22 @@ enum class Level { RUN, DRAIN, STOP;
     companion object { fun of(s: String?) = when (s?.lowercase()) { "drain" -> DRAIN; "stop" -> STOP; else -> RUN } }
 }
 
-class Control(val mode: Level, val stages: Map<String, Level>, val message: String?, val changedAt: String?, val changedBy: String?) {
+/** nodes.<nodeId> in control.json: per-node run limits that win over the node's local settings. */
+class NodeOverride(val budget: Int?, val schedule: String?, val window: String?)
+
+class Control(val mode: Level, val stages: Map<String, Level>, val message: String?, val changedAt: String?, val changedBy: String?, val nodes: Map<String, NodeOverride> = emptyMap()) {
     fun effective(stage: String): Level = maxOf(mode, stages[stage] ?: Level.RUN)
     companion object {
         val RUN = Control(Level.RUN, emptyMap(), null, null, null)
         fun parse(text: String): Control {
             val o = JSONObject(text)
             val st = HashMap<String, Level>(); o.optJSONObject("stages")?.let { s -> s.keys().forEach { st[it] = Level.of(s.optString(it)) } }
-            return Control(Level.of(o.optString("mode", "run")), st, o.optString("message").ifEmpty { null }, o.optString("changedAt").ifEmpty { null }, o.optString("changedBy").ifEmpty { null })
+            val nodes = HashMap<String, NodeOverride>()
+            o.optJSONObject("nodes")?.let { n -> n.keys().forEach { id -> n.optJSONObject(id)?.let { x ->
+                nodes[id] = NodeOverride(if (x.has("budget") && !x.isNull("budget")) x.optInt("budget", -1).takeIf { it >= 0 } else null,
+                    x.optString("schedule").ifEmpty { null }, x.optString("window").ifEmpty { null })
+            } } }
+            return Control(Level.of(o.optString("mode", "run")), st, o.optString("message").ifEmpty { null }, o.optString("changedAt").ifEmpty { null }, o.optString("changedBy").ifEmpty { null }, nodes)
         }
     }
 }
@@ -67,6 +75,9 @@ class ControlWatcher(private val api: BlobApi) {
     companion object { const val CONTROL_PATH = "index/control.json" }
 }
 
+/** The run limits as the registry and the settings screen show them: budget left, schedule, window, and when the next window opens (null inside one). */
+class LimitView(val budget: Int?, val schedule: String?, val window: String?, val nextWindow: String?)
+
 class RunningJob(val jobId: String, val stage: String, @Volatile var step: String, @Volatile var progress: String?)
 
 class NodeConfig(val nodeId: String, val name: String, val conditions: String, val version: String, val platform: String, val threads: Int, val workRoot: File)
@@ -79,6 +90,14 @@ interface NodeState {
     fun setBackoffUntil(t: Long)
     fun record(entry: JobLogEntry)
     fun saveControl(text: String)
+    /** The local settings of the run limits. */
+    fun localLimits(): LocalLimits = LocalLimits(null, null, null)
+    /** Which budget value (local or remote, with changedAt) the countdown belongs to, and what is left of it. */
+    fun budgetKey(): String? = null
+    fun budgetLeft(): Int = 0
+    fun setBudget(key: String?, left: Int) {}
+    /** A one-line description of the limits in force, for the settings screen. */
+    fun saveLimits(text: String) {}
 }
 
 class JobLogEntry(val jobId: String, val title: String?, val result: String, val at: Long, val message: String?)
@@ -94,6 +113,7 @@ class NodeEnv(
     val gapMs: () -> Long = { 20_000L + (Math.random() * 20_000L).toLong() },
     val renewMs: Long = 30_000L,
     val registryMs: Long = 60_000L,
+    val zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
 )
 
 class Summary { var done = 0; var failed = 0; var released = 0; var endReason = ""; var finalState = "idle" }
@@ -107,6 +127,7 @@ class NodeRunner(
     private val aborted = AtomicBoolean(false)
     @Volatile private var running: RunningJob? = null
     private var regState = "idle"
+    private var limitView: LimitView? = null
     private var lastRegistry = 0L
     private val startedAt = iso(env.clock())
 
@@ -124,6 +145,12 @@ class NodeRunner(
                 if (lvl == Level.STOP) { s.endReason = "control: stop"; s.finalState = "stopped"; break }
                 if (lvl == Level.DRAIN) { s.endReason = "control: drain"; regState = "draining"; break }
                 if (state.backoffUntil() > env.clock()) { s.endReason = "backing off"; regState = "backoff"; break }
+                val eff = RunLimits.resolve(state.localLimits(), c, cfg.nodeId)
+                val left = RunLimits.remaining(eff, state)
+                val gate = RunLimits.gate(eff, left, env.clock(), env.zone)
+                limitView = limitView(eff, left)
+                if (gate == Gate.BUDGET_SPENT) { s.endReason = "budget spent"; regState = "budget spent"; break }
+                if (gate == Gate.WAITING) { s.endReason = "waiting for window"; regState = "waiting for window"; break }
                 if (state.doneToday(day(env.clock())) >= cap) { s.endReason = "daily cap reached"; break }
                 val jobs = api.findJobs(STAGE)
                 if (jobs.isEmpty()) { s.endReason = "no work"; break }
@@ -142,7 +169,8 @@ class NodeRunner(
             }
         } finally {
             running = null
-            regState = if (s.finalState == "stopped") "stopped" else "idle" // while the worker is not running the node is idle or stopped
+            // while the worker is not running the node is idle, stopped, or says why it claims nothing
+            regState = if (s.finalState == "stopped") "stopped" else if (regState == "budget spent" || regState == "waiting for window") regState else "idle"
             writeRegistry(true)
         }
         return s
@@ -216,6 +244,7 @@ class NodeRunner(
                     api.put(ref.name, done.toString().toByteArray(), "application/json", tagsOf(ref, "done"), leaseId)
                     release(ref.name, leaseId)
                     state.addDone(day(env.clock())); s.done++
+                    countDown()
                     state.record(JobLogEntry(ref.id, title, "done", env.clock(), null))
                     outcome = Outcome.DONE
                 } catch (e: Exception) {
@@ -229,6 +258,24 @@ class NodeRunner(
         }
         return outcome
     }
+
+    /** One finished download off the budget, when there is one. */
+    private fun countDown() {
+        val eff = RunLimits.resolve(state.localLimits(), control.current, cfg.nodeId)
+        val left = RunLimits.remaining(eff, state) ?: return
+        state.setBudget(eff.budgetKey, maxOf(0, left - 1))
+    }
+
+    private fun limitView(eff: EffectiveLimits, left: Int?): LimitView {
+        val next = eff.schedule?.let { sc -> if (sc.isOpen(env.clock(), env.zone)) null else sc.nextStart(env.clock(), env.zone) }
+        state.saveLimits(describeLimits(left, eff, next))
+        return LimitView(left, eff.scheduleText, if (eff.scheduleText != null) eff.windowText ?: "1h" else null, next?.let { iso(it) })
+    }
+
+    private fun describeLimits(left: Int?, eff: EffectiveLimits, next: Long?): String =
+        (if (left != null) "budget left $left" else "no budget") + "; " +
+            (if (eff.scheduleText == null) "any time" else "schedule ${eff.scheduleText} for ${eff.windowText ?: "1h"}" +
+                (if (next != null) ", next window " + SimpleDateFormat("EEE d MMM HH:mm", Locale.US).apply { timeZone = TimeZone.getTimeZone(env.zone) }.format(Date(next)) else ", in a window now"))
 
     private fun handleFailure(e: Exception, ref: JobRef, leaseId: String, jobText: String, wasCancelled: Boolean, stopped: Boolean, title: String?, s: Summary): Outcome {
         val msg = Redact.sas(e.message ?: e.javaClass.simpleName).take(300)
@@ -283,7 +330,7 @@ class NodeRunner(
         if (!force && now - lastRegistry < env.registryMs) return
         lastRegistry = now
         try {
-            val json = registryJson(cfg, regState, control.current.effective(STAGE).name.lowercase(), running, iso(now), startedAt)
+            val json = registryJson(cfg, regState, control.current.effective(STAGE).name.lowercase(), running, iso(now), startedAt, limitView)
             api.put("index/nodes/${cfg.nodeId}.json", json.toString().toByteArray(), "application/json", mapOf("idx_kind" to "node"))
         } catch (e: Exception) { /* the registry is best effort */ }
     }
@@ -297,12 +344,17 @@ class NodeRunner(
         fun day(ms: Long): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(ms))
         fun describe(c: Control): String = c.effective(STAGE).name.lowercase() + (c.message?.let { " - $it" } ?: "")
 
-        fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String): JSONObject = JSONObject()
+        fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String, limits: LimitView? = null): JSONObject = JSONObject()
             .put("v", 1).put("nodeId", cfg.nodeId).put("name", cfg.name).put("kind", "medusa").put("version", cfg.version).put("platform", cfg.platform)
             .put("stages", JSONArray(listOf("download"))).put("jobs", JSONObject().put("download", 1)).put("threads", cfg.threads)
             .put("conditions", cfg.conditions).put("state", state).put("control", control)
             .put("running", JSONArray().also { a -> running?.let { r -> a.put(JSONObject().put("jobId", r.jobId).put("stage", r.stage).put("step", r.step).put("progress", r.progress ?: JSONObject.NULL)) } })
             .put("lastSeen", lastSeen).put("startedAt", startedAt)
+            .also { o -> limits?.let { l ->
+                l.budget?.let { o.put("budget", it) }
+                l.schedule?.let { o.put("schedule", it) }; l.window?.let { o.put("window", it) }
+                l.nextWindow?.let { o.put("nextWindow", it) }
+            } }
     }
 }
 

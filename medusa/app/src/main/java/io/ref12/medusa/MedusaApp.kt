@@ -9,6 +9,7 @@ class MedusaApp : Application() {
         private set
     lateinit var fetcher: YtDlpFetcher
         private set
+    val sources by lazy { io.ref12.medusa.node.SourceResolver(fetcher) }
     lateinit var media: MediaStore
         private set
     lateinit var jobs: JobManager

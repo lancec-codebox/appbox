@@ -19,19 +19,18 @@ The owner wants that for the index videos. So:
 - **Never write Nexis's tags** except `last_access`.
 - **Index tags all start with `idx_`,** to stay clear of Nexis's tags. Azure allows at most 10 tags per blob.
 
-(Medusa only writes new blobs under `index/videos/<jobId>/` and never reads a big blob, so it needs neither touching nor hydrating.)
-
 ## Jobs
 
-One blob per job: `index/jobs/<stage>/<jobId>.json`. The stages are `download` and `process`. The job's state is in its index tags:
+One blob per job: `index/jobs/<stage>/<jobId>.json`. The stages are `download`, `process` and `comments`. The job's state is in its index tags:
 
 - `idx_stage`: `download` or `process`
 - `idx_state`: `pending`, `done` or `failed`
 - `idx_added`: the time it was added, in sortable UTC
+- `idx_due`: the earliest time it may run, in sortable UTC; for most jobs, the same as `idx_added`
 
 `jobId` is the YouTube video id (11 characters), or a hash of the URL otherwise. `nodeId` is the node's name plus 6 random hex characters, fixed per install.
 
-**Find work:** Find Blobs by Tags on the container (`?restype=container&comp=blobs&where=`), with ``"idx_stage"='download' AND "idx_state"='pending'``. This needs the SAS permission `f`. If the SAS lacks it, fall back to listing `index/jobs/<stage>/` with `include=tags`. Take the oldest `idx_added` first.
+**Find work:** Find Blobs by Tags on the container (`?restype=container&comp=blobs&where=`), with ``"idx_stage"='download' AND "idx_state"='pending' AND "idx_due" <= '<now>'``. This needs the SAS permission `f`. If the SAS lacks it, fall back to listing `index/jobs/<stage>/` with `include=tags`. Take the oldest `idx_added` first.
 
 **Claim:**
 1. Acquire a **blob lease** of 60 s (`x-ms-lease-action: acquire`, `x-ms-lease-duration: 60`). A 409 means another node has the job; move on to the next.
@@ -56,38 +55,109 @@ Rewriting a blob (Put Blob) drops its tags unless they're sent again in `x-ms-ta
   "maxHeight": 480, "format": null, "subs": true, "addedAt": "2026-11-13T19:00:00Z", "attempts": 0 }
 ```
 - `maxHeight` defaults to 480. `format`, when set, is a raw yt-dlp format string that takes priority over `maxHeight`.
-- The default selector is `bv*[height<=H][ext=mp4]+ba[ext=m4a]/b[height<=H]/b`, merged to mp4.
+- The default selector prefers YouTube's own **AV1**, then VP9, then H.264, with compact Opus audio. `bv*[height<=H][vcodec^=av01]+ba[acodec=opus][abr<=80]/bv*[height<=H][vcodec^=vp9]+ba[acodec=opus][abr<=80]/bv*[height<=H]+ba/b[height<=H]/b`, merged to mp4 (`--merge-output-format mp4`). AV1 is the smallest format YouTube offers: roughly 40–60% the size of its H.264 at the same height. `downloaded.json` records `vcodec`, `acodec` and the format ids.
 
 `process`:
 ```json
-{ "v": 1, "stage": "process", "jobId": "dQw4w9WgXcQ", "steps": ["frames", "sscd", "compress"],
+{ "v": 1, "stage": "process", "jobId": "dQw4w9WgXcQ", "steps": ["frames", "sscd", "clip", "transcribe", "ocrsubs"],
   "compress": { "codec": "av1", "crf": 38, "preset": 8, "audioKbps": 48, "keepOriginal": false },
   "addedAt": "...", "attempts": 0 }
 ```
 - `steps` run in that order. A step is skipped when its output already exists.
-- `frames` and `sscd` work on `video.mp4`.
-- `compress` re-encodes to AV1 with SVT-AV1 (`libsvtav1`) at the given CRF and preset, plus Opus audio, into mp4.
+- `frames`, `sscd` and `transcribe` work on `video.mp4`, before `compress`.
+- **Frame sets per step** (keyframe test, 2026-11-13, on a 2.5 h drama with 2,519 keyframes, one per 3.6 s on average):
+  - `sscd` (copy detection) needs about 1 frame per second (~9,100 frames): keyframes alone found the right moment for 13 of 60 edited screenshots, against 53 of 60 for dense frames.
+  - `clip` (search) embeds the same frames as `sscd` (already decoded; ~10.7k), and search results collapse to the best frame per shot. Keyframes alone miss short inserts, though they cover 97% of frames at SigLIP similarity 0.80 or more.
+  - cast/faces uses keyframes only: all 12 main characters found at about a sixth of the cost.
+  - `ocrsubs` decodes every frame (4 fps band).
+  - Keyframes only: the AV1 decoder ignores `-skip_frame nokey`; drop non-key packets first (`-c copy -bsf:v noise=drop='not(key)'`), then decode (~15 s per drama).
+- **`transcribe`:**
+  - Extract the audio: 16 kHz mono via ffmpeg, kept only as a local temp file.
+  - Run our own speech recognition, always, even when subtitles exist: it gives the timing, the text where there are no burned-in subtitles, and the only text for dramas without them.
+  - **Dubbing:** many uploads are dubbed, usually into English, often badly, and some re-uploads carry only the dub. Record the spoken language the model detects (SenseVoice reports it per segment) in `asr/<model>.zh.json` as `language` (the majority) plus per-segment languages. A video whose speech is mostly not Chinese is marked `dubbed: true` and `speechLanguage` in `processed.json`; its burned-in Chinese subtitles, if any, still give the original text, and copy detection still groups it with the original. The viewer prefers an original-audio upload of the same drama when one exists.
+  - Write `asr/<model>.zh.vtt` and `asr/<model>.zh.json`, the JSON holding segments with word or character timings and confidences.
+  - The model is chosen per job: `"transcribe": { "model": "<id>" }`. Default: SenseVoice-Small (sherpa-onnx int8, Silero VAD); ~22 core-minutes per hour of drama, punctuation, no invented segments (2026-11-13 comparison with Paraformer and Whisper turbo). A node without the model, or too slow for it (for example Medusa), never claims a job that needs it.
+- **`clip`:** general image embeddings for every sampled frame, the same frames as `sscd`, for semantic search ("a wedding in red", "a fight in the rain", "a woman in a silver mask") and for attributes.
+  - Model: SigLIP 2 base (Apache-2.0, multilingual text tower, so Chinese and English queries both work), via ONNX, in float16.
+  - Output: `clip.f16` (N×768, L2-normalised, where row i matches `frames.json[i]`) and `clip.json` (model id, input size, preprocessing).
+  - Face crops get the same embedding when the cast step runs, used for the mask, hair and veil attributes.
+  - Tested 2026-11-13 on 120 frames x 3 query types: SigLIP 2 beats CLIP B/32 everywhere and searches Chinese almost as well as English (CLIP can't). Judged by a vision model on 40 queries, SigLIP 2's top result fully fits 35% of the time, at least partly 67%, and 78% of queries have a full fit in the top 8 (CLIP: 15%, 60%, 62%). It finds what a scene looks like, not which of many look-alike scenes it is. Search results collapse to the best frame per shot.
+- **`ocrsubs`:** reads subtitles burned into the picture.
+  - Find the subtitle band: the region where text appears over and over across frames, usually the bottom fifth, sometimes the top.
+  - Sample that band at 4 fps and run Chinese OCR on every sampled frame (no change gating: it lost 5-11% of short cues, and ungated is already ~44 frames/s per core). PP-OCRv5 mobile, which reads simplified and traditional in one model, through ONNX (for example RapidOCR) with detection at the band's native size (`Det.limit_type: max`, `Det.limit_side_len: 480`; RapidOCR's default `min 736` upscales the band ~21x in pixels and was 8x slower).
+  - Merge runs of the same line into timed cues, and keep each line's confidence. Keep English lines separate when a video shows both.
+  - Write:
+    - `ocr/subs.zh.vtt`, exactly as read (often traditional Chinese);
+    - `ocr/subs.zh-Hans.vtt`, converted with OpenCC (`tw2sp`/`t2s`; say which);
+    - `ocr/lines.json`, with cue times, text as read, simplified text, confidence and boxes;
+    - `ocr/subs.en.vtt`, when there are English lines.
+  - **Text priority (owner decision, 2026-11-13): burned-in subtitles first.** Where an OCR'd Chinese subtitle line exists, it is the line's text; our transcript (`transcribe`) supplies the timing and the text for speech with no burned-in subtitle (about 13% of speech in the test drama), with its names corrected to the spellings the OCR found. Dramas without burned-in subtitles use the transcript alone. Uploaded subtitles stay supporting evidence.
+  - Why: on the test drama the OCR was right on all 40 lines where it and the transcript disagreed most (25 sound-alike errors and 9 wrong words in the transcript, every character name wrong only in the transcript), at a tolerant CER of 12.6% between them. Low-confidence OCR lines can be checked by a vision model reading stacked line strips (3.6% CER vs OCR, catches some OCR misreads); one-minute frame grids read worse.
+  - **Audio/video sync (`sync.json`)**, computed after `transcribe` and `ocrsubs`, no extra model: burned-in subtitles are timed to the original audio, so for each OCR cue of 4+ Chinese characters, find the transcript's matching characters within ±4 s and take (transcript time of the cue's first character − cue start). Write per-5-minute windows `{ "t", "offset" (median), "n", "iqr" }` plus `offset`, `drift` (max − min window median) and `suspect` (|offset| > 0.25 s or drift > 0.3 s). The test drama measured +0.04..+0.10 s in every 15-minute window (≈180 cues each, IQR about ±0.1 s), i.e. in sync. Without burned-in subtitles there is no measurement yet (a lip-sync model is a later option). Playback correction is deferred; meanwhile the viewer prefers an in-sync upload of the same drama (copy detection groups them).
+- `compress` (optional, not in the default steps now that downloads are already AV1; for videos that came only as H.264) re-encodes to AV1 with SVT-AV1 (`libsvtav1`) at the given CRF and preset, plus Opus audio, into mp4.
+
+`comments`:
+```json
+{ "v": 1, "stage": "comments", "jobId": "dQw4w9WgXcQ", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "maxComments": 1000, "sort": "top", "round": 0, "addedAt": "...", "attempts": 0 }
+```
+- yt-dlp `--write-comments --skip-download`, with `--extractor-args "youtube:max_comments=<N>,all,all,all;comment_sort=<sort>"`, no cookies. Each round takes the top comments, then a second pass sorted by `new`.
+- Output: `index/videos/<jobId>/comments/<UTC yyyyMMddTHHmmssZ>.json`, a snapshot holding `{ "v": 1, "count", "commentCount" (YouTube's total), "comments": [{ "id", "parent", "author", "authorId", "text", "likes", "timestamp", "pinned", "byUploader" }] }`. Snapshots are never overwritten, so changes over time are kept.
+- Refresh: after a round finishes, the job is rewritten with `round + 1`, `idx_state=pending` and `idx_due` set to the next refresh. Refreshes fall at 1 day, 3 days, 7 days and 30 days after the download, then every 30 days while the video is under a year old. After that the job ends as `done`.
+- Comments mention cast names, other parts and sequels, and sentiment; later steps mine them for that.
+
+`watch` (a followed source, polled on a schedule; the job never ends):
+```json
+{ "v": 1, "stage": "watch", "jobId": "pl-PLxxxx", "kind": "playlist"|"channel", "id": "<playlist id or channel id UC...>", "name": "...",
+  "every": "1h", "tabs": ["videos", "shorts"], "followChannels": false, "maxHeight": 480, "addedAt": "...", "lastPolled": null, "attempts": 0 }
+```
+- Followed sources are the owner's chosen channels and playlists. **Watch Later is never a source**: it was a one-off seed (`index/seeds/`), used only to suggest channels.
+- A node claims a due `watch` job like any other (`idx_due` ≤ now), polls, then rewrites it with `idx_state=pending`, `idx_due` = now + `every` (default 1 h) and `lastPolled`.
+- **Polling uses yt-dlp's flat listing**, newest first, no cookies: `--flat-playlist --playlist-end 30 --print id` on the playlist URL, or on the channel's `/videos` and `/shorts` tabs (per `tabs`), with a JS runtime. Tested 2026-11-13 from the hexad host: listings work without cookies even while video pages ask it to sign in. **Everything YouTube goes through yt-dlp** (owner rule): never YouTube's official Data API, RSS feeds or other official endpoints, which don't cover what we need and are too restrictive. `backfill` uses the same listing with a larger `--playlist-end`.
+- **New videos:** a video id with no `index/jobs/download/<id>.json` and no `index/videos/<id>/` gets a download job (the source's `maxHeight`, `"source": "<watch jobId>"`). Known ids are skipped, so a video in several sources is downloaded once.
+- `followChannels: true` (the owner's public "drop" playlist): the channel of every video found is added as a followed `channel` source, if not already followed, with `backfill: 0` (new uploads only). The owner drops videos into that playlist to say "follow this channel".
+- `backfill`: on the first poll of a newly added source, enqueue at most this many of its existing videos, newest first (default 0: only videos published after it was added).
+- Sources are added and removed with `indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels]`, `sources list`, `sources remove <id>`; a removed source's job is deleted, its downloaded videos stay.
 
 ## Outputs: `index/videos/<jobId>/`
 
 **Download stage:**
-- Files: `video.mp4` (a block blob, uploaded with Put Block and Put Block List in 8 MiB blocks), `info.json` (yt-dlp), `subs/<lang>.vtt` (Chinese first), and `thumb.jpg`.
-- Then, written last, `downloaded.json`: `{ "v": 1, "bytes", "height", "durationSeconds", "nodeId", "at" }`.
-- Then the node creates the `process` job for the same `jobId` with the default steps, if one doesn't exist yet.
+- Files:
+  - `video.mp4`: a block blob, uploaded with Put Block and Put Block List in 8 MiB blocks.
+  - `info.json`: yt-dlp's `--write-info-json`, without the comments.
+  - `description.txt`: the video description, in plain text.
+  - `thumb.jpg`.
+  - Subtitles:
+    - `subs/<lang>.vtt` for uploaded subtitles in English (`en*`) and Chinese (`zh`, `zh-Hans`, `zh-Hant`, `zh-CN`, `zh-TW`, `zh-HK`).
+    - `subs/<lang>.auto.vtt` for YouTube's automatic captions in the same languages, when present.
+    - Missing subtitles are not an error.
+- Then, written last, `downloaded.json`: `{ "v": 1, "bytes", "height", "durationSeconds", "vcodec", "acodec", "formatId", "audioLanguage", "audioNote", "audioTracks": [{ "language", "note" }], "subs": ["en", "zh-Hans.auto", ...], "embeddable": true, "nodeId", "at" }`. The audio is the original-language track when YouTube offers several (dubbed tracks are listed in `audioTracks`, not downloaded). `embeddable` comes from yt-dlp's `playable_in_embed`; the viewer plays embeddable videos through YouTube's IFrame player with our own subtitles, and falls back to the stored copy otherwise.
+- Then the node creates, for the same `jobId` and only where they don't exist yet:
+  - the `process` job, with the default steps;
+  - the first `comments` job, due at once.
 
 **Process stage:**
-- `frames.json`: `[{ "t": seconds, "kind": "scene"|"tick" }]`, with scene changes at `scene>0.3` plus a tick every 1 s. Extract in parallel segments, one ffmpeg process per physical core. A single ffmpeg uses only about 4 cores; segmenting made it 12.5x faster on a 16-core machine.
-- `sscd.f16`: Nx512 float16, L2-normalised SSCD (`sscd_disc_mixup`) descriptors, where row i matches frame i.
+- `frames.json`: `[{ "t": seconds, "kind": "scene"|"tick" }]`, with scene changes at `scene>0.3` plus a tick every 1 s. Extract in parallel segments, one ffmpeg process per physical core. A single ffmpeg uses only about 4 cores; segmenting made it 12.5× faster on a 16-core machine.
+- `sscd.f16`: N×512 float16, L2-normalised SSCD (`sscd_disc_mixup`) descriptors, where row i matches frame i.
 - `compact.mp4` (from `compress`): its duration must be within 1 s of the original, and it must decode end to end. When `keepOriginal` is false, delete `video.mp4` after `processed.json` is written.
-- Then, written last, `processed.json`: `{ "v": 1, "steps", "frames", "model", "originalBytes", "compactBytes", "nodeId", "seconds", "at" }`.
+- `asr/<model>.zh.vtt` and `asr/<model>.zh.json`, from `transcribe`.
+- Then, written last, `processed.json`: `{ "v": 1, "steps", "frames", "model", "asrModel", "speechLanguage", "dubbed", "ocrCues", "originalBytes", "compactBytes", "nodeId", "seconds", "at" }`.
 
 A stage's marker (`downloaded.json`, `processed.json`) is the only signal that its outputs are complete.
 
 ## Nodes
 
-- **Medusa (Android):** runs `download` only.
-- **Desktop node:** runs `download` and/or `process`, chosen per run. It also carries the tools: `enqueue` (URLs or a playlist, with `--max-height` and `--format`), `status` (counts per stage and state), and `requeue` (failed back to pending).
-- **Rate limits:** wait 20-40 s, random, between YouTube downloads. After a bot block or a 429, back off for an hour.
+- **Medusa (Android):** runs `download` only. It can also add followed sources (below), which is a blob write, not processing.
+- **Desktop node:** runs any of `download`, `process` and `comments`, chosen per run.
+  - Its parallelism is settable: `--jobs process=N,download=M` for concurrent jobs per stage, each with its own lease, and `--threads N` for the CPU budget, shared out among the process jobs running at once. It also carries the tools: `enqueue` (URLs or a playlist, with `--max-height` and `--format`), `status` (counts per stage and state), and `requeue` (failed back to pending).
+- **Desktop node:** runs `watch`, `process` and `comments` (and `download` when told to), and is the only node that uses AI (see AI credentials).
+- **Adding sources from either app:** a playlist or channel URL given to Medusa (share it to Medusa, or paste it under Index node → Sources) or to `indexnode sources add <url>` becomes a `watch` job. The node that adds it doesn't have to poll it; whichever node runs `watch` does. `indexnode sources import <channels.json> [--every 1d]` adds many channels at once (used for the Watch Later seed).
+- **Run limits** (both apps; set locally, or remotely per node in `control.json` → `nodes.<nodeId>`, which wins):
+  - `budget`: how many more jobs (downloads, for Medusa) the node may finish; it counts down, and at 0 the node stops claiming and says so in the registry (`state: "budget spent"`). Unset = no limit. Medusa's existing daily cap stays as a separate limit.
+  - `schedule`: a 5-field cron expression in the node's local time plus a `window` (e.g. `"0 1 * * *"`, `"3h"`): the node claims new jobs only inside a window that started at a cron time; jobs already claimed finish. Unset = any time (Medusa still applies its Wi-Fi/charging conditions).
+  - Desktop flags: `--budget N`, `--schedule "<cron>" --window 3h` (the existing `--max-jobs` is a per-run limit and stays); `indexnode config set budget|schedule|window`. Medusa: the same three in the Index node settings.
+- **AI credentials (desktop node only):** an OpenAI-compatible endpoint: `ai.baseUrl`, `ai.key`, and model names `ai.textModel` and `ai.visionModel`. Set with `indexnode config set ai.base-url|ai.key|ai.text-model|ai.vision-model <value>` (stored in the user-only config file), or per run with `--ai-base-url`, `--ai-key`, `--ai-text-model`, `--ai-vision-model`, or the environment (`INDEXNODE_AI_BASE_URL`, `INDEXNODE_AI_KEY`, ...); flag > environment > config. The key is a secret like the SAS: never logged, redacted in output. On the hexad host the endpoint can be hexad's gateway (`http://localhost:5210/v1`, no key). Steps that need AI (later: merging subtitle text and transcript, naming the cast, checking doubtful OCR lines) are skipped, not failed, when no AI is configured, and `processed.json` lists them under `skipped`. AI calls are always batched, never one per line or frame.
+- **Rate limits:** wait 20–40 s, random, between YouTube downloads. After a bot block or a 429, back off for an hour.
 - **The SAS URL is a secret.** Store it in the app's private storage, Android Keystore-backed on the phone, or a user-only config file or environment variable on the desktop. Never log it; redact `sig=` in all output.
 
 ## Control and node registry
@@ -95,7 +165,8 @@ A stage's marker (`downloaded.json`, `processed.json`) is the only signal that i
 **Global control:** `index/control.json` is one small blob that every node obeys, downloaders and processors alike.
 
 ```json
-{ "v": 1, "mode": "run", "stages": { "download": "run", "process": "run" },
+{ "v": 1, "mode": "run", "stages": { "download": "run", "process": "run", "watch": "run" },
+  "nodes": { "<nodeId>": { "budget": 50, "schedule": "0 1 * * *", "window": "3h" } },
   "message": "optional note", "changedAt": "2026-11-13T20:00:00Z", "changedBy": "owner" }
 ```
 

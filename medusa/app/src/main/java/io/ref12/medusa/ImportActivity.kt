@@ -28,6 +28,11 @@ class ImportActivity : Activity() {
         forcedMedia = intent.getStringExtra(EXTRA_MEDIA)
         val uri = fileUri(intent)
         if (uri != null) { load(uri); return }
+        // a shared playlist or channel link: offer "Follow in index"; any other text keeps the old answer below
+        if (intent.action == Intent.ACTION_SEND) {
+            val url = io.ref12.medusa.node.SourceUrl.firstUrl(intent.getStringExtra(Intent.EXTRA_TEXT))
+            if (url != null && (io.ref12.medusa.node.SourceUrl.isSource(url) || io.ref12.medusa.node.SourceUrl.videoId(url) != null)) { startActivity(Intent(this, ShareUrlActivity::class.java).putExtra(ShareUrlActivity.EXTRA_URL, url)); finish(); return }
+        }
         if (forcedMedia == null) { Toast.makeText(this, "No subtitle file", Toast.LENGTH_LONG).show(); finish(); return }
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), PICK)
     }
