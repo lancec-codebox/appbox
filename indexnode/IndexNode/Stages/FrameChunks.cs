@@ -5,7 +5,7 @@ using System.Text.Json;
 namespace IndexNode;
 
 /// <summary>One stored frame: its video time, its number and pts in the chunk file, and the spans (seconds of video) it stands for after pruning.</summary>
-public sealed record ChunkFrame(int I, double T, double Pts, List<double[]> Spans, int? Rep = null);
+public sealed record ChunkFrame(int I, double T, double Pts, List<double[]> Spans, int? Rep = null, long Off = -1, int Len = 0); // Off/Len: byte range of the frame's JPEG in an mjpeg chunk
 
 public sealed record ChunkInfo(string Chunk, double Start, List<ChunkFrame> Frames);
 
@@ -25,11 +25,11 @@ public static class FrameChunks
     {
         readonly Process p; readonly Task<string> err; readonly string file;
         Encoder(Process p, string file) { this.p = p; this.file = file; err = p.StandardError.ReadToEndAsync(); }
-        public static Encoder Start(string ffmpeg, int w, int h, string file, int crf, bool intraOnly)
+        public static Encoder Start(string ffmpeg, int w, int h, string file, int crf, bool intraOnly, int threads = 0)
         {
             var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardInput = true, RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
             var args = new List<string> { "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", $"{w}x{h}", "-framerate", "1", "-i", "-", "-c:v", "libsvtav1", "-preset", "8", "-crf", crf.ToString(CultureInfo.InvariantCulture) };
-            if (intraOnly) args.AddRange(["-svtav1-params", "keyint=1"]); else args.AddRange(["-g", "10"]);
+            if (intraOnly) args.AddRange(["-svtav1-params", threads > 0 ? $"keyint=1:lp={threads}" : "keyint=1"]); else { args.AddRange(["-g", "10"]); if (threads > 0) args.AddRange(["-svtav1-params", $"lp={threads}"]); } // lp: stay within the node's thread budget
             args.AddRange(["-pix_fmt", "yuv420p", "-movflags", "+faststart", file]);
             foreach (var a in args) psi.ArgumentList.Add(a);
             return new Encoder(Process.Start(psi)!, file);
@@ -58,16 +58,34 @@ public static class FrameChunks
         frames = frames.Select(f => withSpans ? (object)new { i = f.I, t = f.T, pts = f.Pts, spans = f.Spans, rep = f.Rep } : new { i = f.I, t = f.T, pts = f.Pts }),
     });
 
-    public static byte[] ManifestJson(string kind, int w, int h, int crf, int count, IReadOnlyList<(string Chunk, double Start, int Frames, long Bytes)> chunks, object? extra = null) => JsonSerializer.SerializeToUtf8Bytes(new
+    /// <summary>Index of an mjpeg chunk: concatenated JPEGs (quality q), each frame with its byte range (off, len) so a reader can slice one frame without decoding the rest.</summary>
+    public static byte[] JpegIndexJson(string chunk, double start, int w, int h, int q, IReadOnlyList<ChunkFrame> frames) => JsonSerializer.SerializeToUtf8Bytes(new
     {
-        v = 1, kind, container = "mp4", codec = "av1", chunkSeconds = ChunkSeconds, width = w, height = h, crf, count, extra,
+        v = 1, chunk, start, width = w, height = h, codec = "jpeg", encoder = "ffmpeg-mjpeg", q, fps = 1,
+        frames = frames.Select(f => new { i = f.I, t = f.T, pts = f.Pts, spans = f.Spans, rep = f.Rep, off = f.Off, len = f.Len }),
+    });
+
+    /// <summary>Splits a raw MJPEG stream (concatenated JPEGs, as ffmpeg's mjpeg muxer writes them) into one byte range per frame, at each SOI marker FF D8 FF.</summary>
+    public static List<(int Off, int Len)> SplitJpegs(byte[] data)
+    {
+        var starts = new List<int>();
+        for (int i = 0; i + 2 < data.Length; i++) if (data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF) { starts.Add(i); i += 2; }
+        var r = new List<(int, int)>(starts.Count);
+        for (int k = 0; k < starts.Count; k++) r.Add((starts[k], (k + 1 < starts.Count ? starts[k + 1] : data.Length) - starts[k]));
+        return r;
+    }
+
+    public static byte[] ManifestJson(string kind, int w, int h, int crf, int count, IReadOnlyList<(string Chunk, double Start, int Frames, long Bytes)> chunks, object? extra = null, string container = "mp4", string codec = "av1") => JsonSerializer.SerializeToUtf8Bytes(new
+    {
+        v = 1, kind, container, codec, chunkSeconds = ChunkSeconds, width = w, height = h, crf, count, extra,
         chunks = chunks.Select(c => new { chunk = c.Chunk, start = c.Start, frames = c.Frames, bytes = c.Bytes }),
     });
 
     /// <summary>Reads a blob that may be a Nexis ghost: touched and hydrated first (RestStore only), then fetched.</summary>
     public static async Task<byte[]?> ReadAsync(IStore store, string name, CancellationToken ct, bool big = true)
     {
-        if (big && store is RestStore rs) await NexisAccess.PrepareAsync(rs, name, ct);
+        var rest = store as RestStore ?? (store as RedirectStore)?.Inner as RestStore; // a test run's redirect store still hydrates production ghosts
+        if (big && rest != null) await NexisAccess.PrepareAsync(rest, name, ct);
         return (await store.GetAsync(name, ct))?.Data;
     }
 
@@ -81,9 +99,10 @@ public static class FrameChunks
         foreach (var c in JsonDocument.Parse(man.Data).RootElement.GetProperty("chunks").EnumerateArray())
         {
             var n = c.GetProperty("chunk").GetString()!;
-            foreach (var ext in new[] { "json", "mp4" })
+            var dataExt = JsonDocument.Parse(man.Data).RootElement.TryGetProperty("container", out var ce) && ce.GetString() == "mjpeg" ? "mjpeg" : "mp4";
+            foreach (var ext in new[] { "json", dataExt })
             {
-                var b = await ReadAsync(store, paths.Video(id, $"{prefix}/{n}.{ext}"), ct, ext == "mp4") ?? throw new InvalidOperationException($"{id}: {prefix}/{n}.{ext} is missing");
+                var b = await ReadAsync(store, paths.Video(id, $"{prefix}/{n}.{ext}"), ct, ext != "json") ?? throw new InvalidOperationException($"{id}: {prefix}/{n}.{ext} is missing");
                 await File.WriteAllBytesAsync(Path.Combine(dir, $"{n}.{ext}"), b, ct);
             }
         }
@@ -154,7 +173,10 @@ public static class FrameChunks
         {
             var list = all.Skip(pos).Take(c.Frames.Count).ToList(); pos += list.Count;
             var j = JsonDocument.Parse(await File.ReadAllBytesAsync(Path.Combine(frames.Dir, c.Chunk + ".json"), ct)).RootElement;
-            await store.PutAsync(paths.Video(id, $"frames/{c.Chunk}.json"), IndexJson(c.Chunk, c.Start, frames.W, frames.H, j.GetProperty("crf").GetInt32(), j.GetProperty("gop").GetInt32(), list, true), null, null, false, ct);
+            var idx = frames.Container == "mjpeg"
+                ? JpegIndexJson(c.Chunk, c.Start, frames.W, frames.H, j.GetProperty("q").GetInt32(), list) // keeps each frame's byte range
+                : IndexJson(c.Chunk, c.Start, frames.W, frames.H, j.GetProperty("crf").GetInt32(), j.GetProperty("gop").GetInt32(), list, true);
+            await store.PutAsync(paths.Video(id, $"frames/{c.Chunk}.json"), idx, null, null, false, ct);
         }
         await store.PutAsync(paths.Video(id, "sscd/keep.json"), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, cosine, lookback, rows = all.Count, kept = keep.Count, keep, rep }), null, null, false, ct);
     }
@@ -183,8 +205,10 @@ public sealed class ChunkDir
     public List<ChunkInfo> Chunks { get; }
     public int W { get; }
     public int H { get; }
+    public string Container { get; }
     public int Count => Chunks.Sum(c => c.Frames.Count);
-    private ChunkDir(string dir, List<ChunkInfo> chunks, int w, int h) { Dir = dir; Chunks = chunks; W = w; H = h; }
+    public string ChunkFile(ChunkInfo c) => Path.Combine(Dir, c.Chunk + (Container == "mjpeg" ? ".mjpeg" : ".mp4"));
+    private ChunkDir(string dir, List<ChunkInfo> chunks, int w, int h, string container) { Dir = dir; Chunks = chunks; W = w; H = h; Container = container; }
 
     public static ChunkDir Open(string dir)
     {
@@ -197,10 +221,12 @@ public sealed class ChunkDir
             chunks.Add(new ChunkInfo(n, j.GetProperty("start").GetDouble(), j.GetProperty("frames").EnumerateArray().Select(f => new ChunkFrame(
                 f.GetProperty("i").GetInt32(), f.GetProperty("t").GetDouble(), f.GetProperty("pts").GetDouble(),
                 f.TryGetProperty("spans", out var sp) ? sp.EnumerateArray().Select(x => new[] { x[0].GetDouble(), x[1].GetDouble() }).ToList() : [],
-                f.TryGetProperty("rep", out var rp) && rp.ValueKind == JsonValueKind.Number ? rp.GetInt32() : null)).ToList()));
+                f.TryGetProperty("rep", out var rp) && rp.ValueKind == JsonValueKind.Number ? rp.GetInt32() : null,
+                f.TryGetProperty("off", out var of) ? of.GetInt64() : -1, f.TryGetProperty("len", out var ln) ? ln.GetInt32() : 0)).ToList()));
         }
         int w = man.TryGetProperty("width", out var we) ? we.GetInt32() : 0, h = man.TryGetProperty("height", out var he) ? he.GetInt32() : 0;
-        return new ChunkDir(dir, chunks, w, h);
+        var container = man.TryGetProperty("container", out var co) ? co.GetString() ?? "mp4" : "mp4";
+        return new ChunkDir(dir, chunks, w, h, container);
     }
 
     public List<double> Times => Chunks.SelectMany(c => c.Frames.Select(f => f.T)).ToList();
@@ -213,7 +239,8 @@ public sealed class ChunkDir
         {
             if (c.Frames.Count == 0) continue;
             var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-            foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-i", Path.Combine(Dir, c.Chunk + ".mp4"), "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) psi.ArgumentList.Add(a);
+            var input = Container == "mjpeg" ? new[] { "-f", "mjpeg", "-i", ChunkFile(c) } : new[] { "-i", ChunkFile(c) };
+            foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin" }.Concat(input).Concat(new[] { "-f", "rawvideo", "-pix_fmt", "rgb24", "-" })) psi.ArgumentList.Add(a);
             using var p = Process.Start(psi)!; using var reg = ct.Register(() => Proc.Kill(p));
             var err = p.StandardError.ReadToEndAsync();
             var buf = new byte[fb]; var st = p.StandardOutput.BaseStream;
@@ -231,9 +258,18 @@ public sealed class ChunkDir
     public async Task ExtractAsync(Tools tools, string outDir, CancellationToken ct)
     {
         Directory.CreateDirectory(outDir); int start = 0; var ffmpeg = await tools.FfmpegAsync(ct);
+        if (Container == "mjpeg")
+        {   // the stored frames already are JPEGs: slice them out, no decode
+            foreach (var c in Chunks)
+            {
+                var data = await File.ReadAllBytesAsync(ChunkFile(c), ct);
+                foreach (var f in c.Frames) await File.WriteAllBytesAsync(Path.Combine(outDir, $"{start++:D6}.jpg"), data.AsMemory((int)f.Off, f.Len).ToArray(), ct);
+            }
+            return;
+        }
         foreach (var c in Chunks)
         {
-            var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", Path.Combine(Dir, c.Chunk + ".mp4"), "-q:v", "1", "-start_number", start.ToString(CultureInfo.InvariantCulture), Path.Combine(outDir, "%06d.jpg")], ct);
+            var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", ChunkFile(c), "-q:v", "1", "-start_number", start.ToString(CultureInfo.InvariantCulture), Path.Combine(outDir, "%06d.jpg")], ct);
             if (r.ExitCode != 0) throw new InvalidOperationException($"decode {c.Chunk}: {r.Stderr.Trim()}");
             start += c.Frames.Count;
         }

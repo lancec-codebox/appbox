@@ -23,7 +23,7 @@ public static class DevCommands
             {
                 var duration = await Frames.DurationAsync(tools, video!, ct);
                 var dir = Path.Combine(outDir, "chunks");
-                var r = await Frames.ProduceAsync(tools, video!, outDir, FrameSettings.From(cfg), threads, duration, p => Console.Error.WriteLine(p), (n, b, _) => { var f = Path.Combine(dir, n.Replace('/', Path.DirectorySeparatorChar)); Directory.CreateDirectory(Path.GetDirectoryName(f)!); File.WriteAllBytes(f, b); return Task.CompletedTask; }, ct);
+                var r = await Frames.ProduceAsync(tools, video!, outDir, FrameSettings.From(cfg) with { Keyframes = !a.Has("no-keyframes") }, threads, duration, p => Console.Error.WriteLine(p), (n, b, _) => { var f = Path.Combine(dir, n.Replace('/', Path.DirectorySeparatorChar)); Directory.CreateDirectory(Path.GetDirectoryName(f)!); File.WriteAllBytes(f, b); return Task.CompletedTask; }, ct);
                 Console.WriteLine($"frames: {r.Kept}/{r.Sampled} frames {r.FrameBytes / 1048576.0:F1} MB, {r.Keyframes} keyframes {r.KeyframeBytes / 1048576.0:F1} MB, {duration:F0}s of video, {sw.Elapsed.TotalSeconds:F0}s");
                 break;
             }
@@ -46,10 +46,10 @@ public static class DevCommands
             {
                 // dev embed --step sscd|clip --out <dir with chunks/frames>: vectors from the stored chunks (no video decode), written as <out>/<step>.f16 plus timing
                 var set = ChunkDir.Open(Path.Combine(outDir, "chunks", "frames")); var dir = Path.Combine(outDir, "jpg");
-                var t0 = sw.Elapsed.TotalSeconds; await set.ExtractAsync(tools, dir, ct); var t1 = sw.Elapsed.TotalSeconds;
+                var t0 = sw.Elapsed.TotalSeconds; await set.ExtractAsync(tools, dir, ct); var t1 = sw.Elapsed.TotalSeconds; Console.Error.WriteLine($"{t1:F1}s extracted {set.Count} frames to images in {t1 - t0:F1}s");
                 byte[] rows;
-                if ((a.Get("step") ?? "sscd") == "sscd") rows = await Sscd.DescribeAsync(tools, a.Get("model") ?? await Sscd.EnsureModelAsync(cfg, http, ct), dir, set.Count, threads, _ => { }, ct);
-                else rows = await Clip.EmbedFramesAsync(tools, a.Get("model") ?? await Models.EnsureAsync(Models.ClipVision, http, ct), dir, set.Count, threads, _ => { }, ct);
+                if ((a.Get("step") ?? "sscd") == "sscd") rows = await Sscd.DescribeAsync(tools, a.Get("model") ?? await Sscd.EnsureModelAsync(cfg, http, ct), dir, set.Count, threads, p => { if (p.EndsWith("00/" + set.Count + " frames") || p.StartsWith(set.Count + "/")) Console.Error.WriteLine($"{sw.Elapsed.TotalSeconds:F1}s {p}"); }, ct);
+                else rows = await Clip.EmbedFramesAsync(tools, a.Get("model") ?? await Models.EnsureAsync(Models.ClipVision, http, ct), dir, set.Count, threads, p => Console.Error.WriteLine($"{sw.Elapsed.TotalSeconds:F1}s {p}"), ct);
                 File.WriteAllBytes(Path.Combine(outDir, (a.Get("step") ?? "sscd") + ".f16"), rows);
                 Console.WriteLine($"{a.Get("step") ?? "sscd"}: {set.Count} frames, decode {t1 - t0:F0}s, embed {sw.Elapsed.TotalSeconds - t1:F0}s");
                 break;

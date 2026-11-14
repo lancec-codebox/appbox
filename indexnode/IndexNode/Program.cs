@@ -75,6 +75,9 @@ public static class Program
                 "enqueue" => await Commands.EnqueueAsync(a),
                 "seeds" => await Commands.SeedsAsync(a),
                 "dev" => await DevCommands.RunAsync(a),
+                "stages" => await StagesCommand.RunAsync(a),
+                "ensure" => await EnsureCommand.RunAsync(a),
+                "scripts" => await ScriptsCommand.RunAsync(a),
                 "search" => await Commands.SearchAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await Commands.RequeueAsync(a),
@@ -554,10 +557,14 @@ public static class Commands
                 case "max-heavy": file.MaxHeavy = int.Parse(val); break;
                 case "device": file.Device = OrtOptions.ParseDevice(val); break;
                 case "cast.model": CastLogic.ModelFor(val); file.CastModel = val.ToLowerInvariant(); break;
-                case "frames.crf": file.FrameCrf = int.Parse(val); break;
-                case "prune.grid": file.PruneGrid = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
-                case "prune.sscd": file.PruneSscd = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
-                case "prune.lookback": file.PruneLookback = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "frames.crf": file.FrameCrf = int.Parse(val); break;
+
+                case "prune.grid": file.PruneGrid = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+
+                case "prune.sscd": file.PruneSscd = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+
+                case "prune.lookback": file.PruneLookback = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+
                 case "storage.region": file.StorageRegion = val.Trim(); break;
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;

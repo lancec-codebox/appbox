@@ -60,6 +60,9 @@ jobs:
               -p:Version="$VERSION" -o "out/fd-$RID"
             cp "out/fd-$RID/indexnode$EXT" "dist/indexnode-$VERSION-$RID-fdd$EXT"
           done
+          # GPU build (linux-x64): CUDA ONNX Runtime inside; CUDA 12 + cuDNN 9 come from the machine/container. For `indexnode ensure <v> --variant gpu`.
+          dotnet publish IndexNode -c Release -r linux-x64 --self-contained true -p:IndexNodeGpu=true \n            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true \n            -p:Version="$VERSION" -o "out/gpu-linux-x64"
+          cp "out/gpu-linux-x64/indexnode" "dist/indexnode-$VERSION-linux-x64-gpu"
           (cd dist && for f in indexnode-*; do sha256sum "$f" > "$f.sha256"; done)
           ls -l dist
       - name: Publish release

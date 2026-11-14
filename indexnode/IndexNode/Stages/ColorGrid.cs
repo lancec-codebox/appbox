@@ -1,7 +1,7 @@
 namespace IndexNode;
 
 /// <summary>Frame pruning settings (all settable: frames.crf, prune.grid, prune.sscd, prune.lookback).</summary>
-public sealed record FrameSettings(int Crf = 22, double GridThreshold = 0.08, double SscdCosine = 0.9, double LookbackSeconds = 30)
+public sealed record FrameSettings(int Crf = 22, double GridThreshold = 0.08, double SscdCosine = 0.9, double LookbackSeconds = 30, bool Keyframes = true, string Format = "jpeg", int JpegQ = 2)
 {
     public static FrameSettings From(NodeConfig c) => new(c.FrameCrf ?? 22, c.PruneGrid ?? 0.08, c.PruneSscd ?? 0.9, c.PruneLookback ?? 30);
 }
