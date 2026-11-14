@@ -49,8 +49,7 @@ public static class Clip
     public static async Task<byte[]> EmbedFramesAsync(Tools tools, string visionModel, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct)
     {
         var ffmpeg = await tools.FfmpegAsync(ct);
-        using var so = OrtOptions.Make(threads);
-        using var session = new InferenceSession(visionModel, so);
+        using var session = OrtOptions.Session(visionModel, threads);
         var inputName = session.InputMetadata.Keys.First();
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
         foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-start_number", "0", "-framerate", "1", "-i", Path.Combine(framesDir, "%06d.jpg"),
@@ -59,7 +58,7 @@ public static class Clip
         using var reg = ct.Register(() => Proc.Kill(p));
         var err = p.StandardError.ReadToEndAsync();
         var rows = new List<float[]>(count);
-        var stats = new StepStats("clip"); int fb = Size * Size * 3, batch = 32; var buf = new byte[fb];
+        var stats = new StepStats("clip"); int fb = Size * Size * 3, batch = OrtOptions.Batch(32, 128); var buf = new byte[fb];
         var stream = p.StandardOutput.BaseStream;
         while (rows.Count < count)
         {

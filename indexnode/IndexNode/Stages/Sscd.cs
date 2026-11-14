@@ -79,8 +79,7 @@ public static class Sscd
         var wh = pr.Stdout.Trim().Split('x');
         var (tw, th) = TargetSize(int.Parse(wh[0]), int.Parse(wh[1]));
 
-        using var so = OrtOptions.Make(threads);
-        using var session = new InferenceSession(modelPath, so);
+        using var session = OrtOptions.Session(modelPath, threads);
         var inputName = session.InputMetadata.Keys.First();
 
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
@@ -90,7 +89,7 @@ public static class Sscd
         using var reg = ct.Register(() => Proc.Kill(p));
         var err = p.StandardError.ReadToEndAsync();
         var rows = new List<float[]>(count);
-        var stats = new StepStats("sscd"); int frameBytes = tw * th * 3, batch = 32;
+        var stats = new StepStats("sscd"); int frameBytes = tw * th * 3, batch = OrtOptions.Batch(32, 64);
         var buf = new byte[frameBytes];
         var stream = p.StandardOutput.BaseStream;
         int read = 0;

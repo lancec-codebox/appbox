@@ -21,9 +21,8 @@ public sealed class OcrEngine : IDisposable
 
     public OcrEngine(string detPath, string recPath, string dictPath, int threads = 1)
     {
-        using var so = OrtOptions.Make(threads);
-        det = new InferenceSession(detPath, so);
-        rec = new InferenceSession(recPath, so);
+        det = OrtOptions.Session(detPath, threads);
+        rec = OrtOptions.Session(recPath, threads);
         ctc = CtcDecoder.FromFile(dictPath);
         detIn = det.InputMetadata.Keys.First(); recIn = rec.InputMetadata.Keys.First();
     }
