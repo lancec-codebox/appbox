@@ -295,3 +295,8 @@ Every picture in a site pack (`cover/lead1.jpg`, `cover/lead2.jpg`, the cast por
 - `focus` is the face centre as fractions of the finished picture.
 - `upload` is the upload the frame was taken from. When the drama group's HD copy is another upload, map `t` through `relations.json` (the offset between the two uploads) before cutting.
 - Portraits where the stage's own `portrait_<id>.jpg` is the fallback have no `source` yet.
+
+
+## GPU markers (0.6.0)
+
+`index/gpu-ready/<step>.<jobId>` (step: sscd, clip or cast) is written by the node that finishes a video's `frames` step, for each of those step jobs that is still pending. Body: `{"v":1,"step","jobId","readyAt"}` (first writer wins). A GPU node (`run --gpu`) deletes the marker when the job is done or has failed for good. A CPU node claims a marker-stage job only once `readyAt` (no marker: the later of `idx_added`, `idx_due`) is more than 30 minutes old. The marker count drives the Azure Container Apps event job (KEDA `azure-blob` scaler, prefix `index/gpu-ready/`).
