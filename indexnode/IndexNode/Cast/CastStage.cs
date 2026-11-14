@@ -208,7 +208,7 @@ public static class CastStage
                 var tiles = new List<Rgb>();
                 for (int k = 0; k < pcs.Count; k++) { var fr = pairFrames[Math.Round(pcs[k].T, 3)]; await Imaging.WriteJpegAsync(tools, fr, Path.Combine(castDir, $"poster_{k}.jpg"), ct, 3); if (k < PosterShortlist) tiles.Add(Imaging.Resize(fr, 160, 284)); }
                 await Imaging.WriteJpegAsync(tools, Imaging.Grid(tiles, 6), Path.Combine(castDir, "poster_sheet.jpg"), ct, 4);
-                await File.WriteAllTextAsync(Path.Combine(castDir, "poster_cands.json"), JsonSerializer.Serialize(pcs.Select((x, k) => new { k, t = x.T, clusters = new[] { x.A.Cluster, x.B.Cluster }, score = Math.Round(x.Score, 3), shortlist = k < PosterShortlist })), ct);
+                await File.WriteAllTextAsync(Path.Combine(castDir, "poster_cands.json"), JsonSerializer.Serialize(pcs.Select((x, k) => new { k, t = x.T, clusters = new[] { x.A.Cluster, x.B.Cluster }, boxes = new[] { new[] { x.A.X, x.A.Y, x.A.W, x.A.H }, new[] { x.B.X, x.B.Y, x.B.W, x.B.H } }, score = Math.Round(x.Score, 3), shortlist = k < PosterShortlist })), ct);
             }
             await File.WriteAllBytesAsync(Path.Combine(castDir, "faces.f16"), FacesF16(faces, cm.Dim), ct);
             await File.WriteAllTextAsync(Path.Combine(castDir, "faces.json"), JsonSerializer.Serialize(new { v = 1, model = cm.Id, dim = cm.Dim, threshold = thr, keyframes = nkf, faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, cluster = f.Cluster, masked = hs.ContainsKey(f) ? (bool?)f.Masked : null }) }), ct);

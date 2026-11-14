@@ -184,8 +184,10 @@ public static class Publish
             stills[cid] = list;
         }
         if (await src.ReadAsync("thumb.jpg", ct) is { } th) File.WriteAllBytes(Path.Combine(tmp, "thumb.jpg"), th);
-        await PosterAsync(tools, src, describe, tmp, ct);
+        var cover = await CoversAsync(tools, src, describe, tmp, ct);
+        await PosterAsync(tools, src, describe, tmp, ct); // poster.jpg stays for one release (compatibility)
         var drama = BuildDrama(describe, info, downloaded, clusters, processed, id, ocrZh.Count > 0 ? "ocr" : "transcript", ocrZh.Count > 0, stills, by);
+        if (cover != null) drama["cover"] = cover;
         File.WriteAllText(Path.Combine(tmp, "drama.json"), drama.ToJsonString(Opt));
         File.WriteAllText(Path.Combine(tmp, ".stamp"), stamp);
         if (Directory.Exists(dir)) Directory.Delete(dir, true);
@@ -204,6 +206,83 @@ public static class Publish
         var ok = cands.OfType<JsonObject>().Where(c => c["clusters"] is JsonArray cl && cl.Select(x => x!.GetValue<int>()).Any(a.Contains) && cl.Select(x => x!.GetValue<int>()).Any(b.Contains) && !cl.Select(x => x!.GetValue<int>()).All(x => a.Contains(x) && b.Contains(x))).Select(c => c["k"]!.GetValue<int>()).ToList();
         if (ok.Count == 0) return null;
         return chosen is { } k && ok.Contains(k) ? k : ok[0];
+    }
+
+    public const int CoverW = 360, CoverH = 640;
+
+    /// <summary>The ffmpeg filter for a 9:16 crop at 360x640 centred on (cx, cy) in source pixels (null: the middle), clamped inside the frame; no text, no compositing.</summary>
+    public static string CoverFilter(double? cx, double? cy)
+    {
+        var x = cx is { } a ? System.FormattableString.Invariant($"{a:0.#}") : "iw/2"; var y = cy is { } b ? System.FormattableString.Invariant($"{b:0.#}") : "ih/2";
+        return $"crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':x='min(max({x}-out_w/2,0),iw-out_w)':y='min(max({y}-out_h/2,0),ih-out_h)',scale={CoverW}:{CoverH}:flags=lanczos,setsar=1";
+    }
+
+    /// <summary>The candidate for a lead's cover: describe's portrait pick when it is unmasked, else the best-quality unmasked candidate, else the pick. Null: no candidates.</summary>
+    public static (int K, double T, double[]? Box)? PickLeadShot(JsonArray? cands, int? picked)
+    {
+        var all = cands?.OfType<JsonObject>().ToList() ?? [];
+        if (all.Count == 0) return null;
+        JsonObject? c = all.FirstOrDefault(x => x["k"]?.GetValue<int>() == picked && x["masked"]?.GetValue<bool>() != true)
+            ?? all.Where(x => x["masked"]?.GetValue<bool>() != true).OrderByDescending(x => x["quality"]?.GetValue<double>() ?? 0).FirstOrDefault()
+            ?? all.FirstOrDefault(x => x["k"]?.GetValue<int>() == picked) ?? all[0];
+        var box = (c["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
+        return (c["k"]!.GetValue<int>(), c["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null);
+    }
+
+    static async Task<bool> CropAsync(Tools tools, byte[] jpg, string outPath, double? cx, double? cy, string tmp, CancellationToken ct)
+    {
+        var inp = Path.Combine(tmp, "cover_src.tmp.jpg"); File.WriteAllBytes(inp, jpg);
+        try
+        {
+            var r = await Proc.RunAsync(await tools.FfmpegAsync(ct), ["-v", "error", "-y", "-i", inp, "-vf", CoverFilter(cx, cy), "-frames:v", "1", "-q:v", "3", outPath], ct);
+            if (r.ExitCode != 0) throw new InvalidOperationException("cover: ffmpeg failed: " + Redact.Sas(r.Stderr.Length > 300 ? r.Stderr[..300] : r.Stderr));
+            return true;
+        }
+        finally { File.Delete(inp); }
+    }
+
+    /// <summary>cover/lead1.jpg (female lead), lead2.jpg (male lead) and together.jpg (the two-shot): three separate 9:16 crops at 360x640, no text. Same picks as the poster. together is omitted without a two-shot; a lead without a usable shot is omitted too. Returns the drama.json "cover" object, or null when there is none.</summary>
+    static async Task<JsonObject?> CoversAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, CancellationToken ct)
+    {
+        var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
+        var f = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "female lead"); var m = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "male lead");
+        var picks = describe["picks"] as JsonObject; var cover = new JsonObject();
+        Directory.CreateDirectory(Path.Combine(tmp, "cover"));
+        async Task Lead(JsonObject? c, string key)
+        {
+            if (c == null) return;
+            int cid = c["cluster"]!.GetValue<int>();
+            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
+            int? pk = picks?[cid.ToString()]?["portrait"] is JsonValue pv && pv.TryGetValue<int>(out var p) ? p : null;
+            var shot = PickLeadShot(cands, pk);
+            byte[]? img = shot is { } s ? await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) : null;
+            double? t = shot?.T; double[]? box = shot?.Box;
+            if (img == null) { img = await src.ReadAsync($"cast/portrait_{cid}.jpg", ct); t = null; box = null; } // old packs: the head-and-shoulders portrait
+            if (img == null) return;
+            var file = $"cover/{key}.jpg";
+            await CropAsync(tools, img, Path.Combine(tmp, file), box == null ? null : box[0] + box[2] / 2, box == null ? null : box[1] + box[3] / 2, tmp, ct);
+            cover[key] = new JsonObject { ["file"] = file, ["t"] = t == null ? null : Math.Round(t.Value, 2), ["cast"] = Id(cid) };
+        }
+        await Lead(f, "lead1"); await Lead(m, "lead2");
+        if (f != null && m != null)
+        {
+            int fc0 = f["cluster"]!.GetValue<int>(), mc0 = m["cluster"]!.GetValue<int>();
+            var cands = await src.ReadAsync("cast/poster_cands.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
+            var gr = Groups(describe); var k = PickTwoShot(cands, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null);
+            if (k != null && await src.ReadAsync($"cast/poster_{k}.jpg", ct) is { } pb)
+            {
+                var cand = cands!.OfType<JsonObject>().First(x => x["k"]!.GetValue<int>() == k);
+                double? cx = null, cy = null;
+                if (cand["boxes"] is JsonArray bs && bs.Count > 0)
+                {   // centre on the union of the two face boxes
+                    var rs = bs.Select(b => b!.AsArray().Select(v => v!.GetValue<double>()).ToArray()).ToList();
+                    cx = (rs.Min(r => r[0]) + rs.Max(r => r[0] + r[2])) / 2; cy = (rs.Min(r => r[1]) + rs.Max(r => r[1] + r[3])) / 2;
+                }
+                await CropAsync(tools, pb, Path.Combine(tmp, "cover", "together.jpg"), cx, cy, tmp, ct);
+                cover["together"] = new JsonObject { ["file"] = "cover/together.jpg", ["t"] = Math.Round(cand["t"]?.GetValue<double>() ?? 0, 2) };
+            }
+        }
+        return cover.Count == 0 ? null : cover;
     }
 
     /// <summary>poster.jpg, 600x800, no text: top 40% the two leads' portraits, bottom 60% the chosen two-shot (cast/poster_&lt;k&gt;.jpg), thin dark gutters; with no two-shot the two portraits fill it.</summary>
