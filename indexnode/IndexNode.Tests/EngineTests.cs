@@ -11,16 +11,19 @@ public class EngineTests
     private static string T(int minute) => $"2026-11-13T19:{minute:D2}:00Z";
 
     private static EngineOptions Opts(string[]? stages = null, int download = 1, int process = 1, bool once = true, int threads = 8, int? maxJobs = null,
-        Func<int, TimeSpan>? backoff = null, TimeSpan? bot = null) => new()
+        Func<int, TimeSpan>? backoff = null, TimeSpan? bot = null, FakeTimer? timer = null) => new()
     {
         NodeId = "test-abc123", Name = "test", Stages = stages ?? ["download", "process"],
         Jobs = new() { ["download"] = download, ["process"] = process }, Threads = threads, Once = once, MaxJobs = maxJobs,
-        PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), ControlInterval = TimeSpan.FromMilliseconds(40),
+        PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = Renew,
         RegistryInterval = TimeSpan.FromMilliseconds(100), BotBackoff = bot ?? TimeSpan.FromHours(1),
         TransientBackoff = backoff ?? (_ => TimeSpan.Zero),
+        Delay = timer == null ? null : timer.Delay, // with a fake timer the renewal and control loops tick only when the test says so
+        ControlInterval = timer == null ? TimeSpan.FromMilliseconds(40) : Control,
     };
+    private static readonly TimeSpan Renew = TimeSpan.FromMilliseconds(40), Control = TimeSpan.FromMilliseconds(45);
 
-    private static NodeEngine Engine(FakeStore s, EngineOptions o, Func<JobContext, Task>? download = null, Func<JobContext, Task>? process = null) =>
+    internal static NodeEngine Engine(FakeStore s, EngineOptions o, Func<JobContext, Task>? download = null, Func<JobContext, Task>? process = null) =>
         new(s, P, o, new Dictionary<string, IStageHandler>
         {
             ["download"] = new FuncHandler(download ?? (_ => Task.CompletedTask)),
@@ -259,24 +262,43 @@ public class EngineTests
         Assert.Equal(1, b.Share);
     }
 
-    // flaky 2026-11-13, timing: windows-latest saw 4 renewals where 5-20 is expected (run 43565387671); skipped, not rerun.
-    [Fact(Skip = "flaky 2026-11-13, timing")]
+    [Fact]
     public async Task Leases_renew_independently_for_each_running_job()
     {
+        // Deterministic: the renewal loops sleep on a fake timer and renew once per tick; no real delays decide the counts.
+        var timer = new FakeTimer();
         var s = new FakeStore();
         await s.AddJob(P, "process", "p1", T(0));
         await s.AddJob(P, "process", "p2", T(1));
         var n1 = P.Job("process", "p1"); var n2 = P.Job("process", "p2");
         var leases = new Dictionary<string, string>();
-        await Run(Engine(s, Opts(["process"], process: 2), process: async ctx =>
+        var gate1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var gate2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int started = 0;
+        var run = Engine(s, Opts(["process"], process: 2, timer: timer), process: async ctx =>
         {
             lock (leases) leases[ctx.Job.JobId] = ctx.LeaseId;
-            await Task.Delay(ctx.Job.JobId == "p1" ? 400 : 200);
-        }));
+            Interlocked.Increment(ref started);
+            await (ctx.Job.JobId == "p1" ? gate1 : gate2).Task;
+        });
+        var task = run.RunAsync(CancellationToken.None);
+        await Within(() => started == 2, 30000);
+        for (int i = 1; i <= 3; i++)                      // three ticks: both jobs renew each time
+        {
+            await timer.TickAsync(Renew, 2);
+            await Within(() => s.RenewCount(n1) >= i && s.RenewCount(n2) >= i, 30000);
+        }
+        gate2.SetResult();                                 // p2 finishes; its renewal loop stops
+        await Within(() => s.State(n2) == "done", 30000);
+        for (int i = 4; i <= 6; i++)                      // p1 goes on alone
+        {
+            await timer.TickAsync(Renew, 1);
+            await Within(() => s.RenewCount(n1) >= i, 30000);
+        }
+        gate1.SetResult();
+        await task.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.NotEqual(leases["p1"], leases["p2"]);
-        Assert.InRange(s.RenewCount(n1), 5, 20);
-        Assert.InRange(s.RenewCount(n2), 3, 20);
-        Assert.True(s.RenewCount(n1) > s.RenewCount(n2)); // p2 stopped renewing when it finished; p1 went on
+        Assert.Equal(3, s.RenewCount(n2));                 // exactly one renewal per tick while it ran
+        Assert.Equal(6, s.RenewCount(n1));
         Assert.Equal("done", s.State(n1)); Assert.Equal("done", s.State(n2));
     }
 
@@ -317,49 +339,48 @@ public class EngineTests
 
     // ------------------------------------------------------------ control
 
-    // flaky 2026-11-13, timing: windows-latest missed the 400 ms release bound (run 43565611361), passed on the run before; skipped, not rerun.
-    [Fact(Skip = "flaky 2026-11-13, timing")]
+    [Fact]
     public async Task Stop_releases_every_lease_within_one_renewal_cycle_without_counting_an_attempt_and_run_resumes()
     {
         var s = new FakeStore();
         await s.AddJob(P, "process", "p1", T(0));
         await s.AddJob(P, "process", "p2", T(1));
         int started = 0, cancelled = 0, completed = 0;
-        var stopAt = DateTime.MinValue; var cancelledAt = new List<DateTime>();
+        var timer = new FakeTimer();
         Func<JobContext, Task> handler = async ctx =>
         {
             Interlocked.Increment(ref started);
             try { await Task.Delay(Timeout.Infinite, ctx.Token); }
-            catch (OperationCanceledException) { Interlocked.Increment(ref cancelled); lock (cancelledAt) cancelledAt.Add(DateTime.UtcNow); throw; }
+            catch (OperationCanceledException) { Interlocked.Increment(ref cancelled); throw; }
         };
-        var e = Engine(s, Opts(["process"], process: 2, once: false), process: handler);
+        var e = Engine(s, Opts(["process"], process: 2, once: false, timer: timer), process: handler);
         using var cts = new CancellationTokenSource();
         var run = e.RunAsync(cts.Token);
-        await Within(() => started == 2);
+        await Within(() => started == 2, 30000);
 
-        stopAt = DateTime.UtcNow;
+        // Stop: both leases are released within ONE renewal cycle, counted in ticks of the fake timer, not milliseconds.
         await ControlWatcher.WriteAsync(s, P, "stop", null, "maintenance", "owner", default);
-        await Within(() => cancelled == 2, 2000);
-        await Within(() => s.LeaseOf(P.Job("process", "p1")) == null && s.LeaseOf(P.Job("process", "p2")) == null, 2000);
-
-        foreach (var t in cancelledAt) Assert.True((t - stopAt).TotalMilliseconds < 400, "released within one renewal cycle"); // renewal 40 ms, control poll 40 ms
+        Assert.Equal(0, cancelled);                       // nothing has ticked yet
+        await timer.TickAsync(Renew, 2);                  // one renewal cycle: each renewal loop reads the stop and cancels its job
+        await Within(() => cancelled == 2, 30000);
+        await Within(() => s.LeaseOf(P.Job("process", "p1")) == null && s.LeaseOf(P.Job("process", "p2")) == null, 30000);
         foreach (var id in new[] { "p1", "p2" })
         {
             var n = P.Job("process", id);
             Assert.Equal("pending", s.State(n));
             Assert.Equal(0, s.Job(n).Attempts);
         }
-        // stays idle while stopped
-        await Task.Delay(300);
+        // stays idle while stopped: more cycles, no new start
+        await timer.TickAsync(Control, 1);
         Assert.Equal(2, started);
-        var info = NodeInfo.Parse(s[P.Node("test-abc123")].Data)!;
-        Assert.Equal("stopped", info.State);
+        await Within(() => NodeInfo.Parse(s[P.Node("test-abc123")].Data)!.State == "stopped", 30000);
 
         // run resumes on its own
         Func<JobContext, Task> finish = _ => { Interlocked.Increment(ref completed); return Task.CompletedTask; };
         // swap behaviour: the same engine now sees run; the handler (still the blocking one) is started again, so release by stopping afterwards
         await ControlWatcher.WriteAsync(s, P, "run", null, null, "owner", default);
-        await Within(() => started == 4, 3000);
+        await timer.TickAsync(Control, 1);
+        await Within(() => started == 4, 30000);
         cts.Cancel();
         await run.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(0, s.Job(P.Job("process", "p1")).Attempts); // Ctrl+C released too, uncounted

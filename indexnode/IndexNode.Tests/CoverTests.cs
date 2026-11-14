@@ -41,10 +41,35 @@ public class CoverTests
         Assert.Equal(1, s.K); Assert.Equal("half", s.Window);
     }
 
+    /// <summary>The real ffmpeg: other tests put fake ffmpeg scripts first on PATH, so walk PATH and take the first one that answers -version.</summary>
+    private static async Task<string?> RealFfmpegAsync()
+    {
+        foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = Path.Combine(dir, OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
+            if (!File.Exists(f)) continue;
+            try { var r = await Proc.RunAsync(f, ["-version"], default); if (r.ExitCode == 0 && r.Stdout.Contains("ffmpeg version")) return f; } catch { }
+        }
+        return null;
+    }
+
+    /// <summary>"WxH" from the JPEG's SOF marker.</summary>
+    private static string JpegSize(byte[] b)
+    {
+        for (int i = 2; i + 9 < b.Length;)
+        {
+            if (b[i] != 0xFF) { i++; continue; }
+            int m = b[i + 1];
+            if (m is >= 0xC0 and <= 0xCF and not 0xC4 and not 0xC8 and not 0xCC) return $"{b[i + 7] << 8 | b[i + 8]}x{b[i + 5] << 8 | b[i + 6]}";
+            i += 2 + (b[i + 2] << 8 | b[i + 3]);
+        }
+        return "";
+    }
+
     [Fact]
     public async Task Cover_filter_gives_a_360x640_crop_centred_and_clamped()
     {
-        var ff = Tools.OnPath("ffmpeg"); if (ff == null) return;
+        var ff = await RealFfmpegAsync(); if (ff == null) return;
         var dir = Path.Combine(Path.GetTempPath(), "indexnode-cover-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try
         {
@@ -53,8 +78,7 @@ public class CoverTests
                 var src = Path.Combine(dir, "s.jpg"); var o = Path.Combine(dir, $"o{w}x{h}.jpg");
                 var r = await Proc.RunAsync(ff, ["-v", "error", "-y", "-f", "lavfi", "-i", $"testsrc=size={w}x{h}:rate=1", "-frames:v", "1", src], default); Assert.Equal(0, r.ExitCode);
                 r = await Proc.RunAsync(ff, ["-v", "error", "-y", "-i", src, "-vf", Publish.CoverFilter(cx, cy), "-frames:v", "1", o], default); Assert.True(r.ExitCode == 0, r.Stderr);
-                var p = await Proc.RunAsync(Tools.OnPath("ffprobe") ?? "ffprobe", ["-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", o], default);
-                Assert.Equal("360x640", p.Stdout.Trim());
+                Assert.Equal("360x640", JpegSize(File.ReadAllBytes(o))); // read from the file itself: other tests change PATH, so no ffprobe lookup
             }
         }
         finally { Directory.Delete(dir, true); }

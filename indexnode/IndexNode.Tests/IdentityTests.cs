@@ -7,15 +7,15 @@ public class IdentityTests
 
     private sealed class Nop : IStageHandler { public Task RunAsync(JobContext ctx) => Task.CompletedTask; }
 
-    private static EngineOptions Opts(string id) => new()
+    private static EngineOptions Opts(string id, Traffic? traffic = null) => new()
     {
-        NodeId = id, Name = id, Stages = ["download"], Jobs = new() { ["download"] = 1 }, Threads = 1, Once = true,
+        NodeId = id, Name = id, Traffic = traffic, Stages = ["download"], Jobs = new() { ["download"] = 1 }, Threads = 1, Once = true,
         PollInterval = TimeSpan.FromMilliseconds(20), RenewInterval = TimeSpan.FromMilliseconds(40), ControlInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(50),
         PlacementProbe = _ => Task.FromResult(new Placement { Provider = "unknown", Reason = "test", CheckedAt = Protocol.NowUtc() }),
     };
 
-    private static Task Run(FakeStore s, string id) =>
-        new NodeEngine(s, P, Opts(id), new Dictionary<string, IStageHandler> { ["download"] = new Nop() }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+    private static Task Run(FakeStore s, string id, Traffic? traffic = null) =>
+        new NodeEngine(s, P, Opts(id, traffic), new Dictionary<string, IStageHandler> { ["download"] = new Nop() }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
 
     [Fact]
     public void Precedence_flag_then_env_then_config()
@@ -38,18 +38,18 @@ public class IdentityTests
         Assert.Equal("gpu-a100-westus3", a.NodeId); Assert.Equal(a, b);
     }
 
-    // flaky 2026-11-13, timing: windows-latest counted 1005 bytes where 1000 is expected (run 43567260980), the static Traffic.Current is shared with parallel tests; skipped, not rerun.
-    [Fact(Skip = "flaky 2026-11-13, timing")]
+    [Fact]
     public async Task Traffic_and_first_seen_carry_over_two_runs_with_the_same_name()
     {
         var s = new FakeStore();
-        Traffic.Current = new Traffic(); Traffic.Current.Add(Traffic.OtherIn, 1000);
-        await Run(s, "gpu-a100-westus3");
+        // each process has its own counters (no shared static, so parallel tests cannot add bytes to them)
+        var run1 = new Traffic(); run1.Add(Traffic.OtherIn, 1000);
+        await Run(s, "gpu-a100-westus3", run1);
         var first = NodeInfo.Parse(s[P.Node("gpu-a100-westus3")].Data)!;
         Assert.Equal(1000, first.Traffic!.Totals.OtherIn); Assert.Equal("offline", first.State);
 
-        Traffic.Current = new Traffic(); Traffic.Current.Add(Traffic.OtherIn, 500); // a new process (new hostname) under the same name
-        await Run(s, "gpu-a100-westus3");
+        var run2 = new Traffic(); run2.Add(Traffic.OtherIn, 500); // a new process (new hostname) under the same name
+        await Run(s, "gpu-a100-westus3", run2);
         var second = NodeInfo.Parse(s[P.Node("gpu-a100-westus3")].Data)!;
         Assert.Equal(1500, second.Traffic!.Totals.OtherIn);
         Assert.Equal(first.FirstSeen, second.FirstSeen);
