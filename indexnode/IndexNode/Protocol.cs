@@ -111,6 +111,8 @@ public sealed class JobDescriptor
     public int? MaxComments { get; set; }
     public string? Sort { get; set; }
     public int? Round { get; set; }
+    /// <summary>Why a comments follow-up round exists ("lead-names").</summary>
+    public string? Reason { get; set; }
     public string? FinishedAt { get; set; }
     public string? NodeId { get; set; }
     public double? ElapsedSeconds { get; set; }

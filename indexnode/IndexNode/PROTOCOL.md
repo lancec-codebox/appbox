@@ -103,7 +103,7 @@ Rewriting a blob (Put Blob) drops its tags unless they're sent again in `x-ms-ta
 ```
 - yt-dlp `--write-comments --skip-download`, with `--extractor-args "youtube:max_comments=<N>,all,all,all;comment_sort=<sort>"`, no cookies. Each round takes the top comments, then a second pass sorted by `new`.
 - Output: `index/videos/<jobId>/comments/<UTC yyyyMMddTHHmmssZ>.json`, a snapshot holding `{ "v": 1, "count", "commentCount" (YouTube's total), "comments": [{ "id", "parent", "author", "authorId", "text", "likes", "timestamp", "pinned", "byUploader" }] }`. Snapshots are never overwritten, so changes over time are kept.
-- Refresh: after a round finishes, the job is rewritten with `round + 1`, `idx_state=pending` and `idx_due` set to the next refresh. Refreshes fall at 1 day, 3 days, 7 days and 30 days after the download, then every 30 days while the video is under a year old. After that the job ends as `done`.
+- **No continuous watching.** One round at download, then the job is `done`. At most one follow-up, and only when the name vote leaves a **lead** unconfirmed: the AI step rewrites the job once with `round: 1`, `reason: "lead-names"`, `idx_state=pending` and `idx_due` = download + 7 days. After that round the job is `done` regardless. Supporting-cast names are never a reason to fetch comments (they come from other evidence, e.g. the same face as a named lead in another drama). Next parts and sequels come from the followed channel (watch stage), never from re-fetching comments.
 - Comments mention cast names, other parts and sequels, and sentiment; later steps mine them for that.
 
 `watch` (a followed source, polled on a schedule; the job never ends):

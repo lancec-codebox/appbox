@@ -3,30 +3,32 @@ using System.Text.Json.Nodes;
 
 namespace IndexNode;
 
-/// <summary>Refresh schedule of a video's comments: 1 d, 3 d, 7 d and 30 d after the download, then every 30 d until a year has passed.</summary>
-public static class CommentsSchedule
+/// <summary>
+/// No continuous watching: one round at download, then done. At most one follow-up, and only when the name vote leaves a LEAD unconfirmed
+/// (the AI step rewrites the job once with round 1, reason "lead-names", due the download + 7 days); after that round the job is done.
+/// Supporting-cast names never ask for comments, and sequels come from the followed channel, not from comments.
+/// </summary>
+public static class CommentsFollowUp
 {
-    public static readonly TimeSpan[] First = [TimeSpan.FromDays(1), TimeSpan.FromDays(3), TimeSpan.FromDays(7), TimeSpan.FromDays(30)];
-    public static readonly TimeSpan Horizon = TimeSpan.FromDays(365);
+    public const string LeadNames = "lead-names";
+    public static readonly TimeSpan Delay = TimeSpan.FromDays(7);
 
-    /// <summary>Offset after the download at which round <paramref name="round"/> is due (round 0 is at once, after the download).</summary>
-    public static TimeSpan Offset(int round) => round <= 0 ? TimeSpan.Zero : round <= First.Length ? First[round - 1] : TimeSpan.FromDays(30 * (round - First.Length + 1));
+    /// <summary>The job for the one follow-up round, or null (none wanted, or this job is already its follow-up).</summary>
+    public static (int Round, string Reason, DateTimeOffset Due)? Plan(DateTimeOffset downloadedAt, int completedRound, bool leadNameUnconfirmed) =>
+        leadNameUnconfirmed && completedRound == 0 ? (1, LeadNames, downloadedAt + Delay) : null;
 
-    /// <summary>
-    /// The round that follows <paramref name="completedRound"/> and when it is due; null when the year is over. Rounds whose time
-    /// has already passed (a node that was away) are skipped, so a late node does not run them back to back.
-    /// </summary>
-    public static (int Round, DateTimeOffset Due)? Next(DateTimeOffset downloadedAt, int completedRound, DateTimeOffset now)
+    /// <summary>Rewrites the finished comments job as pending with round 1 and reason "lead-names", due download + 7 days; false when not allowed.</summary>
+    public static async Task<bool> RequestAsync(IStore store, Paths paths, string jobId, DateTimeOffset downloadedAt, bool leadNameUnconfirmed, CancellationToken ct)
     {
-        var round = completedRound + 1;
-        while (true)
-        {
-            var off = Offset(round);
-            if (off > Horizon) return null;
-            var due = downloadedAt + off;
-            if (due > now) return (round, due);
-            round++;
-        }
+        var name = paths.Job("comments", jobId);
+        var blob = await store.GetAsync(name, ct);
+        if (blob == null) return false;
+        var job = JobDescriptor.Parse(blob.Data);
+        if (Plan(downloadedAt, job.Round ?? 0, leadNameUnconfirmed) is not { } p) return false;
+        job.Round = p.Round; job.Reason = p.Reason; job.Attempts = 0;
+        var added = (await store.GetTagsAsync(name, ct))?.GetValueOrDefault(Tags.Added) ?? job.AddedAt;
+        await store.PutAsync(name, job.ToBytes(), Tags.Job("comments", "pending", added, Protocol.Utc(p.Due)), null, false, ct);
+        return true;
     }
 }
 
@@ -108,8 +110,7 @@ public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) 
             await ctx.Store.PutAsync(name, JsonSerializer.SerializeToUtf8Bytes(snap), null, null, false, ct);
             Log.Info($"comments {id}: snapshot with {(int)snap["count"]!} comments");
 
-            var next = CommentsSchedule.Next(downloadedAt, round, DateTimeOffset.UtcNow);
-            if (next is { } n) { job.Round = n.Round; ctx.NextDue = Protocol.Utc(n.Due); }
+            // one round, then done: a follow-up is requested only by the AI step (CommentsFollowUp.RequestAsync)
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }

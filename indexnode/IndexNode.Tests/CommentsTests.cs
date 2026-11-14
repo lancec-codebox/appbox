@@ -11,23 +11,27 @@ public class CommentsTests
     // ------------------------------------------------------------ schedule
 
     [Fact]
-    public void Refresh_rounds_fall_at_1_3_7_30_days_then_every_30_days_for_a_year()
+    public void Only_an_unconfirmed_lead_name_asks_for_one_follow_up_a_week_after_the_download()
     {
-        var now = D;
-        var offsets = new List<double>();
-        int round = 0;
-        while (CommentsSchedule.Next(D, round, now) is { } n) { Assert.Equal(round + 1, n.Round); offsets.Add((n.Due - D).TotalDays); round = n.Round; }
-        Assert.Equal([1, 3, 7, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360], offsets);
+        var p = CommentsFollowUp.Plan(D, 0, true)!.Value;
+        Assert.Equal((1, "lead-names", D.AddDays(7)), (p.Round, p.Reason, p.Due));
+        Assert.Null(CommentsFollowUp.Plan(D, 0, false));   // leads confirmed (supporting-cast names never count): done after round 0
+        Assert.Null(CommentsFollowUp.Plan(D, 1, true));    // the follow-up round is the last, whatever the vote says
     }
 
     [Fact]
-    public void Late_node_skips_rounds_that_already_passed()
+    public async Task The_follow_up_rewrites_the_job_once_as_round_1_with_a_reason_and_keeps_its_added_time()
     {
-        var n = CommentsSchedule.Next(D, 0, D.AddDays(10))!.Value;
-        Assert.Equal(4, n.Round);
-        Assert.Equal(D.AddDays(30), n.Due);
-        Assert.Null(CommentsSchedule.Next(D, 15, D.AddDays(361)));
-        Assert.Null(CommentsSchedule.Next(D, 3, D.AddDays(400)));
+        var s = new FakeStore();
+        var added = Ago(90);
+        await s.AddJob(P, "comments", "vid", added);
+        var name = P.Job("comments", "vid");
+        Assert.False(await CommentsFollowUp.RequestAsync(s, P, "vid", D, false, default));
+        Assert.True(await CommentsFollowUp.RequestAsync(s, P, "vid", D, true, default));
+        var job = s.Job(name);
+        Assert.Equal(1, job.Round); Assert.Equal("lead-names", job.Reason);
+        Assert.Equal("pending", s.State(name)); Assert.Equal(Protocol.Utc(D.AddDays(7)), s[name].Tags[Tags.Due]); Assert.Equal(added, s[name].Tags[Tags.Added]);
+        Assert.False(await CommentsFollowUp.RequestAsync(s, P, "vid", D, true, default));   // no second follow-up
     }
 
     // ------------------------------------------------------------ snapshot
@@ -316,7 +320,7 @@ public class CommentsTests
     }
 
     [Fact]
-    public async Task Comments_round_saves_a_dated_snapshot_and_schedules_the_next_refresh()
+    public async Task Comments_round_saves_a_dated_snapshot_and_is_then_done()
     {
         if (OperatingSystem.IsWindows()) return;
         var dir = Setup(out var cfg);
@@ -334,8 +338,8 @@ public class CommentsTests
         var snap = JsonDocument.Parse(s[snapName].Data).RootElement;
         Assert.Equal(3, snap.GetProperty("count").GetInt32()); // c1, c2 (top) and c3 (new); c2 once
         Assert.Equal(42, snap.GetProperty("commentCount").GetInt32());
-        Assert.Equal(1, job.Round);
-        Assert.Equal(Protocol.Utc(at.AddDays(1)), ctx.NextDue); // first refresh: 1 day after the download
+        Assert.Equal(0, job.Round);
+        Assert.Null(ctx.NextDue); // one round, then done: no refresh schedule
 
         var calls = File.ReadAllLines(Path.Combine(dir, "calls.log"));
         Assert.Contains(calls, c => c.Contains("comment_sort=top") && c.Contains("--write-comments") && c.Contains("--skip-download"));
