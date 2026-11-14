@@ -59,6 +59,16 @@ public sealed class EngineOptions
     public Func<TimeSpan, CancellationToken, Task>? Delay { get; init; }
     /// <summary>The byte counters this node reports (default: the process-wide Traffic.Current).</summary>
     public Traffic? Traffic { get; init; }
+    /// <summary>A GPU node: its stages are the GPU stages and it claims a marker-stage job at once; a CPU node waits <see cref="GpuFallback"/> before taking one.</summary>
+    public bool Gpu { get; init; }
+    public TimeSpan GpuFallback { get; init; } = GpuRouting.CpuFallbackAfter;
+    /// <summary>Concurrent heavy (model) steps on this node, each getting a share of the threads; 0 = no limit. I/O work (download, upload, AI waits, comments, watch, sync, describe) does not count.</summary>
+    public int MaxHeavy { get; init; } = 2;
+    /// <summary>Stop after this long with no job running (a container job that was started for a marker and has no more work); null: never.</summary>
+    public TimeSpan? ExitWhenIdle { get; init; }
+    public TimeSpan IdleCheck { get; init; } = TimeSpan.FromSeconds(10);
+    /// <summary>How soon a worker that found every heavy slot taken looks again.</summary>
+    public TimeSpan HeavyRetry { get; init; } = TimeSpan.FromSeconds(2);
     public string? StorageHost { get; init; }
     public string StorageRegion { get; init; } = "westus2";
     /// <summary>Tests replace the placement probe (IMDS and the storage connect time).</summary>
@@ -89,6 +99,9 @@ public sealed class NodeEngine
     private readonly DateTimeOffset startedAt = DateTimeOffset.UtcNow;
     private readonly bool[] fallbackListing = new bool[1];
     private int reserved;
+    private SemaphoreSlim? heavySlots;
+    private long lastBusyTicks = DateTime.UtcNow.Ticks;
+    public bool ExitedIdle { get; private set; }
     private string? lastRegistryKey;
     private Placement? placement;
     private string? firstSeen;
@@ -109,6 +122,7 @@ public sealed class NodeEngine
         Control = new ControlWatcher(store, paths);
         Budget = new ThreadBudget(options.Threads);
         Control.Changed += OnControlChanged;
+        if (options.MaxHeavy > 0) heavySlots = new SemaphoreSlim(options.MaxHeavy, options.MaxHeavy);
         o.Limits?.Apply(Control.Current);
     }
 
@@ -253,16 +267,18 @@ public sealed class NodeEngine
         await WriteRegistryAsync(ct: ct);
 
         using var loopsCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var loops = new[] { RegistryLoop(loopsCts.Token), ControlLoop(loopsCts.Token) };
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var loops = new[] { RegistryLoop(loopsCts.Token), ControlLoop(loopsCts.Token), IdleLoop(runCts, loopsCts.Token) };
         try
         {
+            var rt = runCts.Token;
             var workers = new List<Task>();
             int w = 0;
             foreach (var stage in o.Stages)
                 for (int i = 0; i < o.Jobs.GetValueOrDefault(stage, 1); i++)
                 {
                     int number = ++w;
-                    workers.Add(Task.Run(() => WorkerLoop(stage, number, ct)));
+                    workers.Add(Task.Run(() => WorkerLoop(stage, number, rt)));
                 }
             await Task.WhenAll(workers);
         }
@@ -273,6 +289,27 @@ public sealed class NodeEngine
             await WriteRegistryAsync("offline");
         }
     }
+
+    /// <summary>--exit-when-idle: stops the node once no job has been running for the window (a GPU container started for a marker leaves when the work is gone, and costs nothing more).</summary>
+    private async Task IdleLoop(CancellationTokenSource runCts, CancellationToken token)
+    {
+        if (o.ExitWhenIdle is not { } window) return;
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(o.IdleCheck, token);
+                if (!running.IsEmpty || Volatile.Read(ref busyClaims) > 0) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); continue; }
+                if (DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastBusyTicks), DateTimeKind.Utc) >= window)
+                {
+                    Log.Info($"idle for {window.TotalMinutes:F1} min: exiting (--exit-when-idle)");
+                    ExitedIdle = true; runCts.Cancel(); return;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+    private int busyClaims;
 
     private bool TryReserve()
     {
@@ -314,29 +351,44 @@ public sealed class NodeEngine
                     await Task.Delay(o.PollInterval, ct);
                     continue;
                 }
-                if (!TryReserve()) { o.Limits?.Release(stage, false); return; }
+                // the node-level limit on concurrent heavy steps: a worker takes a slot before it looks for work and gives it back when it finds none
+                bool heavy = heavySlots != null && Protocol.HeavyStages.Contains(stage);
+                if (heavy && !await heavySlots!.WaitAsync(0, ct))
+                {
+                    o.Limits?.Release(stage, false);
+                    if (o.Once) return;
+                    await Task.Delay(o.HeavyRetry, ct);
+                    continue;
+                }
+                if (!TryReserve()) { o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release(); return; }
                 Claim? claim;
+                Interlocked.Increment(ref busyClaims);
                 try { claim = await TryClaimAsync(stage, ct); }
-                catch (OperationCanceledException) { throw; }
+                catch (OperationCanceledException) { if (heavy) heavySlots!.Release(); throw; }
                 catch (Exception e)
                 {
                     Log.Info($"{stage}: looking for work failed ({e.Message})");
                     Interlocked.Decrement(ref reserved);
                     o.Limits?.Release(stage, false);
+                    if (heavy) heavySlots!.Release();
                     if (o.Once) return;
                     await Task.Delay(o.PollInterval, ct);
                     continue;
                 }
+                finally { Interlocked.Decrement(ref busyClaims); }
                 if (claim == null)
                 {
                     Interlocked.Decrement(ref reserved);
                     o.Limits?.Release(stage, false);
+                    if (heavy) heavySlots!.Release();
                     if (o.Once) return;
                     RegistryChanged();
                     await Task.Delay(o.PollInterval, ct);
                     continue;
                 }
-                var finished = await RunJobAsync(stage, worker, claim, ct);
+                bool finished;
+                try { finished = await RunJobAsync(stage, worker, claim, ct); }
+                finally { if (heavy) heavySlots!.Release(); }
                 o.Limits?.Release(stage, finished);
             }
         }
@@ -372,6 +424,11 @@ public sealed class NodeEngine
         foreach (var b in ordered)
         {
             if (ignoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) continue;
+            if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, o.GpuFallback))
+            {
+                ignoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(1); // held for the GPU node; look again in a minute
+                continue;
+            }
             var lease = await store.AcquireLeaseAsync(b.Name, Protocol.LeaseSeconds, ct);
             if (lease == null) continue; // 409: another node has it
             try
@@ -407,6 +464,19 @@ public sealed class NodeEngine
             }
         }
         return null;
+    }
+
+    /// <summary>When a GPU-stage job became ready: its marker's readyAt, else (no marker: frames made before 0.6.0) the later of idx_added and idx_due.</summary>
+    private async Task<DateTimeOffset?> ReadySinceAsync(string stage, BlobEntry b, CancellationToken ct)
+    {
+        var jobId = Path.GetFileNameWithoutExtension(b.Name);
+        try { if (await store.GetAsync(GpuRouting.MarkerName(paths, stage, jobId), ct) is { } m && GpuRouting.ReadyAtOf(m.Data) is { } at) return at; }
+        catch (OperationCanceledException) { throw; }
+        catch { }
+        string added = b.Tags.GetValueOrDefault(Tags.Added) ?? "", due = Tags.DueOf(b.Tags);
+        DateTimeOffset? A = DateTimeOffset.TryParse(added, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var x) ? x : null;
+        DateTimeOffset? Dd = DateTimeOffset.TryParse(due, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var y) ? y : null;
+        return A == null ? Dd : Dd == null ? A : (A > Dd ? A : Dd);
     }
 
     private async Task<string?> MissingNeedAsync(JobDescriptor job, string[] needs, CancellationToken ct)
@@ -535,6 +605,8 @@ public sealed class NodeEngine
                 try { await store.SetMetadataAsync(claim.BlobName, new Dictionary<string, string>(), claim.LeaseId, none); } catch { }
                 break;
         }
+        bool final = outcome == Outcome.Done && run.Ctx?.NextDue == null || outcome == Outcome.Permanent || outcome == Outcome.Transient && job.Attempts >= Protocol.MaxAttempts;
+        if (final) await GpuRouting.DeleteMarkerAsync(store, paths, stage, job.JobId);
         await store.ReleaseLeaseAsync(claim.BlobName, claim.LeaseId, none);
     }
 }
