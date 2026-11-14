@@ -199,6 +199,14 @@ Actor names come from noisy evidence, and comments especially misspell them. So 
 - **Extraction:** the AI step on the desktop node reads each drama's comments in batches, never one call per comment. It outputs `{ comment id, name as written, the role, character or "unknown" it refers to, quote }`, and the votes are counted in code, not by the model.
 - Don't guess an actor from a face with a model: names come only from text evidence. Faces only link people across dramas.
 
+## Cover and portrait expression rule
+
+Every cover image (`cover/lead1.jpg`, `together.jpg`, `lead2.jpg`) and every cast portrait must show a **flattering expression**: eyes open and roughly toward the camera, mouth closed or a slight smile. Reject mid-speech, shocked or startled, crying, grimacing, blinking and closed eyes.
+
+- The batched vision call scores every candidate head shot and every poster-sheet frame 0-10 (`describe.json` `expression`: `{ "<clusterId>": [..], "poster": [..] }`, in sheet order). For a two-shot the score is the weaker of the two faces. The score is the decider; a candidate needs at least 6.
+- The pick is the best score inside the allowed window, combined with the existing rules: the start window first, widened to the first half only when nothing there scores 6; never the last 25% of the video; masked faces never; watermarked frames never. Ties go to the model's own pick, then to candidate quality. When no candidate qualifies, a cast portrait keeps the cast stage's portrait and a lead cover or `together.jpg` is left out.
+- Cast portraits choose among `cast/cand_hs_<cluster>_<k>.jpg` head-shot candidates the same way.
+
 ## Nodes
 
 - **Medusa (Android):** runs `download` only. It can also add followed sources (below), which is a blob write, not processing.
