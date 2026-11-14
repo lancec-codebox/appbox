@@ -91,6 +91,26 @@ public class CoverTests
         Assert.Empty(Describe.CleanExpression(null));
     }
 
+    [Fact]
+    public void Focus_is_the_face_centre_as_fractions_of_the_cover_and_follows_the_clamped_crop()
+    {
+        Assert.Equal([0.5, 0.5], Publish.CoverFocus(1920, 1080, null, null));
+        var f = Publish.CoverFocus(1920, 1080, 960, 400);           // crop is 607.5 wide, centred: face dead centre horizontally
+        Assert.Equal(0.5, f[0], 3); Assert.Equal(400.0 / 1080, f[1], 3);
+        var e = Publish.CoverFocus(1920, 1080, 100, 540);           // near the left edge the crop clamps to x=0: face sits left of centre
+        Assert.Equal(100 / 607.5, e[0], 3);
+        var r = Publish.CoverFocus(1920, 1080, 1900, 540);          // right edge
+        Assert.Equal((1900 - (1920 - 607.5)) / 607.5, r[0], 3);
+    }
+
+    [Fact]
+    public void Jpeg_size_is_read_from_the_frame_header()
+    {
+        byte[] j = [0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 11, 8, 0x04, 0x38, 0x07, 0x80, 3, 0, 0, 0];
+        Assert.Equal((1920, 1080), Publish.JpegSize(j));
+        Assert.Null(Publish.JpegSize([0xFF, 0xD8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
     /// <summary>The real ffmpeg: other tests put fake ffmpeg scripts first on PATH, so walk PATH and take the first one that answers -version.</summary>
     private static async Task<string?> RealFfmpegAsync()
     {

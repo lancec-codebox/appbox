@@ -257,6 +257,29 @@ public static class Publish
         return $"crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':x='min(max({x}-out_w/2,0),iw-out_w)':y='min(max({y}-out_h/2,0),ih-out_h)',scale={CoverW}:{CoverH}:flags=lanczos,setsar=1";
     }
 
+    /// <summary>Where the face centre lands in the 9:16 crop, as fractions [x, y] of the cover image (the crop window is clamped inside the frame like CoverFilter does); [0.5, 0.5] without a face.</summary>
+    public static double[] CoverFocus(int w, int h, double? cx, double? cy)
+    {
+        if (cx is not { } x || cy is not { } y) return [0.5, 0.5];
+        double cw = Math.Min(w, h * 9.0 / 16), ch = Math.Min(h, w * 16.0 / 9);
+        double x0 = Math.Min(Math.Max(x - cw / 2, 0), w - cw), y0 = Math.Min(Math.Max(y - ch / 2, 0), h - ch);
+        return [Math.Clamp((x - x0) / cw, 0, 1), Math.Clamp((y - y0) / ch, 0, 1)];
+    }
+
+    /// <summary>Width and height of a JPEG from its start-of-frame marker; null when not found.</summary>
+    public static (int W, int H)? JpegSize(byte[] b)
+    {
+        for (int i = 2; i + 9 < b.Length;)
+        {
+            if (b[i] != 0xFF) { i++; continue; }
+            int m = b[i + 1];
+            if (m == 0xFF) { i++; continue; }
+            if (m is >= 0xC0 and <= 0xCF && m is not (0xC4 or 0xC8 or 0xCC)) return ((b[i + 7] << 8) | b[i + 8], (b[i + 5] << 8) | b[i + 6]);
+            i += 2 + ((b[i + 2] << 8) | b[i + 3]);
+        }
+        return null;
+    }
+
     /// <summary>The candidate for a lead's cover: describe's portrait pick when it is unmasked, else the best-quality unmasked candidate, else the pick. Null: no candidates.</summary>
     public static (int K, double T, double[]? Box)? PickLeadShot(JsonArray? cands, int? picked)
     {
@@ -301,7 +324,7 @@ public static class Publish
         finally { File.Delete(inp); }
     }
 
-    /// <summary>cover/lead1.jpg (female lead), lead2.jpg (male lead) and together.jpg (the two-shot): three separate 9:16 crops at 360x640, no text. Same picks as the poster. together is omitted without a two-shot; a lead without a usable shot is omitted too. Returns the drama.json "cover" object, or null when there is none.</summary>
+    /// <summary>cover/lead1.jpg (female lead) and lead2.jpg (male lead): two separate 9:16 crops at 360x640, no text (no together cover). Each entry is { file, t, window, cast, focus: [x, y] }, the face centre as fractions of the image. A lead without a flattering shot is omitted. Returns the drama.json "cover" object, or null when there is none.</summary>
     static async Task<JsonObject?> CoversAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, double dur, CancellationToken ct)
     {
         var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
@@ -319,34 +342,12 @@ public static class Publish
             if (shot is not { } s || await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) is not { } img) return; // no shot before the late limit: no cover (the portrait has no known time)
             double? t = s.T; double[]? box = s.Box;
             var file = $"cover/{key}.jpg";
-            await CropAsync(tools, img, Path.Combine(tmp, file), box == null ? null : box[0] + box[2] / 2, box == null ? null : box[1] + box[3] / 2, tmp, ct);
-            cover[key] = new JsonObject { ["file"] = file, ["t"] = Math.Round(s.T, 2), ["window"] = s.Window, ["cast"] = Id(cid) };
+            double? fx = box == null ? null : box[0] + box[2] / 2, fy = box == null ? null : box[1] + box[3] / 2;
+            await CropAsync(tools, img, Path.Combine(tmp, file), fx, fy, tmp, ct);
+            var focus = JpegSize(img) is var (iw, ih) ? CoverFocus(iw, ih, fx, fy) : [0.5, 0.5];
+            cover[key] = new JsonObject { ["file"] = file, ["t"] = Math.Round(s.T, 2), ["window"] = s.Window, ["cast"] = Id(cid), ["focus"] = new JsonArray(Math.Round(focus[0], 3), Math.Round(focus[1], 3)) };
         }
         await Lead(f, "lead1"); await Lead(m, "lead2");
-        if (f != null && m != null)
-        {
-            int fc0 = f["cluster"]!.GetValue<int>(), mc0 = m["cluster"]!.GetValue<int>();
-            var cands = await src.ReadAsync("cast/poster_cands.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
-            var gr = Groups(describe); int? k = null; string win = "";
-            foreach (var (wn, maxT) in CoverWindows(cutoff, dur))
-            {
-                var inWin = new JsonArray(cands?.OfType<JsonObject>().Where(c => (c["t"]?.GetValue<double>() ?? 0) <= Math.Min(maxT, dur > 0 ? dur * CoverLateFraction : double.MaxValue)).Select(c => (JsonNode)c.DeepClone()).ToArray() ?? []);
-                k = PickTwoShot(inWin, gr.GetValueOrDefault(fc0) ?? [fc0], gr.GetValueOrDefault(mc0) ?? [mc0], describe["poster"] is JsonValue pv && pv.TryGetValue<int>(out var pk) ? pk : null, ExpressionScores(describe, "poster"));
-                if (k != null) { win = wn; break; }
-            }
-            if (k != null && await src.ReadAsync($"cast/poster_{k}.jpg", ct) is { } pb)
-            {
-                var cand = cands!.OfType<JsonObject>().First(x => x["k"]!.GetValue<int>() == k);
-                double? cx = null, cy = null;
-                if (cand["boxes"] is JsonArray bs && bs.Count > 0)
-                {   // centre on the union of the two face boxes
-                    var rs = bs.Select(b => b!.AsArray().Select(v => v!.GetValue<double>()).ToArray()).ToList();
-                    cx = (rs.Min(r => r[0]) + rs.Max(r => r[0] + r[2])) / 2; cy = (rs.Min(r => r[1]) + rs.Max(r => r[1] + r[3])) / 2;
-                }
-                await CropAsync(tools, pb, Path.Combine(tmp, "cover", "together.jpg"), cx, cy, tmp, ct);
-                cover["together"] = new JsonObject { ["file"] = "cover/together.jpg", ["t"] = Math.Round(cand["t"]?.GetValue<double>() ?? 0, 2), ["window"] = win };
-            }
-        }
         return cover.Count == 0 ? null : cover;
     }
 
