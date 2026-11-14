@@ -39,7 +39,7 @@ public static class Program
 {
     public const string Usage = """
         indexnode run [--stages watch,process,comments] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N]
-                      [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M]
+                      [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
         indexnode ai test [--ai-base-url ...]
@@ -51,7 +51,7 @@ public static class Program
         indexnode requeue [--stage S]
         indexnode control run|drain|stop [--stage download|process|comments] [--message M]
         indexnode config set-sas <url>
-        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port> <value>
+        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port> <value>
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
         """;
 
@@ -219,6 +219,7 @@ public static class Commands
         var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
         Redact.Register(ai.Key);
         if (!ai.Configured) throw new InvalidOperationException("no AI endpoint: set ai.base-url and ai.text-model (config set, --ai-* flags or INDEXNODE_AI_* variables)");
+        if (!AiConfig.ValidApi(ai.EffectiveApi)) throw new ArgumentException("ai.api must be chat, responses or auto");
         Console.WriteLine(ai.Describe());
         var client = new AiClient(NewHttp(), ai);
         Console.WriteLine($"text   ({ai.TextModel}): {Redact.Sas(await client.TextAsync(default))}");
@@ -464,6 +465,7 @@ public static class Commands
                 case "ai.key": (file.Ai ??= new()).Key = val; break;
                 case "ai.text-model": (file.Ai ??= new()).TextModel = val; break;
                 case "ai.vision-model": (file.Ai ??= new()).VisionModel = val; break;
+                case "ai.api": if (!AiConfig.ValidApi(val.ToLowerInvariant())) throw new ArgumentException("ai.api: chat, responses or auto"); (file.Ai ??= new()).Api = val.ToLowerInvariant(); break;
                 case "jobs": file.Jobs = NodeConfig.ParseJobs(val); break;
                 case "threads": file.Threads = int.Parse(val); break;
                 case "model-url": file.ModelUrl = val; break;
@@ -474,7 +476,7 @@ public static class Commands
                 case "browser.exe": (file.Browser ??= new()).Exe = val; break;
                 case "browser.profile-dir": (file.Browser ??= new()).ProfileDir = val; break;
                 case "browser.port": (file.Browser ??= new()).Port = int.Parse(val); break;
-                default: throw new ArgumentException("unknown config key (budget, schedule, window, ai.base-url, ai.key, ai.text-model, ai.vision-model, jobs, threads, model-url, model-path, node-name, ytdlp.command, ytdlp.js-runtime, browser.exe, browser.profile-dir, browser.port)");
+                default: throw new ArgumentException("unknown config key (budget, schedule, window, ai.base-url, ai.key, ai.text-model, ai.vision-model, ai.api, jobs, threads, model-url, model-path, node-name, ytdlp.command, ytdlp.js-runtime, browser.exe, browser.profile-dir, browser.port)");
             }
             file.Save();
             Console.WriteLine($"{key} saved{(key == "ai.key" ? " (hidden)" : "")}");

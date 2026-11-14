@@ -139,10 +139,16 @@ public sealed class AiConfig
     public string? Key { get; set; }
     public string? TextModel { get; set; }
     public string? VisionModel { get; set; }
+    /// <summary>"chat", "responses" or "auto" (the default: chat, and on unsupported_api_for_model one retry on Responses).</summary>
+    public string? Api { get; set; }
+
+    public const string ApiChat = "chat", ApiResponses = "responses", ApiAuto = "auto";
+    public static bool ValidApi(string? v) => v is null or ApiChat or ApiResponses or ApiAuto;
+    public string EffectiveApi => string.IsNullOrWhiteSpace(Api) ? ApiAuto : Api.Trim().ToLowerInvariant();
 
     public bool Configured => !string.IsNullOrWhiteSpace(BaseUrl) && !string.IsNullOrWhiteSpace(TextModel);
 
-    /// <summary>flag > environment (INDEXNODE_AI_BASE_URL, _KEY, _TEXT_MODEL, _VISION_MODEL) > config file, field by field.</summary>
+    /// <summary>flag > environment (INDEXNODE_AI_BASE_URL, _KEY, _TEXT_MODEL, _VISION_MODEL, _API) > config file, field by field.</summary>
     public static AiConfig Resolve(AiConfig? file, Func<string, string?> flag, Func<string, string?> env)
     {
         static string? Pick(params string?[] v) => v.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s))?.Trim();
@@ -152,11 +158,12 @@ public sealed class AiConfig
             Key = Pick(flag("ai-key"), env("INDEXNODE_AI_KEY"), file?.Key),
             TextModel = Pick(flag("ai-text-model"), env("INDEXNODE_AI_TEXT_MODEL"), file?.TextModel),
             VisionModel = Pick(flag("ai-vision-model"), env("INDEXNODE_AI_VISION_MODEL"), file?.VisionModel),
+            Api = Pick(flag("ai-api"), env("INDEXNODE_AI_API"), file?.Api)?.ToLowerInvariant(),
         };
     }
 
     /// <summary>One-line description that never contains the key.</summary>
-    public string Describe() => $"base-url={BaseUrl ?? "(none)"} text-model={TextModel ?? "(none)"} vision-model={VisionModel ?? "(none)"} key={(string.IsNullOrEmpty(Key) ? "(none)" : "set")}";
+    public string Describe() => $"base-url={BaseUrl ?? "(none)"} text-model={TextModel ?? "(none)"} vision-model={VisionModel ?? "(none)"} api={EffectiveApi} key={(string.IsNullOrEmpty(Key) ? "(none)" : "set")}";
 }
 
 public sealed class YtDlpConfig

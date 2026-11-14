@@ -69,6 +69,80 @@ public class AiConfigTests
         Assert.Contains("data:image/png;base64,", seen[1].Body);
     }
 
+    private sealed class Fake(Func<HttpRequestMessage, string, (int Status, string Body)> f) : HttpMessageHandler
+    {
+        public readonly List<(string Path, string Body)> Seen = [];
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage r, CancellationToken ct)
+        {
+            var body = r.Content!.ReadAsStringAsync(ct).Result; Seen.Add((r.RequestUri!.AbsolutePath, body));
+            var (st, b) = f(r, body);
+            return Task.FromResult(new HttpResponseMessage((System.Net.HttpStatusCode)st) { Content = new StringContent(b) });
+        }
+    }
+
+    private const string Unsupported = "{\"error\":{\"message\":\"model \\\"gpt-6-luna\\\" is not accessible via the /chat/completions endpoint\",\"code\":\"unsupported_api_for_model\"}}";
+
+    private static (int, string) LunaServer(HttpRequestMessage r, string body) =>
+        r.RequestUri!.AbsolutePath.EndsWith("/chat/completions") && body.Contains("gpt-6-luna") ? (400, Unsupported)
+        : r.RequestUri.AbsolutePath.EndsWith("/responses") ? (200, "{\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" red \"}]}]}")
+        : (200, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}");
+
+    [Fact]
+    public async Task Auto_retries_once_on_responses_when_chat_says_unsupported_and_remembers_the_model()
+    {
+        var fake = new Fake(LunaServer); var c = new AiClient(new HttpClient(fake), new AiConfig { BaseUrl = "http://gw/v1", VisionModel = "gpt-6-luna", TextModel = "plain" });
+        Assert.Equal("red", await c.VisionAsync(default));
+        Assert.Equal(["/v1/chat/completions", "/v1/responses"], fake.Seen.Select(s => s.Path));
+        var resp = fake.Seen[1].Body;
+        Assert.Contains("\"input_text\"", resp); Assert.Contains("\"input_image\"", resp); Assert.Contains("data:image/png;base64,", resp);
+        Assert.Equal("responses", c.ApiFor("gpt-6-luna"));
+        Assert.Equal("red", await c.VisionAsync(default)); // remembered: straight to responses
+        Assert.Equal(3, fake.Seen.Count); Assert.EndsWith("/responses", fake.Seen[2].Path);
+        Assert.Equal("ok", await c.TextAsync(default)); // another model still uses chat
+        Assert.EndsWith("/chat/completions", fake.Seen[3].Path); Assert.Equal("chat", c.ApiFor("plain"));
+    }
+
+    [Fact]
+    public async Task Chat_mode_does_not_fall_back_and_responses_mode_goes_straight_there()
+    {
+        var f1 = new Fake(LunaServer);
+        var chat = new AiClient(new HttpClient(f1), new AiConfig { BaseUrl = "http://gw/v1", VisionModel = "gpt-6-luna", Api = "chat" });
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => chat.VisionAsync(default));
+        Assert.Contains("unsupported_api_for_model", ex.Message); Assert.Single(f1.Seen);
+        var f2 = new Fake(LunaServer);
+        var resp = new AiClient(new HttpClient(f2), new AiConfig { BaseUrl = "http://gw/v1", VisionModel = "gpt-6-luna", Api = "responses" });
+        Assert.Equal("red", await resp.VisionAsync(default));
+        Assert.Equal(["/v1/responses"], f2.Seen.Select(s => s.Path));
+    }
+
+    [Fact]
+    public async Task Other_chat_errors_do_not_trigger_the_fallback()
+    {
+        var f = new Fake((_, _) => (400, "{\"error\":{\"message\":\"Could not process image\"}}"));
+        var c = new AiClient(new HttpClient(f), new AiConfig { BaseUrl = "http://gw/v1", VisionModel = "v" });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => c.VisionAsync(default));
+        Assert.Single(f.Seen);
+    }
+
+    [Fact]
+    public void Ai_api_resolves_flag_over_env_over_file_and_defaults_to_auto()
+    {
+        Assert.Equal("auto", AiConfig.Resolve(null, _ => null, _ => null).EffectiveApi);
+        var r = AiConfig.Resolve(new AiConfig { Api = "chat" }, k => k == "ai-api" ? "Responses" : null, k => k == "INDEXNODE_AI_API" ? "chat" : null);
+        Assert.Equal("responses", r.Api);
+        Assert.Equal("chat", AiConfig.Resolve(new AiConfig { Api = "responses" }, _ => null, k => k == "INDEXNODE_AI_API" ? "chat" : null).Api);
+        Assert.Equal("responses", AiConfig.Resolve(new AiConfig { Api = "responses" }, _ => null, _ => null).Api);
+        Assert.False(AiConfig.ValidApi("bogus"));
+    }
+
+    [Fact]
+    public void The_test_image_is_a_real_64x64_png()
+    {
+        var p = AiClient.TestPng;
+        Assert.Equal(new byte[] { 0x89, 0x50, 0x4E, 0x47 }, p[..4]);
+        Assert.Equal(64, (p[16] << 24) | (p[17] << 16) | (p[18] << 8) | p[19]); Assert.Equal(64, (p[20] << 24) | (p[21] << 16) | (p[22] << 8) | p[23]);
+    }
+
     private sealed class Stub(Func<HttpRequestMessage, string> f) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage r, CancellationToken ct) =>

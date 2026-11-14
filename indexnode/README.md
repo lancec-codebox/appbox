@@ -53,7 +53,7 @@ Big blobs may be Nexis ghosts. [`IndexNode/Tools/NexisGhost.cs`](IndexNode/Tools
 
 - `indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels]`, `sources list`, `sources remove <id>`, `sources import <channels.json> [--every 1d]`: followed playlists/channels become `watch` jobs, polled with yt-dlp's flat listing (no cookies). Default stages are `watch,process,comments`; `download` only with `--stages`.
 - Limits: `--budget N`, `--schedule "<cron>" --window 3h` (or `config set budget|schedule|window`); `control.json` → `nodes.<nodeId>` overrides. Own cron parser. The registry shows `budget spent` / `next window <time>`.
-- AI: `config set ai.base-url|ai.key|ai.text-model|ai.vision-model`, `--ai-*` flags or `INDEXNODE_AI_*` (flag > env > config); `indexnode ai test`. The key is redacted. No pipeline step uses it yet; `processed.json` lists `skipped`.
+- AI: `config set ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api` (`ai.api`: chat, responses or auto; auto retries a model on the Responses API when chat says unsupported_api_for_model), `--ai-*` flags or `INDEXNODE_AI_*` (flag > env > config); `indexnode ai test`. The key is redacted. No pipeline step uses it yet; `processed.json` lists `skipped`.
 
 ## Model checks
 
