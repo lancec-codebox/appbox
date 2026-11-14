@@ -55,6 +55,10 @@ public sealed class EngineOptions
     public Func<JobDescriptor, bool>? CanRun { get; init; }
     /// <summary>Budget, schedule and window; null: no limits.</summary>
     public LimitState? Limits { get; init; }
+    /// <summary>Tests replace the delay of the renewal and control loops with a fake timer (default Task.Delay), so no test depends on real time.</summary>
+    public Func<TimeSpan, CancellationToken, Task>? Delay { get; init; }
+    /// <summary>The byte counters this node reports (default: the process-wide Traffic.Current).</summary>
+    public Traffic? Traffic { get; init; }
     public string? StorageHost { get; init; }
     public string StorageRegion { get; init; } = "westus2";
     /// <summary>Tests replace the placement probe (IMDS and the storage connect time).</summary>
@@ -88,6 +92,8 @@ public sealed class NodeEngine
     private string? lastRegistryKey;
     private Placement? placement;
     private string? firstSeen;
+    private Traffic traffic => o.Traffic ?? Traffic.Current;
+    private Task Wait(TimeSpan t, CancellationToken ct) => (o.Delay ?? Task.Delay)(t, ct);
     private volatile bool recordLoaded; // no registry write before the previous record's traffic is loaded, or it would be counted twice
     private readonly string instance = Guid.NewGuid().ToString("N");
     public static readonly TimeSpan InstanceWindow = TimeSpan.FromMinutes(2);
@@ -127,7 +133,7 @@ public sealed class NodeEngine
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
         Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker }).ToList(),
-        Traffic = Traffic.Current.Snapshot(), Placement = placement, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
+        Traffic = traffic.Snapshot(), Placement = placement, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
         LastSeen = Protocol.NowUtc(), StartedAt = Protocol.Utc(startedAt),
     };
 
@@ -177,7 +183,7 @@ public sealed class NodeEngine
         {
             if (await store.GetAsync(paths.Node(o.NodeId), ct) is { } c && NodeInfo.Parse(c.Data) is { } prev)
             {
-                Traffic.Current.Load(prev.Traffic);
+                traffic.Load(prev.Traffic);
                 firstSeen = prev.FirstSeen ?? prev.StartedAt;
                 placement ??= prev.Placement;
                 var others = LivePeers(prev, instance, DateTimeOffset.UtcNow);
@@ -222,7 +228,7 @@ public sealed class NodeEngine
         {
             while (true)
             {
-                await Task.Delay(o.ControlInterval, ct);
+                await Wait(o.ControlInterval, ct);
                 await Control.RefreshAsync(ct, force: true);
             }
         }
@@ -464,7 +470,7 @@ public sealed class NodeEngine
         {
             while (true)
             {
-                await Task.Delay(o.RenewInterval, token);
+                await Wait(o.RenewInterval, token);
                 try
                 {
                     await store.RenewLeaseAsync(claim.BlobName, claim.LeaseId, token);
