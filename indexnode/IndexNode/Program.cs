@@ -48,7 +48,6 @@ public static class Program
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
         indexnode gpu markers [--dry]
-        indexnode redo sscd-int8 [--dry]
         indexnode status [--json]
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
         indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
@@ -83,7 +82,6 @@ public static class Program
                 "config" => Commands.Config(a),
                 "browser" => await Commands.BrowserAsync(a),
                 "gpu" => await Commands.GpuAsync(a),
-                "redo" => await Commands.RedoAsync(a),
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
                 "ai" => await Commands.AiAsync(a),
@@ -492,17 +490,6 @@ public static class Commands
             }
         }
         Console.WriteLine($"gpu markers: {(a.Has("dry") ? "would write" : "wrote")} {made}, {have} already there, {waiting} jobs still wait for their frames");
-        return 0;
-    }
-
-    /// <summary>`indexnode redo sscd-int8 [--dry]`: SSCD is fp32 everywhere since 0.6.1. Every sscd job whose stored sscd/manifest.json names the int8 model goes back to pending (and gets its gpu-ready marker); the old vectors stay in place until the new ones are written. A job that is leased right now is left alone and counted.</summary>
-    public static async Task<int> RedoAsync(Args a)
-    {
-        if (a.Positional.FirstOrDefault() != "sscd-int8") throw new ArgumentException("redo sscd-int8 [--dry]");
-        var (cfg, store, paths, http) = Open(a);
-        using var _ = http;
-        var r = await Redo.Sscd.RunAsync(store, paths, a.Has("dry"), default);
-        Console.WriteLine($"redo sscd-int8: {r.Jobs} sscd jobs, {r.Int8} made by the int8 model, {(a.Has("dry") ? "would reset" : "reset")} {r.Reset} to pending ({r.Marked} markers), {r.Leased} leased (skipped), {r.Fp32} already fp32, {r.NoManifest} without a manifest");
         return 0;
     }
 

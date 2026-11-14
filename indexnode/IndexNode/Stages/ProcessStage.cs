@@ -71,13 +71,10 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             ?? throw new InvalidOperationException($"{id} has no downloaded.json yet");
         double duration = JsonDocument.Parse(downloaded.Data).RootElement.TryGetProperty("durationSeconds", out var dEl) ? dEl.GetDouble() : 0;
 
-        // an sscd manifest made by the int8 model is stale: the step runs again (the old vectors stay until the new ones are written)
-        bool sscdStale = steps.Contains("sscd") && Has("sscd/manifest.json") && await store.GetAsync(paths.Video(id, "sscd/manifest.json"), ct) is { } sm && Sscd.IsInt8Manifest(sm.Data);
-        if (sscdStale) Log.Info($"process {id}: sscd/manifest.json was made by the int8 model: computing the fp32 vectors again");
         var need = new Dictionary<string, bool>
         {
             ["frames"] = steps.Contains("frames") && !Has("frames/manifest.json"),
-            ["sscd"] = steps.Contains("sscd") && (!Has("sscd/manifest.json") || sscdStale),
+            ["sscd"] = steps.Contains("sscd") && !Has("sscd/manifest.json"),
             ["clip"] = steps.Contains("clip") && !Has("clip/manifest.json"),
             ["transcribe"] = steps.Contains("transcribe") && !Has("asr/" + Transcribe.ModelName + ".zh.json"),
             ["ocrsubs"] = steps.Contains("ocrsubs") && !Has("ocr/lines.json"),
