@@ -284,3 +284,14 @@ Processing is split into one job per step: `jobs/<step>/<jobId>.json` for `sscd`
 - **`processed.json`** is written by whichever node finishes the last step (every step's output exists; `describe.json` is not required on a node without an AI endpoint).
 - **Node stages:** `--stages sscd,clip,transcribe,ocrsubs,cast,sync,describe`, or `--stages process` for all of them (and legacy `process` jobs). `--jobs sscd=1,clip=1,transcribe=2,ocrsubs=1` sets workers per step; `--threads` is shared by the running heavy steps. Control (`drain`/`stop`) of a step falls back to the `process` setting unless the step is set itself.
 - A node's `steps` list (registry) also decides which step jobs it claims (a model step it lacks is never claimed).
+
+## Picture sources (`stills`)
+
+Every picture in a site pack (`cover/lead1.jpg`, `cover/lead2.jpg`, the cast portrait `cast/<id>.jpg`, each still in `cast[].stills[]`) records where it came from in a `source` object in drama.json, so it can be re-cut from a full-HD copy at the same moment and crop without re-choosing:
+
+`{ "upload": "<video id>", "t": seconds, "crop": [x, y, w, h], "focus": [x, y] }`
+
+- `crop` is the rectangle cut from the source frame, as fractions of the frame (0-1). A still is the whole frame: `[0, 0, 1, 1]`. A cover is its 9:16 window, a portrait its 4:5 head-and-shoulders window, as actually cut.
+- `focus` is the face centre as fractions of the finished picture.
+- `upload` is the upload the frame was taken from. When the drama group's HD copy is another upload, map `t` through `relations.json` (the offset between the two uploads) before cutting.
+- Portraits where the stage's own `portrait_<id>.jpg` is the fallback have no `source` yet.

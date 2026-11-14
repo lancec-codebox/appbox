@@ -78,6 +78,29 @@ public static class Publish
 
     public static string Id(int cluster) => "c" + cluster;
 
+    /// <summary>Where a picture came from, so it can be re-cut from a full-HD copy of the same moment: { upload, t, crop: [x, y, w, h] as fractions of the source frame, focus: [x, y] as fractions of the picture }.</summary>
+    public static JsonObject Source(string upload, double t, double[] crop, double[] focus) => new()
+    {
+        ["upload"] = upload, ["t"] = Math.Round(t, 2),
+        ["crop"] = new JsonArray(crop.Select(v => (JsonNode)Math.Round(v, 4)).ToArray()), ["focus"] = new JsonArray(focus.Select(v => (JsonNode)Math.Round(v, 3)).ToArray()),
+    };
+
+    /// <summary>The head-and-shoulders crop of the cast stage (CastStage.HeadShoulders: box widened 2.5x, 4:5) as fractions of a w x h frame, clamped to the frame; focus is the face centre inside that crop.</summary>
+    public static (double[] Crop, double[] Focus) HeadCrop(double[] box, int w, int h)
+    {
+        double bw = box[2], bh = box[3], cw = Math.Max(bw, bh * 0.8) * 2.5, ch = cw * CastStage.PortraitH / CastStage.PortraitW, fx = box[0] + bw / 2, fy = box[1] + bh / 2, cy = fy + bh * 0.45;
+        double x0 = Math.Max(fx - cw / 2, 0), y0 = Math.Max(cy - ch / 2, 0), x1 = Math.Min(fx + cw / 2, w), y1 = Math.Min(cy + ch / 2, h);
+        return ([x0 / w, y0 / h, (x1 - x0) / w, (y1 - y0) / h], [Math.Clamp((fx - x0) / (x1 - x0), 0, 1), Math.Clamp((fy - y0) / (y1 - y0), 0, 1)]);
+    }
+
+    /// <summary>The 9:16 cover crop (CoverFilter's window) as fractions of a w x h frame.</summary>
+    public static double[] CoverCrop(int w, int h, double? cx, double? cy)
+    {
+        double cw = Math.Min(w, h * 9.0 / 16), ch = Math.Min(h, w * 16.0 / 9), x = cx ?? w / 2.0, y = cy ?? h / 2.0;
+        double x0 = Math.Min(Math.Max(x - cw / 2, 0), w - cw), y0 = Math.Min(Math.Max(y - ch / 2, 0), h - ch);
+        return [x0 / w, y0 / h, cw / w, ch / h];
+    }
+
     /// <summary>describe's samePerson groups: kept cluster id to every cluster id of that person (the kept one first).</summary>
     public static Dictionary<int, List<int>> Groups(JsonObject describe)
     {
@@ -90,7 +113,7 @@ public static class Publish
     }
 
     /// <summary>drama.json: describe.json plus the facts (youtubeId, embeddable, channel, duration, sources) and the cluster facts of the cast.</summary>
-    public static JsonObject BuildDrama(JsonObject describe, JsonObject? info, JsonObject? downloaded, JsonObject? clusters, JsonObject? processed, string jobId, string textSource, bool hasOcr, IReadOnlyDictionary<int, List<(string File, double T, bool Spoiler)>> stills, string by)
+    public static JsonObject BuildDrama(JsonObject describe, JsonObject? info, JsonObject? downloaded, JsonObject? clusters, JsonObject? processed, string jobId, string textSource, bool hasOcr, IReadOnlyDictionary<int, List<(string File, double T, bool Spoiler)>> stills, string by, IReadOnlyDictionary<string, JsonObject>? sources = null)
     {
         double dur = downloaded?["durationSeconds"]?.GetValue<double>() ?? info?["duration"]?.GetValue<double>() ?? 0;
         double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? Describe.Cutoff(dur);
@@ -100,11 +123,12 @@ public static class Publish
         {
             int id = c!["cluster"]!.GetValue<int>(); cl.TryGetValue(id, out var f); var grp = Groups(describe).GetValueOrDefault(id) ?? [id];
             var fs = grp.Where(cl.ContainsKey).Select(x => cl[x]).ToList();
-            var st = new JsonArray(); foreach (var s in stills.GetValueOrDefault(id) ?? []) st.Add(new JsonObject { ["file"] = s.File, ["t"] = s.T, ["spoiler"] = s.Spoiler });
+            var st = new JsonArray(); foreach (var s in stills.GetValueOrDefault(id) ?? []) { var so = new JsonObject { ["file"] = s.File, ["t"] = s.T, ["spoiler"] = s.Spoiler }; if (sources?.GetValueOrDefault(s.File) is { } src0) so["source"] = src0.DeepClone(); st.Add(so); }
             cast.Add(new JsonObject
             {
                 ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = c["roleAtStart"]?.DeepClone(), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
                 ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
+                ["portrait"] = sources?.GetValueOrDefault($"cast/{Id(id)}.jpg") is { } ps0 ? new JsonObject { ["file"] = $"cast/{Id(id)}.jpg", ["source"] = ps0.DeepClone() } : null,
             });
         }
         var rel = new JsonArray();
@@ -168,7 +192,7 @@ public static class Publish
         byte[]? en = null; foreach (var f in new[] { "subs.en.vtt", "subs.en.srt", "ocr/subs.en.vtt" }) { en = await src.ReadAsync(f, ct); if (en != null) { if (f.EndsWith(".srt")) en = Encoding.UTF8.GetBytes(Srt2Vtt(Encoding.UTF8.GetString(en))); break; } }
         if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en))));
         // pictures: portraits, stills (spoiler after the cutoff), thumb
-        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; double dur0 = info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject;
+        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; double dur0 = info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject; var sources = new Dictionary<string, JsonObject>();
         foreach (var c in (describe["cast"] as JsonArray) ?? [])
         {
             int cid = c!["cluster"]!.GetValue<int>();
@@ -177,22 +201,29 @@ public static class Publish
             byte[]? pb = null;
             if (ExpressionScores(describe, cid.ToString()) is { } sc && cand is JsonArray ca
                 && PickByExpression(ca, picks?[cid.ToString()]?["portrait"] is JsonValue ppv && ppv.TryGetValue<int>(out var ppk) ? ppk : null, cut, dur0, sc) is { } ps)
+            {
                 pb = await src.ReadAsync($"cast/cand_hs_{cid}_{ps.K}.jpg", ct);
+                if (pb != null && ps.Box is { } pbox && await src.ReadAsync($"cast/cand_{cid}_{ps.K}.jpg", ct) is { } full && JpegSize(full) is var (fw, fh))
+                { var (pc, pf) = HeadCrop(pbox, fw, fh); sources[$"cast/{Id(cid)}.jpg"] = Source(id, ps.T, pc, pf); }
+            }
             pb ??= await src.ReadAsync($"cast/portrait_{cid}.jpg", ct);
             if (pb != null) File.WriteAllBytes(Path.Combine(tmp, "cast", $"{Id(cid)}.jpg"), pb); var list = new List<(string, double, bool)>(); int n = 0;
             foreach (var s in (picks?[cid.ToString()]?["stills"] as JsonArray) ?? [])
             {
                 if (n >= 3 || s is not JsonValue sv || !sv.TryGetValue<int>(out var k)) continue;
                 if (await src.ReadAsync($"cast/cand_{cid}_{k}.jpg", ct) is not { } jb) continue;
-                double t = (cand as JsonNode)?.AsArray().FirstOrDefault(x => x?["k"]?.GetValue<int>() == k)?["t"]?.GetValue<double>() ?? 0;
+                var cc = (cand as JsonNode)?.AsArray().FirstOrDefault(x => x?["k"]?.GetValue<int>() == k); double t = cc?["t"]?.GetValue<double>() ?? 0;
                 n++; var name = $"cast/{Id(cid)}_s{n}.jpg"; File.WriteAllBytes(Path.Combine(tmp, name), jb); list.Add((name, t, t > cut));
+                var sbox = (cc?["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
+                double[] sfocus = [0.5, 0.5]; if (sbox is { Length: 4 } && JpegSize(jb) is var (sw, sh)) sfocus = [Math.Clamp((sbox[0] + sbox[2] / 2) / sw, 0, 1), Math.Clamp((sbox[1] + sbox[3] / 2) / sh, 0, 1)];
+                sources[name] = Source(id, t, [0, 0, 1, 1], sfocus);
             }
             stills[cid] = list;
         }
         if (await src.ReadAsync("thumb.jpg", ct) is { } th) File.WriteAllBytes(Path.Combine(tmp, "thumb.jpg"), th);
-        var cover = await CoversAsync(tools, src, describe, tmp, info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0, ct);
+        var cover = await CoversAsync(tools, src, describe, tmp, id, info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0, ct);
         await PosterAsync(tools, src, describe, tmp, ct); // poster.jpg stays for one release (compatibility)
-        var drama = BuildDrama(describe, info, downloaded, clusters, processed, id, ocrZh.Count > 0 ? "ocr" : "transcript", ocrZh.Count > 0, stills, by);
+        var drama = BuildDrama(describe, info, downloaded, clusters, processed, id, ocrZh.Count > 0 ? "ocr" : "transcript", ocrZh.Count > 0, stills, by, sources);
         if (cover != null) drama["cover"] = cover;
         File.WriteAllText(Path.Combine(tmp, "drama.json"), drama.ToJsonString(Opt));
         File.WriteAllText(Path.Combine(tmp, ".stamp"), stamp);
@@ -325,7 +356,7 @@ public static class Publish
     }
 
     /// <summary>cover/lead1.jpg (female lead) and lead2.jpg (male lead): two separate 9:16 crops at 360x640, no text (no together cover). Each entry is { file, t, window, cast, focus: [x, y] }, the face centre as fractions of the image. A lead without a flattering shot is omitted. Returns the drama.json "cover" object, or null when there is none.</summary>
-    static async Task<JsonObject?> CoversAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, double dur, CancellationToken ct)
+    static async Task<JsonObject?> CoversAsync(Tools tools, IJobSource src, JsonObject describe, string tmp, string upload, double dur, CancellationToken ct)
     {
         var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
         var f = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "female lead"); var m = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "male lead");
@@ -346,6 +377,7 @@ public static class Publish
             await CropAsync(tools, img, Path.Combine(tmp, file), fx, fy, tmp, ct);
             var focus = JpegSize(img) is var (iw, ih) ? CoverFocus(iw, ih, fx, fy) : [0.5, 0.5];
             cover[key] = new JsonObject { ["file"] = file, ["t"] = Math.Round(s.T, 2), ["window"] = s.Window, ["cast"] = Id(cid), ["focus"] = new JsonArray(Math.Round(focus[0], 3), Math.Round(focus[1], 3)) };
+            if (JpegSize(img) is var (sw, sh)) cover[key]!["source"] = Source(upload, s.T, CoverCrop(sw, sh, fx, fy), focus);
         }
         await Lead(f, "lead1"); await Lead(m, "lead2");
         return cover.Count == 0 ? null : cover;
