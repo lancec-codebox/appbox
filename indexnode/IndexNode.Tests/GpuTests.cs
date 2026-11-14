@@ -83,6 +83,20 @@ public class GpuTests
     }
 
     [Fact]
+    public void Strict_mode_is_off_by_default_and_on_with_the_env_var()
+    {
+        var old = Environment.GetEnvironmentVariable("INDEXNODE_CUDA_STRICT");
+        try
+        {
+            Environment.SetEnvironmentVariable("INDEXNODE_CUDA_STRICT", null);
+            Assert.False(OrtOptions.Strict);
+            Environment.SetEnvironmentVariable("INDEXNODE_CUDA_STRICT", "1");
+            Assert.True(OrtOptions.Strict);
+        }
+        finally { Environment.SetEnvironmentVariable("INDEXNODE_CUDA_STRICT", old); }
+    }
+
+    [Fact]
     public async Task Frames_completion_marks_each_pending_gpu_step_once_and_skips_done_ones()
     {
         var s = new FakeStore();

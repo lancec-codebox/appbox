@@ -33,8 +33,9 @@ ENV INDEXNODE_CONFIG_DIR=/models \
     DOTNET_EnableDiagnostics=0
 # the pinned ffmpeg (with libsvtav1/libdav1d) and, optionally, every model
 ARG BAKE_MODELS=0
-RUN mkdir -p /models && dotnet /app/indexnode.dll tools install --ffmpeg \
- && if [ "$BAKE_MODELS" = "1" ]; then dotnet /app/indexnode.dll tools install --models; fi
+RUN mkdir -p /models && chmod 1777 /models && dotnet /app/indexnode.dll tools install --ffmpeg \
+ && if [ "$BAKE_MODELS" = "1" ]; then dotnet /app/indexnode.dll tools install --models; fi \
+ && chmod -R a+rwX /models
 WORKDIR /app
 # INDEXNODE_SAS_URL comes from the job's secret; INDEXNODE_NODE_NAME names the node in the registry
 ENTRYPOINT ["dotnet", "/app/indexnode.dll"]

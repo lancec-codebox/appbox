@@ -85,7 +85,7 @@ Big blobs may be Nexis ghosts. [`IndexNode/Tools/NexisGhost.cs`](IndexNode/Tools
 
 `indexnode run --gpu --node-name gpu-a100-westus3 --exit-when-idle 10m` runs only the GPU stages (sscd, clip, cast; ocrsubs when listed in `--stages`) on the ONNX Runtime **CUDA** provider.
 
-- **No silent CPU fallback.** If the CUDA provider cannot load, or a model has a node that would run on the CPU, the step fails with an explicit message (`INDEXNODE_CUDA_ALLOW_CPU_NODES=1` relaxes only the second check, for diagnostics). The first session logs the provider.
+- **No silent CPU fallback.** If the CUDA provider cannot load or is not registered, the step fails with an explicit message. Small shape operations may run on the CPU (ONNX Runtime places them there on purpose); `INDEXNODE_CUDA_STRICT=1` refuses any CPU node. Every session logs its provider.
 - **Models and batches.** SigLIP uses the fp16 vision model (186 MB), SSCD the fp32 model (the int8 QDQ model is a CPU model). Batches are 64 (SSCD) and 128 (SigLIP) frames; the CPU keeps 32. Frame chunks are read from blob as before.
 - **Only videos whose frames are done.** When the `frames` step finishes, it writes `index/gpu-ready/<step>.<jobId>` for each pending sscd/clip/cast job. The GPU node deletes the marker when the job is done or fails for good (not when it is released). `indexnode gpu markers [--dry]` writes the markers for jobs whose frames were made before 0.6.0.
 - **CPU fallback.** A CPU node takes an sscd/clip/cast job only after it has been ready for 30 minutes (marker `readyAt`; without a marker the later of `idx_added` and `idx_due`), so nothing stalls when the GPU is off. `--gpu-fallback 30m` changes the wait.

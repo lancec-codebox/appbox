@@ -65,7 +65,8 @@ resource job 'Microsoft.App/jobs@2024-10-02-preview' = {
               name: 'gpu-ready-markers'
               type: 'azure-blob'
               metadata: {
-                containerName: blobContainerName
+                blobContainerName: blobContainerName
+                recursive: 'true'
                 blobPrefix: markerPrefix
                 blobCount: blobCount
               }
