@@ -359,9 +359,15 @@ class NodeRunner(
 }
 
 class DownloadJob(val jobId: String, val url: String, val maxHeight: Int, val format: String?, val subs: Boolean) {
-    /** The protocol's selector: a raw format wins, else the default capped at the height. */
-    fun selector(): String = format ?: ("bv*[height<=$maxHeight][vcodec^=av01]+ba[acodec=opus][abr<=80]/bv*[height<=$maxHeight][vcodec^=vp9]+ba[acodec=opus][abr<=80]/" +
-          "bv*[height<=$maxHeight]+ba/b[height<=$maxHeight]/b")
+    /** The -f value: a raw format wins, else any video plus compact Opus audio, falling back to a single file. Resolution comes from [sortArgs]. */
+    fun selector(): String = format ?: "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b"
+
+    /** Extra sort arguments: resolution first (-S res:H) for the default request; none when the job brings its own format. */
+    fun sortArgs(): List<String> = if (format != null) emptyList() else listOf("-S", "res:$maxHeight")
+
+    /** All yt-dlp format arguments, in order. */
+    fun formatArgs(): List<String> = sortArgs() + listOf("-f", selector(), "--merge-output-format", "mp4")
+
     companion object {
         fun parse(text: String): DownloadJob {
             val o = JSONObject(text)

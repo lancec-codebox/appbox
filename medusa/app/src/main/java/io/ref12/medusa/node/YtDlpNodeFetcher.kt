@@ -20,6 +20,7 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
         progress("starting", null)
         val req = YoutubeDLRequest(job.url).apply {
             addOption("--no-playlist"); addOption("--no-warnings")
+            job.sortArgs().chunked(2).forEach { addOption(it[0], it[1]) }
             addOption("-f", job.selector()); addOption("--merge-output-format", "mp4")
             addOption("--write-info-json"); addOption("--write-thumbnail"); addOption("--convert-thumbnails", "jpg")
             if (job.subs) {

@@ -353,9 +353,20 @@ class NodeRunnerTest {
     @Test fun theFormatSelector() {
         val d = DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":null,\"format\":null}")
         assertEquals(480, d.maxHeight)
-        fun sel(h: Int) = "bv*[height<=$h][vcodec^=av01]+ba[acodec=opus][abr<=80]/bv*[height<=$h][vcodec^=vp9]+ba[acodec=opus][abr<=80]/bv*[height<=$h]+ba/b[height<=$h]/b"
-        assertEquals(sel(480), d.selector())
-        assertEquals(sel(720), DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720}").selector())
+        val sel = "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b"
+        assertEquals(sel, d.selector())
+        assertEquals(sel, DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720}").selector())
         assertEquals("best", DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720,\"format\":\"best\"}").selector())
+    }
+
+    @Test fun theFormatArguments() {
+        // resolution first, then codec: no codec preference at all, the height goes to -S
+        assertEquals(listOf("-S", "res:480", "-f", "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b", "--merge-output-format", "mp4"),
+            DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\"}").formatArgs())
+        assertEquals(listOf("-S", "res:720"), DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720}").sortArgs())
+        // a job with its own format: that is -f, and no -S
+        assertEquals(listOf("-f", "best", "--merge-output-format", "mp4"),
+            DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"maxHeight\":720,\"format\":\"best\"}").formatArgs())
+        assertTrue(DownloadJob.parse("{\"jobId\":\"a\",\"url\":\"u\",\"format\":\"best\"}").sortArgs().isEmpty())
     }
 }
