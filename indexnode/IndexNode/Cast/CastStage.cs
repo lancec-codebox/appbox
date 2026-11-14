@@ -106,25 +106,26 @@ public static class CastStage
         Directory.CreateDirectory(outDir); var work = Path.Combine(Path.GetTempPath(), "indexnode", "cast-" + Guid.NewGuid().ToString("N")[..8]); Directory.CreateDirectory(work);
         try
         {
-            await Models.EnsureAllAsync(AllModelFiles(opt.Model), http, ct, modelsDir);
+            var stats = new StepStats("cast");
+            using (stats.Phase("models")) await Models.EnsureAllAsync(AllModelFiles(opt.Model), http, ct, modelsDir);
             var (w, h) = keyframes != null ? (keyframes.W, keyframes.H) : await OcrSubs.SizeAsync(tools, video, ct);
-            progress("keyframes"); var kf = keyframes != null ? "" : await KeyframeFileAsync(tools, video, work, ct);
+            progress("keyframes"); string kf; using (stats.Phase("keyframe-extract")) kf = keyframes != null ? "" : await KeyframeFileAsync(tools, video, work, ct);
             // stored keyframes (keyframes/NNNN.jpgs) when given, else decoded from the video
             Task Each(Func<double, Rgb, bool, Task> each) => keyframes != null ? keyframes.DecodeAsync(tools, (_, t, im) => each(t, im, true), ct) : DecodeAsync(tools, kf, w, h, each, null, ct);
             var (det, emb) = Open(opt.Model, modelsDir ?? NodeConfig.ToolsDir(), opt.Threads);
             var faces = new List<FaceRec>(); var kfTimes = new List<double>(); int nkf = 0, rawDet = 0;
-            using (det) using (emb)
+            using (det) using (emb) using (stats.Phase("pass1-wall"))
                 await Each((t, im, _) =>
                 {
                     kfTimes.Add(t); nkf++;
-                    foreach (var d in det.Detect(im))
+                    foreach (var d in stats.Time("detect", () => det.Detect(im)))
                     {
                         rawDet++;
                         if (d.H < CastLogic.MinHeight || d.Score < CastLogic.MinScore) continue;
                         var (yaw, roll) = FaceMath.Pose(d.Kps);
-                        var f = new FaceRec { T = Math.Round(t, 3), X = d.X, Y = d.Y, W = d.W, H = d.H, Score = d.Score, Yaw = Math.Round(yaw, 3), Roll = Math.Round(roll, 1), Kps = d.Kps, Blur = Math.Round(FaceBlur(im, d), 1) };
+                        using var prep = stats.Phase("blur+pose"); var f = new FaceRec { T = Math.Round(t, 3), X = d.X, Y = d.Y, W = d.W, H = d.H, Score = d.Score, Yaw = Math.Round(yaw, 3), Roll = Math.Round(roll, 1), Kps = d.Kps, Blur = Math.Round(FaceBlur(im, d), 1) };
                         if (!CastLogic.Passes(f)) continue;
-                        f.Emb = emb.Embed(Imaging.AlignFace(im, d.Kps)); f.Quality = CastLogic.QualityOf(f, h); faces.Add(f);
+                        f.Emb = stats.Time("embed", () => emb.Embed(Imaging.AlignFace(im, d.Kps))); f.Quality = CastLogic.QualityOf(f, h); faces.Add(f);
                     }
                     if (nkf % 100 == 0) progress($"faces {nkf} keyframes, {faces.Count} kept");
                     return Task.CompletedTask;
@@ -149,7 +150,7 @@ public static class CastStage
             var probe = faces.Where(f => f.Cluster >= 0).GroupBy(f => f.Cluster).Where(g => g.Count() >= opt.MinFaces).SelectMany(g => g.OrderByDescending(f => f.Quality).Take(8)).ToList();
             if (borderAt > mergeAt && probe.Count > 0)
             {
-                progress("merge");
+                progress("merge"); using var mergePhase = stats.Phase("merge-probe");
                 var pt = probe.GroupBy(f => f.T).ToDictionary(g => g.Key, g => g.ToList()); var pcrop = new Dictionary<FaceRec, Rgb>();
                 await Each((t, im, _) => { if (pt.TryGetValue(Math.Round(t, 3), out var fs)) foreach (var f in fs) pcrop[f] = HeadShoulders(im, f); return Task.CompletedTask; });
                 ScoreMasks(probe.Where(pcrop.ContainsKey).ToList(), f => Imaging.CropResize(pcrop[f], pcrop[f].W * 0.2, pcrop[f].H * 0.12, pcrop[f].W * 0.6, pcrop[f].H * 0.5, 224, 224), Models.PathOf(Models.ClipVision, modelsDir), Models.PathOf(Models.ClipText, modelsDir), Models.PathOf(Models.ClipTokenizer, modelsDir), opt.Threads, progress, ct);
@@ -175,17 +176,18 @@ public static class CastStage
             foreach (var pc in pairCand) { need.Add(pc.A); need.Add(pc.B); }
             need = need.Distinct().ToList(); var byTime = need.GroupBy(f => f.T).ToDictionary(g => g.Key, g => g.ToList());
             var pairFrames = new Dictionary<double, Rgb>(); var hs = new Dictionary<FaceRec, Rgb>(); var full = new Dictionary<FaceRec, Rgb>(); var candSet = sheets.Values.SelectMany(x => x).ToHashSet();
+            using var crops = stats.Phase("crop-pass");
             await Each((t, im, _) =>
             {
                 if (byTime.TryGetValue(Math.Round(t, 3), out var fs)) foreach (var f in fs) { hs[f] = HeadShoulders(im, f); if (candSet.Contains(f)) full[f] = im; }
                 if (pairCand.Any(x => Math.Abs(x.T - t) < 1e-3)) pairFrames[Math.Round(t, 3)] = im;
                 return Task.CompletedTask;
             });
-            progress("masks");
+            crops.Dispose(); progress("masks"); using var masks = stats.Phase("masks");
             var vision = Models.PathOf(Models.ClipVision, modelsDir); var text = Models.PathOf(Models.ClipText, modelsDir); var tokp = Models.PathOf(Models.ClipTokenizer, modelsDir);
             ScoreMasks(need.Where(hs.ContainsKey).ToList(), f => Imaging.CropResize(hs[f], hs[f].W * 0.2, hs[f].H * 0.12, hs[f].W * 0.6, hs[f].H * 0.5, 224, 224), vision, text, tokp, opt.Threads, progress, ct);
 
-            var clusters = new List<object>(); var castDir = Path.Combine(outDir, "cast"); Directory.CreateDirectory(castDir);
+            masks.Dispose(); var clusters = new List<object>(); var castDir = Path.Combine(outDir, "cast"); Directory.CreateDirectory(castDir);
             foreach (var g in faces.Where(f => f.Cluster >= 0).GroupBy(f => f.Cluster).OrderBy(g => g.Key))
             {
                 var list = g.ToList(); bool isMain = main.Contains(g.Key);
@@ -214,7 +216,8 @@ public static class CastStage
             await File.WriteAllTextAsync(Path.Combine(castDir, "faces.json"), JsonSerializer.Serialize(new { v = 1, model = cm.Id, dim = cm.Dim, threshold = thr, keyframes = nkf, faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, cluster = f.Cluster, masked = hs.ContainsKey(f) ? (bool?)f.Masked : null }) }), ct);
             await File.WriteAllTextAsync(Path.Combine(castDir, "clusters.json"), JsonSerializer.Serialize(new { v = 1, model = cm.Id, threshold = thr, mergeAt, borderAt, rawClusters, merges = merges.Select(m => new { into = m.Into, from = m.From, dist = m.Dist, vis = m.Vis }), clusters }), ct);
             progress("credits");
-            var credits = await CreditsAsync(tools, video, w, h, duration, opt.Threads, modelsDir, ct);
+            List<(double Start, double End, string Text)> credits; using (stats.Phase("credits-ocr")) credits = await CreditsAsync(tools, video, w, h, duration, opt.Threads, modelsDir, ct);
+            stats.Log(nkf, "keyframes", opt.Threads);
             await File.WriteAllTextAsync(Path.Combine(castDir, "credits.json"), JsonSerializer.Serialize(new { v = 1, lines = credits.Select(c => new { start = c.Start, end = c.End, text = c.Text }) }), ct);
             return $"{cm.Id}: {nkf} keyframes, {faces.Count} faces, {faces.Select(f => f.Cluster).Where(c => c >= 0).Distinct().Count()} clusters, {main.Count} main";
         }
