@@ -229,9 +229,15 @@ public static class DevCommands
             case "asr":
             {
                 var m = await Models.EnsureAsync(Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vad = await Models.EnsureAsync(Models.Vad, http, ct);
-                var audio = await Transcribe.ReadAudioAsync(tools, video!, 0, 0, ct);
-                var t0 = sw.Elapsed.TotalSeconds;
-                var segs = Transcribe.Run(m, tk, vad, audio, threads, _ => { }, ct, offset);
+                var a0 = sw.Elapsed.TotalSeconds;
+                var audio = a.Get("asr-workers") is { } aw0 ? await Transcribe.ReadAudioParallelAsync(tools, video!, await Frames.DurationAsync(tools, video!, ct), int.Parse(aw0), ct) : await Transcribe.ReadAudioAsync(tools, video!, 0, 0, ct);
+                var t0 = sw.Elapsed.TotalSeconds; Console.Error.WriteLine($"{t0:F1}s audio read in {t0 - a0:F1}s ({audio.Length / 16000.0:F0}s of audio)");
+                void Pr(string p) => Console.Error.WriteLine($"{sw.Elapsed.TotalSeconds:F1}s {p}");
+                if (a.Get("asr-warm") is { } wu) Transcribe.WarmUpSeconds = int.Parse(wu);
+                if (a.Has("asr-shared")) Transcribe.SharedModel = true;
+                var segs = a.Get("asr-workers") is { } aw
+                    ? Transcribe.RunParallel(m, tk, vad, audio, int.Parse(aw), int.Parse(a.Get("asr-threads") ?? "1"), int.Parse(a.Get("asr-batch") ?? "1"), Pr, ct, offset)
+                    : Transcribe.Run(m, tk, vad, audio, threads, Pr, ct, offset);
                 var (lang, dubbed) = Transcribe.Dubbing(segs);
                 var wall = sw.Elapsed.TotalSeconds - t0; var secs = audio.Length / 16000.0;
                 File.WriteAllText(Path.Combine(outDir, "sensevoice.zh.vtt"), Transcribe.Vtt(segs));

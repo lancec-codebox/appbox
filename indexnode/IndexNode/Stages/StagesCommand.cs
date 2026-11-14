@@ -14,7 +14,7 @@ namespace IndexNode;
 /// </summary>
 public static class StagesCommand
 {
-    static readonly string[] Known = ["frames", "sscd", "cast"];
+    static readonly string[] Known = ["frames", "sscd", "cast", "transcribe"];
 
     public static async Task<int> RunAsync(Args a)
     {
@@ -64,6 +64,35 @@ public static class StagesCommand
                             (n, b, type) => store.PutAsync(paths.Video(id, n), b, null, null, false, ct, type), ct);
                         frameSet = null;
                         Console.WriteLine($"frames: {r.Kept}/{r.Sampled} frames kept, {r.FrameBytes / 1048576.0:F1} MB, {duration:F0}s of video; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
+                        break;
+                    }
+                    case "transcribe":
+                    {
+                        var videoBlob = paths.Video(id, "video.mp4"); var video = Path.Combine(work, "video.mp4");
+                        if (!File.Exists(video))
+                        {
+                            P(stage, "fetching video.mp4");
+                            var rest = store as RestStore ?? (store as RedirectStore)?.Inner as RestStore;
+                            if (rest != null) await NexisAccess.PrepareAsync(rest, videoBlob, ct);
+                            await store.DownloadToFileAsync(videoBlob, video, ct);
+                        }
+                        double fetch = sw.Elapsed.TotalSeconds;
+                        var m = await Models.EnsureAsync(Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vadm = await Models.EnsureAsync(Models.Vad, http, ct);
+                        var duration = await Frames.DurationAsync(tools, video, ct);
+                        var audio = await Transcribe.ReadAudioParallelAsync(tools, video, duration, threads, ct);
+                        P(stage, $"audio read in {sw.Elapsed.TotalSeconds - fetch:F1}s ({audio.Length / 16000.0:F0}s)");
+                        Transcribe.SharedModel = true;
+                        if (a.Get("asr-piece") is { } ap) Transcribe.PieceSeconds = int.Parse(ap);
+                        var segs = Transcribe.RunParallel(m, tk, vadm, audio, threads, 1, 1, msg => P(stage, msg), ct);
+                        var (lang, dubbed) = Transcribe.Dubbing(segs);
+                        var vtt = System.Text.Encoding.UTF8.GetBytes(Transcribe.Vtt(segs)); var json = Transcribe.ToJson(segs, lang, dubbed, audio.Length / (double)Transcribe.SampleRate, sw.Elapsed.TotalSeconds - fetch);
+                        if (a.Get("out") is { } od) { Directory.CreateDirectory(od); await File.WriteAllBytesAsync(Path.Combine(od, Transcribe.ModelName + ".zh.vtt"), vtt, ct); await File.WriteAllBytesAsync(Path.Combine(od, Transcribe.ModelName + ".zh.json"), json, ct); }
+                        else
+                        {
+                            await store.PutAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.vtt"), vtt, null, null, false, ct, "text/vtt");
+                            await store.PutAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), json, null, null, false, ct);
+                        }
+                        Console.WriteLine($"transcribe: {segs.Count} segments, {duration:F0}s of audio, language {lang}, dubbed {dubbed}; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }
                     case "cast":
