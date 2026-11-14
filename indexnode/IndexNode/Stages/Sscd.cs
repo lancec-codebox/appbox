@@ -43,10 +43,11 @@ public static class Sscd
             if (!File.Exists(path)) throw new InvalidOperationException($"sscd model not found at configured modelPath {path}");
             return path;
         }
-        var int8 = Path.Combine(NodeConfig.ToolsDir(), Int8Name + ".onnx");
+        var int8 = Models.PathOf(Models.SscdInt8);
         if (File.Exists(int8)) return int8;
         var local = Path.Combine(NodeConfig.ToolsDir(), ModelName + ".onnx");
         if (File.Exists(local)) return local;
+        if (string.IsNullOrEmpty(cfg.ModelUrl)) return await Models.EnsureAsync(Models.SscdInt8, http, ct); // the pinned static int8 model
         if (string.IsNullOrEmpty(cfg.ModelUrl)) throw new InvalidOperationException("sscd model missing: set modelUrl or modelPath in the config (see tools/export_sscd_onnx.py)");
         Log.Info("sscd: downloading the ONNX model");
         Directory.CreateDirectory(NodeConfig.ToolsDir());
@@ -56,6 +57,7 @@ public static class Sscd
             if (!r.IsSuccessStatusCode) throw new InvalidOperationException($"model download failed: HTTP {(int)r.StatusCode}");
             await using var fs = File.Create(tmp);
             await r.Content.CopyToAsync(fs, ct);
+            Traffic.Current.Add(Traffic.OtherIn, fs.Length);
         }
         File.Move(tmp, local, true);
         return local;

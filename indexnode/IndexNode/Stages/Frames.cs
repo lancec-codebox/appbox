@@ -115,6 +115,21 @@ public static class Frames
     /// (frames/NNNN.mp4 + .json with each frame's pts and spans). Keyframes: every key frame at full size, all-intra AV1 (keyframes/NNNN.mp4 + .json). Everything goes to <paramref name="put"/>
     /// (name relative to the job folder, bytes, content type); the manifests are put last.
     /// </summary>
+    /// <summary>Reads the raw rgb file frame by frame (into <paramref name="buf"/>, whose length is the frame size) and calls <paramref name="onFrame"/> with the frame index until it returns false or the file ends. The file is closed and then deleted: Windows refuses to delete an open file.</summary>
+    public static async Task ConsumeRawAsync(string file, byte[] buf, Func<int, Task<bool>> onFrame, CancellationToken ct)
+    {
+        await using (var fs = File.OpenRead(file))
+        {
+            for (int i = 0; ; i++)
+            {
+                int off = 0; while (off < buf.Length) { int r = await fs.ReadAsync(buf.AsMemory(off, buf.Length - off), ct); if (r == 0) break; off += r; }
+                if (off < buf.Length) break;
+                if (!await onFrame(i)) break;
+            }
+        }
+        File.Delete(file);
+    }
+
     public static async Task<Produced> ProduceAsync(Tools tools, string video, string work, FrameSettings st, int segments, double duration, Action<string> progress, Func<string, byte[], string, Task> put, CancellationToken ct)
     {
         var ffmpeg = await tools.FfmpegAsync(ct);
@@ -140,24 +155,20 @@ public static class Frames
             var frames = new List<ChunkFrame>();
             using (enc)
             {
-                int i0 = 0;
                 for (int k = 0; k < parts; k++)
                 {
                     int a0 = s0 + (s1 - s0) * k / parts; var buf = new byte[frameBytes];
-                    await using var fs = File.OpenRead(files[k]);
-                    for (int i = 0; ; i++)
+                    await ConsumeRawAsync(files[k], buf, async i =>
                     {
-                        int off = 0; while (off < frameBytes) { int r = await fs.ReadAsync(buf.AsMemory(off, frameBytes - off), ct); if (r == 0) break; off += r; }
-                        if (off < frameBytes) break;
-                        double t = a0 + i; if (t >= s1) break; sampled++;
+                        double t = a0 + i; if (t >= s1) return false; sampled++;
                         var feat = ColorGrid.Compute(new Rgb(buf, W, H));
                         int rep = pruner.Offer(t, feat);
-                        if (rep >= 0) { FramePruner.AddSpan(kept[rep].Spans, t, t + FramePruner.FrameSeconds); continue; }
+                        if (rep >= 0) { FramePruner.AddSpan(kept[rep].Spans, t, t + FramePruner.FrameSeconds); return true; }
                         var f = new ChunkFrame(kept.Count, t, frames.Count, [[t, t + FramePruner.FrameSeconds]]);
                         pruner.Keep(f.I, t, feat); kept.Add(f); frames.Add(f); keptN++;
                         await enc.WriteAsync(buf, ct);
-                    }
-                    File.Delete(files[k]); i0++;
+                        return true;
+                    }, ct);
                 }
                 var bytes = await enc.FinishAsync(); fb += bytes.Length;
                 await put($"frames/{name}.mp4", bytes, "video/mp4"); index.Add((name, c * FrameChunks.ChunkSeconds, frames, bytes.Length));

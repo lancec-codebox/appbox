@@ -12,6 +12,9 @@ public sealed class RestStore : IStore
     public const int BlockParallelism = 4;
     public const int BlockRetries = 3;
 
+    /// <summary>Where this store counts its bytes (the node's counters unless a test sets its own).</summary>
+    public Traffic Counters { get; set; } = Traffic.Current;
+
     private readonly HttpClient http;
     private readonly string origin;        // https://acct.blob.core.windows.net
     private readonly string containerPath; // /container
@@ -67,7 +70,10 @@ public sealed class RestStore : IStore
             try
             {
                 var req = make();
+                var sent = req.Content?.Headers.ContentLength ?? 0;
                 var resp = await http.SendAsync(req, opt, ct);
+                Counters.Add(Traffic.StorageWrite, sent);
+                Counters.Add(Traffic.StorageRead, resp.Content.Headers.ContentLength ?? 0);
                 if ((int)resp.StatusCode >= 500 || resp.StatusCode == HttpStatusCode.TooManyRequests)
                 {
                     if (attempt < retries)

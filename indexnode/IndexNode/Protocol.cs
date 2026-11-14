@@ -238,6 +238,16 @@ public sealed class NodeInfo
     public List<RunningJob> Running { get; set; } = new();
     /// <summary>State of the sources this node polls, e.g. { "watch-later": "ok" | "signed-out" }.</summary>
     public Dictionary<string, string>? Sources { get; set; }
+    /// <summary>Bytes this node moved: totals since it started and the last 48 hourly buckets.</summary>
+    public TrafficReport? Traffic { get; set; }
+    /// <summary>Where the node runs, detected at start and refreshed daily.</summary>
+    public Placement? Placement { get; set; }
+    /// <summary>When this node first registered; kept across restarts.</summary>
+    public string? FirstSeen { get; set; }
+    /// <summary>A per-process GUID of the process that wrote the record last.</summary>
+    public string? Instance { get; set; }
+    /// <summary>Processes writing under this node id in the last 2 minutes: instance GUID to its lastSeen.</summary>
+    public Dictionary<string, string>? Instances { get; set; }
     public string LastSeen { get; set; } = "";
     public string StartedAt { get; set; } = "";
 

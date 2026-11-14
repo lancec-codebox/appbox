@@ -55,6 +55,10 @@ public sealed class EngineOptions
     public Func<JobDescriptor, bool>? CanRun { get; init; }
     /// <summary>Budget, schedule and window; null: no limits.</summary>
     public LimitState? Limits { get; init; }
+    public string? StorageHost { get; init; }
+    public string StorageRegion { get; init; } = "westus2";
+    /// <summary>Tests replace the placement probe (IMDS and the storage connect time).</summary>
+    public Func<CancellationToken, Task<Placement>>? PlacementProbe { get; init; }
 }
 
 public sealed class NodeEngine
@@ -82,6 +86,12 @@ public sealed class NodeEngine
     private readonly bool[] fallbackListing = new bool[1];
     private int reserved;
     private string? lastRegistryKey;
+    private Placement? placement;
+    private string? firstSeen;
+    private volatile bool recordLoaded; // no registry write before the previous record's traffic is loaded, or it would be counted twice
+    private readonly string instance = Guid.NewGuid().ToString("N");
+    public static readonly TimeSpan InstanceWindow = TimeSpan.FromMinutes(2);
+    private Dictionary<string, string> peers = new();
 
     public ControlWatcher Control { get; }
     public ThreadBudget Budget { get; }
@@ -117,15 +127,20 @@ public sealed class NodeEngine
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
         Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker }).ToList(),
+        Traffic = Traffic.Current.Snapshot(), Placement = placement, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
         LastSeen = Protocol.NowUtc(), StartedAt = Protocol.Utc(startedAt),
     };
 
     public async Task WriteRegistryAsync(string? state = null, CancellationToken ct = default)
     {
+        if (!recordLoaded) return;
         await registryGate.WaitAsync(ct);
         try
         {
+            try { peers = LivePeers(NodeInfo.Parse((await store.GetAsync(paths.Node(o.NodeId), ct))?.Data ?? []), instance, DateTimeOffset.UtcNow); } catch (Exception ex) when (ex is not OperationCanceledException) { }
             var info = Snapshot(state);
+            // every live process under this name, this one included, while there is more than one
+            info.Instances = peers.Count > 0 && state != "offline" ? new Dictionary<string, string>(peers) { [instance] = info.LastSeen } : null;
             lastRegistryKey = RegistryKey(info);
             await store.PutAsync(paths.Node(o.NodeId), info.ToBytes(), new Dictionary<string, string> { [Tags.Kind] = "node" }, null, false, ct);
         }
@@ -143,13 +158,58 @@ public sealed class NodeEngine
         _ = WriteRegistryAsync();
     }
 
+    /// <summary>The instances in a record that wrote within the last 2 minutes, other than this process.</summary>
+    public static Dictionary<string, string> LivePeers(NodeInfo? rec, string self, DateTimeOffset now)
+    {
+        var live = new Dictionary<string, string>();
+        if (rec == null) return live;
+        var all = new Dictionary<string, string>(rec.Instances ?? new());
+        if (rec.Instance != null && !all.ContainsKey(rec.Instance)) all[rec.Instance] = rec.LastSeen;
+        foreach (var (id, seen) in all)
+            if (id != self && rec.State != "offline" && DateTimeOffset.TryParse(seen, out var at) && now - at < InstanceWindow) live[id] = seen;
+        return live;
+    }
+
+    /// <summary>The node's record is never deleted or reset: its traffic and firstSeen carry over from the last run.</summary>
+    private async Task LoadPreviousRecordAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (await store.GetAsync(paths.Node(o.NodeId), ct) is { } c && NodeInfo.Parse(c.Data) is { } prev)
+            {
+                Traffic.Current.Load(prev.Traffic);
+                firstSeen = prev.FirstSeen ?? prev.StartedAt;
+                placement ??= prev.Placement;
+                var others = LivePeers(prev, instance, DateTimeOffset.UtcNow);
+                if (others.Count > 0) Log.Info($"WARNING: another process is already reporting as node '{o.NodeId}' (seen {string.Join(", ", others.Values)}); running anyway, leases keep jobs safe");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { Log.Info($"registry: could not read the previous record ({e.Message})"); }
+        finally { recordLoaded = true; }
+    }
+
+    private async Task RefreshPlacementAsync(CancellationToken ct)
+    {
+        try
+        {
+            placement = o.PlacementProbe != null ? await o.PlacementProbe(ct)
+                : await Placement.DetectAsync(o.StorageHost, o.StorageRegion, null, Environment.GetEnvironmentVariable("INDEXNODE_REGION"), null, ct);
+            Log.Info($"placement: {placement.Provider} {placement.Region ?? "(region unknown" + (placement.Reason != null ? ": " + placement.Reason : "") + ")"} storageRtt={placement.StorageRttMs?.ToString() ?? "n/a"} ms");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { Log.Info($"placement: detection failed ({e.Message})"); }
+    }
+
     private async Task RegistryLoop(CancellationToken ct)
+
     {
         try
         {
             while (true)
             {
                 await Task.Delay(o.RegistryInterval, ct);
+                if (!DateTimeOffset.TryParse(placement?.CheckedAt, out var chk) || DateTimeOffset.UtcNow - chk > Placement.Refresh) await RefreshPlacementAsync(ct);
                 await WriteRegistryAsync(ct: ct);
             }
         }
@@ -182,7 +242,10 @@ public sealed class NodeEngine
     public async Task RunAsync(CancellationToken ct)
     {
         await Control.RefreshAsync(ct, force: true);
+        await LoadPreviousRecordAsync(ct);
+        await RefreshPlacementAsync(ct);
         await WriteRegistryAsync(ct: ct);
+
         using var loopsCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var loops = new[] { RegistryLoop(loopsCts.Token), ControlLoop(loopsCts.Token) };
         try

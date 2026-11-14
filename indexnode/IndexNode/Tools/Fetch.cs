@@ -25,6 +25,7 @@ public static class Fetch
                 if (!r.IsSuccessStatusCode) throw new InvalidOperationException($"download failed: HTTP {(int)r.StatusCode} for {Redact.Sas(url)}");
                 await using var fs = File.Create(tmp);
                 await r.Content.CopyToAsync(fs, ct);
+                Traffic.Current.Add(Traffic.OtherIn, fs.Length);
             }
             var got = await Sha256Async(tmp, ct);
             if (!string.Equals(got, sha256, StringComparison.OrdinalIgnoreCase))

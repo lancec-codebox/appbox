@@ -43,18 +43,24 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      - name: Publish single-file apphosts
+      - name: Publish single-file builds
         run: |
           VERSION="${GITHUB_REF_NAME#indexnode-v}"
           mkdir -p dist
           for RID in win-x64 linux-x64; do
+            if [ "$RID" = win-x64 ]; then EXT=.exe; else EXT=; fi
+            # self-contained: no .NET install needed; ONNX Runtime and sherpa-onnx natives are inside
+            dotnet publish IndexNode -c Release -r "$RID" --self-contained true \
+              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true \
+              -p:Version="$VERSION" -o "out/sc-$RID"
+            cp "out/sc-$RID/indexnode$EXT" "dist/indexnode-$VERSION-$RID$EXT"
+            # framework-dependent: smaller, needs the .NET 10 runtime
             dotnet publish IndexNode -c Release -r "$RID" --self-contained false \
               -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
-              -p:Version="$VERSION" -o "out/$RID"
-            if [ "$RID" = win-x64 ]; then EXT=.exe; else EXT=; fi
-            cp "out/$RID/indexnode$EXT" "dist/indexnode-$VERSION-$RID$EXT"
-            (cd dist && sha256sum "indexnode-$VERSION-$RID$EXT" > "indexnode-$VERSION-$RID$EXT.sha256")
+              -p:Version="$VERSION" -o "out/fd-$RID"
+            cp "out/fd-$RID/indexnode$EXT" "dist/indexnode-$VERSION-$RID-fdd$EXT"
           done
+          (cd dist && for f in indexnode-*; do sha256sum "$f" > "$f.sha256"; done)
           ls -l dist
       - name: Publish release
         env:

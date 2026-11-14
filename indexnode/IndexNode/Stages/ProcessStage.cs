@@ -32,6 +32,9 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
         return steps.All(supported.Contains);
     }
 
+    /// <summary>One work folder per step: the steps of one video can run at the same time on a node and must not delete each other's files.</summary>
+    public static string WorkDir(string id, string step) => Path.Combine(Path.GetTempPath(), "indexnode", $"p-{id}-{step}");
+
     public async Task RunAsync(JobContext ctx)
     {
         var ct = ctx.Token;
@@ -83,7 +86,7 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
         // sscd, clip and cast read the stored frames/keyframes chunks; only the frames step (and transcribe, ocrsubs, compress, the cast credits) decode the video
         bool needVideo = need["frames"] || need["transcribe"] || need["ocrsubs"] || need["compress"] || need["cast"];
 
-        var work = Path.Combine(Path.GetTempPath(), "indexnode", "p-" + id);
+        var work = WorkDir(id, stepJob ? job.Stage : "process");
         if (Directory.Exists(work)) Directory.Delete(work, true);
         Directory.CreateDirectory(work);
         try

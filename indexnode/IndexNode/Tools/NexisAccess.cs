@@ -21,8 +21,32 @@ public static class NexisAccess
         try { await TouchAsync(store, name, ct); }
         catch (StorageException e) { Log.Info($"nexis: could not touch {name} ({e.Message})"); }
         var client = new BlockBlobClient(store.BlobUri(name));
-        if (await DehydrateOperation.HydrateIfGhostAsync(client, ct)) Log.Info($"nexis: hydrated {name}");
+        await HydrateOrYieldAsync(name, () => DehydrateOperation.HydrateIfGhostAsync(client, ct), async () => (await client.GetPropertiesAsync(cancellationToken: ct)).Value.ContentLength == 0 && (await client.GetTagsAsync(cancellationToken: ct)).Value.Tags.TryGetValue(DehydrateOperation.TagNames.State, out var st) && st == "ghost");
     }
+
+    /// <summary>
+    /// Hydrates; when another step hydrated the same ghost first, the conditional commit fails (412 ConditionNotMet / "condition specified using HTTP conditional header(s) is not met").
+    /// That means someone else did it: look again, and carry on when the blob is no longer a ghost. Any other failure, or a blob still a ghost, is thrown.
+    /// </summary>
+    public static async Task<bool> HydrateOrYieldAsync(string name, Func<Task<bool>> hydrate, Func<Task<bool>> stillGhost)
+    {
+        try
+        {
+            var done = await hydrate();
+            if (done) Log.Info($"nexis: hydrated {name}");
+            return done;
+        }
+        catch (Exception e) when (IsConditionNotMet(e))
+        {
+            if (await stillGhost()) throw;
+            Log.Info($"nexis: {name} was hydrated by another step");
+            return false;
+        }
+    }
+
+    public static bool IsConditionNotMet(Exception e) =>
+        e is Azure.RequestFailedException { Status: 412 } || e is Azure.RequestFailedException { ErrorCode: "ConditionNotMet" }
+        || e.Message.Contains("condition specified using HTTP conditional header(s) is not met", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Touches again every 5 minutes until disposed.</summary>
     public static IDisposable KeepTouched(IStore store, string name, TimeSpan? every = null)

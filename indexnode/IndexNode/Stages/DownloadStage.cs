@@ -149,6 +149,7 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             if (height <= 0) height = await Frames.HeightAsync(tools, videoFile, ct);
 
             var bytes = new FileInfo(videoFile).Length;
+            Traffic.Current.Add(Traffic.YoutubeIn, Directory.EnumerateFiles(work, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length)); // video, subtitles, info, thumbnail
             var progress = new Progress<long>(n => ctx.Report("upload", $"{n * 100 / Math.Max(1, bytes)}%"));
             ctx.Report("upload", "0%");
             await store.PutFileAsync(paths.Video(id, "video.mp4"), videoFile, "video/mp4", progress, ct);

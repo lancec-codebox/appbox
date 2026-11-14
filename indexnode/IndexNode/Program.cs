@@ -38,7 +38,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages watch,process,comments] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N]
+        indexnode run [--stages watch,process,comments] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
@@ -126,7 +126,7 @@ public static class Commands
         foreach (var st in Protocol.StepStages) jobs[st] = cfg.Jobs != null && cfg.Jobs.TryGetValue(st, out var sn) ? sn : cfg.JobsFor("process");
         foreach (var kv in NodeConfig.ParseJobs(a.Get("jobs"))) jobs[kv.Key] = kv.Value;
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
-        var nodeId = cfg.EnsureNodeId();
+        var (nodeId, nodeName) = cfg.ResolveIdentity(a.Get("node-name"), Environment.GetEnvironmentVariable(NodeConfig.NodeNameEnv));
 
         var tools = new Tools(http, cfg);
         var gate = new DownloadGate();
@@ -144,11 +144,12 @@ public static class Commands
         ProcessStage.Ai = ai;
         var opts = new EngineOptions
         {
-            NodeId = nodeId, Name = cfg.NodeName ?? NodeConfig.SanitizeName(Environment.MachineName),
+            NodeId = nodeId, Name = nodeName,
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
             Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
             Stages = stages, Jobs = jobs, Threads = threads, Once = a.Has("once"),
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
+            StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         var engine = new NodeEngine(store, paths, opts, handlers);
 
@@ -416,10 +417,16 @@ public static class Commands
             foreach (var l in Models.Status()) Console.WriteLine(l);
             return 0;
         }
-        if (sub != "install") throw new ArgumentException("tools status | tools install [--ffmpeg] [--ytdlp-zipapp] [--models]");
+        if (sub != "install") throw new ArgumentException("tools status | tools install [--all] [--ffmpeg] [--ytdlp] [--ytdlp-zipapp] [--models]");
         var http = NewHttp();
         var tools = new Tools(http, cfg);
-        bool any = a.Has("ffmpeg") || a.Has("ytdlp-zipapp") || a.Has("models");
+        bool all = a.Has("all");
+        bool any = all || a.Has("ffmpeg") || a.Has("ytdlp") || a.Has("ytdlp-zipapp") || a.Has("models");
+        if (all || a.Has("ytdlp"))
+        {
+            var yd = await tools.InstallYtDlpPinnedAsync(default);
+            Console.WriteLine($"yt-dlp {Tools.YtDlpVersion} ready: {yd}");
+        }
         if (a.Has("ytdlp-zipapp"))
         {
             var file = LoadFileConfig();
@@ -428,12 +435,12 @@ public static class Commands
             file.Save();
             Console.WriteLine("yt-dlp zipapp installed; ytdlp.command = " + JsonSerializer.Serialize(cmd));
         }
-        if (a.Has("ffmpeg") || !any)
+        if (all || a.Has("ffmpeg") || !any)
         {
             await tools.InstallFfmpegPinnedAsync(default);
             Console.WriteLine($"ffmpeg {Tools.FfmpegVersion} installed in {NodeConfig.ToolsDir()}");
         }
-        if (a.Has("models"))
+        if (all || a.Has("models"))
             foreach (var m in Models.All) { await Models.EnsureAsync(m, http, default); Console.WriteLine($"model {m.Id} ready"); }
         return 0;
     }
@@ -501,6 +508,7 @@ public static class Commands
                 case "prune.grid": file.PruneGrid = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "prune.sscd": file.PruneSscd = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "prune.lookback": file.PruneLookback = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "storage.region": file.StorageRegion = val.Trim(); break;
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
                 case "node-name": file.NodeName = NodeConfig.SanitizeName(val); break;
@@ -509,7 +517,7 @@ public static class Commands
                 case "browser.exe": (file.Browser ??= new()).Exe = val; break;
                 case "browser.profile-dir": (file.Browser ??= new()).ProfileDir = val; break;
                 case "browser.port": (file.Browser ??= new()).Port = int.Parse(val); break;
-                default: throw new ArgumentException("unknown config key (budget, schedule, window, ai.base-url, ai.key, ai.text-model, ai.vision-model, ai.api, jobs, threads, model-url, model-path, node-name, ytdlp.command, ytdlp.js-runtime, browser.exe, browser.profile-dir, browser.port)");
+                default: throw new ArgumentException("unknown config key (budget, schedule, window, ai.base-url, ai.key, ai.text-model, ai.vision-model, ai.api, jobs, threads, storage.region, model-url, model-path, node-name, ytdlp.command, ytdlp.js-runtime, browser.exe, browser.profile-dir, browser.port)");
             }
             file.Save();
             Console.WriteLine($"{key} saved{(key == "ai.key" ? " (hidden)" : "")}");

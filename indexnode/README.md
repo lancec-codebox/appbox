@@ -12,6 +12,7 @@ indexnode run [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N
 indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F]
 indexnode enqueue --from watch-later [--max-height 480]
 indexnode browser login | status
+indexnode tools install --all        # yt-dlp, ffmpeg and every model, each sha256-pinned (about 1.2 GB)
 indexnode tools install --ytdlp-zipapp
 indexnode status
 indexnode requeue [--stage S]
@@ -22,7 +23,18 @@ indexnode config set <jobs|threads|model-url|model-path|node-name|ytdlp.command|
 
 All commands take `--prefix` (default `index/`). `INDEXNODE_SAS_URL` overrides the stored SAS.
 
+## Download (0.5.1)
+
+Each release has, per platform: `indexnode-<v>-<rid>[.exe]` (self-contained single file: no .NET install, ONNX Runtime and sherpa-onnx inside; win-x64 45.7 MiB, linux-x64 49.4 MiB) and `indexnode-<v>-<rid>-fdd[.exe]` (framework-dependent, needs the .NET 10 runtime; 25.9 MiB and 35.2 MiB). Each has a `.sha256`. On a new machine: download, run `indexnode tools install --all`, then `indexnode config set-sas <url>`.
+
+Traffic: each node counts the bytes it moves (youtubeIn, storageRead, storageWrite, aiOut, aiIn, otherIn) and reports them in its registry record; `indexnode status --json` shows totals, last hour and last 24 h.
+
+## Node name (stable identity)
+
+`indexnode run --node-name <name>` (or `INDEXNODE_NODE_NAME`, or `config set node-name`; precedence in that order). A name given by flag or environment *is* the node id, with no machine-name or random suffix: every execution of a container job, which gets a new hostname each time, reports to one registry record, and its traffic and history keep accumulating. The record is never deleted. The GPU job uses `--node-name gpu-a100-westus3`. If another process reported under the same name less than 2 minutes ago, the node logs a warning and still runs (leases keep jobs safe); the record's `instances` lists the live processes.
+
 ## Setup on Windows
+
 
 1. Install the .NET 10 runtime. Download `indexnode-<version>-win-x64.exe` from the [releases](https://github.com/lancec-codebox/appbox/releases) (tags `indexnode-v*`), check it against its `.sha256`, and rename it to `indexnode.exe`.
 2. `indexnode config set-sas <container SAS URL>`.

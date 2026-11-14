@@ -102,6 +102,7 @@ public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) 
                 var f = Path.Combine(work, sort + ".info.json");
                 infos.Add(File.Exists(f) ? JsonNode.Parse(File.ReadAllText(f))!.AsObject() : null);
             }
+            Traffic.Current.Add(Traffic.YoutubeIn, Directory.EnumerateFiles(work).Sum(x => new FileInfo(x).Length));
             var snap = CommentsSnapshot.Build(infos.ToArray());
             var name = paths.Video(id, $"comments/{CommentsSnapshot.BlobTimestamp(DateTimeOffset.UtcNow)}.json");
             await ctx.Store.PutAsync(name, JsonSerializer.SerializeToUtf8Bytes(snap), null, null, false, ct);

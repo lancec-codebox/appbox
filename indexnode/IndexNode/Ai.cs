@@ -16,6 +16,8 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     /// <summary>A 64x64 PNG: a red disc on white, which `ai test` asks the vision model to name the colour of.</summary>
     public static readonly byte[] TestPng = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAq0lEQVR42u3ZwQ2AQAgFUYrwbP9F2YtaAq4b+MAQC5iXeFCwu/gYAAAAAAAAAACAMOA6zkqAN9fzKAKc6dsZlpK+kWGJ6VsYplD/x2Ai9csG06lfM5hU/YJhGCCg/qthEiCs/pNhDCC43m8AAADABEBKvdPAKwQAAIAaAD6nBQD8UgoAWKsIAMpv5jrsRjtspzvcBzpcaJrcyJpcKZvcieMHAAAAAAAAAJA5DzBSU7R9DBxDAAAAAElFTkSuQmCC");
 
+    public Traffic Counters { get; set; } = Traffic.Current;
+
     private readonly ConcurrentDictionary<string, string> chosen = new();
 
     /// <summary>The API in use for a model in this run ("chat" or "responses"); null in auto mode before the first call.</summary>
@@ -29,8 +31,11 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint(path)) { Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json") };
         if (!string.IsNullOrEmpty(cfg.Key)) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cfg.Key);
+        Counters.Add(Traffic.AiOut, req.Content!.Headers.ContentLength ?? 0);
         using var res = await http.SendAsync(req, ct);
-        return new Reply(res.IsSuccessStatusCode, (int)res.StatusCode, await res.Content.ReadAsStringAsync(ct));
+        var text = await res.Content.ReadAsStringAsync(ct);
+        Counters.Add(Traffic.AiIn, Encoding.UTF8.GetByteCount(text));
+        return new Reply(res.IsSuccessStatusCode, (int)res.StatusCode, text);
     }
 
     private static InvalidOperationException Fail(Reply r) =>

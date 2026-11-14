@@ -77,6 +77,7 @@ public static class StatusSnapshot
             nodeRows.Add(new JsonObject
             {
                 ["nodeId"] = n.NodeId, ["name"] = n.Name, ["kind"] = n.Kind, ["version"] = n.Version, ["stages"] = new JsonArray(n.Stages.Select(s => (JsonNode)s).ToArray()), ["state"] = state, ["workers"] = workers,
+                ["traffic"] = TrafficJson(n.Traffic, now), ["firstSeen"] = n.FirstSeen, ["placement"] = n.Placement == null ? null : JsonSerializer.SerializeToNode(n.Placement, Protocol.Json),
                 ["lastSeen"] = n.LastSeen, ["budget"] = lim?.Budget, ["budgetRemaining"] = remaining, ["nextWindow"] = nextWindow, ["etaBudgetHours"] = etaHours, ["finishedPerHour"] = perHour,
             });
         }
@@ -88,6 +89,14 @@ public static class StatusSnapshot
             ["finished"] = new JsonArray(finished.Take(50).Select(f => (JsonNode)f.Row).ToArray()), ["failures"] = new JsonArray(failures.Take(50).Select(f => (JsonNode)f.Row).ToArray()),
             ["throughput"] = throughput,
         };
+    }
+
+    /// <summary>A node's traffic as JSON: totals, the last-hour and last-24-hour sums, and the hourly buckets.</summary>
+    public static JsonObject TrafficJson(TrafficReport? t, DateTimeOffset now)
+    {
+        t ??= new TrafficReport();
+        JsonNode C(TrafficCounts c) => JsonSerializer.SerializeToNode(c, Protocol.Json)!;
+        return new JsonObject { ["totals"] = C(t.Totals), ["lastHour"] = C(t.Sum(now, TimeSpan.FromHours(1))), ["last24h"] = C(t.Sum(now, TimeSpan.FromHours(24))), ["hours"] = JsonSerializer.SerializeToNode(t.Hours, Protocol.Json) };
     }
 
     /// <summary>Atomic replace: write a temp file next to the target, then move it over.</summary>

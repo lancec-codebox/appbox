@@ -31,12 +31,17 @@ public static class Models
     public static readonly ModelFile ScrfdDet = new("face-det-buffalo", "buffalo_l.det_10g.onnx", Buffalo + "det_10g.onnx", "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91", 16_923_827, "NON-COMMERCIAL (InsightFace buffalo_l)");
     public static readonly ModelFile ArcFaceRec = new("face-rec-buffalo", "buffalo_l.w600k_r50.onnx", Buffalo + "w600k_r50.onnx", "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43", 174_383_860, "NON-COMMERCIAL (InsightFace buffalo_l)");
 
+    /// <summary>The static QDQ int8 SSCD (per-channel, calibrated on 100 frames at 288x512; 25 MB). Never dynamic quantization: ConvInteger is 11x slower on CPU. The URL is where the file is hosted; the sha256 is what counts (move the file, keep the pin, or set it in the tools folder by hand).</summary>
+    public const string SscdInt8Url = "https://github.com/refops-analysis/refops/releases/download/vidtest/sscd_int8_static.onnx";
+    public static readonly ModelFile SscdInt8 = new("sscd-int8", "sscd_disc_mixup_int8_static.onnx", SscdInt8Url, "bb79ea725a6ca075ac0395b388d62134040b63f55be7e823bdd26512c77132cf", 25_102_615, "SSCD (CC-BY-NC 4.0, Meta), int8 static QDQ export");
+
     public static readonly ModelFile[] Clip = [ClipVision, ClipText, ClipTokenizer];
     public static readonly ModelFile[] FaceYuNet = [YuNetDet, SFaceRec];
     public static readonly ModelFile[] FaceDefault = [ScrfdDet, ArcFaceRec];
     public static readonly ModelFile[] Ocr = [OcrDet, OcrRec, OcrDict];
     public static readonly ModelFile[] Asr = [AsrModel, AsrTokens, Vad];
-    public static readonly ModelFile[] All = [.. Clip, .. Ocr, .. Asr];
+    /// <summary>Everything a node needs for every step (the default face models included).</summary>
+    public static readonly ModelFile[] All = [SscdInt8, .. Clip, .. Ocr, .. Asr, .. FaceDefault];
 
     /// <summary>The steps a node can run with the model files it has: a node never claims a job that needs a step it cannot run.</summary>
     public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["ocrsubs"] = Ocr, ["transcribe"] = Asr, ["cast"] = FaceDefault };

@@ -243,9 +243,15 @@ Write it with `indexnode control run|drain|stop [--stage download|process] [--me
   "jobs": { "download": 1, "process": 2 }, "threads": 16, "conditions": "wifi+charging",
   "state": "working" | "idle" | "draining" | "stopped" | "backoff" | "offline",
   "control": "run", "running": [ { "jobId": "...", "stage": "process", "step": "sscd", "progress": "42%" } ],
+  "traffic": { "totals": { "youtubeIn": 0, "storageRead": 0, "storageWrite": 0, "aiOut": 0, "aiIn": 0, "otherIn": 0 },
+               "hours": [ { "hour": "2026-11-14T06:00Z", "youtubeIn": 0, "storageRead": 0, "storageWrite": 0, "aiOut": 0, "aiIn": 0, "otherIn": 0 } ] },
   "lastSeen": "2026-11-13T20:00:30Z", "startedAt": "..." }
 ```
 
+- `traffic` (0.5.1): bytes the node moved since it started, plus the last 48 hourly buckets (UTC hour start). youtubeIn = yt-dlp output files (video, subtitles, info, thumbnail, comments); storageRead/storageWrite = blob request and response bodies; aiOut/aiIn = AI request and response bodies; otherIn = models and tools. `status --json` adds lastHour and last24h sums per node.
+- `firstSeen`: when the node first registered. A node's record is never deleted or reset: at start the node loads its previous `traffic` and `firstSeen` and keeps adding, and the record stays after the node stops, so its usage stays visible.
+- `placement` (detected at start, refreshed daily): `{ provider: "azure"|"unknown", region, vmSize, zone, source: "imds"|"env", reason (when unknown: timeout, refused, 404), storageRttMs (median TCP connect over 5 tries to the storage host), sameRegionAsStorage, checkedAt }`. IMDS is `GET http://169.254.169.254/metadata/instance?api-version=2021-02-01` with `Metadata: true`, 2 s, no proxy. Container Apps has no IMDS: set `INDEXNODE_REGION`. The storage region is `storage.region` (default westus2); `sameRegionAsStorage` tells the admin page whether this node's storage reads are free or billed egress.
+- `instance` is a per-process GUID of the last writer. A name given with `--node-name` / `INDEXNODE_NODE_NAME` is the node id itself. When a record's `lastSeen` is under 2 minutes old and its `instance` differs, a starting node warns, still runs, and `instances` (`{ guid: lastSeen }`) lists every live process.
 - A node writes `state: "offline"` when it shuts down cleanly. Any node whose `lastSeen` is more than 5 minutes old counts as offline.
 - `indexnode status` lists every node: its kind, the stages it handles, its parallelism, state, running jobs, and last seen. Then come the queue counts and the control state.
 - The tag `idx_kind=node` on these blobs lets them be found by tag.

@@ -18,6 +18,8 @@ public sealed class NodeConfig
     public double? PruneGrid { get; set; }
     public double? PruneSscd { get; set; }
     public double? PruneLookback { get; set; }
+    /// <summary>The storage account's Azure region (default westus2): reads from a node in the same region are free.</summary>
+    public string? StorageRegion { get; set; }
     public string? ModelUrl { get; set; }
     public string? ModelPath { get; set; }
     public BrowserConfig? Browser { get; set; }
@@ -76,6 +78,20 @@ public sealed class NodeConfig
         }
         File.WriteAllText(p, JsonSerializer.Serialize(this, Json));
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(p, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    public const string NodeNameEnv = "INDEXNODE_NODE_NAME";
+
+    /// <summary>The name given for this run: the --node-name flag, then INDEXNODE_NODE_NAME. Null when neither is set (the config's node-name and the generated id apply).</summary>
+    public static string? ExplicitName(string? flag, string? env) =>
+        !string.IsNullOrWhiteSpace(flag) ? SanitizeName(flag) : !string.IsNullOrWhiteSpace(env) ? SanitizeName(env) : null;
+
+    /// <summary>(nodeId, display name). A name given by flag or environment IS the node id (no suffix), so every run under it reports to one registry record; otherwise the stored id of this install (name plus random suffix).</summary>
+    public (string NodeId, string Name) ResolveIdentity(string? flag, string? env)
+    {
+        if (ExplicitName(flag, env) is { } n) return (n, n);
+        var id = EnsureNodeId();
+        return (id, NodeName ?? SanitizeName(Environment.MachineName));
     }
 
     /// <summary>Stable per install: name plus 6 random hex characters, stored in the config.</summary>
