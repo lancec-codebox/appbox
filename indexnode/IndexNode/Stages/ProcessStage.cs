@@ -114,10 +114,8 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
                 var r = await Frames.ProduceAsync(tools, video, work, FrameSettings.From(config), segs, duration, p => ctx.Report("frames", p), (name, bytes, type) => ctx.Store.PutAsync(paths.Video(id, name), bytes, null, null, false, ct, type), ct);
                 frameCount = r.Kept;
                 // both manifests are written last, so the three GPU steps are ready now: one marker each wakes the on-demand GPU node
-                foreach (var gs in GpuRouting.MarkerStages)
-                    if (await store.GetTagsAsync(paths.Job(gs, id), ct) is { } jt && jt.GetValueOrDefault(Tags.State) == "pending")
-                        await GpuRouting.WriteMarkerAsync(store, paths, gs, id, ct);
-                Log.Info($"process {id}: gpu-ready markers written for {string.Join(',', GpuRouting.MarkerStages)}");
+                var marked = await GpuRouting.WriteReadyMarkersAsync(store, paths, id, ct);
+                Log.Info($"process {id}: gpu-ready markers written for {(marked.Length == 0 ? "(none: no pending GPU step)" : string.Join(',', marked))}");
                 Log.Info($"process {id}: {r.Kept} frames kept of {r.Sampled} sampled ({r.FrameBytes / 1048576.0:F1} MB AV1) and {r.Keyframes} keyframes ({r.KeyframeBytes / 1048576.0:F1} MB all-intra AV1)");
             }
             // the stored frames, fetched (and hydrated) once for the steps that embed them

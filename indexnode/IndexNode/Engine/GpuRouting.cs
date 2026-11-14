@@ -43,6 +43,16 @@ public static class GpuRouting
     public static Task<bool> WriteMarkerAsync(IStore store, Paths paths, string step, string jobId, CancellationToken ct, DateTimeOffset? now = null) =>
         store.PutAsync(MarkerName(paths, step, jobId), MarkerBody(step, jobId, now ?? DateTimeOffset.UtcNow), null, null, true, ct);
 
+    /// <summary>Called when a video's frames are done: one marker per pending GPU-stage job of the video (a step that is already done or has no job gets none). Returns the steps marked.</summary>
+    public static async Task<string[]> WriteReadyMarkersAsync(IStore store, Paths paths, string jobId, CancellationToken ct)
+    {
+        var made = new List<string>();
+        foreach (var step in MarkerStages)
+            if (await store.GetTagsAsync(paths.Job(step, jobId), ct) is { } tags && tags.GetValueOrDefault(Tags.State) == "pending")
+            { await WriteMarkerAsync(store, paths, step, jobId, ct); made.Add(step); }
+        return made.ToArray();
+    }
+
     public static async Task DeleteMarkerAsync(IStore store, Paths paths, string step, string jobId)
     {
         if (!IsMarkerStage(step)) return;
