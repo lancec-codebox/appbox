@@ -27,7 +27,9 @@ public static class CastLogic
     public const double MinScore = 0.6, MinBlur = 40, MaxYaw = 0.45, MaxRoll = 30;
 
     /// <summary>Per model: the cosine-distance threshold of average linkage (found on input.mp4, see README), then the second-pass merge limits.</summary>
-    public static readonly CastModel Default = new("buffalo_l", 0.65, 512, 0.50, 0), YuNetSFace = new("yunet-sface", 0.50, 128, 0.50, 0);
+    public static readonly CastModel Default = new("buffalo_l", 0.65, 512, 0.50, 0), YuNetSFace = new("yunet-sface", 0.50, 128, 0.50, 0),
+        // buffalo_s (det_500m + w600k_mbf) on the frames stage's 360x640 frames: merge 0.45 (0.50 merged two children), found on 01FsMcrfjWI against r50 on the same faces (14/14 main kept apart)
+        BuffaloS = new("buffalo_s", 0.65, 512, 0.45, 0);
     public const double VisAgree = 0.93;
 
     public sealed record Merge(int Into, int From, double Dist, double? Vis);
@@ -82,7 +84,8 @@ public static class CastLogic
     {
         "" or "default" or "buffalo_l" or "buffalo-l" => Default,
         "yunet-sface" or "yunet+sface" or "sface" => YuNetSFace,
-        _ => throw new ArgumentException("cast.model: buffalo_l (default) or yunet-sface"),
+        "buffalo_s" or "buffalo-s" or "w600k_mbf" => BuffaloS,
+        _ => throw new ArgumentException("cast.model: buffalo_l (default), buffalo_s or yunet-sface"),
     };
 
     /// <summary>The filter before clustering: tall enough, confident, sharp and roughly frontal.</summary>

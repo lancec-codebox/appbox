@@ -8,12 +8,13 @@ namespace IndexNode;
 ///
 ///   indexnode stages run --video <id> --stages frames,sscd [--prefix index/] [--out-prefix index-test/run1/] [--threads N] [--timeout 120] [--model path]
 ///   indexnode stages run --local <dir> --video <id> --stages sscd     # <dir>/videos/<id>/... instead of blob storage
+///   cast: [--face-det path] [--face-rec path] [--face-alt path] [--threshold x] [--merge x] [--model-id name] [--out dir]  (--out: write cast/ there, not to the store)
 ///
 /// Progress goes to stderr as "<elapsed>s [stage] ...", one summary line per stage to stdout. Past --timeout seconds everything stops (exit 124).
 /// </summary>
 public static class StagesCommand
 {
-    static readonly string[] Known = ["frames", "sscd"];
+    static readonly string[] Known = ["frames", "sscd", "cast"];
 
     public static async Task<int> RunAsync(Args a)
     {
@@ -63,6 +64,22 @@ public static class StagesCommand
                             (n, b, type) => store.PutAsync(paths.Video(id, n), b, null, null, false, ct, type), ct);
                         frameSet = null;
                         Console.WriteLine($"frames: {r.Kept}/{r.Sampled} frames kept, {r.FrameBytes / 1048576.0:F1} MB, {duration:F0}s of video; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
+                        break;
+                    }
+                    case "cast":
+                    {
+                        P(stage, "fetching frames"); var fs = await FrameSet(); var shots = (await store.GetAsync(paths.Video(id, "frames/shots.json"), ct))?.Data;
+                        await Models.EnsureAllAsync([.. Models.FaceDefault, Models.ClipVision, Models.ClipText, Models.ClipTokenizer], http, ct);
+                        double D(string k, double d) => a.Get(k) is { } v ? double.Parse(v, System.Globalization.CultureInfo.InvariantCulture) : d;
+                        var cm = CastLogic.ModelFor(a.Get("model-id") ?? (a.Get("face-rec") is { } fr && fr.Contains("mbf") ? "buffalo_s" : "buffalo_l"));
+                        var cs = new CastFrames.Settings(a.Get("face-det") ?? Models.PathOf(Models.ScrfdDet, null), a.Get("face-rec") ?? Models.PathOf(Models.ArcFaceRec, null),
+                            cm.Id, D("threshold", cm.Threshold), D("merge", cm.Merge), threads, AlsoRec: a.Get("face-alt"));
+                        var outDir = a.Get("out") ?? Path.Combine(work, "cast-out");
+                        var msg = await CastFrames.RunAsync(tools, fs, shots, outDir, cs, m => P(stage, m), ct);
+                        if (a.Get("out") == null)
+                            foreach (var f in Directory.GetFiles(Path.Combine(outDir, "cast")))
+                                await store.PutAsync(paths.Video(id, "cast/" + Path.GetFileName(f)), await File.ReadAllBytesAsync(f, ct), null, null, false, ct, f.EndsWith(".json") ? "application/json" : f.EndsWith(".jpg") ? "image/jpeg" : "application/octet-stream");
+                        Console.WriteLine($"cast: {msg}; total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }
                     case "sscd":
