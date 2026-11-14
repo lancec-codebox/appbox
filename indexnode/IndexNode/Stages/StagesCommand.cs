@@ -52,7 +52,8 @@ public static class StagesCommand
                 {
                     case "frames":
                     {
-                        var videoBlob = paths.Video(id, "video.mp4"); var video = Path.Combine(work, "video.mp4");
+                        var videoBlob = a.Get("video-blob") ?? paths.Video(id, "video.mp4"); // --video-blob: a video stored elsewhere (e.g. index-test/mockup/<id>/video.mp4)
+                        var video = Path.Combine(work, "video.mp4");
                         P(stage, "fetching video.mp4");
                         var rest = store as RestStore ?? (store as RedirectStore)?.Inner as RestStore;
                         if (rest != null) await NexisAccess.PrepareAsync(rest, videoBlob, ct); // ghosted video: hydrate (or read its snapshot) first
