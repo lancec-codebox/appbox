@@ -49,7 +49,7 @@ public static class DevCommands
                 var t0 = sw.Elapsed.TotalSeconds; await set.ExtractAsync(tools, dir, ct); var t1 = sw.Elapsed.TotalSeconds;
                 byte[] rows;
                 if ((a.Get("step") ?? "sscd") == "sscd") rows = await Sscd.DescribeAsync(tools, a.Get("model") ?? await Sscd.EnsureModelAsync(cfg, http, ct), dir, set.Count, threads, _ => { }, ct);
-                else rows = await Clip.EmbedFramesAsync(tools, await Models.EnsureAsync(Models.ClipVision, http, ct), dir, set.Count, threads, _ => { }, ct);
+                else rows = await Clip.EmbedFramesAsync(tools, a.Get("model") ?? await Models.EnsureAsync(Models.ClipVision, http, ct), dir, set.Count, threads, _ => { }, ct);
                 File.WriteAllBytes(Path.Combine(outDir, (a.Get("step") ?? "sscd") + ".f16"), rows);
                 Console.WriteLine($"{a.Get("step") ?? "sscd"}: {set.Count} frames, decode {t1 - t0:F0}s, embed {sw.Elapsed.TotalSeconds - t1:F0}s");
                 break;
