@@ -104,7 +104,8 @@ from/to and picks keys are cluster ids.
     public static JsonObject ParseObject(string reply)
     {
         var s = reply.Trim(); int a = s.IndexOf('{'), b = s.LastIndexOf('}');
-        if (a < 0 || b <= a) throw new FormatException("the AI reply holds no JSON object");
+        if (AiClient.ErrorMessage(s) is { } em) throw new FormatException("the AI endpoint answered with an error: " + Redact.Sas(Trunc(em, 300)));
+        if (a < 0 || b <= a) throw new FormatException("the AI reply holds no JSON object; it starts: " + Redact.Sas(Trunc(s, 300)));
         return JsonNode.Parse(s[a..(b + 1)], null, new JsonDocumentOptions { AllowTrailingCommas = true })!.AsObject();
     }
 

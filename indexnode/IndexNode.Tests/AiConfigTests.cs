@@ -92,14 +92,14 @@ public class AiConfigTests
     {
         var fake = new Fake(LunaServer); var c = new AiClient(new HttpClient(fake), new AiConfig { BaseUrl = "http://gw/v1", VisionModel = "gpt-6-luna", TextModel = "plain" });
         Assert.Equal("red", await c.VisionAsync(default));
-        Assert.Equal(["/v1/chat/completions", "/v1/responses"], fake.Seen.Select(s => s.Path));
-        var resp = fake.Seen[1].Body;
+        Assert.Equal(["/v1/responses"], fake.Seen.Select(s => s.Path)); // gpt-* goes straight to responses in auto mode
+        var resp = fake.Seen[0].Body;
         Assert.Contains("\"input_text\"", resp); Assert.Contains("\"input_image\"", resp); Assert.Contains("data:image/png;base64,", resp);
         Assert.Equal("responses", c.ApiFor("gpt-6-luna"));
         Assert.Equal("red", await c.VisionAsync(default)); // remembered: straight to responses
-        Assert.Equal(3, fake.Seen.Count); Assert.EndsWith("/responses", fake.Seen[2].Path);
+        Assert.Equal(2, fake.Seen.Count); Assert.EndsWith("/responses", fake.Seen[1].Path);
         Assert.Equal("ok", await c.TextAsync(default)); // another model still uses chat
-        Assert.EndsWith("/chat/completions", fake.Seen[3].Path); Assert.Equal("chat", c.ApiFor("plain"));
+        Assert.EndsWith("/chat/completions", fake.Seen[2].Path); Assert.Equal("chat", c.ApiFor("plain"));
     }
 
     [Fact]

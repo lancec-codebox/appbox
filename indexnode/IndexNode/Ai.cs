@@ -38,6 +38,20 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
         return new Reply(res.IsSuccessStatusCode, (int)res.StatusCode, text);
     }
 
+    /// <summary>Output budget per call: describe replies are whole JSON documents (64 cut them off before the closing brace).</summary>
+    public const int MaxOutputTokens = 8192;
+
+    /// <summary>A body that is really an error ({"error":{...}} or {"error":"..."}): its message, else null.</summary>
+    public static string? ErrorMessage(string body)
+    {
+        try
+        {
+            if (JsonNode.Parse(body) is not JsonObject o || o["error"] is not { } e) return null;
+            return (e is JsonObject eo ? (eo["code"]?.ToString() + ": " + eo["message"]?.ToString()) : e.ToString()).Trim(' ', ':');
+        }
+        catch (JsonException) { return null; }
+    }
+
     private static InvalidOperationException Fail(Reply r) =>
         new($"{r.Status} from the AI endpoint: {Redact.Sas(r.Body.Length > 300 ? r.Body[..300] : r.Body)}");
 
@@ -67,9 +81,9 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
 
     private async Task<string> ViaChatAsync(string model, JsonNode content, CancellationToken ct, bool detectUnsupported)
     {
-        var body = new JsonObject { ["model"] = model, ["max_tokens"] = 64, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }) };
+        var body = new JsonObject { ["model"] = model, ["max_tokens"] = MaxOutputTokens, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }) };
         var r = await PostAsync("/chat/completions", body, ct);
-        if (!r.Ok) { if (detectUnsupported && IsUnsupportedApi(r.Body)) throw new UnsupportedApiException(); throw Fail(r); }
+        if (!r.Ok || ErrorMessage(r.Body) != null) { if (detectUnsupported && IsUnsupportedApi(r.Body)) throw new UnsupportedApiException(); throw Fail(r); }
         return (JsonNode.Parse(r.Body)?["choices"]?[0]?["message"]?["content"]?.GetValue<string>() ?? "").Trim();
     }
 
@@ -77,11 +91,11 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     {
         var body = new JsonObject
         {
-            ["model"] = model, ["max_output_tokens"] = 64,
+            ["model"] = model, ["max_output_tokens"] = MaxOutputTokens,
             ["input"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = ToResponsesContent(content) }),
         };
         var r = await PostAsync("/responses", body, ct);
-        if (!r.Ok) throw Fail(r);
+        if (!r.Ok || ErrorMessage(r.Body) != null) throw Fail(r);
         var root = JsonNode.Parse(r.Body);
         var sb = new StringBuilder();
         if (root?["output"] is JsonArray output)
@@ -94,6 +108,7 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     public async Task<string> ChatAsync(string model, JsonNode content, CancellationToken ct)
     {
         var mode = cfg.EffectiveApi;
+        if (mode == AiConfig.ApiAuto && !chosen.ContainsKey(model) && model.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase)) chosen[model] = AiConfig.ApiResponses; // gateway: gpt-* models answer only on /responses
         if (mode == AiConfig.ApiResponses || (mode == AiConfig.ApiAuto && chosen.GetValueOrDefault(model) == AiConfig.ApiResponses)) return await ViaResponsesAsync(model, content, ct);
         if (mode == AiConfig.ApiChat) return await ViaChatAsync(model, content, ct, false);
         try
