@@ -16,6 +16,8 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
     /// <summary>The AI steps this run cannot do for lack of an endpoint; they go under "skipped" in processed.json, they do not fail the job.</summary>
     public static string[] SkippedAiSteps(AiConfig? ai) => ai is { Configured: true } ? [] : AiSteps;
 
+    /// <summary>Every step of a fully processed video (sync is computed after transcribe + ocrsubs; clip is dropped).</summary>
+    public static readonly string[] FullSteps = ["frames", "sscd", "transcribe", "ocrsubs", "cast", "describe"];
     public static readonly string[] KnownSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "sync"];
 
     /// <summary>The outputs that make a video fully processed, per step: the node that writes the last one also writes processed.json.</summary>

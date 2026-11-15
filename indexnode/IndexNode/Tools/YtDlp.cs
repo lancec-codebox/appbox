@@ -59,6 +59,13 @@ public static class YtDlp
     public static bool IsSingleVideoUrl(string url) =>
         Regex.IsMatch(url, @"(?i)^https?://(www\.|m\.)?(youtube\.com/(watch\?|shorts/)|youtu\.be/)") && !Regex.IsMatch(url, @"[?&]list=");
 
+    /// <summary>The 11-character video id of a single-video URL (watch?v=, youtu.be/, shorts/), else null.</summary>
+    public static string? VideoId(string url)
+    {
+        var m = Regex.Match(url, @"(?:[?&]v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})");
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
     public static void Throw(string stderr)
     {
         var msg = Redact.Sas(LastErrorLine(stderr));
