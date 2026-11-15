@@ -1,5 +1,12 @@
 # IndexNode release notes
 
+## 0.7.5
+
+- **Reads hydrate Nexis ghosts.** Nexis ghosts every blob over 2 MB older than 20 min (0 bytes committed, `ghostd_state=ghost`, the data in uncommitted blocks). `RestStore` Get, conditional Get, file download and the new `GetRangeAsync` now check a 0-byte answer: a ghost is hydrated first (Nexis's `HydrateBlobAsync`: the uncommitted blocks with the `ghostd_block_prefix`, in name order, whose total must equal `ghostd_size`, else refused with nothing committed; Put Block List If-Match on the ETag, metadata kept; tags without `ghostd_*`, `archive_version=1`, `ghostd_state=active`; a 412 re-reads). One log line per hydration (`nexis: hydrated <blob>`, no SAS). A blob that really is empty comes back as it is. Fixes the 13 cast failures of 0.7.4 (empty `ocr/lines.json` ghosts).
+- **Clear errors for empty stored data.** `StoredJson` parses stored JSON (ocr/lines.json, faces.json, clusters.json, manifests, info/downloaded/shots, cand_*.json): an empty or blank body fails with "stored blob <name> is empty (0 bytes) ..." instead of a bare JsonReaderException. An empty or short `cast/faces.f16` fails the same way (it gave a NullReferenceException in `CastLogic.Diverse`).
+- **Fix: `CastLogic.Diverse` crashed (NRE) when a cluster had fewer usable faces than candidates**: the tiers repeat each other's faces, so the greedy pick ran out of unpicked faces (and could list a face twice). It now stops and never repeats.
+- cast-candidates reads frame ranges through the store, so a ghosted chunk is hydrated first.
+
 ## 0.7.4
 
 - **Fix: cast crashed with `'0' cannot be greater than -5.684341886080802E-14`** on 4 of 6 real dramas (360x640 frames). `CastStage.HeadWindow` shrinks the window to the frame with `cw *= min(fw / cw, ...)`; `cw * (fw / cw)` can land one ulp over the frame width, so the room `fw - cw` was -5.7e-14 and `Math.Clamp(v, 0, room)` throws. The window is now capped at the frame, and every window position goes through `CastStage.Within` (a room below 0 is 0); `Publish.TightWindow` uses it too.
