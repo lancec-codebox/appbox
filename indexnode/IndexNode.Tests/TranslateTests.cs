@@ -81,6 +81,40 @@ public class TranslateTests
     }
 
     [Fact]
+    public async Task A_boundary_cue_sees_the_next_batch_as_context_for_at_least_30_s_or_10_cues()
+    {
+        // dense cues: 1 s apart, so 30 s is 30 cues (more than 10)
+        var i = new TranslateInput { JobId = "j", Ocr = Zh(450, 1.0), Asr = [new ShapeCue(0, 450, "说话")] };
+        var (r, f) = await Run(i);
+        var first = f.Prompts.Single(p => p.Contains("TRANSLATE [0] "));
+        Assert.Contains("TRANSLATE [199] ", first); Assert.DoesNotContain("TRANSLATE [200] ", first);
+        Assert.Contains("CONTEXT [200] ", first); Assert.Contains("CONTEXT [229] ", first); Assert.DoesNotContain("[231] ", first);
+        var second = f.Prompts.Single(p => p.Contains("TRANSLATE [200] "));
+        Assert.Contains("CONTEXT [199] ", second); Assert.Contains("CONTEXT [170] ", second); Assert.Contains("CONTEXT [400] ", second); Assert.Contains("CONTEXT [429] ", second);
+        // each cue is translated in exactly one batch
+        for (int k = 0; k < 450; k++) Assert.Equal(1, f.Prompts.Count(p => p.Contains($"TRANSLATE [{k}] ")));
+        // sparse cues (10 s apart): ten cues reach further than 30 s
+        var sparse = new TranslateInput { JobId = "j", Ocr = Zh(450, 10.0), Asr = Zh(450, 10.0) };
+        var (_, f2) = await Run(sparse);
+        var s1 = f2.Prompts.Single(p => p.Contains("TRANSLATE [0] "));
+        Assert.Contains("CONTEXT [209] ", s1); Assert.DoesNotContain("[210] ", s1);
+    }
+
+    [Fact]
+    public async Task The_sidecar_keeps_every_cue_pair_before_shaping()
+    {
+        var f = new Fake { Override = (id, _) => id == 1 ? "A very long line that will be split into several cues when it is shaped for the screen, yes" : null };
+        var (r, _) = await Run(Input(4), f);
+        var cues = JsonNode.Parse(r.Json!)!["cues"]!.AsArray();
+        Assert.Equal(4, cues.Count);
+        Assert.Equal(3.0, cues[1]!["start"]!.GetValue<double>()); Assert.Equal(5.0, cues[1]!["end"]!.GetValue<double>());
+        Assert.Equal("你好，世界1", cues[1]!["zh"]!.GetValue<string>());
+        Assert.StartsWith("A very long line", cues[1]!["en"]!.GetValue<string>()); // before shaping: not split
+        Assert.Equal(Translate.CleanHash("你好世界1"), cues[1]!["hash"]!.GetValue<string>()); // punctuation does not change it
+        Assert.Equal(16, cues[0]!["hash"]!.GetValue<string>().Length);
+    }
+
+    [Fact]
     public async Task Every_cue_is_answered_and_a_missing_id_is_asked_again()
     {
         var f = new Fake { Override = (id, at) => id == 7 && at == 1 ? "<drop>" : id == 9 && at == 1 ? "" : null };
