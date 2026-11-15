@@ -1,5 +1,10 @@
 # IndexNode release notes
 
+## 0.8.0
+
+- **New step `thumbs`: a 36x64 thumbnail of every stored frame.** `process --job=<id> --steps thumbs` reads the stored `frames/NNNN.mjpeg` chunks (ghosts are hydrated on read, 0.7.5; older AV1 chunks are decoded) and writes, per chunk, `thumbs/NNNN.mjpeg` (whole standalone JPEGs back to back, box/area downscale, quality 75, full tables in each, about 1.3 KB each; 64x36 for a landscape frame) and `thumbs/NNNN.json` (`[[off, len], ...]`, one pair per row, the same chunks and row order as `frames/` and `sscd/`; its own index, the frames JSON is untouched), then `thumbs/manifest.json` (size, quality, chunk list; written last). A chunk file must stay under Nexis's 2 MB ghosting size: the step fails with a clear error naming the chunk if one would not. Screenshot search re-ranks the copy matcher's top 10 with them (blurred copies); the UI shows frame previews from them without rehydrating ghosts.
+- The step is in the default and full step lists (after sscd, before transcribe), `KnownSteps`, `processed.json`'s outputs and the node's step stages (needs `frames/manifest.json`); a redo of it replaces only `thumbs/`. `stages run --stages thumbs` runs it standalone too.
+
 ## 0.7.5
 
 - **Reads hydrate Nexis ghosts.** Nexis ghosts every blob over 2 MB older than 20 min (0 bytes committed, `ghostd_state=ghost`, the data in uncommitted blocks). `RestStore` Get, conditional Get, file download and the new `GetRangeAsync` now check a 0-byte answer: a ghost is hydrated first (Nexis's `HydrateBlobAsync`: the uncommitted blocks with the `ghostd_block_prefix`, in name order, whose total must equal `ghostd_size`, else refused with nothing committed; Put Block List If-Match on the ETag, metadata kept; tags without `ghostd_*`, `archive_version=1`, `ghostd_state=active`; a 412 re-reads). One log line per hydration (`nexis: hydrated <blob>`, no SAS). A blob that really is empty comes back as it is. Fixes the 13 cast failures of 0.7.4 (empty `ocr/lines.json` ghosts).
