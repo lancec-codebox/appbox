@@ -130,7 +130,7 @@ public static class StagesCommand
                         if (!StageSteps.FramesAreJpeg(fs, shots)) throw new InvalidOperationException($"{id}: cast needs the JPEG frames and frames/shots.json (run the frames stage)");
                         var duration = (await store.GetAsync(paths.Video(id, "info.json"), ct))?.Data is { } ib && System.Text.Json.Nodes.JsonNode.Parse(ib)?["duration"]?.GetValue<double>() is { } dd ? dd : 0;
                         var msg = await StageSteps.CastAsync(tools, http, fs, shots, duration, threads, work, a.Get("out") is { } od ? (n, b, _) => { var f = Path.Combine(od, n); Directory.CreateDirectory(Path.GetDirectoryName(f)!); return File.WriteAllBytesAsync(f, b, ct); } : Put,
-                            m => P(stage, m), ct, a.Get("face-det"), a.Get("face-rec"), a.Get("face-alt"));
+                            m => P(stage, m), ct, a.Get("face-det"), a.Get("face-rec"), a.Get("face-alt"), (await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct))?.Data);
                         Console.WriteLine($"cast: {msg}; total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }
