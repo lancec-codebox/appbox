@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace IndexNode;
@@ -61,12 +63,40 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         return all;
     }
 
+    public static string RequestsDir(Paths p) => $"{p.Prefix}requests/sources/";
+
+    /// <summary>
+    /// Add requests from the admin page (requests/sources/&lt;id&gt;.json, written without yt-dlp or the storage key in the browser): resolved here on the
+    /// yt-dlp node into watch jobs. A playlist is curated (its videos so far are downloaded, up to 200, and its channels followed); a channel is ingested
+    /// (its new uploads, after its first look-back, go to classification). The request is marked done (with the job id) or failed (with the error).
+    /// </summary>
+    public async Task ResolveRequestsAsync(Paths paths, CancellationToken ct)
+    {
+        foreach (var b in await store.ListAsync(RequestsDir(paths), false, false, ct))
+        {
+            if (await store.GetAsync(b.Name, ct) is not { } body || JsonNode.Parse(body.Data) is not JsonObject req || req["state"]?.ToString() != "pending") continue;
+            var url = req["url"]?.ToString() ?? "";
+            try
+            {
+                bool playlist = Sources.Classify(url)?.Kind == "playlist";
+                var job = await Sources.ResolveAsync(tools, url, "1h", ["videos"], req["followChannels"]?.GetValue<bool>() ?? playlist, playlist ? 200 : 0, 480, ct);
+                bool made = await Sources.AddAsync(store, paths, job, ct);
+                req["state"] = "done"; req["jobId"] = job.JobId; req["name"] = job.Name; req["note"] = made ? "watch job created" : "already watched";
+                Log.Info($"watch: source request {url} -> {job.JobId} ({job.Name}){(made ? "" : " (already watched)")}");
+            }
+            catch (Exception e) when (e is not OperationCanceledException) { req["state"] = "failed"; req["error"] = Redact.Sas(e.Message.Length > 300 ? e.Message[..300] : e.Message); Log.Info($"watch: source request {url} failed: {req["error"]}"); }
+            req["resolvedAt"] = Protocol.Utc(now());
+            await store.PutAsync(b.Name, JsonSerializer.SerializeToUtf8Bytes(req), null, null, false, ct);
+        }
+    }
+
     private async Task<bool> KnownAsync(Paths paths, string id, CancellationToken ct) =>
         await store.GetTagsAsync(paths.Job("download", id), ct) != null || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0;
 
     public async Task RunAsync(JobContext ctx)
     {
         var job = ctx.Job; var ct = ctx.Token; var paths = ctx.Paths;
+        await ResolveRequestsAsync(paths, ct);
         if (string.IsNullOrEmpty(job.Id) || job.Kind is not ("playlist" or "channel")) throw new PermanentFailure("watch job needs kind (playlist|channel) and id");
         var every = ParseEvery(job.Every);
         bool first = job.Seen == null;
