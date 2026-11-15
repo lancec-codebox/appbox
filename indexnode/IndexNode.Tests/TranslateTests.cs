@@ -1,0 +1,210 @@
+using System.Collections.Concurrent;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using IndexNode;
+using Xunit;
+
+namespace IndexNode.Tests;
+
+public class TranslateTests
+{
+    /// <summary>A fake model: the glossary call answers a fixed list; a translation call answers "EN&lt;id&gt;" for each TRANSLATE line (optionally dropping or breaking some on the first ask).</summary>
+    private sealed class Fake : IChat
+    {
+        public readonly ConcurrentBag<string> Prompts = [];
+        public int GlossaryCalls, BatchCalls; public int[] Asked = [];
+        public Func<int, int, string?>? Override; // (id, attempt) -> text, null: default
+        public ConcurrentDictionary<int, int> Attempts = new();
+        public Task<string> ChatAsync(string model, JsonNode content, CancellationToken ct) => throw new NotSupportedException();
+        public Task<JsonObject> JsonAsync(string model, JsonNode content, string tool, CancellationToken ct)
+        {
+            var p = content.GetValue<string>(); Prompts.Add(p);
+            if (tool == "submit_glossary")
+            {
+                Interlocked.Increment(ref GlossaryCalls);
+                return Task.FromResult(JsonNode.Parse("""{"entries":[{"zh":"霍湛","en":"Wrong Name","kind":"character"},{"zh":"嫂嫂","en":"Sister-in-law","kind":"address"},{"zh":"侯府","en":"Marquis Manor","kind":"place"}]}""")!.AsObject());
+            }
+            Interlocked.Increment(ref BatchCalls);
+            var arr = new JsonArray();
+            foreach (Match m in Regex.Matches(p, @"^TRANSLATE \[(\d+)\] ", RegexOptions.Multiline))
+            {
+                int id = int.Parse(m.Groups[1].Value); int at = Attempts.AddOrUpdate(id, 1, (_, v) => v + 1);
+                var text = Override?.Invoke(id, at) ?? "Line " + id;
+                if (text == "<drop>") continue;
+                arr.Add(new JsonObject { ["i"] = id, ["en"] = text });
+            }
+            return Task.FromResult(new JsonObject { ["cues"] = arr });
+        }
+    }
+
+    static AiConfig Ai => new() { BaseUrl = "http://x", TextModel = "m" };
+
+    static List<ShapeCue> Zh(int n, double step = 3.0, string text = "你好，世界")
+        => Enumerable.Range(0, n).Select(i => new ShapeCue(i * step, i * step + 2.0, text + i)).ToList();
+
+    static JsonObject Describe() => JsonNode.Parse("""
+        {"title":{"en":"Marquis Bride"},"synopsis":{"en":"A bride and a marquis."},
+         "cast":[{"character":{"zh":"霍湛","pinyin":"Huo Zhan","en":"Huo Zhan"},"label":{"en":"Huo Zhan, the marquis"},"roleAtStart":"male lead"}]}
+        """)!.AsObject();
+
+    static TranslateInput Input(int n, JsonObject? describe = null) => new() { JobId = "j", Ocr = Zh(n), Asr = [new ShapeCue(0, n * 3.0, "说话")], Describe = describe };
+
+    static async Task<(TranslateResult R, Fake F)> Run(TranslateInput i, Fake? f = null, byte[]? existing = null, bool force = false)
+    {
+        f ??= new Fake();
+        var r = await Translate.RunAsync(f, Ai, i, existing, force, _ => { }, default);
+        return (r, f);
+    }
+
+    [Fact]
+    public async Task Glossary_names_appear_in_every_batch_and_describe_spelling_wins()
+    {
+        var (r, f) = await Run(Input(450, Describe()));
+        Assert.Equal(3, r.Batches); // 450 cues -> 200 + 200 + 50
+        Assert.Equal(1, f.GlossaryCalls); Assert.Equal(3, f.BatchCalls); Assert.Equal(4, r.Calls);
+        var batch = f.Prompts.Where(p => p.Contains("GLOSSARY:")).ToList();
+        Assert.Equal(3, batch.Count);
+        foreach (var p in batch) { Assert.Contains("霍湛 => Huo Zhan", p); Assert.DoesNotContain("Wrong Name", p); Assert.Contains("嫂嫂 => Sister-in-law", p); Assert.Contains("A bride and a marquis.", p); }
+        Assert.DoesNotContain("Wrong Name", System.Text.Encoding.UTF8.GetString(r.Json!));
+        // the glossary prompt carries describe's English names and roles
+        var gp = f.Prompts.Single(p => p.Contains("preparing the name glossary"));
+        Assert.Contains("Huo Zhan", gp); Assert.Contains("male lead", gp);
+    }
+
+    [Fact]
+    public async Task Batches_carry_context_only_neighbours()
+    {
+        var (_, f) = await Run(Input(450));
+        var second = f.Prompts.Single(p => p.Contains("TRANSLATE [200] "));
+        Assert.Contains("CONTEXT [190] ", second); Assert.DoesNotContain("CONTEXT [189] ", second); Assert.Contains("TRANSLATE [399] ", second);
+        Assert.Contains("CONTEXT [400] ", second); Assert.Contains("CONTEXT [409] ", second); Assert.DoesNotContain("[410] ", second);
+    }
+
+    [Fact]
+    public async Task Every_cue_is_answered_and_a_missing_id_is_asked_again()
+    {
+        var f = new Fake { Override = (id, at) => id == 7 && at == 1 ? "<drop>" : id == 9 && at == 1 ? "" : null };
+        var (r, _) = await Run(Input(30), f);
+        Assert.Equal(1 + 2, r.Calls); // glossary + batch + one re-ask
+        var vtt = System.Text.Encoding.UTF8.GetString(r.Vtt!);
+        for (int i = 0; i < 30; i++) Assert.Contains("Line " + i, vtt);
+        // the re-ask names only the two bad ids
+        var re = f.Prompts.Where(p => p.Contains("TRANSLATE [7] ") && !p.Contains("TRANSLATE [0] ")).ToList();
+        Assert.Single(re); Assert.Contains("TRANSLATE [9] ", re[0]); Assert.DoesNotContain("TRANSLATE [8] ", re[0]);
+    }
+
+    [Fact]
+    public async Task Step_fails_after_two_reasks()
+    {
+        var f = new Fake { Override = (id, _) => id == 3 ? "<drop>" : null };
+        var e = await Assert.ThrowsAsync<InvalidOperationException>(() => Run(Input(10), f));
+        Assert.Contains("still has 1 cue", e.Message);
+        Assert.Equal(1 + 3, f.GlossaryCalls + f.BatchCalls); // glossary + first ask + 2 re-asks
+    }
+
+    [Fact]
+    public async Task Output_keeps_cue_times_and_is_shaped()
+    {
+        var f = new Fake { Override = (id, _) => id == 2 ? "This is a very long translated sentence that certainly does not fit in two short lines of forty two characters at all, so it has to be split by words" : null };
+        var i5 = Input(5); i5.Ocr = Zh(5, text: "这是一句很长的话需要拆开来翻译成英文字幕");
+        var (r, _) = await Run(i5, f);
+        var cues = CueShaper.ParseVtt(System.Text.Encoding.UTF8.GetString(r.Vtt!));
+        Assert.True(cues.Count > 5); // the long one was split
+        Assert.Equal(0, r.Stats!.Over6s); Assert.Equal(0, r.Stats.OverChars); Assert.Equal(0, r.Stats.Overlaps);
+        var again = CueShaper.Stats(cues); Assert.Equal(0, again.Overlaps); Assert.Equal(0, again.OverChars);
+        // cue 0 and 4 start exactly where the Chinese ones did; the split pieces of cue 2 stay within its time (6 s .. 9 s, hold up to the next start)
+        Assert.Equal(0.0, cues[0].Start, 3); Assert.Equal(12.0, cues.Single(c => c.Text.StartsWith("Line 4")).Start, 3);
+        var pieces = cues.Where(c => c.Start >= 6 && c.Start < 9).ToList(); Assert.True(pieces.Count >= 2); Assert.True(pieces[^1].End <= 9.0 + 1e-6);
+        Assert.Contains("\"over6s\": 0", System.Text.Encoding.UTF8.GetString(r.Json!));
+    }
+
+    [Fact]
+    public void Source_choice_by_coverage()
+    {
+        // speech 0-100 s; OCR covers 0-80 (80%) -> OCR
+        var asr = new[] { new ShapeCue(0, 100, "说") };
+        var good = Enumerable.Range(0, 40).Select(i => new ShapeCue(i * 2, i * 2 + 2, "字幕" + i)).ToList();
+        var a = Translate.ChooseSource(good, asr, 0);
+        Assert.Equal("ocr", a.Track); Assert.InRange(a.Coverage!.Value, 0.79, 0.85);
+        // OCR covers 0-30 -> transcript
+        var b = Translate.ChooseSource(good.Take(15).ToList(), asr, 0);
+        Assert.Equal("asr", b.Track); Assert.InRange(b.Coverage!.Value, 0.29, 0.35); Assert.Equal(asr[0].Text, b.Cues[0].Text);
+        // no OCR at all -> transcript; no transcript -> OCR
+        Assert.Equal("asr", Translate.ChooseSource([], asr, 0).Track);
+        Assert.Equal("ocr", Translate.ChooseSource(good, [], 0).Track);
+        Assert.Equal("none", Translate.ChooseSource([], [], 0).Track);
+        // the sync offset moves the OCR on the speech clock: shifted 60 s past the end it covers nothing
+        Assert.Equal("asr", Translate.ChooseSource(good, asr, 100).Track);
+        // the source keeps its own cue times and the hash follows the text
+        Assert.Equal(good[3].Start, a.Cues[3].Start);
+        Assert.NotEqual(a.Hash, Translate.ChooseSource(good.Select(c => c with { Text = c.Text + "!" }).ToList(), asr, 0).Hash);
+    }
+
+    [Fact]
+    public async Task Source_is_the_chinese_never_existing_english()
+    {
+        var f = new Fake(); var i = Input(5);
+        await Run(i, f);
+        Assert.All(f.Prompts, p => Assert.DoesNotContain("Hello, world", p));
+        Assert.Contains(f.Prompts, p => p.Contains("你好，世界0"));
+    }
+
+    [Fact]
+    public async Task Redo_only_when_source_or_glossary_seed_changes()
+    {
+        var (r1, _) = await Run(Input(20, Describe()));
+        Assert.False(r1.Skipped);
+        // same source, same describe -> skipped, no AI call
+        var f = new Fake();
+        var (r2, _) = await Run(Input(20, Describe()), f, r1.Json);
+        Assert.True(r2.Skipped); Assert.Equal(0, f.GlossaryCalls + f.BatchCalls); Assert.Equal(0, r2.Calls);
+        // --steps translate (force) redoes it
+        var (r3, f3) = await Run(Input(20, Describe()), null, r1.Json, force: true);
+        Assert.False(r3.Skipped); Assert.Equal(1, f3.GlossaryCalls);
+        // changed source text -> redone
+        var changed = Input(20, Describe()); changed.Ocr = changed.Ocr.Select((c, k) => k == 5 ? c with { Text = "完全不同" } : c).ToList();
+        Assert.False((await Run(changed, null, r1.Json)).R.Skipped);
+        // changed describe names -> redone
+        var d2 = Describe(); d2["cast"]![0]!["character"]!["en"] = "Zhan Huo";
+        Assert.False((await Run(Input(20, d2), null, r1.Json)).R.Skipped);
+        // garbage sidecar -> redone
+        Assert.False((await Run(Input(20), null, "nope"u8.ToArray())).R.Skipped);
+    }
+
+    [Fact]
+    public async Task Sidecar_records_what_was_used_and_no_describe_still_works()
+    {
+        var (r, _) = await Run(Input(10));
+        var j = JsonNode.Parse(r.Json!)!;
+        Assert.Equal("ocr", j["sourceTrack"]!.GetValue<string>()); Assert.Equal("m", j["model"]!.GetValue<string>());
+        Assert.NotNull(j["glossaryHash"]); Assert.NotNull(j["sourceHash"]); Assert.Equal(1, j["batches"]!.GetValue<int>()); Assert.Equal(2, j["aiCalls"]!.GetValue<int>());
+        Assert.False(j["describeUsed"]!.GetValue<bool>()); Assert.Equal(10, j["shape"]!["cues"]!.GetValue<int>());
+        Assert.True(j["glossary"]!.AsArray().Count == 3);
+    }
+
+    [Fact]
+    public void Accept_rules()
+    {
+        Assert.Equal("", Translate.Accept("（音乐）", "", out _));
+        Assert.Null(Translate.Accept("你好吗", "", out var why)); Assert.Equal("empty", why);
+        Assert.Equal("Hello there", Translate.Accept("你好", "Hello [softly] there", out _));
+        Assert.Null(Translate.Accept("你好", "你好", out _));
+    }
+
+    [Fact]
+    public async Task Gather_reads_the_job_folder()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "tr-" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, "ocr")); Directory.CreateDirectory(Path.Combine(dir, "asr"));
+            File.WriteAllText(Path.Combine(dir, "ocr", "subs.zh-Hans.vtt"), "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n你好\n");
+            File.WriteAllText(Path.Combine(dir, "ocr", "subs.en.vtt"), "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nHello\n");
+            File.WriteAllText(Path.Combine(dir, "asr", "sensevoice.zh.json"), """{"segments":[{"start":1,"end":3,"text":"你好"}]}""");
+            File.WriteAllText(Path.Combine(dir, "sync.json"), """{"offset":0.4}""");
+            var i = await Translate.GatherAsync(new LocalJob(dir, "j"), default);
+            Assert.Single(i.Ocr); Assert.Equal("你好", i.Ocr[0].Text); Assert.Single(i.Asr); Assert.Equal(0.4, i.SyncOffset); Assert.Null(i.Describe);
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+}
