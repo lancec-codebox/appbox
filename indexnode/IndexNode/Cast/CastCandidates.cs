@@ -66,7 +66,7 @@ public static class CastCandidates
         if (a.Get("local") is { } local) { store = new LocalStore(Path.GetFullPath(local)); paths = new Paths(""); }
         else { store = new RestStore(http, cfg.Sas); paths = new Paths(a.Get("prefix") ?? "index/"); }
         bool write = a.Has("write"); var outDir = a.Get("out") ?? Path.Combine(Path.GetTempPath(), "cast-candidates", id);
-        async Task<byte[]?> Read(string f) => (await store.GetAsync(paths.Video(id, f), ct))?.Data;
+        async Task<byte[]?> Read(string f) => await FrameChunks.ReadAsync(store, paths.Video(id, f), ct, f.EndsWith(".json") && !f.StartsWith("cast/") && !f.StartsWith("ocr/") ? false : true); // large blobs may be ghosts: hydrated first
         var facesDoc = JsonNode.Parse(await Read("cast/faces.json") ?? throw new InvalidOperationException($"{id}: no cast/faces.json (run cast)")) as JsonObject ?? throw new InvalidOperationException("faces.json");
         var clustersDoc = JsonNode.Parse(await Read("cast/clusters.json") ?? throw new InvalidOperationException($"{id}: no cast/clusters.json"))!.AsObject();
         int fw = facesDoc["source"]?["width"]?.GetValue<int>() ?? 360, fh = facesDoc["source"]?["height"]?.GetValue<int>() ?? 640;
@@ -79,13 +79,26 @@ public static class CastCandidates
 
         // the stored frames (one per shot) and the small detector
         var work = Path.Combine(Path.GetTempPath(), "cast-candidates-frames", id);
-        var fs = await FrameChunks.DownloadAsync(store, paths, id, "frames", work, ct) ?? throw new InvalidOperationException($"{id}: no frames/");
+        // only the manifest and chunk indexes come down; the frames the candidates need are read by byte range (a few hundred of about 8,000), after the ghost chunks are hydrated
+        Directory.CreateDirectory(work);
+        var man = await Read("frames/manifest.json") ?? throw new InvalidOperationException($"{id}: no frames/");
+        await File.WriteAllBytesAsync(Path.Combine(work, "manifest.json"), man, ct);
+        foreach (var c in JsonDocument.Parse(man).RootElement.GetProperty("chunks").EnumerateArray()) { var n = c.GetProperty("chunk").GetString()!; await File.WriteAllBytesAsync(Path.Combine(work, n + ".json"), await Read($"frames/{n}.json") ?? throw new InvalidOperationException($"{id}: frames/{n}.json is missing"), ct); }
+        var fs = ChunkDir.Open(work); var rest = store as RestStore; var hydrated = new HashSet<string>();
         var (detPath, _) = await Models.EnsureBuffaloSAsync(http, ct);
         using var det = new Scrfd(detPath, Math.Max(1, a.Get("threads") is { } th ? int.Parse(th) : Environment.ProcessorCount));
         var rowOf = new Dictionary<double, (ChunkInfo C, ChunkFrame F)>();
         foreach (var c in fs.Chunks) foreach (var f in c.Frames) rowOf[Math.Round(f.T, 3)] = (c, f);
         var handles = new Dictionary<string, byte[]>();
-        byte[] FrameJpeg(double t) { var (c, f) = rowOf[Math.Round(t, 3)]; var file = fs.ChunkFile(c); using var h = File.OpenHandle(file); var b = new byte[f.Len]; RandomAccess.Read(h, b, f.Off); return b; }
+        byte[] FrameJpeg(double t)
+        {
+            var (c, f) = rowOf[Math.Round(t, 3)]; var name = paths.Video(id, $"frames/{c.Chunk}.mjpeg");
+            if (rest == null) { var all = store.GetAsync(name, ct).GetAwaiter().GetResult()!.Data; return all.AsSpan((int)f.Off, f.Len).ToArray(); }
+            if (hydrated.Add(name)) NexisAccess.PrepareAsync(rest, name, ct).GetAwaiter().GetResult();
+            using var req = new HttpRequestMessage(HttpMethod.Get, rest.BlobUri(name)); req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(f.Off, f.Off + f.Len - 1);
+            using var r = http.SendAsync(req, ct).GetAwaiter().GetResult(); r.EnsureSuccessStatusCode();
+            return r.Content.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
+        }
         Rgb? last = null; double lastT = double.NaN;
         var (matched, unmatched, dropped) = Annotate(pool, t => { var im = Imaging.DecodeJpeg(FrameJpeg(t)); return (det.Detect(im), im); }, fh);
         Console.Error.WriteLine($"landmarks: {matched} matched, {unmatched} without a detection, {dropped} now fail the filter (pitch)");
