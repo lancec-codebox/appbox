@@ -31,6 +31,7 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint(path)) { Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json") };
         if (!string.IsNullOrEmpty(cfg.Key)) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cfg.Key);
+        if (!string.IsNullOrEmpty(cfg.SessionId)) req.Headers.TryAddWithoutValidation("x-session-id", cfg.SessionId);
         Counters.Add(Traffic.AiOut, req.Content!.Headers.ContentLength ?? 0);
         using var res = await http.SendAsync(req, ct);
         var text = await res.Content.ReadAsStringAsync(ct);

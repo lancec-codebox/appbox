@@ -169,6 +169,8 @@ public sealed class AiConfig
     public string? VisionModel { get; set; }
     /// <summary>"chat", "responses" or "auto" (the default: chat, and on unsupported_api_for_model one retry on Responses).</summary>
     public string? Api { get; set; }
+    /// <summary>Sent as x-session-id, so a gateway that groups calls into sessions (hexad) keeps a whole run in one session instead of one per conversation.</summary>
+    public string? SessionId { get; set; }
 
     public const string ApiChat = "chat", ApiResponses = "responses", ApiAuto = "auto";
     public static bool ValidApi(string? v) => v is null or ApiChat or ApiResponses or ApiAuto;
@@ -187,11 +189,12 @@ public sealed class AiConfig
             TextModel = Pick(flag("ai-text-model"), env("INDEXNODE_AI_TEXT_MODEL"), file?.TextModel),
             VisionModel = Pick(flag("ai-vision-model"), env("INDEXNODE_AI_VISION_MODEL"), file?.VisionModel),
             Api = Pick(flag("ai-api"), env("INDEXNODE_AI_API"), file?.Api)?.ToLowerInvariant(),
+            SessionId = Pick(flag("ai-session-id"), env("INDEXNODE_AI_SESSION_ID"), file?.SessionId),
         };
     }
 
     /// <summary>One-line description that never contains the key.</summary>
-    public string Describe() => $"base-url={BaseUrl ?? "(none)"} text-model={TextModel ?? "(none)"} vision-model={VisionModel ?? "(none)"} api={EffectiveApi} key={(string.IsNullOrEmpty(Key) ? "(none)" : "set")}";
+    public string Describe() => $"base-url={BaseUrl ?? "(none)"} text-model={TextModel ?? "(none)"} vision-model={VisionModel ?? "(none)"} api={EffectiveApi} session-id={SessionId ?? "(none)"} key={(string.IsNullOrEmpty(Key) ? "(none)" : "set")}";
 }
 
 public sealed class YtDlpConfig
