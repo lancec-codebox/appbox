@@ -266,6 +266,28 @@ public class CoverTests
     }
 
     [Fact]
+    public void Not_introduced_with_the_same_line_as_description_falls_back_to_label_then_role()
+    {
+        // 24FQCFLd7K8 c2: roleAtStart and description both "Not introduced in the opening scenes.", label "Not yet introduced"
+        var c = System.Text.Json.Nodes.JsonNode.Parse("""{"cluster":2,"role":"male lead","roleAtStart":"Not introduced in the opening scenes.","description":"Not introduced in the opening scenes.","label":{"en":"Not yet introduced"}}""")!.AsObject();
+        Assert.Equal("One of the leads.", (string)Publish.SafeRoleAtStart(c, out var rep)!); Assert.True(rep);
+        c["label"] = System.Text.Json.Nodes.JsonNode.Parse("""{"en":"Chancellor Jiang"}""");
+        Assert.Equal("Chancellor Jiang", (string)Publish.SafeRoleAtStart(c, out _)!);
+        c["description"] = "A powerful chief minister.";
+        Assert.Equal("A powerful chief minister.", (string)Publish.SafeRoleAtStart(c, out _)!);
+        c["roleAtStart"] = "The prince's friend.";
+        Assert.Equal("The prince's friend.", (string)Publish.SafeRoleAtStart(c, out rep)!); Assert.False(rep);
+    }
+
+    [Fact]
+    public void Drama_json_never_keeps_a_not_introduced_line_even_when_the_description_says_it_too()
+    {
+        var d = System.Text.Json.Nodes.JsonNode.Parse("""{"cutoffSeconds":10,"title":{"en":"t"},"fullTitle":{"en":"t"},"teaser":{"en":"t"},"synopsis":{"en":"s"},"tags":[],"cast":[{"cluster":2,"role":"male lead","roleAtStart":"Not introduced in the opening scenes.","description":"Not introduced in the opening scenes.","label":{"en":"Not yet introduced"}}],"relations":[]}""")!.AsObject();
+        var o = Publish.BuildDrama(d, null, null, null, null, "j", "transcript", false, new Dictionary<int, List<(string, double, bool)>>(), "t");
+        Assert.DoesNotContain("introduced", (string)o["cast"]![0]!["roleAtStart"]!);
+    }
+
+    [Fact]
     public void Score_floor_comes_before_the_solo_and_subtitle_tiers()
     {
         // 0: alone, clean, scores 2;  1: crowded two-shot, scores 9;  2: alone with a subtitle, scores 7
