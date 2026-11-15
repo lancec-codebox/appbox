@@ -1,5 +1,11 @@
 # IndexNode release notes
 
+## 0.7.3
+
+- **Subtitles never rule out a candidate or portrait.** Only a subtitle that overlaps the face box counts against a frame (and only as a last tier). `CastLogic.Diverse` and publish's re-pick lose the "no subtitle" tier: they keep alone, then any frame. A band elsewhere on the frame is cropped out by the portrait and cover windows (they move or shrink above the band, never pad).
+- **Pitch and eye visibility in the face quality.** `FaceMath.Pitch` (nose between the eye line and the mouth line, along the face's own vertical) and `FaceMath.EyeEnergy` (gradient energy in small patches around the eye landmarks) join `QualityOf` (pitch .15, eyes .10; size .28, detector .20, sharpness .17, yaw .10) and `Passes` (|pitch| at most .25). On Pei Zimo (24FQCFLd7K8) #4 and #7 now fail, #1 stays frontal.
+- **cast stores the landmarks.** faces.json carries pitch, eyes and the 5 landmarks per face, cand_*.json pitch and eyes.
+- **`indexnode cast-candidates --job <id> [--dry] [--write] [--out <dir>] [--clusters 1,2]`** rebuilds the 12 candidates of existing dramas from the stored faces, embeddings and frames (the detector runs again on the main characters' frames to get landmarks). Touches only cast's candidate files. Re-run describe afterwards: its expression scores are by candidate index.
 ## 0.7.2
 
 - **Translate**: one unusable cue no longer fails a drama (the model's last non-empty answer is kept, else the cue stays untranslated; en.json has `unresolved` and `unresolvedCues`; more than 2% unresolved fails); a wholly unusable batch is retried split in halves, then quarters, and the model's actual reply is logged; a Latin word longer than a line is cut so shaping never leaves an over-long line (the "shaping left" check was right: it was the character limit, the message's first count was just 0).
