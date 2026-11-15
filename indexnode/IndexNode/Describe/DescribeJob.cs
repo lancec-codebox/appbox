@@ -4,8 +4,11 @@ using System.Text.Json.Nodes;
 namespace IndexNode;
 
 /// <summary>Gathers a job's inputs (text track, description, thumbnail, cast sheets, credits) and runs or dries the describe step.</summary>
-public static class DescribeJob
+public static partial class DescribeJob
 {
+    [System.Text.RegularExpressions.GeneratedRegex(@"(?i)\bA\.?I\b|人工智能|AI生成|AI做|AI制作|AI换脸|generated|deepfake|computer.?generated")]
+    private static partial System.Text.RegularExpressions.Regex AiMention();
+
     /// <summary>Writes the files the vision call needs to <paramref name="work"/> and builds the input.</summary>
     public static async Task<DescribeInput> GatherAsync(IJobSource src, string work, CancellationToken ct)
     {
@@ -30,8 +33,15 @@ public static class DescribeJob
         string? ps = null; int pn = 0;
         bool framesCast = (await J("cast/clusters.json") as JsonObject)?["source"] != null; // the frame-based cast has no two-shot posters (dropped): never pick up an older run's sheet
         if (!framesCast && await src.ReadAsync("cast/poster_sheet.jpg", ct) is { } pb) { ps = Path.Combine(work, "poster_sheet.jpg"); File.WriteAllBytes(ps, pb); pn = (await J("cast/poster_cands.json") as JsonArray)?.Count(x => x?["shortlist"]?.GetValue<bool>() ?? true) ?? 0; }
+        // viewer comments that mention AI: a hint for aiGenerated (the newest comments snapshot, at most 8, each shortened)
+        var aiComments = new List<string>();
+        var snaps = (await src.ListAsync("comments", ct)).Where(f => f.EndsWith(".json")).Order().ToList();
+        if (snaps.Count > 0 && await J(snaps[^1]) is JsonObject cj2)
+            foreach (var c in ((cj2["comments"] as JsonArray) ?? []).OfType<JsonObject>())
+                if (c["text"]?.ToString() is { Length: > 0 } t && AiMention().IsMatch(t)) { aiComments.Add(t.Length > 200 ? t[..200] + "..." : t); if (aiComments.Count == 8) break; }
         return new DescribeInput
         {
+            AiComments = aiComments,
             JobId = src.JobId, Title = info?["title"]?.GetValue<string>() ?? "", Description = desc, Duration = dur, TextSource = ocr.Count > 0 ? "burned-in OCR" : "transcript",
             Cues = cues, Credits = credits, Clusters = clusters, Thumb = thumb, Sheets = sheets, PosterSheet = ps, PosterCount = pn,
         };
