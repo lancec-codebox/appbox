@@ -125,6 +125,72 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
         }
     }
 
+    // ---- JSON answers as a forced tool call: the model hands its JSON over as the tool's arguments (no prose, no fences, one object) ----
+    private readonly ConcurrentDictionary<string, bool> noTools = new();
+    private sealed class ToolsUnsupportedException(string m) : Exception(m);
+    const string ToolNote = "Submit your answer: the complete JSON object the instructions ask for, as this function's arguments.";
+    static JsonObject Params() => new() { ["type"] = "object", ["properties"] = new JsonObject(), ["additionalProperties"] = true };
+
+    static bool ToolsRefused(string body) => body.Contains("tool", StringComparison.OrdinalIgnoreCase) && !body.Contains("content_filter", StringComparison.OrdinalIgnoreCase);
+    static string Head(string s) => Redact.Sas(s.Length > 200 ? s[..200] : s);
+
+    /// <summary>One forced tool call: the arguments as JSON text, or (when the model answered in text anyway) that text.</summary>
+    private async Task<string> ToolCallAsync(string model, JsonNode content, string tool, CancellationToken ct)
+    {
+        bool responses = cfg.EffectiveApi == AiConfig.ApiResponses || (cfg.EffectiveApi == AiConfig.ApiAuto && (chosen.GetValueOrDefault(model) == AiConfig.ApiResponses || model.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase)));
+        if (responses)
+        {
+            var body = new JsonObject
+            {
+                ["model"] = model, ["max_output_tokens"] = MaxOutputTokens,
+                ["input"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = ToResponsesContent(content) }),
+                ["tools"] = new JsonArray(new JsonObject { ["type"] = "function", ["name"] = tool, ["description"] = ToolNote, ["parameters"] = Params() }),
+                ["tool_choice"] = new JsonObject { ["type"] = "function", ["name"] = tool },
+            };
+            var r = await PostAsync("/responses", body, ct);
+            if (!r.Ok || ErrorMessage(r.Body) != null) { if (ToolsRefused(r.Body)) throw new ToolsUnsupportedException(Head(r.Body)); throw Fail(r); }
+            var root = JsonNode.Parse(r.Body); var text = new StringBuilder();
+            foreach (var item in (root?["output"] as JsonArray) ?? [])
+            {
+                if (item?["type"]?.GetValue<string>() == "function_call" && item["arguments"]?.GetValue<string>() is { } a) return a;
+                if (item?["content"] is JsonArray cs) foreach (var c in cs) if (c?["text"]?.GetValue<string>() is { } t) text.Append(t);
+            }
+            return text.ToString();
+        }
+        else
+        {
+            var body = new JsonObject
+            {
+                ["model"] = model, ["max_tokens"] = MaxOutputTokens, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }),
+                ["tools"] = new JsonArray(new JsonObject { ["type"] = "function", ["function"] = new JsonObject { ["name"] = tool, ["description"] = ToolNote, ["parameters"] = Params() } }),
+                ["tool_choice"] = new JsonObject { ["type"] = "function", ["function"] = new JsonObject { ["name"] = tool } },
+            };
+            var r = await PostAsync("/chat/completions", body, ct);
+            if (!r.Ok || ErrorMessage(r.Body) != null) { if (ToolsRefused(r.Body) || IsUnsupportedApi(r.Body)) throw new ToolsUnsupportedException(Head(r.Body)); throw Fail(r); }
+            var msg = JsonNode.Parse(r.Body)?["choices"]?[0]?["message"];
+            if (msg?["tool_calls"]?[0]?["function"]?["arguments"]?.GetValue<string>() is { } a) return a;
+            return msg?["content"]?.GetValue<string>() ?? "";
+        }
+    }
+
+    /// <summary>A JSON-object answer as a forced tool call, retried with the parse error passed back; a model or endpoint that refuses tools falls back to text replies (also retried).</summary>
+    public async Task<JsonObject> JsonAsync(string model, JsonNode content, string tool, CancellationToken ct)
+    {
+        if (!noTools.ContainsKey(model))
+        {
+            string? last = null; Exception? err = null;
+            for (int k = 0; k <= AiJson.Retries; k++)
+            {
+                try { last = await ToolCallAsync(model, k == 0 ? content : AiJson.WithError(content, last!, err!.Message), tool, ct); }
+                catch (ToolsUnsupportedException e) { noTools[model] = true; Log.Info($"ai {model}: tool calls refused ({e.Message}); using text replies"); break; }
+                try { return Describe.ParseObject(last); }
+                catch (Exception e) when (e is JsonException or FormatException) { err = e; Log.Info($"ai {model}: {tool} answer {k + 1} did not parse ({AiJson.Short(e.Message)}); {(k < AiJson.Retries ? "asking again with the error" : "giving up")}"); }
+            }
+            if (!noTools.ContainsKey(model)) throw new FormatException($"the AI answer did not parse after {AiJson.Retries + 1} tries: {err!.Message}");
+        }
+        return await AiJson.ViaTextAsync(this, model, content, ct);
+    }
+
     public Task<string> TextAsync(CancellationToken ct) => ChatAsync(cfg.TextModel!, JsonValue.Create("Reply with the single word: ok"), ct);
 
     public Task<string> VisionAsync(CancellationToken ct) => ChatAsync(cfg.VisionModel!, new JsonArray(
