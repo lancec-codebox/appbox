@@ -15,3 +15,5 @@ Everything since 0.7.0 (the 0.7 stages pipeline):
 - **The translate step**: our own English subtitles (glossary call, batched translation with context across batches, shaped, published as the default English track; existing English stays as the "original English" track).
 - **A redo does not rewrite processed.json.**
 - GPU publish step is one command again (line breaks instead of literal \n).
+
+- **One person per portrait and cover**: a frame is used for a character's portrait or a lead cover only if no other detected face in it is larger than 25% of that character's face area (cast/faces.json, no cast rerun). A solo frame beats a crowded one even from a later window (up to the 75% limit). With no solo frame, today's choice is kept and cut tight so the other faces fall outside the crop.
