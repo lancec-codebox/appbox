@@ -136,10 +136,33 @@ public static partial class Translate
         return (sb.ToString(), fixedNames);
     }
 
+    /// <summary>describe's relations as lines: "Huo Zhan (the marquis) -[spouse]-> Su Wan (his bride): husband and wife [REVEAL]"; from and to are cast clusters, named by character label (else English name). Reveals (spoiler true) are kept: the translators need them.</summary>
+    public static string Relations(JsonObject? d)
+    {
+        if (d == null) return "";
+        var names = new Dictionary<int, string>();
+        foreach (var c in (d["cast"] as JsonArray) ?? [])
+        {
+            if (c is not JsonObject co || co["cluster"] is not JsonValue cv || !cv.TryGetValue<int>(out var id)) continue;
+            string label = (co["label"] as JsonObject)?["en"]?.GetValue<string>()?.Trim() ?? co["label"]?.ToString().Trim() ?? "", en = (co["character"] as JsonObject)?["en"]?.GetValue<string>()?.Trim() ?? "";
+            names[id] = label.Length > 0 ? label : en.Length > 0 ? en : "cluster " + id;
+        }
+        string N(JsonNode? n) => n is JsonValue v && v.TryGetValue<int>(out var i) ? names.GetValueOrDefault(i, "cluster " + i) : n?.ToString() ?? "?";
+        var sb = new StringBuilder();
+        foreach (var r in (d["relations"] as JsonArray) ?? [])
+        {
+            if (r is not JsonObject ro) continue;
+            string label = (ro["label"] as JsonObject)?["en"]?.GetValue<string>()?.Trim() ?? ro["label"]?.ToString().Trim() ?? "";
+            bool reveal = ro["spoiler"] is JsonValue sv && sv.TryGetValue<bool>(out var b) && b;
+            sb.Append("- ").Append(N(ro["from"])).Append(" -[").Append(ro["type"]?.ToString()).Append("]-> ").Append(N(ro["to"])).Append(label.Length > 0 ? ": " + label : "").Append(reveal ? " [REVEAL]" : "").Append('\n');
+        }
+        return sb.ToString();
+    }
+
     static string SynopsisOf(JsonObject? d) => d?["synopsis"]?["en"]?.GetValue<string>()?.Trim() ?? "";
 
     public static string SeedHash(JsonObject? describe) =>
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(PromptVersion + "\n" + Seed(describe).Text + "\n" + SynopsisOf(describe)))).ToLowerInvariant()[..16];
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(PromptVersion + "\n" + Seed(describe).Text + "\n" + SynopsisOf(describe) + "\n" + Relations(describe)))).ToLowerInvariant()[..16];
 
     public static string GlossaryHash(IReadOnlyList<GlossaryEntry> g) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', g.OrderBy(e => e.Zh, StringComparer.Ordinal).Select(e => $"{e.Kind}\t{e.Zh}\t{e.En}")))))
@@ -155,7 +178,11 @@ public static partial class Translate
         return string.Join('\n', res);
     }
 
-    static string GlossaryPrompt(string seed, string synopsis, string script) => $$"""
+    static string GlossaryPrompt(string seed, string synopsis, string script, bool wantPlot)
+    {
+        var plotLine = wantPlot ? "Also write \"plot\": a short PRIVATE plot summary of the whole drama, end to end, about 100 to 150 words in English, spoilers allowed: who the main characters are (use the glossary spellings), how they relate (spouse, sibling, master and servant, rank) and any hidden identity or reveal that changes how people address each other. It is only a briefing for the translators." : "";
+        var shape = wantPlot ? "{\"plot\":\"\",\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\"}]}" : "{\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\"}]}";
+        return $$"""
         You are preparing the name glossary for the English subtitles of a Chinese drama. Read the whole Chinese script below and list every proper name and recurring form of address that must be rendered the same way in every line.
 
         Include:
@@ -172,18 +199,19 @@ public static partial class Translate
         Characters:
         {{(seed.Length > 0 ? seed : "(none)")}}
 
-        Also write "plot": a PRIVATE plot summary of the whole drama, end to end, 150 to 250 words in English, spoilers allowed. It is only a briefing for the translators: say who the main characters are (use the glossary spellings), how they relate (spouse, sibling, master and servant, rank), and any identity reveals or hidden identities that change how people address each other, and when.
+        {{plotLine}}
 
-        Answer with ONE JSON object: {"plot":"","entries":[{"zh":"","en":"","kind":"character"}]}
+        Answer with ONE JSON object: {{shape}}
 
         CHINESE SCRIPT (one subtitle cue per line):
         {{script}}
         """;
+    }
 
     public static async Task<GlossaryResult> BuildGlossaryAsync(IChat chat, string model, TranslateSource src, JsonObject? describe, CancellationToken ct)
     {
         var (seed, fixedNames) = Seed(describe);
-        var o = await chat.JsonAsync(model, JsonValue.Create(GlossaryPrompt(seed, SynopsisOf(describe), Script(src.Cues)))!, "submit_glossary", ct);
+        var o = await chat.JsonAsync(model, JsonValue.Create(GlossaryPrompt(seed, SynopsisOf(describe), Script(src.Cues), describe == null))!, "submit_glossary", ct);
         var map = new Dictionary<string, GlossaryEntry>(StringComparer.Ordinal);
         var arr = o["entries"] as JsonArray ?? o.Select(kv => kv.Value).OfType<JsonArray>().FirstOrDefault() ?? [];
         foreach (var e in arr.OfType<JsonObject>())
@@ -195,7 +223,7 @@ public static partial class Translate
         }
         // describe's spellings win for its characters, whatever the model wrote
         foreach (var f in fixedNames) map[f.Zh] = f;
-        var plot = Regex.Replace(o["plot"]?.ToString() ?? "", @"\s+", " ").Trim();
+        var plot = describe == null ? Regex.Replace(o["plot"]?.ToString() ?? "", @"\s+", " ").Trim() : "";
         return new GlossaryResult(map.Values.OrderBy(e => e.Kind, StringComparer.Ordinal).ThenBy(e => e.Zh, StringComparer.Ordinal).ToList(), plot);
     }
 
@@ -206,7 +234,7 @@ public static partial class Translate
     static string GlossaryText(IReadOnlyList<GlossaryEntry> g) =>
         g.Count == 0 ? "(none)" : string.Join('\n', g.Select(e => $"{e.Zh} => {e.En} [{e.Kind}]"));
 
-    static string BatchPrompt(IReadOnlyList<ShapeCue> cues, IReadOnlyList<(int Id, bool Ask)> window, IReadOnlyDictionary<int, string> known, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string plot, string title)
+    static string BatchPrompt(IReadOnlyList<ShapeCue> cues, IReadOnlyList<(int Id, bool Ask)> window, IReadOnlyDictionary<int, string> known, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string relations, string plot, string title)
     {
         var sb = new StringBuilder();
         sb.Append("""
@@ -222,8 +250,10 @@ public static partial class Translate
 
             """);
         if (title.Length > 0) sb.Append("Drama: ").Append(title).Append('\n');
-        sb.Append("Synopsis (public): ").Append(synopsis.Length > 0 ? synopsis : "(none)")
-          .Append("\n\nPlot of the whole drama (private briefing, spoilers; use it to get relations and forms of address right, never to add words): ").Append(plot.Length > 0 ? plot : "(none)").Append("\n\nGLOSSARY:\n").Append(GlossaryText(glossary)).Append("\n\nSCRIPT:\n");
+        if (synopsis.Length > 0) sb.Append("The whole story, with the ending (spoilers; a briefing only, never add words from it): ").Append(synopsis).Append("\n\n");
+        if (relations.Length > 0) sb.Append("Relations between the characters ([REVEAL] = hidden until later in the story; use it to know who is who and how they address each other, and keep the speaker's current knowledge):\n").Append(relations).Append('\n');
+        if (plot.Length > 0) sb.Append("Plot of the whole drama (a short briefing, spoilers; never add words from it): ").Append(plot).Append("\n\n");
+        sb.Append("GLOSSARY:\n").Append(GlossaryText(glossary)).Append("\n\nSCRIPT:\n");
         foreach (var (id, ask) in window)
         {
             sb.Append(ask ? "TRANSLATE " : "CONTEXT ").Append('[').Append(id).Append("] ").Append(cues[id].Text);
@@ -289,7 +319,7 @@ public static partial class Translate
         return keep.Select(i => (i, set.Contains(i))).ToList();
     }
 
-    static async Task TranslateBatchAsync(IChat chat, string model, IReadOnlyList<ShapeCue> cues, int from, int to, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string plot, string title,
+    static async Task TranslateBatchAsync(IChat chat, string model, IReadOnlyList<ShapeCue> cues, int from, int to, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string relations, string plot, string title,
         string?[] result, Counter counter, int batchNo, int batches, Action<string> progress, CancellationToken ct)
     {
         var pending = Enumerable.Range(from, to - from).ToList(); var known = new Dictionary<int, string>(); string lastWhy = "";
@@ -298,7 +328,7 @@ public static partial class Translate
             // first ask: the batch with ~10 cues of context on each side; a re-ask: only the bad ids, each with a few neighbours and the English already accepted
             var window = attempt == 0 ? Window(cues, pending, ContextCues, ContextSeconds) : Window(cues, pending, 4, 10);
             var known2 = attempt == 0 ? new Dictionary<int, string>() : known;
-            var prompt = BatchPrompt(cues, window, known2, glossary, synopsis, plot, title);
+            var prompt = BatchPrompt(cues, window, known2, glossary, synopsis, relations, plot, title);
             Interlocked.Increment(ref counter.Calls);
             try
             {
@@ -353,14 +383,14 @@ public static partial class Translate
         var gHash = GlossaryHash(glossary);
         progress($"glossary: {glossary.Count} entries (version {gHash}); plot summary {plot.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length} words");
 
-        var synopsis = SynopsisOf(input.Describe); var title = input.Describe?["title"]?["en"]?.GetValue<string>() ?? "";
+        var synopsis = SynopsisOf(input.Describe); var relations = Relations(input.Describe); var title = input.Describe?["title"]?["en"]?.GetValue<string>() ?? "";
         var cues = src.Cues; int batches = (cues.Count + BatchCues - 1) / BatchCues;
         var en = new string?[cues.Count]; var gate = new SemaphoreSlim(Parallelism); var lockObj = new object(); int done = 0;
         void P(string m) { lock (lockObj) progress(m); }
         var tasks = Enumerable.Range(0, batches).Select(async b =>
         {
             await gate.WaitAsync(ct);
-            try { await TranslateBatchAsync(chat, model, cues, b * BatchCues, Math.Min(cues.Count, (b + 1) * BatchCues), glossary, synopsis, plot, title, en, counter, b + 1, batches, P, ct); Interlocked.Increment(ref done); }
+            try { await TranslateBatchAsync(chat, model, cues, b * BatchCues, Math.Min(cues.Count, (b + 1) * BatchCues), glossary, synopsis, relations, plot, title, en, counter, b + 1, batches, P, ct); Interlocked.Increment(ref done); }
             finally { gate.Release(); }
         }).ToList();
         await Task.WhenAll(tasks);
@@ -375,7 +405,7 @@ public static partial class Translate
         var json = JsonSerializer.SerializeToUtf8Bytes(new
         {
             v = 1, promptVersion = PromptVersion, model, api = ai2?.ApiFor(model) ?? ai.EffectiveApi,
-            plot, glossaryHash = gHash, glossarySeedHash = seedHash, glossary = glossary.Select(g => new { zh = g.Zh, en = g.En, kind = g.Kind }),
+            briefing = input.Describe != null ? "describe" : "glossary-call", plot = plot.Length > 0 ? plot : null, glossaryHash = gHash, glossarySeedHash = seedHash, glossary = glossary.Select(g => new { zh = g.Zh, en = g.En, kind = g.Kind }),
             sourceTrack = src.Track, sourceHash = src.Hash, coverage = src.Coverage, speechSeconds = src.SpeechSeconds, sourceCues = cues.Count, syncOffset = input.SyncOffset,
             describeUsed = input.Describe != null,
             // the pairs before shaping, for reuse by time alignment: start, end, Chinese, hash of its letters and digits, our English ("" for non-speech)
