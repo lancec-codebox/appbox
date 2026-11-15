@@ -198,6 +198,25 @@ from/to and picks keys are cluster ids.
         }
     }
 
+    /// <summary>A text field of a model answer: a string, or the "en"/"text" of an object ("The node must be of type 'JsonValue'" came from reading an object as a string); anything else is missing (null).</summary>
+    public static string? Txt(JsonNode? n) => n switch
+    {
+        JsonValue v when v.TryGetValue<string>(out var s) => s,
+        JsonValue v when v.TryGetValue<double>(out var d) => d.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        JsonObject o => Txt(o["en"] ?? o["text"]),
+        JsonArray a => a.Select(Txt).FirstOrDefault(x => !string.IsNullOrEmpty(x)),
+        _ => null,
+    };
+
+    /// <summary>An integer from a node: a number, a numeric string, or an object holding "cluster"; else null.</summary>
+    public static int? AsInt(JsonNode? n) => n switch
+    {
+        JsonValue v when v.TryGetValue<int>(out var i) => i,
+        JsonValue v when v.TryGetValue<string>(out var s) && int.TryParse(s, out var j) => j,
+        JsonObject o => AsInt(o["cluster"]),
+        _ => null,
+    };
+
     static readonly Regex Bad = new(@"villain|antagonist", RegexOptions.IgnoreCase);
     static readonly Regex Cjk = new(@"[\u3400-\u9fff]");
 
@@ -217,19 +236,19 @@ from/to and picks keys are cluster ids.
     /// <summary>Validates and cleans a model reply into the describe result: English-only text, valid era, no villain wording, roles from the allowed set, one lead each.</summary>
     public static JsonObject Normalize(JsonObject r, DescribeInput d)
     {
-        string En(JsonNode? n) => n is JsonObject o ? o["en"]?.GetValue<string>()?.Trim() ?? "" : n?.GetValue<string>()?.Trim() ?? "";
+        string En(JsonNode? n) => Txt(n)?.Trim() ?? "";
         string Clean(string s) => Bad.Replace(s, "").Replace("  ", " ").Trim();
         var o = new JsonObject
         {
-            ["title"] = new JsonObject { ["en"] = Clean(En(r["title"])), ["zh"] = (r["title"] as JsonObject)?["zh"]?.GetValue<string>() ?? "" },
+            ["title"] = new JsonObject { ["en"] = Clean(En(r["title"])), ["zh"] = (r["title"] as JsonObject)?["zh"] is { } tz ? Txt(tz) ?? "" : "" },
             ["fullTitle"] = new JsonObject { ["en"] = Clean(En(r["fullTitle"])) },
             ["teaser"] = new JsonObject { ["en"] = Clean(En(r["teaser"])) },
             ["synopsis"] = new JsonObject { ["en"] = Clean(En(r["synopsis"])) },
         };
         var tags = new JsonArray();
-        foreach (var t in (r["tags"] as JsonArray) ?? []) { var s = t?.GetValue<string>()?.Trim().ToLowerInvariant() ?? ""; if (s.Length > 0 && !Cjk.IsMatch(s) && !Bad.IsMatch(s) && !tags.Any(x => x!.GetValue<string>() == s)) tags.Add(s); }
+        foreach (var t in (r["tags"] as JsonArray) ?? []) { var s = Txt(t)?.Trim().ToLowerInvariant() ?? ""; if (s.Length > 0 && !Cjk.IsMatch(s) && !Bad.IsMatch(s) && !tags.Any(x => Txt(x) == s)) tags.Add(s); }
         o["tags"] = tags;
-        var era = r["era"]?.GetValue<string>()?.Trim().ToLowerInvariant() ?? "";
+        var era = Txt(r["era"])?.Trim().ToLowerInvariant() ?? "";
         o["era"] = Eras.Contains(era) ? era : null; o["fantasy"] = r["fantasy"] is JsonValue fv && fv.TryGetValue<bool>(out var fb) && fb;
         var aiLevel = (r["aiGenerated"]?["level"]?.ToString() ?? "").Trim().ToLowerInvariant();
         o["aiGenerated"] = new JsonObject
@@ -253,9 +272,9 @@ from/to and picks keys are cluster ids.
             var ch = c["character"] as JsonObject;
             cast.Add(new JsonObject
             {
-                ["cluster"] = cid, ["character"] = ch == null ? null : new JsonObject { ["zh"] = ch["zh"]?.GetValue<string>() ?? "", ["pinyin"] = ch["pinyin"]?.GetValue<string>() ?? "", ["en"] = ch["en"]?.GetValue<string>() ?? "" },
-                ["role"] = Role(c["role"]?.GetValue<string>()), ["roleAtStart"] = Clean(Publish.NotIntroduced(c["roleAtStart"]?.GetValue<string>()) ? c["description"]?.GetValue<string>() ?? "supporting" : c["roleAtStart"]?.GetValue<string>() ?? c["role"]?.GetValue<string>() ?? "supporting"),
-                ["description"] = Clean(En(c["description"])), ["actor"] = c["actor"]?.GetValue<string>() is { Length: > 0 } a && d.Credits.Any(x => x.Contains(a)) ? a : null,
+                ["cluster"] = cid, ["character"] = ch == null ? null : new JsonObject { ["zh"] = Txt(ch["zh"]) ?? "", ["pinyin"] = Txt(ch["pinyin"]) ?? "", ["en"] = Txt(ch["en"]) ?? "" },
+                ["role"] = Role(Txt(c["role"])), ["roleAtStart"] = Clean(Publish.NotIntroduced(Txt(c["roleAtStart"])) ? Txt(c["description"]) ?? "supporting" : Txt(c["roleAtStart"]) ?? Txt(c["role"]) ?? "supporting"),
+                ["description"] = Clean(En(c["description"])), ["actor"] = Txt(c["actor"]) is { Length: > 0 } a && d.Credits.Any(x => x.Contains(a)) ? a : null,
                 ["label"] = new JsonObject { ["en"] = Clean(En(c["label"])) },
             });
         }
@@ -267,7 +286,7 @@ from/to and picks keys are cluster ids.
             if (!ids.Contains(from) || !ids.Contains(to)) continue; from = Cn(from); to = Cn(to); if (from == to) continue;
             double since = x["since"] is JsonValue sv && sv.TryGetValue<double>(out var sd) ? sd : 0; double? until = x["until"] is JsonValue uv && uv.TryGetValue<double>(out var ud) ? ud : null;
             bool spoiler = (x["spoiler"] is JsonValue pv && pv.TryGetValue<bool>(out var pb) && pb) || since > cut;
-            rels.Add(new JsonObject { ["from"] = from, ["to"] = to, ["type"] = Clean(x["type"]?.GetValue<string>() ?? "").ToLowerInvariant(), ["label"] = new JsonObject { ["en"] = Clean(En(x["label"])) }, ["since"] = since, ["until"] = until, ["spoiler"] = spoiler, ["implied"] = x["implied"] is JsonValue iv && iv.TryGetValue<bool>(out var ib) && ib });
+            rels.Add(new JsonObject { ["from"] = from, ["to"] = to, ["type"] = Clean(Txt(x["type"]) ?? "").ToLowerInvariant(), ["label"] = new JsonObject { ["en"] = Clean(En(x["label"])) }, ["since"] = since, ["until"] = until, ["spoiler"] = spoiler, ["implied"] = x["implied"] is JsonValue iv && iv.TryGetValue<bool>(out var ib) && ib });
         }
         o["relations"] = rels;
         o["picks"] = r["picks"] is JsonObject p ? JsonNode.Parse(p.ToJsonString()) : new JsonObject();
@@ -288,7 +307,7 @@ relations: {JsonSerializer.Serialize(res["relations"]!.AsArray().Select((r, i) =
 Reasons: {check["reasons"]?.ToJsonString()}
 Answer ONE JSON object: {{""teaser"":""..."",""cast"":[{{""cluster"":0,""roleAtStart"":"""",""description"":"""",""label"":""""}}]}}, listing only the flagged cast entries.
 teaser: {res["teaser"]!["en"]}
-flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check["flaggedCast"] as JsonArray)?.Any(x => x!.GetValue<int>() == c!["cluster"]!.GetValue<int>()) == true).Select(c => c!))}", []);
+flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check["flaggedCast"] as JsonArray)?.Any(x => AsInt(x) == c!["cluster"]!.GetValue<int>()) == true).Select(c => c!))}", []);
 
     /// <summary>Applies a spoiler check to the result: flagged relations become spoilers, and one rewrite call fixes the teaser and cast. Returns the number of AI calls made.</summary>
     public static async Task<int> SpoilerCheckAsync(IChat chat, string model, JsonObject res, DescribeInput d, CancellationToken ct)
@@ -303,14 +322,14 @@ flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check
             var fc = (check["flaggedCast"] as JsonArray) ?? [];
             if (!teaser && fc.Count == 0) { res["spoilerCheck"] = new JsonObject { ["rounds"] = round + 1, ["clean"] = true }; return calls; }
             var rw = await chat.JsonAsync(model, JsonValue.Create(BuildRewrite(res, check, model).Prompt)!, "submit_rewrite", ct); calls++;
-            if (teaser && rw["teaser"]?.GetValue<string>() is { Length: > 0 } nt) res["teaser"] = new JsonObject { ["en"] = Bad.Replace(nt, "").Trim() };
+            if (teaser && Txt(rw["teaser"]) is { Length: > 0 } nt) res["teaser"] = new JsonObject { ["en"] = Bad.Replace(nt, "").Trim() };
             foreach (var e in (rw["cast"] as JsonArray) ?? [])
             {
-                if (e is not JsonObject c || c["cluster"] is not JsonValue cv || !cv.TryGetValue<int>(out var cid)) continue;
+                if (e is not JsonObject c || AsInt(c["cluster"]) is not { } cid) continue;
                 var tgt = res["cast"]!.AsArray().FirstOrDefault(x => x!["cluster"]!.GetValue<int>() == cid); if (tgt == null) continue;
-                if (c["roleAtStart"]?.GetValue<string>() is { Length: > 0 } r) tgt["roleAtStart"] = Bad.Replace(r, "").Trim();
-                if (c["description"]?.GetValue<string>() is { Length: > 0 } ds) tgt["description"] = Bad.Replace(ds, "").Trim();
-                if (c["label"]?.GetValue<string>() is { Length: > 0 } lb) tgt["label"] = new JsonObject { ["en"] = Bad.Replace(lb, "").Trim() };
+                if (Txt(c["roleAtStart"]) is { Length: > 0 } r) tgt["roleAtStart"] = Bad.Replace(r, "").Trim();
+                if (Txt(c["description"]) is { Length: > 0 } ds) tgt["description"] = Bad.Replace(ds, "").Trim();
+                if (Txt(c["label"]) is { Length: > 0 } lb) tgt["label"] = new JsonObject { ["en"] = Bad.Replace(lb, "").Trim() };
             }
         }
         res["spoilerCheck"] = new JsonObject { ["rounds"] = 2, ["clean"] = false };
