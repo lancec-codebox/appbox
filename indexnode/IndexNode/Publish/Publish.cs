@@ -127,7 +127,7 @@ public static class Publish
             cast.Add(new JsonObject
             {
                 ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = c["roleAtStart"]?.DeepClone(), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
-                ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
+                ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = Describe.ClusterMasked(describe, id) is { } dm ? dm : f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
                 ["portrait"] = sources?.GetValueOrDefault($"cast/{Id(id)}.jpg") is { } ps0 ? new JsonObject { ["file"] = $"cast/{Id(id)}.jpg", ["source"] = ps0.DeepClone() } : null,
             });
         }
@@ -196,7 +196,7 @@ public static class Publish
         foreach (var c in (describe["cast"] as JsonArray) ?? [])
         {
             int cid = c!["cluster"]!.GetValue<int>();
-            var cand = await JN($"cast/cand_{cid}.json");
+            var cand = await JN($"cast/cand_{cid}.json"); Describe.ApplyMasks(cand as JsonArray, describe, cid);
             // portrait: the best expression-scored head shot before the late limit; else the cast stage's portrait
             byte[]? pb = null;
             if (ExpressionScores(describe, cid.ToString()) is { } sc && cand is JsonArray ca
@@ -367,7 +367,7 @@ public static class Publish
         {
             if (c == null) return;
             int cid = c["cluster"]!.GetValue<int>();
-            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null;
+            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null; Describe.ApplyMasks(cands, describe, cid);
             int? pk = picks?[cid.ToString()]?["portrait"] is JsonValue pv && pv.TryGetValue<int>(out var p) ? p : null;
             var shot = PickCoverShot(cands, pk, cutoff, dur, ExpressionScores(describe, cid.ToString()));
             if (shot is not { } s || await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) is not { } img) return; // no shot before the late limit: no cover (the portrait has no known time)

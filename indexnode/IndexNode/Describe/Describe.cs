@@ -32,13 +32,36 @@ public sealed class DescribeInput
 /// <summary>The describe step: titles, tags, era, teaser, synopsis, cast and relations in one batched vision call, then a spoiler check with rewrite.</summary>
 public static class Describe
 {
-    public const string PromptVersion = "describe-2";
+    public const string PromptVersion = "describe-3"; // describe-3 (2026-11-14): marks covered faces per head shot ("masked"); cast no longer scores masks
     public static readonly string[] Eras = ["ancient", "republic", "1950s-60s", "1970s", "1980s-90s", "modern", "futuristic"];
     public const double CutoffFraction = 0.12;
 
     public static double Cutoff(double duration) => Math.Round(duration * CutoffFraction, 1);
 
     /// <summary>The model's expression scores as { key: [0..10 or null] }: clamped, anything else null. Keys are cluster ids and "poster".</summary>
+    /// <summary>The model's covered head shots as { cluster id: [sheet indexes] }: integers 0..99 only, anything else dropped.</summary>
+    public static JsonObject CleanMasked(JsonNode? n)
+    {
+        var o = new JsonObject();
+        if (n is JsonObject m)
+            foreach (var (k, v) in m)
+                if (int.TryParse(k, out _) && v is JsonArray a)
+                    o[k] = new JsonArray(a.Select(x => x is JsonValue xv && xv.TryGetValue<int>(out var i) && i >= 0 && i < 100 ? (int?)i : null).Where(i => i != null).Distinct().Select(i => (JsonNode)i!.Value).ToArray());
+        return o;
+    }
+
+    /// <summary>Sets each candidate's "masked" from describe's covered head shots (describe-3 and later); older describe outputs leave the cast stage's flags.</summary>
+    public static void ApplyMasks(JsonArray? cands, JsonObject describe, int cluster)
+    {
+        if (cands == null || describe["masked"] is not JsonObject m) return;
+        var covered = (m[cluster.ToString()] as JsonArray)?.Select(x => x!.GetValue<int>()).ToHashSet() ?? [];
+        foreach (var c in cands.OfType<JsonObject>()) c["masked"] = c["k"] is JsonValue kv && kv.TryGetValue<int>(out var k) && covered.Contains(k);
+    }
+
+    /// <summary>A character is masked when most of its head shots are covered (describe-3 and later); null for older describe outputs.</summary>
+    public static bool? ClusterMasked(JsonObject describe, int cluster, int shots = CastStage.Candidates) =>
+        describe["masked"] is JsonObject m ? ((m[cluster.ToString()] as JsonArray)?.Count ?? 0) > shots / 2 : null;
+
     public static JsonObject CleanExpression(JsonNode? n)
     {
         var o = new JsonObject();
@@ -58,7 +81,7 @@ public static class Describe
         sb.AppendLine($"Upload description:\n{Trunc(d.Description, 3000)}");
         sb.AppendLine($"Text track ({d.TextSource}; burned-in subtitles where they exist, else our speech recognition), [m:ss] text:\n{TextTrack.Compress(d.Cues)}");
         if (d.Credits.Count > 0) sb.AppendLine("Credits lines read from the video (主演/饰/领衔):\n" + string.Join('\n', d.Credits));
-        sb.AppendLine("Main face clusters (cluster id, screen seconds, first seen s, masked): " + string.Join("; ", d.Clusters.Select(c => $"{c.Id}: {c.ScreenSeconds:F0}s, {c.FirstSeen:F0}, {(c.Masked ? "masked" : "bare")}")));
+        sb.AppendLine("Main face clusters (cluster id, screen seconds, first seen s): " + string.Join("; ", d.Clusters.Select(c => $"{c.Id}: {c.ScreenSeconds:F0}s, {c.FirstSeen:F0}")));
         sb.AppendLine("Images, in order: the upload thumbnail, then one contact sheet per cluster (12 numbered candidate head shots, row by row from 0), then the poster candidate sheet (numbered frames).");
         sb.AppendLine(@"Rules:
 - ENGLISH ONLY for teaser, synopsis, tags, descriptions and labels. Chinese appears only as content: title.zh, character.zh, character.pinyin.
@@ -68,8 +91,9 @@ public static class Describe
 - era: one of ancient (dynastic costume drama), republic (1912-1949), 1950s-60s, 1970s, 1980s-90s, modern (present day), futuristic. A time-travel or rebirth story takes the era where most of it happens. fantasy: true for xianxia, xuanhuan or supernatural stories.
 - cast: one entry per cluster you can identify; exactly one 'female lead' and one 'male lead' when the story has them, others 'main' or 'supporting'. NEVER use the words villain or antagonist anywhere. Name a person only when subtitles, dialogue or credits support it; otherwise label them relative to a named character (""Gu Heng's grandmother""). actor only from the credits lines, else null. role is the final role, roleAtStart what the viewer knows in the opening; descriptions and labels describe the start, never later reveals.
 - relations: every cast member linked to at least one other. since/until in seconds; spoiler is true when since is after the cutoff or the relation is itself a reveal; implied true when not stated outright.
-- picks: for each cluster, the best portrait (most flattering, in-character, well lit, expressive, no other face dominating) and 1-3 stills as candidate indexes of its sheet; poster: the index of the single most poster-worthy 'together' frame (charged, iconic, cinematic; NOT a twist, death, blood, identity reveal or late-story costume), or null.
-JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""expression"":{""0"":[0],""poster"":[0]},""samePerson"":[[0,1]]}
+- masked: for each cluster, the indexes of the head shots on its sheet where the face is covered (mask, veil, helmet, face covering, the face hidden by a hand or object); [] when none. Most clusters have none.
+- picks: for each cluster, the best portrait (most flattering, in-character, well lit, expressive, no other face dominating, never a covered face) and 1-3 stills as candidate indexes of its sheet; poster: the index of the single most poster-worthy 'together' frame (charged, iconic, cinematic; NOT a twist, death, blood, identity reveal or late-story costume), or null.
+JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""expression"":{""0"":[0],""poster"":[0]},""masked"":{""0"":[]},""samePerson"":[[0,1]]}
 - expression: score EVERY numbered head shot of EVERY cluster sheet, and every frame of the poster candidate sheet, for how flattering the face is, an integer 0-10. 8-10: eyes open and roughly toward the camera, mouth closed or a slight smile, relaxed or composed. 5-7: acceptable but flat or slightly off. 0-2: mid-speech (open mouth), shocked or startled, crying, grimacing, blinking, eyes closed, looking far away. For a poster frame score the weaker of the two faces. Arrays are in sheet order; ""poster"" is the poster sheet.
 from/to and picks keys are cluster ids.
 - samePerson: lists of cluster ids that show the SAME person (the face matcher sometimes splits one character across clusters, e.g. in another costume or mask). Compare the contact sheets carefully; only merge when you are sure; [] when none. Do not list such a cluster separately in cast: give the group once, the first id is kept.");
@@ -177,6 +201,7 @@ from/to and picks keys are cluster ids.
         o["relations"] = rels;
         o["picks"] = r["picks"] is JsonObject p ? JsonNode.Parse(p.ToJsonString()) : new JsonObject();
         o["expression"] = CleanExpression(r["expression"]);
+        o["masked"] = CleanMasked(r["masked"]);
         o["poster"] = r["poster"] is JsonValue pv2 && pv2.TryGetValue<int>(out var pi) ? pi : null;
         return o;
     }
@@ -227,7 +252,14 @@ flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check
         var main = BuildMain(d, visionModel);
         var reply = await chat.ChatAsync(visionModel, ToContent(main), ct);
         var res = Normalize(ParseObject(reply), d);
-        int calls = 1 + await SpoilerCheckAsync(chat, textModel, res, d, ct);
+        int calls = 1;
+        // the spoiler check runs on the text model; a provider content filter there (drama plots trip them) moves it to the vision model, which already read the whole drama
+        try { calls += await SpoilerCheckAsync(chat, textModel, res, d, ct); }
+        catch (Exception e) when (e.Message.Contains("content_filter", StringComparison.OrdinalIgnoreCase) && visionModel != textModel)
+        {
+            Log.Info($"describe {d.JobId}: spoiler check refused by {textModel}'s content filter; running it on {visionModel}");
+            calls += 1 + await SpoilerCheckAsync(chat, visionModel, res, d, ct);
+        }
         res["v"] = 1; res["promptVersion"] = PromptVersion; res["jobId"] = d.JobId;
         res["models"] = new JsonObject { ["text"] = textModel, ["vision"] = visionModel };
         res["aiCalls"] = calls; res["cutoffSeconds"] = Cutoff(d.Duration); res["at"] = Protocol.NowUtc();

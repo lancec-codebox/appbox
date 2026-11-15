@@ -134,21 +134,12 @@ public static class CastFrames
         Log.Info($"cast: {rawClusters} clusters, {merges.Count} merged -> {faces.Select(f => f.Cluster).Where(c => c >= 0).Distinct().Count()}, {main.Count} main");
 
         // per main cluster: the 12 diverse contact-sheet faces and the best MaskPerCluster faces (the portrait is the best unmasked of these)
+        // masks are no longer scored here (owner 2026-11-14): SigLIP flagged 235 of 1,211 production main characters, mostly wrongly; describe marks covered faces on the sheets
         var sheets = new Dictionary<int, List<FaceRec>>(); var need = new List<FaceRec>();
-        foreach (var c in main)
-        {
-            var cl = faces.Where(f => f.Cluster == c).ToList(); sheets[c] = CastLogic.Diverse(cl, CastStage.Candidates);
-            need.AddRange(sheets[c]); need.AddRange(cl.OrderByDescending(f => f.Quality).Take(s.MaskPerCluster));
-        }
+        foreach (var c in main) { sheets[c] = CastLogic.Diverse(faces.Where(f => f.Cluster == c).ToList(), CastStage.Candidates); need.AddRange(sheets[c]); }
         need = need.Distinct().ToList();
         Dictionary<FaceRec, Rgb> hs;
         using (stats.Phase("crop-decode")) hs = await DecodeCropsAsync(ffmpeg, need, hsJpeg, ct);
-        using (stats.Phase("masks"))
-        {
-            progress($"masks: {need.Count} faces");
-            ScoreMasksParallel(need, f => Imaging.CropResize(hs[f], hs[f].W * 0.2, hs[f].H * 0.12, hs[f].W * 0.6, hs[f].H * 0.5, 224, 224),
-                Models.PathOf(Models.ClipVision, modelsDir), Models.PathOf(Models.ClipText, modelsDir), Models.PathOf(Models.ClipTokenizer, modelsDir), s.Threads, progress, ct);
-        }
 
         var outputs = stats.Phase("outputs");
         var castDir = Path.Combine(outDir, "cast"); Directory.CreateDirectory(castDir);
@@ -156,11 +147,12 @@ public static class CastFrames
         byte[] FrameJpeg(int row) { var (c, f) = all[row]; using var fh = File.OpenHandle(frames.ChunkFile(c)); var b = new byte[f.Len]; RandomAccess.Read(fh, b, f.Off); return b; }
         foreach (var g in faces.Where(f => f.Cluster >= 0).GroupBy(f => f.Cluster).OrderBy(g => g.Key))
         {
-            var list = g.ToList(); bool isMain = main.Contains(g.Key); var scored = list.Where(hs.ContainsKey).ToList();
+            var list = g.ToList(); bool isMain = main.Contains(g.Key);
             clusters.Add(new { id = g.Key, faces = list.Count, screenSeconds = CastLogic.ScreenSeconds(list, kfTimes), first = list.Min(f => f.T), last = list.Max(f => f.T), main = isMain,
-                masked = isMain && scored.Count > 0 && scored.Count(f => f.Masked) > scored.Count / 2, centroid = CastLogic.Centroid(list.Select(f => f.Emb)).Select(x => MathF.Round(x, 5)) });
+                masked = false, centroid = CastLogic.Centroid(list.Select(f => f.Emb)).Select(x => MathF.Round(x, 5)) }); // masked: decided by describe
             if (!isMain) continue;
-            if (CastLogic.PortraitFace(scored) is { } pf) await File.WriteAllBytesAsync(Path.Combine(castDir, $"portrait_{g.Key}.jpg"), hsJpeg[pf], ct);
+            // the portrait: the best-quality sheet face; describe's pick replaces it at publish
+            if (sheets[g.Key].OrderByDescending(f => f.Quality).FirstOrDefault() is { } pf) await File.WriteAllBytesAsync(Path.Combine(castDir, $"portrait_{g.Key}.jpg"), hsJpeg[pf], ct);
             var cand = sheets[g.Key];
             if (cand.Count == 0) continue;
             await Imaging.WriteJpegAsync(tools, Imaging.Grid(cand.Select(f => Imaging.Resize(hs[f], CastStage.SheetTile, CastStage.SheetTile * 5 / 4)).ToList(), 4), Path.Combine(castDir, $"sheet_{g.Key}.jpg"), ct, 4);
@@ -169,7 +161,7 @@ public static class CastFrames
                 await File.WriteAllBytesAsync(Path.Combine(castDir, $"cand_{g.Key}_{k}.jpg"), FrameJpeg(rowOf[cand[k]]), ct);
                 await File.WriteAllBytesAsync(Path.Combine(castDir, $"cand_hs_{g.Key}_{k}.jpg"), hsJpeg[cand[k]], ct);
             }
-            await File.WriteAllTextAsync(Path.Combine(castDir, $"cand_{g.Key}.json"), JsonSerializer.Serialize(cand.Select((f, k) => new { k, t = f.T, quality = f.Quality, masked = f.Masked, box = new[] { f.X, f.Y, f.W, f.H } })), ct);
+            await File.WriteAllTextAsync(Path.Combine(castDir, $"cand_{g.Key}.json"), JsonSerializer.Serialize(cand.Select((f, k) => new { k, t = f.T, quality = f.Quality, masked = false, box = new[] { f.X, f.Y, f.W, f.H } })), ct);
         }
         int dim = faces.FirstOrDefault()?.Emb.Length ?? 512;
         await File.WriteAllBytesAsync(Path.Combine(castDir, "faces.f16"), CastStage.FacesF16(faces, dim), ct);
@@ -177,12 +169,12 @@ public static class CastFrames
             await File.WriteAllBytesAsync(Path.Combine(castDir, "faces_alt.f16"), CastStage.FacesF16(faces.Select(f => new FaceRec { Emb = altOf[f] }).ToList(), altOf[faces[0]].Length), ct);
         var source = new { frames = "frames/ (1 fps JPEG)", width = w, height = h, rows = rows.Count, detector = Path.GetFileName(s.Det), embedder = Path.GetFileName(s.Rec) };
         await File.WriteAllTextAsync(Path.Combine(castDir, "faces.json"), JsonSerializer.Serialize(new { v = 1, model = s.ModelId, dim, threshold = s.Threshold, keyframes = rows.Count, source,
-            faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, cluster = f.Cluster, masked = hs.ContainsKey(f) ? (bool?)f.Masked : null }) }), ct);
+            faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, cluster = f.Cluster, masked = (bool?)null }) }), ct);
         await File.WriteAllTextAsync(Path.Combine(castDir, "clusters.json"), JsonSerializer.Serialize(new { v = 1, model = s.ModelId, threshold = s.Threshold, mergeAt = s.Merge, borderAt = 0, rawClusters, source,
             merges = merges.Select(m => new { into = m.Into, from = m.From, dist = m.Dist, vis = m.Vis }), clusters }), ct);
         outputs.Dispose();
         stats.Log(rows.Count, "frames", s.Threads);
-        return $"{s.ModelId}: {rows.Count} frames, {faces.Count} faces, {faces.Select(f => f.Cluster).Where(c => c >= 0).Distinct().Count()} clusters, {main.Count} main, {need.Count} mask checks";
+        return $"{s.ModelId}: {rows.Count} frames, {faces.Count} faces, {faces.Select(f => f.Cluster).Where(c => c >= 0).Distinct().Count()} clusters, {main.Count} main";
     }
 
     /// <summary>CastStage.ScoreMasks, but one single-thread SigLIP session per part (one session over all threads scaled poorly: 37 faces took 5 s on 12 threads).</summary>

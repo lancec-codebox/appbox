@@ -99,7 +99,7 @@ public static class StagesCommand
                     case "cast":
                     {
                         P(stage, "fetching frames"); var fs = await FrameSet(); var shots = (await store.GetAsync(paths.Video(id, "frames/shots.json"), ct))?.Data;
-                        await Models.EnsureAllAsync([.. Models.FaceDefault, Models.ClipVision, Models.ClipText, Models.ClipTokenizer], http, ct);
+                        await Models.EnsureAllAsync(Models.FaceDefault, http, ct);
                         double D(string k, double d) => a.Get(k) is { } v ? double.Parse(v, System.Globalization.CultureInfo.InvariantCulture) : d;
                         var cm = CastLogic.ModelFor(a.Get("model-id") ?? (a.Get("face-rec") is { } fr && fr.Contains("mbf") ? "buffalo_s" : "buffalo_l"));
                         var cs = new CastFrames.Settings(a.Get("face-det") ?? Models.PathOf(Models.ScrfdDet, null), a.Get("face-rec") ?? Models.PathOf(Models.ArcFaceRec, null),
