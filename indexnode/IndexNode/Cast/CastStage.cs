@@ -71,8 +71,16 @@ public static class CastStage
     /// <summary>The head-and-shoulders crop of a face: box widened 2.5x, 4:5, 320x400.</summary>
     public static Rgb HeadShoulders(Rgb im, FaceRec f, int w = PortraitW, int h = PortraitH)
     {
-        double cw = Math.Max(f.W, f.H * 0.8) * 2.5, ch = cw * h / w, cx = f.X + f.W / 2, cy = f.Y + f.H / 2 + f.H * 0.45;
-        return Imaging.CropResize(im, cx - cw / 2, cy - ch / 2, cw, ch, w, h);
+        var (x, y, cw, ch) = HeadWindow(f.X, f.Y, f.W, f.H, im.W, im.H, (double)h / w);
+        return Imaging.CropResize(im, x, y, cw, ch, w, h);
+    }
+
+    /// <summary>The head-and-shoulders window (face box widened 2.5x, ratio = height / width, face centre 0.45 face-heights above the window centre) always inside the frame, never padded: the window slides to stay inside, and when it does not fit at that aspect it shrinks (a tighter face) until it does.</summary>
+    public static (double X, double Y, double W, double H) HeadWindow(double bx, double by, double bw, double bh, int fw, int fh, double ratio)
+    {
+        double cw = Math.Max(bw, bh * 0.8) * 2.5, ch = cw * ratio, fx = bx + bw / 2, fy = by + bh / 2, cy = fy + bh * 0.45;
+        double s = Math.Min(1.0, Math.Min(fw / cw, fh / ch)); cw *= s; ch *= s;
+        return (Math.Clamp(fx - cw / 2, 0, fw - cw), Math.Clamp(cy - ch / 2, 0, fh - ch), cw, ch);
     }
 
     public static byte[] FacesF16(IReadOnlyList<FaceRec> faces, int dim)

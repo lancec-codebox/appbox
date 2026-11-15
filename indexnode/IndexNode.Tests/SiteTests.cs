@@ -126,7 +126,7 @@ public class DescribeTests
         Assert.Equal(4, arr.Count(x => x!["type"]!.GetValue<string>() == "image_url"));
         var prompt = arr[0]!["text"]!.GetValue<string>();
         Assert.Contains("新娘重生 #shorts FULL", prompt); Assert.Contains("主演：张三", prompt); Assert.Contains("第7句", prompt); Assert.Contains("ENGLISH ONLY", prompt); Assert.Contains("never invent", prompt, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal("describe-4", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
+        Assert.Equal("describe-5", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
     }
 
     [Fact]
