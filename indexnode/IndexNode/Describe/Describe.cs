@@ -130,7 +130,12 @@ from/to and picks keys are cluster ids.
         var s = reply.Trim(); int a = s.IndexOf('{'), b = s.LastIndexOf('}');
         if (AiClient.ErrorMessage(s) is { } em) throw new FormatException("the AI endpoint answered with an error: " + Redact.Sas(Trunc(em, 300)));
         if (a < 0 || b <= a) throw new FormatException("the AI reply holds no JSON object; it starts: " + Redact.Sas(Trunc(s, 300)));
-        return JsonNode.Parse(s[a..(b + 1)], null, new JsonDocumentOptions { AllowTrailingCommas = true })!.AsObject();
+        // the FIRST complete object from the first '{': a reply with a second object or prose after it (braces included) still parses
+        // (first '{' to last '}' failed on -CesE-eJY8s: "'{' is invalid after a value")
+        var bytes = System.Text.Encoding.UTF8.GetBytes(s[a..]);
+        var reader = new Utf8JsonReader(bytes, new JsonReaderOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
+        using var doc = JsonDocument.ParseValue(ref reader);
+        return JsonNode.Parse(doc.RootElement.GetRawText())!.AsObject();
     }
 
     static readonly Regex Bad = new(@"villain|antagonist", RegexOptions.IgnoreCase);

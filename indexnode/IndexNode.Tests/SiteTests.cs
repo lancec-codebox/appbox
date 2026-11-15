@@ -71,6 +71,14 @@ public class CastLogicTests
 
 public class DescribeTests
 {
+    [Fact]
+    public void A_reply_with_a_second_object_or_trailing_braces_parses_its_first_object()
+    {
+        Assert.Equal(1, (int)Describe.ParseObject("```json {\"a\":1,\"b\":{\"c\":2}} ``` {\"a\":9}")["a"]!);
+        Assert.Equal(2, (int)Describe.ParseObject("Here it is: {\"a\":2} -- note: {braces} in prose")["a"]!);
+        Assert.Throws<FormatException>(() => Describe.ParseObject("no json here"));
+    }
+
     static DescribeInput Input(string dir)
     {
         File.WriteAllBytes(Path.Combine(dir, "s0.jpg"), [1, 2, 3]); File.WriteAllBytes(Path.Combine(dir, "s1.jpg"), [4, 5]); File.WriteAllBytes(Path.Combine(dir, "t.jpg"), [9]); File.WriteAllBytes(Path.Combine(dir, "p.jpg"), [7]);
