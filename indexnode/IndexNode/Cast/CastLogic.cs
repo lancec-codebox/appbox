@@ -12,6 +12,8 @@ public sealed class FaceRec
     /// <summary>The largest other detected face in the same frame, as a fraction of this face's area (0: none).</summary>
     public double Other { get; set; }
     public bool Solo => Other <= SoloMaxRatio;
+    /// <summary>The burned-in subtitle on screen in this face's frame, [x, y, w, h] in frame pixels; null when there is none.</summary>
+    public double[]? Sub { get; set; }
     public const double SoloMaxRatio = 0.25;
     public bool Masked { get; set; }
     public double MaskScore { get; set; }
@@ -174,10 +176,11 @@ public static class CastLogic
     public static List<FaceRec> Diverse(IReadOnlyList<FaceRec> cluster, int count = 12)
     {
         // candidates come from frames where the person is alone (no other face above 25% of theirs); other frames only fill what is missing
+        // and, within those, from frames with no burned-in subtitle on screen (a subtitle can be cropped away; a second person is harder)
         var all = cluster.Where(f => f.Quality > 0).OrderByDescending(f => f.Quality).ToList();
-        var solo = all.Where(f => f.Solo).ToList();
-        var picked = Greedy(solo, [], count);
-        if (picked.Count < count) picked = Greedy(all.Where(f => !f.Solo).ToList(), picked, count);
+        var picked = new List<FaceRec>();
+        foreach (var tier in new[] { all.Where(f => f.Solo && f.Sub == null), all.Where(f => f.Solo && f.Sub != null), all.Where(f => !f.Solo) })
+            if (picked.Count < count) picked = Greedy(tier.ToList(), picked, count);
         return picked.OrderBy(f => f.T).ToList();
     }
 

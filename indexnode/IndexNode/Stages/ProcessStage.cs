@@ -185,7 +185,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 var castDir = Path.Combine(work, "castout");
                 var shotsB = (await store.GetAsync(paths.Video(id, "frames/shots.json"), ct))?.Data;
                 if (StageSteps.FramesAreJpeg(await FrameSet(), shotsB))
-                    Log.Info($"process {id}: cast (frames) {await StageSteps.CastAsync(tools, http, await FrameSet(), shotsB, duration, ctx.ThreadShare(), work, Put, p => ctx.Report("cast", p), ct)}");
+                    Log.Info($"process {id}: cast (frames) {await StageSteps.CastAsync(tools, http, await FrameSet(), shotsB, duration, ctx.ThreadShare(), work, Put, p => ctx.Report("cast", p), ct, ocrLines: (await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct))?.Data)}");
                 else
                 {
                 var kfs = await FrameChunks.DownloadAsync(store, paths, id, "keyframes", Path.Combine(work, "kfchunks"), ct) ?? throw new InvalidOperationException($"{id} has no keyframes/ chunks yet (run the frames step)");

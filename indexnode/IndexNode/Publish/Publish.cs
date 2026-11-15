@@ -176,6 +176,7 @@ public static class Publish
         async Task<JsonNode?> JN(string f) => await src.ReadAsync(f, ct) is { } b ? JsonNode.Parse(b) : null;
         var describe = JsonNode.Parse(describeB)!.AsObject(); var processed = JsonNode.Parse(processedB)!.AsObject();
         var info = await J("info.json"); var downloaded = await J("downloaded.json"); var clusters = await J("cast/clusters.json"); var facesDoc = await J("cast/faces.json");
+        var subs = SubtitleBand.Parse(await src.ReadAsync("ocr/lines.json", ct)); double frameW = facesDoc?["source"]?["width"]?.GetValue<double>() ?? 360;
 
         // frames.json + sscd.f16 at 1 fps; clip.f16 + clipFrames.json one row per shot
         var times = await FrameChunks.TimesAsync(src, ct);
@@ -208,7 +209,7 @@ public static class Publish
         foreach (var c in (describe["cast"] as JsonArray) ?? [])
         {
             int cid = c!["cluster"]!.GetValue<int>();
-            var cand = await JN($"cast/cand_{cid}.json"); Describe.ApplyMasks(cand as JsonArray, describe, cid); MarkSolo(cand as JsonArray, facesDoc);
+            var cand = await JN($"cast/cand_{cid}.json"); Describe.ApplyMasks(cand as JsonArray, describe, cid); MarkSolo(cand as JsonArray, facesDoc, subs, frameW);
             // portrait: the best expression-scored head shot before the late limit; else the cast stage's portrait
             byte[]? pb = null;
             if (ExpressionScores(describe, cid.ToString()) is { } sc && cand is JsonArray ca
@@ -219,9 +220,9 @@ public static class Publish
                 if (pb != null && ps.Box is { } pbox && await src.ReadAsync($"cast/cand_{cid}_{ps.K}.jpg", ct) is { } full && JpegSize(full) is var (fw, fh))
                 {
                     var (pc, pf) = HeadCrop(pbox, fw, fh);
-                    if (IsCrowded(pcand)) // no solo frame: cut tight so the other faces are out
+                    if (IsCrowded(pcand) || HasSub(pcand)) // no solo / subtitle-free frame: cut tight so the other faces and the subtitle band are out
                     {
-                        (pc, pf) = TightWindow(pbox, OtherBoxes(pcand), (double)CastStage.PortraitH / CastStage.PortraitW, Math.Max(pbox[2], pbox[3] * 0.8) * 2.5, 0.45, fw, fh);
+                        (pc, pf) = TightWindow(pbox, Avoid(pcand), (double)CastStage.PortraitH / CastStage.PortraitW, Math.Max(pbox[2], pbox[3] * 0.8) * 2.5, 0.45, fw, fh);
                         pb = CropTo(full, pc, CastStage.PortraitW, CastStage.PortraitH);
                     }
                     sources[$"cast/{Id(cid)}.jpg"] = Source(id, ps.T, pc, pf);
@@ -242,7 +243,7 @@ public static class Publish
             stills[cid] = list;
         }
         if (await src.ReadAsync("thumb.jpg", ct) is { } th) File.WriteAllBytes(Path.Combine(tmp, "thumb.jpg"), th);
-        var cover = await CoversAsync(src, describe, facesDoc, tmp, id, info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0, ct);
+        var cover = await CoversAsync(src, describe, facesDoc, subs, frameW, tmp, id, info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0, ct);
         Poster(describe, tmp); // poster.jpg stays for one release (compatibility)
         var drama = BuildDrama(describe, info, downloaded, clusters, processed, id, ocrZh.Count > 0 ? "ocr" : "transcript", ocrZh.Count > 0, stills, by, sources);
         if (cover != null) drama["cover"] = cover;
@@ -319,8 +320,11 @@ public static class Publish
     public const double SoloMaxRatio = 0.25;
 
     /// <summary>Marks each candidate "solo" (true/false) and lists the boxes of the other faces on its frame as "others" (only those that break the rule are not needed: all are listed, so a tight crop can avoid every one). Uses the stored faces.json; without it the candidates stay unmarked.</summary>
-    public static void MarkSolo(JsonArray? cands, JsonObject? facesDoc)
+    public static void MarkSolo(JsonArray? cands, JsonObject? facesDoc, SubtitleBand? subs = null, double frameW = 360)
     {
+        if (cands != null && subs != null) // burned-in subtitle on screen at the candidate's time: "sub" = [x, y, w, h] in frame pixels (cast's own value, when there, wins)
+            foreach (var c in cands.OfType<JsonObject>())
+                if (c["sub"] == null && c["t"] != null && subs.At(c["t"]!.GetValue<double>(), frameW) is { } sb) c["sub"] = new JsonArray(sb.Select(v => (JsonNode)v).ToArray());
         if (cands == null || facesDoc?["faces"] is not JsonArray fa) return;
         var byT = fa.OfType<JsonObject>().Where(f => f["box"] is JsonArray { Count: 4 }).GroupBy(f => Math.Round(f["t"]!.GetValue<double>(), 2)).ToDictionary(g => g.Key, g => g.Select(f => ((JsonArray)f["box"]!).Select(v => v!.GetValue<double>()).ToArray()).ToList());
         foreach (var c in cands.OfType<JsonObject>())
@@ -333,7 +337,16 @@ public static class Publish
     }
 
     /// <summary>The candidate pool: the solo ones when there are any, else all (today's choice; the picture is then cut tight).</summary>
-    static List<JsonObject> SoloPool(List<JsonObject> all) => all.Where(c => c["solo"]?.GetValue<bool>() != false).ToList() is { Count: > 0 } s ? s : all;
+    static List<JsonObject> SoloPool(List<JsonObject> all) =>
+        all.Where(c => c["solo"]?.GetValue<bool>() != false && !HasSub(c)).ToList() is { Count: > 0 } a ? a
+        : all.Where(c => c["solo"]?.GetValue<bool>() != false).ToList() is { Count: > 0 } s ? s : all;
+
+    public static bool HasSub(JsonObject? c) => c?["sub"] is JsonArray { Count: 4 };
+
+    public static double[]? SubBox(JsonObject? c) => c?["sub"] is JsonArray { Count: 4 } a ? a.Select(v => v!.GetValue<double>()).ToArray() : null;
+
+    /// <summary>What a tight crop must keep out: the other faces of a crowded frame, and the subtitle band when one is on screen.</summary>
+    public static List<double[]> Avoid(JsonObject? c) { var l = IsCrowded(c) ? OtherBoxes(c) : []; if (SubBox(c) is { } s) l.Add(s); return l; }
 
     public static bool IsCrowded(JsonObject? c) => c?["solo"]?.GetValue<bool>() == false;
 
@@ -344,14 +357,21 @@ public static class Publish
     {
         double bw = box[2], bh = box[3], fx = box[0] + bw / 2, fy = box[1] + bh / 2, face = Math.Max(bw, bh * 0.8);
         maxW = Math.Min(Math.Min(maxW, w), h / ratio); double min = Math.Min(face * 1.3, maxW), cw = maxW;
-        (double X, double Y, double W, double H) Win(double cw0)
+        (double X, double Y, double W, double H) Win(double cw0, double yo)
         {
-            double ch0 = cw0 * ratio, x0 = Math.Clamp(fx - cw0 / 2, 0, w - cw0), y0 = Math.Clamp(fy + bh * yOff - ch0 / 2, 0, h - ch0);
+            double ch0 = cw0 * ratio, x0 = Math.Clamp(fx - cw0 / 2, 0, w - cw0), y0 = Math.Clamp(fy + bh * yo - ch0 / 2, 0, h - ch0);
             return (x0, y0, cw0, ch0);
         }
-        bool Hits(double cw0) { var r = Win(cw0); return others.Any(o => o[0] < r.X + r.W && o[0] + o[2] > r.X && o[1] < r.Y + r.H && o[1] + o[3] > r.Y); }
-        while (cw > min && Hits(cw)) cw = Math.Max(min, cw * 0.95);
-        var k = Win(cw);
+        bool Hits(double cw0, double yo) { var r = Win(cw0, yo); return others.Any(o => o[0] < r.X + r.W && o[0] + o[2] > r.X && o[1] < r.Y + r.H && o[1] + o[3] > r.Y); }
+        // largest window first; at each size try the head-and-shoulders offset, then centred on the face, then shifted up (a subtitle band sits below the face)
+        double[] offs = [yOff, yOff / 2, 0, -0.2, -0.4]; double yBest = yOff;
+        for (; ; cw = Math.Max(min, cw * 0.95))
+        {
+            var ok = offs.Where(o => !Hits(cw, o)).Cast<double?>().FirstOrDefault();
+            if (ok != null) { yBest = ok.Value; break; }
+            if (cw <= min) break;
+        }
+        var k = Win(cw, yBest);
         return ([k.X / w, k.Y / h, k.W / w, k.H / h], [Math.Clamp((fx - k.X) / k.W, 0, 1), Math.Clamp((fy - k.Y) / k.H, 0, 1)]);
     }
 
@@ -369,17 +389,17 @@ public static class Publish
 
     /// <summary>Expression-scored pick: in each window (start, then first half; never the last 25%) the unmasked candidates scoring at least MinExpression compete; the best score wins, ties go to describe's pick, then to quality. No window with a flattering shot: null.</summary>
     public static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores) =>
-        PickByExpression(cands, picked, cutoff, duration, scores, true) ?? PickByExpression(cands, picked, cutoff, duration, scores, false); // solo frames first, any frame only when none qualifies
+        PickByExpression(cands, picked, cutoff, duration, scores, true, true) ?? PickByExpression(cands, picked, cutoff, duration, scores, true, false) ?? PickByExpression(cands, picked, cutoff, duration, scores, false, false); // solo without a burned-in subtitle, then solo (subtitle cropped away), then any frame
 
-    static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores, bool soloOnly)
+    static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores, bool soloOnly, bool noSub = false)
     {
         var all = cands?.OfType<JsonObject>().ToList() ?? [];
         var windows = CoverWindows(cutoff, duration).ToList();
-        if (soloOnly && duration > 0 && all.Any(c => c["solo"]?.GetValue<bool>() == true)) windows.Add(("late", duration * CoverLateFraction)); // alone is a hard rule: a solo frame up to the late limit beats a crowded early one
+        if (soloOnly && duration > 0 && all.Any(c => c["solo"]?.GetValue<bool>() == true && (!noSub || !HasSub(c)))) windows.Add(("late", duration * CoverLateFraction)); // alone is a hard rule: a solo frame up to the late limit beats a crowded early one
         foreach (var (name, maxT) in windows)
         {
             var limit = Math.Min(maxT, duration > 0 ? duration * CoverLateFraction : double.MaxValue);
-            var best = all.Where(c => c["masked"]?.GetValue<bool>() != true && (!soloOnly || !IsCrowded(c)) && (c["t"]?.GetValue<double>() ?? 0) <= limit)
+            var best = all.Where(c => c["masked"]?.GetValue<bool>() != true && (!soloOnly || !IsCrowded(c)) && (!noSub || !HasSub(c)) && (c["t"]?.GetValue<double>() ?? 0) <= limit)
                 .Select(c => (C: c, K: c["k"]!.GetValue<int>()))
                 .Select(x => (x.C, x.K, S: x.K >= 0 && x.K < scores.Count ? scores[x.K] ?? -1 : -1))
                 .Where(x => x.S >= MinExpression)
@@ -407,7 +427,7 @@ public static class Publish
     }
 
     /// <summary>cover/lead1.jpg (female lead) and lead2.jpg (male lead): two separate 9:16 crops at 360x640, no text (no together cover). Each entry is { file, t, window, cast, focus: [x, y] }, the face centre as fractions of the image. A lead without a flattering shot is omitted. Returns the drama.json "cover" object, or null when there is none.</summary>
-    static async Task<JsonObject?> CoversAsync(IJobSource src, JsonObject describe, JsonObject? facesDoc, string tmp, string upload, double dur, CancellationToken ct)
+    static async Task<JsonObject?> CoversAsync(IJobSource src, JsonObject describe, JsonObject? facesDoc, SubtitleBand? subs, double frameW, string tmp, string upload, double dur, CancellationToken ct)
     {
         var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
         var f = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "female lead"); var m = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "male lead");
@@ -418,7 +438,7 @@ public static class Publish
         {
             if (c == null) return;
             int cid = c["cluster"]!.GetValue<int>();
-            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null; Describe.ApplyMasks(cands, describe, cid); MarkSolo(cands, facesDoc);
+            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null; Describe.ApplyMasks(cands, describe, cid); MarkSolo(cands, facesDoc, subs, frameW);
             int? pk = picks?[cid.ToString()]?["portrait"] is JsonValue pv && pv.TryGetValue<int>(out var p) ? p : null;
             var shot = PickCoverShot(cands, pk, cutoff, dur, ExpressionScores(describe, cid.ToString()));
             if (shot is not { } s || await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) is not { } img) return; // no shot before the late limit: no cover (the portrait has no known time)
@@ -427,9 +447,9 @@ public static class Publish
             double? fx = box == null ? null : box[0] + box[2] / 2, fy = box == null ? null : box[1] + box[3] / 2;
             var scand = (cands ?? []).OfType<JsonObject>().FirstOrDefault(x => x["k"]?.GetValue<int>() == s.K);
             double[]? tight = null; double[] focus = [0.5, 0.5];
-            if (IsCrowded(scand) && box != null && JpegSize(img) is var (tw, th)) // no solo frame: tight 9:16 window clear of the other faces
+            if ((IsCrowded(scand) || HasSub(scand)) && box != null && JpegSize(img) is var (tw, th)) // no solo frame: tight 9:16 window clear of the other faces
             {
-                var (tc, tf) = TightWindow(box, OtherBoxes(scand), 16.0 / 9, Math.Min(tw, th * 9.0 / 16), 0.0, tw, th); tight = tc; focus = tf;
+                var (tc, tf) = TightWindow(box, Avoid(scand), 16.0 / 9, Math.Min(tw, th * 9.0 / 16), 0.0, tw, th); tight = tc; focus = tf;
                 File.WriteAllBytes(Path.Combine(tmp, file), CropTo(img, tc, CoverW, CoverH));
             }
             else

@@ -170,4 +170,24 @@ public class CoverTests
         Assert.Equal(2, pick.Count(f => !f.Solo));            // crowded ones only fill the gap
         Assert.All(CastLogic.Diverse(faces.Take(10).Concat(faces.Skip(10).Take(15)).ToList(), 5), f => Assert.True(f.Solo));
     }
+
+    [Fact]
+    public void Subtitle_free_frames_win_and_the_fallback_crops_the_band_away()
+    {
+        var lines = System.Text.Encoding.UTF8.GetBytes("""{"band":{"y":570,"height":62,"width":480},"en":[{"start":10,"end":12,"boxes":[{"x0":100,"y0":440,"x1":260,"y1":470}]}],"zh":[]}""");
+        var subs = SubtitleBand.Parse(lines)!;
+        Assert.NotNull(subs.At(10.4, 360)); Assert.Null(subs.At(30, 360));
+        Assert.Equal(75, subs.At(11, 360)![0], 1);            // scaled from the 480 px OCR video to a 360 px frame
+        var c = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"box":[110,200,100,120]}]""");
+        Publish.MarkSolo(c, null, subs, 360);
+        Assert.True(Publish.HasSub(c[0] as System.Text.Json.Nodes.JsonObject)); Assert.False(Publish.HasSub(c[1] as System.Text.Json.Nodes.JsonObject));
+        Assert.Equal(1, Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);   // lower score, but no subtitle
+        Assert.Equal(1, Publish.PickLeadShot(c, 0)!.Value.K);
+        var only = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""); Publish.MarkSolo(only, null, subs, 360);
+        Assert.Equal(0, Publish.PickByExpression(only, 0, 1000, 9080, new int?[] { 9 })!.Value.K);  // only a subtitled frame: still used, cropped
+        var (crop, _) = Publish.TightWindow([110, 200, 100, 120], Publish.Avoid(only[0] as System.Text.Json.Nodes.JsonObject), 1.25, 250, 0.45, 360, 640);
+        Assert.True((crop[1] + crop[3]) * 640 <= 330.01);       // the band starts at y=330
+        var f = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i, Quality = i < 10 ? 0.95 : 0.5, Sub = i < 10 ? [0, 500, 100, 30] : null, Emb = new float[8] { i, 0, 0, 0, 0, 0, 0, 1 }, Cluster = 0 }).ToList();
+        Assert.Equal(10, CastLogic.Diverse(f, 10).Count(x => x.Sub == null));
+    }
 }
