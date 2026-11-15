@@ -41,6 +41,7 @@ public static class SiteCommands
         {
             var r = await Publish.PublishOneAsync(tools, j, outDir, force, ct);
             Console.WriteLine(r.Written ? $"{r.Id}: published" : $"{r.Id}: skipped ({r.Skipped})");
+            foreach (var w in r.Warnings ?? []) Console.WriteLine(w);
             if (r.Written) written++; else skipped++;
         }
         Publish.WriteIndex(outDir);

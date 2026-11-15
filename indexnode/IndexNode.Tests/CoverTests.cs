@@ -190,4 +190,19 @@ public class CoverTests
         var f = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i, Quality = i < 10 ? 0.95 : 0.5, Sub = i < 10 ? [0, 500, 100, 30] : null, Emb = new float[8] { i, 0, 0, 0, 0, 0, 0, 1 }, Cluster = 0 }).ToList();
         Assert.Equal(10, CastLogic.Diverse(f, 10).Count(x => x.Sub == null));
     }
+
+    [Fact]
+    public void Portrait_is_the_best_expression_among_candidates_that_pass_the_rules()
+    {
+        var lines = System.Text.Encoding.UTF8.GetBytes("""{"band":{"y":570,"height":62,"width":480},"en":[{"start":10,"end":12,"boxes":[{"x0":100,"y0":440,"x1":260,"y1":470}]}],"zh":[]}""");
+        var c = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"box":[110,200,100,120]},{"k":2,"t":50,"quality":0.4,"masked":false,"box":[110,200,100,120]},{"k":3,"t":70,"quality":0.9,"masked":false,"box":[110,200,100,120]}]""");
+        Publish.MarkSolo(c, null, SubtitleBand.Parse(lines), 360);
+        // describe picked 3 (score 7), but 1 and 2 score 9 and pass: describe's pick only breaks ties; 0 scores 10 but has a subtitle
+        var p = Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 9, 9, 7 })!.Value; Assert.Equal(1, p.K);   // tie 1 v 2: quality
+        Assert.Equal(2, Publish.PickPortrait(c, 2, 9080, new int?[] { 10, 9, 9, 7 })!.Value.K);           // tie: describe's pick
+        Assert.Equal(4, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.Score);       // under 6 is still returned (the caller warns)... best passing is 4 (candidate 1)
+        Assert.Equal(1, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.K);
+        Assert.Equal(0, Publish.PickPortrait(Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""), 0, 9080, new int?[] { 5 })!.Value.K);
+        Assert.Null(Publish.PickPortrait(c, 3, 9080, new int?[] { null, null, null, null }));
+    }
 }

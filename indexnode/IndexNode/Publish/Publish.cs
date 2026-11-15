@@ -161,7 +161,7 @@ public static class Publish
         Version + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(processed ?? [])) + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(describe ?? []))
         + (ourEn == null ? "" : "|en:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(ourEn)));
 
-    public sealed record Result(string Id, bool Written, string? Skipped);
+    public sealed record Result(string Id, bool Written, string? Skipped, IReadOnlyList<string>? Warnings = null);
 
     public static async Task<Result> PublishOneAsync(Tools tools, IJobSource src, string outDir, bool force, CancellationToken ct, string by = "indexnode")
     {
@@ -205,7 +205,7 @@ public static class Publish
         if (ourEn != null) { File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(ourEn)))); if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en-orig.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en)))); }
         else if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en))));
         // pictures: portraits, stills (spoiler after the cutoff), thumb
-        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; double dur0 = info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject; var sources = new Dictionary<string, JsonObject>();
+        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; double dur0 = info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject; var sources = new Dictionary<string, JsonObject>(); var warnings = new List<string>();
         foreach (var c in (describe["cast"] as JsonArray) ?? [])
         {
             int cid = c!["cluster"]!.GetValue<int>();
@@ -213,8 +213,9 @@ public static class Publish
             // portrait: the best expression-scored head shot before the late limit; else the cast stage's portrait
             byte[]? pb = null;
             if (ExpressionScores(describe, cid.ToString()) is { } sc && cand is JsonArray ca
-                && PickByExpression(ca, picks?[cid.ToString()]?["portrait"] is JsonValue ppv && ppv.TryGetValue<int>(out var ppk) ? ppk : null, cut, dur0, sc) is { } ps)
+                && PickPortrait(ca, picks?[cid.ToString()]?["portrait"] is JsonValue ppv && ppv.TryGetValue<int>(out var ppk) ? ppk : null, dur0, sc) is { } ps)
             {
+                if (ps.Score < MinExpression) warnings.Add($"warning: {id} {Id(cid)}: best portrait expression score is {ps.Score} (below {MinExpression}), candidate {ps.K} at t={Math.Round(ps.T)}");
                 pb = await src.ReadAsync($"cast/cand_hs_{cid}_{ps.K}.jpg", ct);
                 var pcand = ca.OfType<JsonObject>().FirstOrDefault(x => x["k"]?.GetValue<int>() == ps.K);
                 if (pb != null && ps.Box is { } pbox && await src.ReadAsync($"cast/cand_{cid}_{ps.K}.jpg", ct) is { } full && JpegSize(full) is var (fw, fh))
@@ -251,7 +252,7 @@ public static class Publish
         File.WriteAllText(Path.Combine(tmp, ".stamp"), stamp);
         if (Directory.Exists(dir)) Directory.Delete(dir, true);
         Directory.Move(tmp, dir);
-        return new(id, true, null);
+        return new(id, true, null, warnings);
     }
 
     static string Srt2Vtt(string srt) => "WEBVTT\n\n" + System.Text.RegularExpressions.Regex.Replace(srt.Replace("\r", ""), @"(\d\d:\d\d:\d\d),(\d\d\d)", "$1.$2");
@@ -417,6 +418,22 @@ public static class Publish
     {
         var im = Imaging.DecodeJpeg(jpg);
         return Imaging.EncodeJpeg(Imaging.CropResizeLanczos(im, crop[0] * im.W, crop[1] * im.H, crop[2] * im.W, crop[3] * im.H, w, h));
+    }
+
+    /// <summary>The portrait: among the unmasked candidates before the late limit, the best that passes the rules (alone, no burned-in subtitle) by describe's expression score; describe's own pick only breaks a tie, then quality. Rules relax in order: alone and no subtitle, alone, any. The score may be under MinExpression (the caller warns). Null: no scores for any candidate.</summary>
+    public static (int K, double T, double[]? Box, int Score)? PickPortrait(JsonArray? cands, int? picked, double duration, IReadOnlyList<int?> scores)
+    {
+        double limit = duration > 0 ? duration * CoverLateFraction : double.MaxValue;
+        var all = (cands?.OfType<JsonObject>() ?? []).Where(c => c["masked"]?.GetValue<bool>() != true && (c["t"]?.GetValue<double>() ?? 0) <= limit)
+            .Select(c => (C: c, K: c["k"]!.GetValue<int>())).Select(x => (x.C, x.K, S: x.K >= 0 && x.K < scores.Count ? scores[x.K] : null)).Where(x => x.S != null).ToList();
+        foreach (var tier in new Func<JsonObject, bool>[] { c => !IsCrowded(c) && !HasSub(c), c => !IsCrowded(c), _ => true })
+        {
+            var best = all.Where(x => tier(x.C)).OrderByDescending(x => x.S).ThenByDescending(x => x.K == picked).ThenByDescending(x => x.C["quality"]?.GetValue<double>() ?? 0).Cast<(JsonObject C, int K, int? S)?>().FirstOrDefault();
+            if (best is not { } b) continue;
+            var box = (b.C["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
+            return (b.K, b.C["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null, b.S!.Value);
+        }
+        return null;
     }
 
     /// <summary>The 9:16 cover: decode the stored frame, crop CoverCrop's window, Lanczos-resize to 360x640, encode JPEG. Same crop box as CoverFilter, no ffmpeg.</summary>
