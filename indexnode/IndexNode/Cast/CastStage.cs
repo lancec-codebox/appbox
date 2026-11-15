@@ -79,9 +79,12 @@ public static class CastStage
     public static (double X, double Y, double W, double H) HeadWindow(double bx, double by, double bw, double bh, int fw, int fh, double ratio)
     {
         double cw = Math.Max(bw, bh * 0.8) * 2.5, ch = cw * ratio, fx = bx + bw / 2, fy = by + bh / 2, cy = fy + bh * 0.45;
-        double s = Math.Min(1.0, Math.Min(fw / cw, fh / ch)); cw *= s; ch *= s;
-        return (Math.Clamp(fx - cw / 2, 0, fw - cw), Math.Clamp(cy - ch / 2, 0, fh - ch), cw, ch);
+        double s = Math.Min(1.0, Math.Min(fw / cw, fh / ch)); cw = Math.Min(cw * s, fw); ch = Math.Min(ch * s, fh);   // cw * (fw / cw) can land one ulp over fw: the room below would be -5.7e-14 and Math.Clamp refuses a max under its min
+        return (Within(fx - cw / 2, fw - cw), Within(cy - ch / 2, fh - ch), cw, ch);
     }
+
+    /// <summary>v clamped to 0..room, where room (a frame size minus a window size) may come out a hair below 0 from floating-point subtraction: that is 0, not an error.</summary>
+    public static double Within(double v, double room) => Math.Clamp(v, 0, Math.Max(0, room));
 
     public static byte[] FacesF16(IReadOnlyList<FaceRec> faces, int dim)
     {

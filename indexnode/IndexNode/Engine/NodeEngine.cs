@@ -529,7 +529,7 @@ public sealed class NodeEngine
         catch (BotBlocked e) { outcome = Outcome.Bot; error = e.Message; }
         catch (LeaseLostException e) { outcome = Outcome.LeaseLost; error = e.Message; }
         catch (OperationCanceledException) { outcome = run.LeaseLost ? Outcome.LeaseLost : Outcome.Released; }
-        catch (Exception e) { outcome = run.LeaseLost ? Outcome.LeaseLost : Outcome.Transient; error = e.Message; }
+        catch (Exception e) { outcome = run.LeaseLost ? Outcome.LeaseLost : Outcome.Transient; error = e.Message; Console.Error.WriteLine($"[{stage}#{worker}] {claim.Job.JobId}: {Redact.Trace(e)}"); }
 
         cts.Cancel();
         try { await renewTask; } catch { }

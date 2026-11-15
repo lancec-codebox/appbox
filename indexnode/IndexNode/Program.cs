@@ -102,6 +102,7 @@ public static class Program
         catch (Exception e)
         {
             Console.Error.WriteLine("error: " + Redact.Sas(e.Message));
+            Console.Error.WriteLine(Redact.Trace(e));   // type and stack: the message alone ("'0' cannot be greater than ...") does not say where
             return 1;
         }
     }
@@ -310,7 +311,7 @@ public static class Commands
                 await store.PutAsync(paths.Job("download", id), job.ToBytes(), Tags.Job("download", "done", job.AddedAt), null, false, cts.Token);
                 Console.WriteLine($"{id}: downloaded{(queue ? ", processing queued" : " (processing not queued: `indexnode process --job " + id + "` runs it)")}");
             }
-            catch (Exception e) when (e is not OperationCanceledException) { failed++; Console.Error.WriteLine($"{id}: {Redact.Sas(e.Message)}"); }
+            catch (Exception e) when (e is not OperationCanceledException) { failed++; Console.Error.WriteLine($"{id}: {Redact.Sas(e.Message)}"); Console.Error.WriteLine(Redact.Trace(e)); }
         }
         return failed == 0 ? 0 : 1;
     }

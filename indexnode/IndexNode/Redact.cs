@@ -25,6 +25,9 @@ public static partial class Redact
     public static void Register(string? secret) { if (!string.IsNullOrEmpty(secret) && secret.Length >= 6) KnownSecrets[secret] = 0; }
     public static void ClearKnown() => KnownSecrets.Clear();
 
+    /// <summary>The exception type, message and stack trace (inner exceptions too) for stderr, with SAS signatures and cookies removed; nothing else is left out.</summary>
+    public static string Trace(Exception e) => Sas(e.ToString());
+
     public static string Sas(string? text)
     {
         if (text == null) return "";

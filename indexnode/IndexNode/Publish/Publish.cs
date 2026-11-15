@@ -384,7 +384,7 @@ public static class Publish
         maxW = Math.Min(Math.Min(maxW, w), h / ratio); double min = Math.Min(face * 1.3, maxW), cw = maxW;
         (double X, double Y, double W, double H) Win(double cw0, double yo)
         {
-            double ch0 = cw0 * ratio, x0 = Math.Clamp(fx - cw0 / 2, 0, w - cw0), y0 = Math.Clamp(fy + bh * yo - ch0 / 2, 0, h - ch0);
+            double ch0 = cw0 * ratio, x0 = CastStage.Within(fx - cw0 / 2, w - cw0), y0 = CastStage.Within(fy + bh * yo - ch0 / 2, h - ch0);
             return (x0, y0, cw0, ch0);
         }
         bool Hits(double cw0, double yo) { var r = Win(cw0, yo); return others.Any(o => o[0] < r.X + r.W && o[0] + o[2] > r.X && o[1] < r.Y + r.H && o[1] + o[3] > r.Y); }
