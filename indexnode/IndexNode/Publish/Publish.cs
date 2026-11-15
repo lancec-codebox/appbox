@@ -394,30 +394,38 @@ public static class Publish
         return (c["k"]!.GetValue<int>(), c["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null);
     }
 
-    /// <summary>Expression-scored pick: in each window (start, then first half; never the last 25%) the unmasked candidates scoring at least MinExpression compete; the best score wins, ties go to describe's pick, then to quality. No window with a flattering shot: null.</summary>
-    public static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores) =>
-        PickByExpression(cands, picked, cutoff, duration, scores, true, true) ?? PickByExpression(cands, picked, cutoff, duration, scores, true, false) ?? PickByExpression(cands, picked, cutoff, duration, scores, false, false); // solo without a burned-in subtitle, then solo (subtitle cropped away), then any frame
-
-    static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores, bool soloOnly, bool noSub = false)
+    /// <summary>Expression-scored cover pick. The score floor comes first: only unmasked candidates scoring at least MinExpression compete, and the tiers relax within it: alone with no burned-in subtitle, alone, any frame (cut tight by the caller). Inside a tier the windows run in order (start, first half, then up to the late limit, 75%); the best score wins, ties go to describe's pick, then quality. Nothing scores the floor: null.</summary>
+    public static (int K, double T, double[]? Box, string Window)? PickByExpression(JsonArray? cands, int? picked, double cutoff, double duration, IReadOnlyList<int?> scores)
     {
         var all = cands?.OfType<JsonObject>().ToList() ?? [];
-        var windows = CoverWindows(cutoff, duration).ToList();
-        if (soloOnly && duration > 0 && all.Any(c => c["solo"]?.GetValue<bool>() == true && (!noSub || !HasSub(c)))) windows.Add(("late", duration * CoverLateFraction)); // alone is a hard rule: a solo frame up to the late limit beats a crowded early one
-        foreach (var (name, maxT) in windows)
+        var windows = CoverWindows(cutoff, duration).ToList(); if (duration > 0) windows.Add(("late", duration * CoverLateFraction));
+        foreach (var tier in Tiers)
+            foreach (var (name, maxT) in windows)
+            {
+                var limit = Math.Min(maxT, duration > 0 ? duration * CoverLateFraction : double.MaxValue);
+                var best = Ranked(all, picked, scores, tier, MinExpression).Where(x => (x.C["t"]?.GetValue<double>() ?? 0) <= limit).Cast<(JsonObject C, int K, int S)?>().FirstOrDefault();
+                if (best is not { } b) continue;
+                var box = (b.C["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
+                return (b.K, b.C["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null, name);
+            }
+        // tier 4: nothing scores the floor anywhere before the late limit: the best score overall (the caller warns)
+        var lateLimit = duration > 0 ? duration * CoverLateFraction : double.MaxValue;
+        if (Ranked(all.Where(c => (c["t"]?.GetValue<double>() ?? 0) <= lateLimit).ToList(), picked, scores, Tiers[^1], int.MinValue).Cast<(JsonObject C, int K, int S)?>().FirstOrDefault() is { } f)
         {
-            var limit = Math.Min(maxT, duration > 0 ? duration * CoverLateFraction : double.MaxValue);
-            var best = all.Where(c => c["masked"]?.GetValue<bool>() != true && (!soloOnly || !IsCrowded(c)) && (!noSub || !HasSub(c)) && (c["t"]?.GetValue<double>() ?? 0) <= limit)
-                .Select(c => (C: c, K: c["k"]!.GetValue<int>()))
-                .Select(x => (x.C, x.K, S: x.K >= 0 && x.K < scores.Count ? scores[x.K] ?? -1 : -1))
-                .Where(x => x.S >= MinExpression)
-                .OrderByDescending(x => x.S).ThenByDescending(x => x.K == picked).ThenByDescending(x => x.C["quality"]?.GetValue<double>() ?? 0)
-                .Select(x => ((JsonObject C, int K, int S)?)x).FirstOrDefault();
-            if (best is not { } b) continue;
-            var box = (b.C["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
-            return (b.K, b.C["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null, name);
+            var fb = (f.C["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
+            return (f.K, f.C["t"]?.GetValue<double>() ?? 0, fb is { Length: 4 } ? fb : null, "low");
         }
         return null;
     }
+
+    /// <summary>The tiers, strictest first: alone and no subtitle, alone, any frame.</summary>
+    static readonly Func<JsonObject, bool>[] Tiers = [c => !IsCrowded(c) && !HasSub(c), c => !IsCrowded(c), _ => true];
+
+    /// <summary>Unmasked, scored candidates passing a tier and at least the floor, best first: score, then describe's pick, then quality.</summary>
+    static IEnumerable<(JsonObject C, int K, int S)> Ranked(List<JsonObject> all, int? picked, IReadOnlyList<int?> scores, Func<JsonObject, bool> tier, int floor) =>
+        all.Where(c => c["masked"]?.GetValue<bool>() != true && tier(c))
+            .Select(c => (C: c, K: c["k"]!.GetValue<int>())).Select(x => (x.C, x.K, S: x.K >= 0 && x.K < scores.Count ? scores[x.K] : null)).Where(x => x.S != null && x.S >= floor).Select(x => (x.C, x.K, S: x.S!.Value))
+            .OrderByDescending(x => x.S).ThenByDescending(x => x.K == picked).ThenByDescending(x => x.C["quality"]?.GetValue<double>() ?? 0);
 
     /// <summary>The crop (fractions of the frame) Lanczos-resized to w x h and JPEG-encoded.</summary>
     public static byte[] CropTo(byte[] jpg, double[] crop, int w, int h)
@@ -426,18 +434,17 @@ public static class Publish
         return Imaging.EncodeJpeg(Imaging.CropResizeLanczos(im, crop[0] * im.W, crop[1] * im.H, crop[2] * im.W, crop[3] * im.H, w, h));
     }
 
-    /// <summary>The portrait: among the unmasked candidates before the late limit, the best that passes the rules (alone, no burned-in subtitle) by describe's expression score; describe's own pick only breaks a tie, then quality. Rules relax in order: alone and no subtitle, alone, any. The score may be under MinExpression (the caller warns). Null: no scores for any candidate.</summary>
+    /// <summary>The portrait. The score floor comes first: among the unmasked candidates before the late limit that score at least MinExpression, the tiers relax alone and no subtitle, alone, any frame (cut tight by the caller); the best score wins, describe's pick breaks a tie, then quality. Only when nothing scores the floor: the best score overall (any frame), which the caller warns about. Null: no scores for any candidate.</summary>
     public static (int K, double T, double[]? Box, int Score)? PickPortrait(JsonArray? cands, int? picked, double duration, IReadOnlyList<int?> scores)
     {
         double limit = duration > 0 ? duration * CoverLateFraction : double.MaxValue;
-        var all = (cands?.OfType<JsonObject>() ?? []).Where(c => c["masked"]?.GetValue<bool>() != true && (c["t"]?.GetValue<double>() ?? 0) <= limit)
-            .Select(c => (C: c, K: c["k"]!.GetValue<int>())).Select(x => (x.C, x.K, S: x.K >= 0 && x.K < scores.Count ? scores[x.K] : null)).Where(x => x.S != null).ToList();
-        foreach (var tier in new Func<JsonObject, bool>[] { c => !IsCrowded(c) && !HasSub(c), c => !IsCrowded(c), _ => true })
+        var all = (cands?.OfType<JsonObject>() ?? []).Where(c => (c["t"]?.GetValue<double>() ?? 0) <= limit).ToList();
+        foreach (var (tier, floor) in Tiers.Select(t => (t, MinExpression)).Append((Tiers[^1], int.MinValue)))
         {
-            var best = all.Where(x => tier(x.C)).OrderByDescending(x => x.S).ThenByDescending(x => x.K == picked).ThenByDescending(x => x.C["quality"]?.GetValue<double>() ?? 0).Cast<(JsonObject C, int K, int? S)?>().FirstOrDefault();
+            var best = Ranked(all, picked, scores, tier, floor).Cast<(JsonObject C, int K, int S)?>().FirstOrDefault();
             if (best is not { } b) continue;
             var box = (b.C["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray();
-            return (b.K, b.C["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null, b.S!.Value);
+            return (b.K, b.C["t"]?.GetValue<double>() ?? 0, box is { Length: 4 } ? box : null, b.S);
         }
         return null;
     }
