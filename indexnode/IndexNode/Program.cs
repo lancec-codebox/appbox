@@ -39,7 +39,7 @@ public static class Program
 {
     public const string Usage = """
         indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
-                      [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
+                      [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
         indexnode ai test [--ai-base-url ...]

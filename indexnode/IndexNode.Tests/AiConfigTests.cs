@@ -69,6 +69,18 @@ public class AiConfigTests
         Assert.Contains("data:image/png;base64,", seen[1].Body);
     }
 
+    [Fact]
+    public async Task A_session_id_goes_on_every_call_as_x_session_id_and_none_is_sent_without_one()
+    {
+        var seen = new List<string?>();
+        HttpClient Http() => new(new Stub(req => { seen.Add(req.Headers.TryGetValues("x-session-id", out var v) ? v.Single() : null); return "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"; }));
+        var cfg = AiConfig.Resolve(null, f => f == "ai-session-id" ? "drama-describe" : f == "ai-base-url" ? "http://gw/v1" : f == "ai-text-model" ? "t" : null, _ => null);
+        Assert.Contains("session-id=drama-describe", cfg.Describe());
+        await new AiClient(Http(), cfg).TextAsync(default);
+        await new AiClient(Http(), new AiConfig { BaseUrl = "http://gw/v1", TextModel = "t" }).TextAsync(default);
+        Assert.Equal(["drama-describe", null], seen);
+    }
+
     private sealed class Fake(Func<HttpRequestMessage, string, (int Status, string Body)> f) : HttpMessageHandler
     {
         public readonly List<(string Path, string Body)> Seen = [];
