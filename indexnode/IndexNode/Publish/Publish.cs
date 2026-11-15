@@ -375,7 +375,7 @@ public static class Publish
     {
         var all = cands?.OfType<JsonObject>().ToList() ?? [];
         var windows = CoverWindows(cutoff, duration).ToList();
-        if (soloOnly && duration > 0) windows.Add(("late", duration * CoverLateFraction)); // a person alone beats an early window
+        if (soloOnly && duration > 0 && all.Any(c => c["solo"]?.GetValue<bool>() == true)) windows.Add(("late", duration * CoverLateFraction)); // alone is a hard rule: a solo frame up to the late limit beats a crowded early one
         foreach (var (name, maxT) in windows)
         {
             var limit = Math.Min(maxT, duration > 0 ? duration * CoverLateFraction : double.MaxValue);
