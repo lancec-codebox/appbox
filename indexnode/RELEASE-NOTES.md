@@ -1,5 +1,14 @@
 # IndexNode release notes
 
+## 0.8.1
+
+- `thumbs` is about 30-40x faster (a drama of 6-10k frames: 12-18 s instead of 450-690 s on a 4-core runner). One ffmpeg process per chunk reads the stored `frames/NNNN.mjpeg` as an mjpeg stream with `-lowres 3` (1/8-scale DCT decode), scales with `flags=area` and writes mjpeg; the output is split on SOI and must be exactly one standalone JPEG per row, else the step fails naming the chunk. Chunks are split into runs of whole frames, one ffmpeg each, up to `--threads` (default: cores).
+- The standalone run pipelines: chunk n+1 downloads and chunk n-1 uploads while chunk n is processed; timings (download / thumbnailing us per frame / upload) are logged.
+- Same files, sizes and 2 MB assertion as 0.8.0. `thumbs/manifest.json` gains `"decode": "scaled-1/8"` (`"full"` for the managed fallback used when ffmpeg is unavailable: full decode, frames in parallel, identical to 0.8.0 output).
+- Thumbnails differ slightly from 0.8.0's (real chunks: mean abs 5.1-5.6 levels, max about 96, mostly edge pixels), same size or ~6% larger.
+- Not used: LibJpeg.NET's classic scaled decode (scale_denom 2/4/8 returns blank images in this port).
+- New hidden `thumbs-bench` command for timing and comparing the routes on local chunks.
+
 ## 0.8.0
 
 - **New step `thumbs`: a 36x64 thumbnail of every stored frame.** `process --job=<id> --steps thumbs` reads the stored `frames/NNNN.mjpeg` chunks (ghosts are hydrated on read, 0.7.5; older AV1 chunks are decoded) and writes, per chunk, `thumbs/NNNN.mjpeg` (whole standalone JPEGs back to back, box/area downscale, quality 75, full tables in each, about 1.3 KB each; 64x36 for a landscape frame) and `thumbs/NNNN.json` (`[[off, len], ...]`, one pair per row, the same chunks and row order as `frames/` and `sscd/`; its own index, the frames JSON is untouched), then `thumbs/manifest.json` (size, quality, chunk list; written last). A chunk file must stay under Nexis's 2 MB ghosting size: the step fails with a clear error naming the chunk if one would not. Screenshot search re-ranks the copy matcher's top 10 with them (blurred copies); the UI shows frame previews from them without rehydrating ghosts.
