@@ -208,7 +208,7 @@ public class TranslateTests
         foreach (var p in f.Prompts.Where(p => p.Contains("GLOSSARY:")))
         {
             Assert.Contains("昭姐姐 => Sister Zhao [address form; refers to Gu Zhao, context only]", p);
-            Assert.Contains("NEVER swap in the person's full name", p); Assert.Contains("\"skip\":true", p);
+            Assert.Contains("NEVER swap in the person's full name", p); Assert.Contains("Interjections and laughs are speech", p); Assert.Contains("TRANSLATE it whenever its meaning is evident", p); Assert.Contains("\"skip\":true", p);
         }
         var e = JsonNode.Parse(r.Json!)!["glossary"]!.AsArray().Single(x => x!["zh"]!.GetValue<string>() == "昭姐姐")!;
         Assert.Equal("address", e["kind"]!.GetValue<string>()); Assert.Equal("Gu Zhao", e["refers"]!.GetValue<string>());
