@@ -69,6 +69,25 @@ public static class Models
         return path;
     }
 
+    /// <summary>InsightFace's small pack (det_500m + w600k_mbf), published only inside buffalo_s.zip: downloaded once from InsightFace's own release, checked, and the two models extracted (the zip is then deleted).</summary>
+    public static readonly ModelFile BuffaloSZip = new("face-buffalo-s", "buffalo_s.zip", "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip", "d85a87f503f691807cd8bb97128bdf7a0660326cd9cd02657127fa978bab8b5e", 127_607_557, "NON-COMMERCIAL (InsightFace buffalo_s)");
+
+    public static async Task<(string Det, string Rec)> EnsureBuffaloSAsync(HttpClient http, CancellationToken ct, string? dir = null)
+    {
+        var mdir = Path.Combine(dir ?? NodeConfig.ToolsDir(), "models"); string det = Path.Combine(mdir, "buffalo_s.det_500m.onnx"), rec = Path.Combine(mdir, "buffalo_s.w600k_mbf.onnx");
+        if (File.Exists(det) && File.Exists(rec)) return (det, rec);
+        var zip = await EnsureAsync(BuffaloSZip, http, ct, dir);
+        using (var z = System.IO.Compression.ZipFile.OpenRead(zip))
+            foreach (var (member, dest) in new[] { ("det_500m.onnx", det), ("w600k_mbf.onnx", rec) })
+            {
+                var e = z.Entries.FirstOrDefault(x => x.Name == member) ?? throw new InvalidOperationException($"buffalo_s.zip has no {member}");
+                using (var es = e.Open()) using (var fo = File.Create(dest + ".tmp")) es.CopyTo(fo);
+                File.Move(dest + ".tmp", dest, true);
+            }
+        File.Delete(zip);
+        return (det, rec);
+    }
+
     public static async Task EnsureAllAsync(IEnumerable<ModelFile> files, HttpClient http, CancellationToken ct, string? dir = null)
     { foreach (var f in files) await EnsureAsync(f, http, ct, dir); }
 

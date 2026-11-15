@@ -14,7 +14,7 @@ namespace IndexNode;
 /// </summary>
 public static class StagesCommand
 {
-    static readonly string[] Known = ["frames", "sscd", "cast", "transcribe"];
+    static readonly string[] Known = ["frames", "sscd", "transcribe", "text", "cast", "sync", "describe"];
 
     public static async Task<int> RunAsync(Args a)
     {
@@ -42,6 +42,21 @@ public static class StagesCommand
         Directory.CreateDirectory(work);
         try
         {
+            Task Put(string name, byte[] data, string type) => store.PutAsync(paths.Video(id, name), data, null, null, false, ct, type);
+            string? videoPath = null;
+            async Task<string> Video()
+            {   // the job's video, fetched once for every stage that reads it (--video-blob: a video stored elsewhere)
+                if (videoPath != null) return videoPath;
+                var blob = a.Get("video-blob") ?? paths.Video(id, "video.mp4"); var v = Path.Combine(work, "video.mp4");
+                if (!File.Exists(v))
+                {
+                    P(current, "fetching video.mp4");
+                    var rest = store as RestStore ?? (store as RedirectStore)?.Inner as RestStore;
+                    if (rest != null) await NexisAccess.PrepareAsync(rest, blob, ct);
+                    await store.DownloadToFileAsync(blob, v, ct);
+                }
+                return videoPath = v;
+            }
             ChunkDir? frameSet = null;
             async Task<ChunkDir> FrameSet() => frameSet ??= await FrameChunks.DownloadAsync(store, paths, id, "frames", Path.Combine(work, "framechunks"), ct)
                 ?? throw new InvalidOperationException($"{id} has no frames/ chunks (run the frames stage first)");
@@ -68,48 +83,39 @@ public static class StagesCommand
                         break;
                     }
                     case "transcribe":
+                    case "text":
                     {
-                        var videoBlob = paths.Video(id, "video.mp4"); var video = Path.Combine(work, "video.mp4");
-                        if (!File.Exists(video))
-                        {
-                            P(stage, "fetching video.mp4");
-                            var rest = store as RestStore ?? (store as RedirectStore)?.Inner as RestStore;
-                            if (rest != null) await NexisAccess.PrepareAsync(rest, videoBlob, ct);
-                            await store.DownloadToFileAsync(videoBlob, video, ct);
-                        }
-                        double fetch = sw.Elapsed.TotalSeconds;
-                        var m = await Models.EnsureAsync(Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vadm = await Models.EnsureAsync(Models.Vad, http, ct);
-                        var duration = await Frames.DurationAsync(tools, video, ct);
-                        var audio = await Transcribe.ReadAudioParallelAsync(tools, video, duration, threads, ct);
-                        P(stage, $"audio read in {sw.Elapsed.TotalSeconds - fetch:F1}s ({audio.Length / 16000.0:F0}s)");
-                        Transcribe.SharedModel = true;
-                        if (a.Get("asr-piece") is { } ap) Transcribe.PieceSeconds = int.Parse(ap);
-                        var segs = Transcribe.RunParallel(m, tk, vadm, audio, threads, 1, 1, msg => P(stage, msg), ct);
-                        var (lang, dubbed) = Transcribe.Dubbing(segs);
-                        var vtt = System.Text.Encoding.UTF8.GetBytes(Transcribe.Vtt(segs)); var json = Transcribe.ToJson(segs, lang, dubbed, audio.Length / (double)Transcribe.SampleRate, sw.Elapsed.TotalSeconds - fetch);
-                        if (a.Get("out") is { } od) { Directory.CreateDirectory(od); await File.WriteAllBytesAsync(Path.Combine(od, Transcribe.ModelName + ".zh.vtt"), vtt, ct); await File.WriteAllBytesAsync(Path.Combine(od, Transcribe.ModelName + ".zh.json"), json, ct); }
-                        else
-                        {
-                            await store.PutAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.vtt"), vtt, null, null, false, ct, "text/vtt");
-                            await store.PutAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), json, null, null, false, ct);
-                        }
-                        Console.WriteLine($"transcribe: {segs.Count} segments, {duration:F0}s of audio, language {lang}, dubbed {dubbed}; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
+                        var video = await Video(); double fetch = sw.Elapsed.TotalSeconds;
+                        if (stage == "transcribe" && a.Get("asr-piece") is { } ap) Transcribe.PieceSeconds = int.Parse(ap);
+                        var msg = stage == "transcribe" ? await StageSteps.TranscribeAsync(tools, http, video, 0, threads, Put, m => P(stage, m), ct)
+                                                        : await StageSteps.TextAsync(tools, http, video, 0, threads, Put, m => P(stage, m), ct);
+                        Console.WriteLine($"{stage}: {msg}; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }
                     case "cast":
                     {
                         P(stage, "fetching frames"); var fs = await FrameSet(); var shots = (await store.GetAsync(paths.Video(id, "frames/shots.json"), ct))?.Data;
-                        await Models.EnsureAllAsync(Models.FaceDefault, http, ct);
-                        double D(string k, double d) => a.Get(k) is { } v ? double.Parse(v, System.Globalization.CultureInfo.InvariantCulture) : d;
-                        var cm = CastLogic.ModelFor(a.Get("model-id") ?? (a.Get("face-rec") is { } fr && fr.Contains("mbf") ? "buffalo_s" : "buffalo_l"));
-                        var cs = new CastFrames.Settings(a.Get("face-det") ?? Models.PathOf(Models.ScrfdDet, null), a.Get("face-rec") ?? Models.PathOf(Models.ArcFaceRec, null),
-                            cm.Id, D("threshold", cm.Threshold), D("merge", cm.Merge), threads, AlsoRec: a.Get("face-alt"));
-                        var outDir = a.Get("out") ?? Path.Combine(work, "cast-out");
-                        var msg = await CastFrames.RunAsync(tools, fs, shots, outDir, cs, m => P(stage, m), ct);
-                        if (a.Get("out") == null)
-                            foreach (var f in Directory.GetFiles(Path.Combine(outDir, "cast")))
-                                await store.PutAsync(paths.Video(id, "cast/" + Path.GetFileName(f)), await File.ReadAllBytesAsync(f, ct), null, null, false, ct, f.EndsWith(".json") ? "application/json" : f.EndsWith(".jpg") ? "image/jpeg" : "application/octet-stream");
+                        if (!StageSteps.FramesAreJpeg(fs, shots)) throw new InvalidOperationException($"{id}: cast needs the JPEG frames and frames/shots.json (run the frames stage)");
+                        var duration = (await store.GetAsync(paths.Video(id, "info.json"), ct))?.Data is { } ib && System.Text.Json.Nodes.JsonNode.Parse(ib)?["duration"]?.GetValue<double>() is { } dd ? dd : 0;
+                        var msg = await StageSteps.CastAsync(tools, http, fs, shots, duration, threads, work, a.Get("out") is { } od ? (n, b, _) => { var f = Path.Combine(od, n); Directory.CreateDirectory(Path.GetDirectoryName(f)!); return File.WriteAllBytesAsync(f, b, ct); } : Put,
+                            m => P(stage, m), ct, a.Get("face-det"), a.Get("face-rec"), a.Get("face-alt"));
                         Console.WriteLine($"cast: {msg}; total {sw.Elapsed.TotalSeconds:F1}s");
+                        break;
+                    }
+                    case "sync":
+                    {
+                        var r = await StageSteps.SyncAsync((await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct))?.Data, (await store.GetAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), ct))?.Data, Put);
+                        Console.WriteLine(r == null ? "sync: nothing to measure (no OCR subtitles or no transcript)" : $"sync: offset {r.Offset:+0.00;-0.00} s, drift {r.Drift:0.00} s{(r.Suspect ? " (SUSPECT)" : "")}, {r.Matches} matches");
+                        break;
+                    }
+                    case "describe":
+                    {
+                        var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
+                        if (!ai.Configured) throw new InvalidOperationException("describe needs an AI endpoint (ai.* in the config)");
+                        var d = await DescribeJob.GatherAsync(new StoreJob(store, paths, id), Path.Combine(work, "describe"), ct);
+                        var bytes = await DescribeJob.RunAsync(new AiClient(http, ai), ai, d, ct);
+                        if (bytes != null) await Put("describe.json", bytes, "application/json");
+                        Console.WriteLine($"describe: {(bytes == null ? "skipped" : "written")}; total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }
                     case "sscd":

@@ -106,6 +106,7 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             }
             else originalBytes = listing.GetValueOrDefault(videoBlob);
 
+            Task Put(string name, byte[] data, string type) => ctx.Store.PutAsync(paths.Video(id, name), data, null, null, false, ct, type);
             int frameCount = 0;
             if (need["frames"])
             {
@@ -146,51 +147,28 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             if (need["transcribe"])
             {
                 ctx.Report("transcribe", null);
-                var model = await Models.EnsureAsync(Models.AsrModel, http, ct);
-                var tokens = await Models.EnsureAsync(Models.AsrTokens, http, ct);
-                var vad = await Models.EnsureAsync(Models.Vad, http, ct);
-                var t0 = watch.Elapsed.TotalSeconds;
-                var audio = await Transcribe.ReadAudioAsync(tools, video, 0, 0, ct);
-                var segs = Transcribe.Run(model, tokens, vad, audio, ctx.ThreadShare(), p => ctx.Report("transcribe", p), ct);
-                var (lang, isDubbed) = Transcribe.Dubbing(segs);
-                await ctx.Store.PutAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.vtt"), System.Text.Encoding.UTF8.GetBytes(Transcribe.Vtt(segs)), null, null, false, ct, "text/vtt");
-                await ctx.Store.PutAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), Transcribe.ToJson(segs, lang, isDubbed, audio.Length / (double)Transcribe.SampleRate, watch.Elapsed.TotalSeconds - t0), null, null, false, ct);
+                Log.Info($"process {id}: transcribe {await StageSteps.TranscribeAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("transcribe", p), ct)}");
             }
             if (need["ocrsubs"])
             {
                 ctx.Report("ocrsubs", null);
-                var det = await Models.EnsureAsync(Models.OcrDet, http, ct);
-                var rec = await Models.EnsureAsync(Models.OcrRec, http, ct);
-                var dict = await Models.EnsureAsync(Models.OcrDict, http, ct);
-                var (w, h) = await OcrSubs.SizeAsync(tools, video, ct);
-                int workers = Math.Max(1, ctx.ThreadShare());
-                var band = await OcrSubs.FindBandAsync(tools, det, rec, dict, video, w, h, 0, duration, workers, p => ctx.Report("ocrsubs", p), ct);
-                OcrResult res;
-                if (band == null)
-                {
-                    Log.Info($"process {id}: no subtitle band found: no burned-in subtitles");
-                    res = new OcrResult([], [], 0, 0, w, 0, 0);
-                }
-                else
-                {
-                    Log.Info($"process {id}: subtitle band y={band.Value.Y} h={band.Value.H}");
-                    res = await OcrSubs.ReadAsync(tools, video, det, rec, dict, w, h, band.Value.Y, band.Value.H, 0, duration, workers, p => ctx.Report("ocrsubs", p), ct);
-                }
-                var enc = System.Text.Encoding.UTF8;
-                await ctx.Store.PutAsync(paths.Video(id, "ocr/subs.zh.vtt"), enc.GetBytes(OcrCues.ToVtt(res.Zh, false)), null, null, false, ct, "text/vtt");
-                await ctx.Store.PutAsync(paths.Video(id, "ocr/subs.zh-Hans.vtt"), enc.GetBytes(OcrCues.ToVtt(res.Zh, true)), null, null, false, ct, "text/vtt");
-                await ctx.Store.PutAsync(paths.Video(id, "ocr/lines.json"), OcrCues.ToJson(res.Zh, res.En, res.BandY, res.BandH, res.Width), null, null, false, ct);
-                if (res.En.Count > 0) await ctx.Store.PutAsync(paths.Video(id, "ocr/subs.en.vtt"), enc.GetBytes(OcrCues.ToVtt(res.En, false)), null, null, false, ct, "text/vtt");
+                Log.Info($"process {id}: text {await StageSteps.TextAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("ocrsubs", p), ct)}");
             }
             if (need["cast"])
             {
                 ctx.Report("cast", null);
                 var castDir = Path.Combine(work, "castout");
+                var shotsB = (await store.GetAsync(paths.Video(id, "frames/shots.json"), ct))?.Data;
+                if (StageSteps.FramesAreJpeg(await FrameSet(), shotsB))
+                    Log.Info($"process {id}: cast (frames) {await StageSteps.CastAsync(tools, http, await FrameSet(), shotsB, duration, ctx.ThreadShare(), work, Put, p => ctx.Report("cast", p), ct)}");
+                else
+                {
                 var kfs = await FrameChunks.DownloadAsync(store, paths, id, "keyframes", Path.Combine(work, "kfchunks"), ct) ?? throw new InvalidOperationException($"{id} has no keyframes/ chunks yet (run the frames step)");
                 var msg = await CastStage.RunAsync(tools, http, video, duration, castDir, new CastStage.Options(config.CastModel ?? "buffalo_l", ctx.ThreadShare()), s => ctx.Report("cast", s), ct, null, kfs);
                 Log.Info($"process {id}: cast {msg}");
                 foreach (var f in Directory.GetFiles(Path.Combine(castDir, "cast")))
                     await ctx.Store.PutAsync(paths.Video(id, "cast/" + Path.GetFileName(f)), await File.ReadAllBytesAsync(f, ct), null, null, false, ct, f.EndsWith(".jpg") ? "image/jpeg" : f.EndsWith(".f16") ? "application/octet-stream" : "application/json");
+                }
             }
             if (need["describe"])
             {

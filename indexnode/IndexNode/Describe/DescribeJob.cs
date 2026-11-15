@@ -28,7 +28,8 @@ public static class DescribeJob
             }
         string? thumb = null; if (await src.ReadAsync("thumb.jpg", ct) is { } tb) { thumb = Path.Combine(work, "thumb.jpg"); File.WriteAllBytes(thumb, tb); }
         string? ps = null; int pn = 0;
-        if (await src.ReadAsync("cast/poster_sheet.jpg", ct) is { } pb) { ps = Path.Combine(work, "poster_sheet.jpg"); File.WriteAllBytes(ps, pb); pn = (await J("cast/poster_cands.json") as JsonArray)?.Count(x => x?["shortlist"]?.GetValue<bool>() ?? true) ?? 0; }
+        bool framesCast = (await J("cast/clusters.json") as JsonObject)?["source"] != null; // the frame-based cast has no two-shot posters (dropped): never pick up an older run's sheet
+        if (!framesCast && await src.ReadAsync("cast/poster_sheet.jpg", ct) is { } pb) { ps = Path.Combine(work, "poster_sheet.jpg"); File.WriteAllBytes(ps, pb); pn = (await J("cast/poster_cands.json") as JsonArray)?.Count(x => x?["shortlist"]?.GetValue<bool>() ?? true) ?? 0; }
         return new DescribeInput
         {
             JobId = src.JobId, Title = info?["title"]?.GetValue<string>() ?? "", Description = desc, Duration = dur, TextSource = ocr.Count > 0 ? "burned-in OCR" : "transcript",

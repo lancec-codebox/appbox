@@ -200,6 +200,47 @@ public static class CastFrames
         });
     }
 
+    /// <summary>
+    /// Credits lines (主演, 饰, 领衔) read from the stored frames of the first and last 3 minutes (the whole video when shorter than 6 minutes),
+    /// each JPEG decoded once, <paramref name="threads"/> parts at once. Replaces the video-based credits OCR of the old cast.
+    /// </summary>
+    public static async Task<List<(double Start, double End, string Text)>> CreditsAsync(Tools tools, HttpClient http, ChunkDir frames, double duration, int threads, Action<string> progress, CancellationToken ct)
+    {
+        var det = await Models.EnsureAsync(Models.OcrDet, http, ct); var rec = await Models.EnsureAsync(Models.OcrRec, http, ct); var dict = await Models.EnsureAsync(Models.OcrDict, http, ct);
+        var all = frames.Chunks.SelectMany(c => c.Frames.Select(f => (C: c, F: f))).ToList();
+        if (duration <= 0) duration = all.Count > 0 ? all[^1].F.T + 1 : 0;
+        const double edge = 180;
+        var rows = Enumerable.Range(0, all.Count).Where(i => duration <= 2 * edge || all[i].F.T < edge || all[i].F.T >= duration - edge).ToList();
+        if (rows.Count == 0) return [];
+        var ffmpeg = await tools.FfmpegAsync(ct); int w = frames.W, h = frames.H, fb = w * h * 3, parts = Math.Max(1, Math.Min(threads, rows.Count));
+        var hits = new List<(double S, double E, string Key)>[parts];
+        await Task.WhenAll(Enumerable.Range(0, parts).Select(p => Task.Run(async () =>
+        {
+            var mine = rows.Where((_, k) => k % parts == p).ToList(); var list = hits[p] = [];
+            using var eng = new OcrEngine(det, rec, dict, 1);
+            using var dec = Start(ffmpeg, ["-f", "mjpeg", "-i", "-", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], ct);
+            var feed = Task.Run(async () =>
+            {
+                try { foreach (var r in mine) { var (c, f) = all[r]; using var fh = File.OpenHandle(frames.ChunkFile(c)); var b = new byte[f.Len]; RandomAccess.Read(fh, b, f.Off); await dec.StandardInput.BaseStream.WriteAsync(b, ct); } }
+                finally { dec.StandardInput.Close(); }
+            }, ct);
+            var st = dec.StandardOutput.BaseStream;
+            foreach (var r in mine)
+            {
+                var buf = new byte[fb]; int off = 0; while (off < fb) { int k = await st.ReadAsync(buf.AsMemory(off, fb - off), ct); if (k == 0) break; off += k; }
+                if (off < fb) break;
+                var f = all[r].F; double end = f.Spans.Count > 0 ? f.Spans.Max(x => x[1]) : f.T + 1;
+                foreach (var l in eng.Recognize(buf, w, h))
+                    if (CastLogic.CreditWords.Any(c => l.Text.Contains(c))) list.Add((f.T, end, OpenCc.T2S.Convert(l.Text)));
+            }
+            await feed; await dec.WaitForExitAsync(ct);
+        }, ct)));
+        var seen = new Dictionary<string, (double S, double E)>();
+        foreach (var (s, e, key) in hits.SelectMany(x => x).OrderBy(x => x.S)) seen[key] = seen.TryGetValue(key, out var v) ? (Math.Min(v.S, s), Math.Max(v.E, e)) : (s, e);
+        progress($"credits: {rows.Count} frames read, {seen.Count} lines");
+        return seen.Select(kv => (kv.Value.S, kv.Value.E, kv.Key)).OrderBy(x => x.Item1).ToList();
+    }
+
     static Process Start(string ffmpeg, string[] args, CancellationToken ct)
     {
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };

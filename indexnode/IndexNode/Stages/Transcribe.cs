@@ -164,7 +164,7 @@ public static class Transcribe
     /// <summary>Voice detection in parallel: each piece's detector starts this long before the piece (grid-aligned), and pieces are at least PieceSeconds long.
     /// On the 10-min window (1-min pieces): no warm-up 18.6% CER against the burned-in subtitles, 60 s 17.7%, one sequential pass 17.1%.</summary>
     public static int WarmUpSeconds = 60, PieceSeconds = 600;
-    public static bool SharedModel = false;
+    public static bool SharedModel = true; // one loaded model serves every worker (same text as separate copies, no 5 s / 3 GB of loading)
 
     /// <summary>The audio of the whole file read by <paramref name="parts"/> ffmpeg processes at once (each seeks to its part), joined.</summary>
     public static async Task<float[]> ReadAudioParallelAsync(Tools tools, string file, double duration, int parts, CancellationToken ct)
