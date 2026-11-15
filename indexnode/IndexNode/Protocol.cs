@@ -20,7 +20,8 @@ public static partial class Protocol
     public static string[] NeedsOf(string step) => step switch
     {
         "sscd" or "clip" => ["frames/manifest.json"],
-        "cast" => ["frames/manifest.json", "keyframes/manifest.json"],
+        // 0.7: cast reads the stored frames (no keyframes), after the SSCD pass has rewritten their index; jobs created before keep their stored needs
+        "cast" => ["frames/manifest.json", "sscd/manifest.json"],
         "sync" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json"],
         "describe" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json", "cast/clusters.json"],
         _ => [],
