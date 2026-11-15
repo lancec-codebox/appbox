@@ -100,7 +100,7 @@ public static class Thumbs
         var errT = p.StandardError.ReadToEndAsync(ct);
         var outMs = new MemoryStream(); var outT = p.StandardOutput.BaseStream.CopyToAsync(outMs, ct);
         try { await p.StandardInput.BaseStream.WriteAsync(data, ct); } catch (IOException) { }   // ffmpeg quit early: its error is below
-        p.StandardInput.Close();
+        try { p.StandardInput.Close(); } catch (IOException) { }
         await outT; await p.WaitForExitAsync(ct); var err = await errT;
         if (p.ExitCode != 0) throw new InvalidOperationException($"{id}: ffmpeg failed on frames/{c.Chunk}.mjpeg (exit {p.ExitCode}): {err.Trim()[..Math.Min(300, err.Trim().Length)]}");
         var all = outMs.ToArray(); var rows = FrameChunks.SplitJpegs(all);
@@ -136,7 +136,7 @@ public static class Thumbs
     public sealed class Timing { public long DownloadMs, ProcessMs, UploadMs; public int Frames; public override string ToString() => $"download {DownloadMs} ms, thumbnailing {ProcessMs} ms ({(Frames == 0 ? 0 : ProcessMs * 1000.0 / Frames):F0} us/frame), upload {UploadMs} ms"; }
 
     /// <summary>Standalone path: reads the stored frames/ chunks itself (hydrating ghosts) and pipelines: chunk n+1 downloads and chunk n-1 uploads while chunk n is processed.</summary>
-    public static async Task<int> RunStoredAsync(Tools? tools, IStore store, Paths paths, string id, int threads, Action<string>? progress, CancellationToken ct, Timing? timing = null, bool managed = false)
+    public static async Task<int> RunStoredAsync(Tools? tools, IStore store, Paths paths, string id, int threads, Action<string>? progress, CancellationToken ct, Timing? timing = null, bool managed = false, string? ffmpegPath = null)
     {
         var manName = paths.Video(id, "frames/manifest.json");
         var man = await store.GetAsync(manName, ct) ?? throw new InvalidOperationException($"{id} has no frames/ chunks yet (run the frames step)");
@@ -151,7 +151,7 @@ public static class Thumbs
             finally { try { Directory.Delete(dir, true); } catch { } }
         }
         var (tw, th) = SizeFor(w, h); timing ??= new Timing();
-        string? ffmpeg = managed || tools == null ? null : await tools.FfmpegAsync(ct);
+        string? ffmpeg = managed ? null : ffmpegPath ?? (tools == null ? null : await tools.FfmpegAsync(ct));
         async Task<(ChunkInfo, byte[])> Fetch(string n)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();

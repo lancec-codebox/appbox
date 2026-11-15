@@ -96,4 +96,70 @@ public class ThumbsTests
         }
         finally { Directory.Delete(dir, true); }
     }
+
+    static string? Ffmpeg() => new[] { "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg" }.FirstOrDefault(File.Exists);
+
+    [Fact]
+    public async Task The_scaled_ffmpeg_route_gives_one_standalone_jpeg_per_row_in_order_close_to_the_full_decode()
+    {
+        var ff = Ffmpeg(); if (ff == null) return;   // no ffmpeg on this machine: the fallback route is tested above
+        int n = 30; var jpgs = Enumerable.Range(0, n).Select(i => Imaging.EncodeJpeg(Frame(360, 640, i), 85)).ToList();
+        var ms = new MemoryStream(); var frames = new List<ChunkFrame>();
+        for (int k = 0; k < n; k++) { frames.Add(new ChunkFrame(k, k, k, [], null, ms.Length, jpgs[k].Length)); ms.Write(jpgs[k]); }
+        var c = new ChunkInfo("0000", 0, frames);
+        var fast = await Thumbs.ChunkFfmpegParallelAsync(ff, ms.ToArray(), c, 36, 64, 3, "vid", default);   // 3 ffmpegs of 10 frames
+        Assert.Equal(n, fast.Count);
+        double sum = 0; long cnt = 0;
+        for (int k = 0; k < n; k++)
+        {
+            var a = Imaging.DecodeJpeg(fast[k]); Assert.Equal((36, 64), (a.W, a.H));   // decodes standalone
+            var b = Imaging.DecodeJpeg(Thumbs.Thumb(Imaging.DecodeJpeg(jpgs[k])));
+            for (int i = 0; i < a.Data.Length; i++) { sum += Math.Abs(a.Data[i] - b.Data[i]); cnt++; }
+        }
+        Assert.True(sum / cnt < 8, "mean abs difference " + sum / cnt);   // the 1/8 DCT decode differs from the full decode by a few levels
+        // a count that does not match the rows is refused
+        var bad = new ChunkInfo("0000", 0, frames.Take(n - 1).ToList());
+        var e = await Assert.ThrowsAsync<InvalidOperationException>(() => Thumbs.ChunkFfmpegAsync(ff, ms.ToArray(), bad, 36, 64, 1, "vid", default));
+        Assert.Contains("30 thumbnails for 29 frames", e.Message);
+    }
+
+    [Fact]
+    public void The_managed_fallback_is_the_0_8_0_thumbnail_exactly()
+    {
+        var jpg = Imaging.EncodeJpeg(Frame(360, 640, 4), 85);
+        var f = new ChunkFrame(0, 0, 0, [], null, 0, jpg.Length); var c = new ChunkInfo("0000", 0, [f]);
+        Assert.Equal(Thumbs.Thumb(Imaging.DecodeJpeg(jpg)), Thumbs.ChunkManaged(jpg, c, 36, 64, 2, "vid")[0]);
+    }
+
+    [Fact]
+    public async Task The_standalone_pipelined_run_writes_the_same_files_and_the_manifest_says_how_it_decoded()
+    {
+        var ff = Ffmpeg(); if (ff == null) return;
+        var store = new FakeStore(); var paths = new Paths("index/"); int seed = 0; var meta = new List<(string, double, int, long)>();
+        foreach (var (nme, cnt, st) in new[] { ("0000", 50, 0.0), ("0001", 20, 600.0) })
+        {
+            var ms = new MemoryStream(); var frames = new List<ChunkFrame>();
+            for (int k = 0; k < cnt; k++) { var j = Imaging.EncodeJpeg(Frame(360, 640, seed++), 85); frames.Add(new ChunkFrame(k, st + k, k, [], null, ms.Length, j.Length)); ms.Write(j); }
+            await store.PutAsync(paths.Video("vid", $"frames/{nme}.mjpeg"), ms.ToArray(), null, null, false, default);
+            await store.PutAsync(paths.Video("vid", $"frames/{nme}.json"), FrameChunks.JpegIndexJson(nme, st, 360, 640, 85, frames), null, null, false, default);
+            meta.Add((nme, st, cnt, ms.Length));
+        }
+        await store.PutAsync(paths.Video("vid", "frames/manifest.json"), FrameChunks.ManifestJson("frames", 360, 640, 0, 70, meta, null, "mjpeg", "jpeg"), null, null, false, default);
+        var tools = new Tools(new HttpClient());   // finds ffmpeg on PATH (or in IndexNode's own tools)
+        var tm = new Thumbs.Timing();
+        Assert.Equal(70, await Thumbs.RunStoredAsync(tools, store, paths, "vid", 2, null, default, tm, false, ff));
+        var man = System.Text.Json.JsonDocument.Parse((await store.GetAsync(paths.Video("vid", "thumbs/manifest.json"), default))!.Data).RootElement;
+        Assert.Equal("scaled-1/8", man.GetProperty("decode").GetString()); Assert.Equal(70, man.GetProperty("count").GetInt32());
+        foreach (var (nme, _, cnt, _) in meta)
+        {
+            var rows = Thumbs.ParseIndex((await store.GetAsync(paths.Video("vid", $"thumbs/{nme}.json"), default))!.Data, "i"); Assert.Equal(cnt, rows.Count);
+            var data = (await store.GetAsync(paths.Video("vid", $"thumbs/{nme}.mjpeg"), default))!.Data;
+            foreach (var (off, len) in rows) { var im = Imaging.DecodeJpeg(data.AsSpan(off, len).ToArray()); Assert.Equal((36, 64), (im.W, im.H)); }
+        }
+        Assert.Equal(70, tm.Frames);
+        // the fallback (no ffmpeg) writes "full"
+        var store2 = new FakeStore(); foreach (var b in store.Blobs) if (b.Key.Contains("/frames/")) await store2.PutAsync(b.Key, b.Value.Data, null, null, false, default);
+        await Thumbs.RunStoredAsync(null, store2, paths, "vid", 2, null, default);
+        Assert.Equal("full", System.Text.Json.JsonDocument.Parse((await store2.GetAsync(paths.Video("vid", "thumbs/manifest.json"), default))!.Data).RootElement.GetProperty("decode").GetString());
+    }
 }
