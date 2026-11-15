@@ -67,7 +67,7 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
             if (JsonNode.Parse(body) is not JsonObject o || o["error"] is not { } e) return null;
             return (e is JsonObject eo ? (eo["code"]?.ToString() + ": " + eo["message"]?.ToString()) : e.ToString()).Trim(' ', ':');
         }
-        catch (JsonException) { return null; }
+        catch (Exception e) when (e is JsonException or ArgumentException) { return null; } // ArgumentException: a repeated key in the body ("An item with the same key has already been added")
     }
 
     private static InvalidOperationException Fail(Reply r) =>
@@ -77,7 +77,7 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     public static bool IsUnsupportedApi(string body)
     {
         if (body.Contains("unsupported_api_for_model", StringComparison.Ordinal)) return true;
-        try { return JsonNode.Parse(body)?["error"]?["code"]?.GetValue<string>() == "unsupported_api_for_model"; } catch (Exception e) when (e is JsonException or InvalidOperationException) { return false; }
+        try { return JsonNode.Parse(body)?["error"]?["code"]?.GetValue<string>() == "unsupported_api_for_model"; } catch (Exception e) when (e is JsonException or InvalidOperationException or ArgumentException) { return false; }
     }
 
     /// <summary>Chat content as Responses input content: text -> input_text, image_url -> input_image.</summary>

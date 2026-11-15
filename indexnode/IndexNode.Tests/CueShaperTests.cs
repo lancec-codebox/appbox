@@ -123,4 +123,12 @@ public class CueShaperTests
         var c = CueShaper.Shape([new ShapeCue(0, 5.8, text)]);
         Assert.True(c.All(x => x.End - x.Start <= CueShaper.MaxSeconds + 1e-6));
     }
+
+    [Fact]
+    public void A_latin_word_longer_than_a_line_is_cut_so_every_line_fits()
+    {
+        var c = CueShaper.Shape([new ShapeCue(0, 3, "Aaaaah " + new string('h', 100) + " no")]);
+        var s = CueShaper.Stats(c);
+        Assert.Equal(0, s.OverChars);
+    }
 }

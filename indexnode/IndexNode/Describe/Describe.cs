@@ -173,7 +173,29 @@ from/to and picks keys are cluster ids.
         var bytes = System.Text.Encoding.UTF8.GetBytes(s[a..]);
         var reader = new Utf8JsonReader(bytes, new JsonReaderOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
         using var doc = JsonDocument.ParseValue(ref reader);
-        return JsonNode.Parse(doc.RootElement.GetRawText())!.AsObject();
+        return (JsonObject)FromElement(doc.RootElement)!;
+    }
+
+    /// <summary>A node from a parsed element, tolerant of what JsonNode.Parse refuses: a repeated key keeps its first value (the model repeated one: "An item with the same key has already been added. Key: }") and a junk key (empty, or no letter or digit) is dropped.</summary>
+    public static JsonNode? FromElement(JsonElement e)
+    {
+        switch (e.ValueKind)
+        {
+            case JsonValueKind.Object:
+                var o = new JsonObject();
+                foreach (var p in e.EnumerateObject())
+                {
+                    if (!p.Name.Any(char.IsLetterOrDigit) || o.ContainsKey(p.Name)) continue;
+                    o[p.Name] = FromElement(p.Value);
+                }
+                return o;
+            case JsonValueKind.Array:
+                var a = new JsonArray();
+                foreach (var x in e.EnumerateArray()) a.Add(FromElement(x));
+                return a;
+            default:
+                return JsonNode.Parse(e.GetRawText());
+        }
     }
 
     static readonly Regex Bad = new(@"villain|antagonist", RegexOptions.IgnoreCase);
