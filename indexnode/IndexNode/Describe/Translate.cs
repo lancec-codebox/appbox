@@ -38,7 +38,7 @@ public sealed record TranslateResult(bool Skipped, string? Reason, byte[]? Vtt, 
 /// </summary>
 public static partial class Translate
 {
-    public const string PromptVersion = "translate-2";
+    public const string PromptVersion = "translate-3";
     public const int BatchCues = 200, ContextCues = 10, Parallelism = 4, MaxReasks = 2;
     /// <summary>Context on each side of a batch: at least this many cues AND at least this many seconds (whichever reaches further), so an exchange split by a boundary is seen whole.</summary>
     public const double ContextSeconds = 30;
@@ -247,7 +247,9 @@ public static partial class Translate
             - Natural, spoken English that an audience reads at a glance. Keep each speaker's register (formal court speech, family talk, slang, anger, tenderness).
             - Use the glossary EXACTLY for names, places and titles: the English in the glossary is the only spelling to use, every time.
             - A form of address stays a form of address: translate it as the address, in the speaker's register, using the glossary's English for that form (昭姐姐 => "Sister Zhao", 阿战 from his mother => "Zhan" or "A-Zhan", 小可爱 => "sweetie"). NEVER swap in the person's full name for an address. Use a full name only where the Chinese itself uses the name. "refers to" is context only, so you know who is meant.
-            - Garbled or stray OCR: a lone character or fragment that is not a word in this context (an OCR error) is not translated. Answer it with "en": "" and "skip": true. Do not guess or invent text for it. Real short words and names are translated normally.
+            - Fragments and scrambled OCR: the Chinese is burned-in OCR, so a cue may be cut off, partial or have swapped or wrong characters. TRANSLATE it whenever its meaning is evident from the cue and its neighbours: give the evident meaning (a cut-off line stays cut off, e.g. "...may not be able to protect the heir"; a scrambled repeat of a nearby line takes that line's meaning, in the same English). Do not drop a cue just because it looks odd.
+            - Interjections and laughs are speech: 哈哈哈 => "Hahaha", 啊啊啊 => "Aaah!", 哼 => "Hmph." Translate them.
+            - Skip ONLY (answer "en": "" and "skip": true): a lone character or fragment with no evident meaning in context (an OCR error), and on-screen text that is not dialogue (signs, wanted posters, edicts shown with no speaker). Never invent text for a skipped cue.
             - No notes, no explanations, no brackets, no speaker labels, no quotation of the Chinese. Do not add words that are not said.
             - One sentence may run across several cues: translate each cue's own part so that the cues read right in sequence (do not repeat the whole sentence in each cue).
             - A cue that is only a sound effect, music or non-speech gets an empty string ("skip": true).
