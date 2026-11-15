@@ -92,7 +92,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
         if (Has("processed.json") && !Redo && !stepJob) return;
         var downloaded = await store.GetAsync(paths.Video(id, "downloaded.json"), ct)
             ?? throw new InvalidOperationException($"{id} has no downloaded.json yet");
-        double duration = JsonDocument.Parse(downloaded.Data).RootElement.TryGetProperty("durationSeconds", out var dEl) ? dEl.GetDouble() : 0;
+        double duration = StoredJson.Doc(downloaded.Data, $"{id}/downloaded.json").RootElement.TryGetProperty("durationSeconds", out var dEl) ? dEl.GetDouble() : 0;
 
         var need = new Dictionary<string, bool>
         {
@@ -239,17 +239,17 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             // a redo (`process --job --steps`) replaces the listed outputs only: processed.json and the video stay as they are
             if (Redo) { Log.Info($"process {id}: redone {string.Join(',', steps)} (processed.json left alone)"); return; }
             if (frameCount == 0 && steps.Contains("frames") && await store.GetAsync(paths.Video(id, "frames/manifest.json"), ct) is { } fm)
-                frameCount = JsonDocument.Parse(fm.Data).RootElement.GetProperty("count").GetInt32();
+                frameCount = StoredJson.Doc(fm.Data, $"{id}/frames/manifest.json").RootElement.GetProperty("count").GetInt32();
             // speech language and OCR cue count come from the outputs, whether this run made them or an earlier one did
             string? speechLanguage = null; bool? dubbed = null; int? ocrCues = null;
             if (!stepJob && steps.Contains("transcribe") && await store.GetAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), ct) is { } asr)
             {
-                var root = JsonDocument.Parse(asr.Data).RootElement;
+                var root = StoredJson.Doc(asr.Data, $"{id}/asr/" + Transcribe.ModelName + ".zh.json").RootElement;
                 speechLanguage = root.TryGetProperty("language", out var l) ? l.GetString() : null;
                 dubbed = root.TryGetProperty("dubbed", out var d) && d.ValueKind == JsonValueKind.True;
             }
             if (!stepJob && steps.Contains("ocrsubs") && await store.GetAsync(paths.Video(id, "ocr/lines.json"), ct) is { } ocr)
-                ocrCues = JsonDocument.Parse(ocr.Data).RootElement.GetProperty("zh").GetArrayLength();
+                ocrCues = StoredJson.Doc(ocr.Data, $"{id}/ocr/lines.json").RootElement.GetProperty("zh").GetArrayLength();
             // sync.json, once transcribe and ocrsubs have both run for the job
             double? avOffset = null; bool? avSuspect = null;
             if ((steps.Contains("transcribe") && steps.Contains("ocrsubs")) || need["sync"])

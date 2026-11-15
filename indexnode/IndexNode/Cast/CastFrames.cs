@@ -27,7 +27,7 @@ public static class CastFrames
     public static List<int> Rows(byte[]? shotsJson, int count)
     {
         if (shotsJson == null) return Enumerable.Range(0, count).ToList();
-        var rows = JsonDocument.Parse(shotsJson).RootElement.GetProperty("shots").EnumerateArray().Select(s => s.GetProperty("frame").GetInt32()).Where(r => r >= 0 && r < count);
+        var rows = JsonDocument.Parse(shotsJson.Length == 0 ? throw new StoredJson.EmptyBlobException("frames/shots.json") : shotsJson).RootElement.GetProperty("shots").EnumerateArray().Select(s => s.GetProperty("frame").GetInt32()).Where(r => r >= 0 && r < count);
         return rows.Distinct().Order().ToList();
     }
 

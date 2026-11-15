@@ -55,7 +55,7 @@ public static class NexisAccess
     /// - ghost (0 bytes, uncommitted blocks): commit the blocks (Nexis's hydrate), conditional on the ETag; a lost race re-reads the blob.
     /// - anything else with 0 bytes, or a length that is not the recorded size: PermanentFailure naming the blob and its state.
     /// </summary>
-    public static async Task<BlobRead> EnsureReadableAsync(IGhostBlob blob, CancellationToken ct)
+    public static async Task<BlobRead> EnsureReadableAsync(IGhostBlob blob, CancellationToken ct, bool failOnEmptyNonGhost = true)
     {
         long? expected = null; bool repaired = false;
         for (int attempt = 0; attempt < 6; attempt++)
@@ -67,7 +67,7 @@ public static class NexisAccess
             bool transitioning = state == nameof(BlobStateNames.transitioning), ghost = state == nameof(BlobStateNames.ghost);
             if (!transitioning && !ghost)
             {
-                if (s.Length == 0) throw Unreadable(blob.Name, s, "0 bytes committed and not a ghost");
+                if (s.Length == 0) { if (!failOnEmptyNonGhost) return new(null, repaired); throw Unreadable(blob.Name, s, "0 bytes committed and not a ghost"); }
                 if (expected is { } exp && s.Length != exp) throw Unreadable(blob.Name, s, $"{s.Length} bytes committed but {exp} expected");
                 return new(null, repaired);      // active (or untagged): readable
             }

@@ -96,10 +96,10 @@ public static class FrameChunks
         if (man == null) return null;
         Directory.CreateDirectory(dir);
         await File.WriteAllBytesAsync(Path.Combine(dir, "manifest.json"), man.Data, ct);
-        foreach (var c in JsonDocument.Parse(man.Data).RootElement.GetProperty("chunks").EnumerateArray())
+        foreach (var c in StoredJson.Doc(man.Data, paths.Video(id, prefix + "/manifest.json")).RootElement.GetProperty("chunks").EnumerateArray())
         {
             var n = c.GetProperty("chunk").GetString()!;
-            var dataExt = JsonDocument.Parse(man.Data).RootElement.TryGetProperty("container", out var ce) && ce.GetString() == "mjpeg" ? "mjpeg" : "mp4";
+            var dataExt = StoredJson.Doc(man.Data, paths.Video(id, prefix + "/manifest.json")).RootElement.TryGetProperty("container", out var ce) && ce.GetString() == "mjpeg" ? "mjpeg" : "mp4";
             foreach (var ext in new[] { "json", dataExt })
             {
                 var b = await ReadAsync(store, paths.Video(id, $"{prefix}/{n}.{ext}"), ct, ext != "json") ?? throw new InvalidOperationException($"{id}: {prefix}/{n}.{ext} is missing");
@@ -154,7 +154,7 @@ public static class FrameChunks
 
     /// <summary>The rows the SSCD pass kept (sscd/keep.json), or null when there is no such pass.</summary>
     public static async Task<HashSet<int>?> SscdKeepAsync(IJobSource src, CancellationToken ct) =>
-        await src.ReadAsync("sscd/keep.json", ct) is { } b ? JsonDocument.Parse(b).RootElement.GetProperty("keep").EnumerateArray().Select(x => x.GetInt32()).ToHashSet() : null;
+        await src.ReadAsync("sscd/keep.json", ct) is { } b ? StoredJson.Doc(b, "sscd/keep.json").RootElement.GetProperty("keep").EnumerateArray().Select(x => x.GetInt32()).ToHashSet() : null;
 
     /// <summary>Applies the SSCD pass to the stored indexes: a dropped frame points to the kept one (rep) and its spans move to it; writes sscd/keep.json and the rewritten frames/NNNN.json.</summary>
     public static async Task ApplySscdPassAsync(IStore store, Paths paths, string id, ChunkDir frames, int[] rep, List<int> keep, double cosine, double lookback, CancellationToken ct)

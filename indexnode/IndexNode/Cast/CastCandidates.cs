@@ -67,10 +67,10 @@ public static class CastCandidates
         else { store = new RestStore(http, cfg.Sas); paths = new Paths(a.Get("prefix") ?? "index/"); }
         bool write = a.Has("write"); var outDir = a.Get("out") ?? Path.Combine(Path.GetTempPath(), "cast-candidates", id);
         async Task<byte[]?> Read(string f) => await FrameChunks.ReadAsync(store, paths.Video(id, f), ct, f.EndsWith(".json") && !f.StartsWith("cast/") && !f.StartsWith("ocr/") ? false : true); // large blobs may be ghosts: hydrated first
-        var facesDoc = JsonNode.Parse(await Read("cast/faces.json") ?? throw new InvalidOperationException($"{id}: no cast/faces.json (run cast)")) as JsonObject ?? throw new InvalidOperationException("faces.json");
-        var clustersDoc = JsonNode.Parse(await Read("cast/clusters.json") ?? throw new InvalidOperationException($"{id}: no cast/clusters.json"))!.AsObject();
+        var facesDoc = StoredJson.Object(await Read("cast/faces.json") ?? throw new InvalidOperationException($"{id}: no cast/faces.json (run cast)"), $"{id}/cast/faces.json");
+        var clustersDoc = StoredJson.Object(await Read("cast/clusters.json") ?? throw new InvalidOperationException($"{id}: no cast/clusters.json"), $"{id}/cast/clusters.json");
         int fw = facesDoc["source"]?["width"]?.GetValue<int>() ?? 360, fh = facesDoc["source"]?["height"]?.GetValue<int>() ?? 640;
-        var subs = SubtitleBand.Parse(await Read("ocr/lines.json"));
+        var subs = SubtitleBand.Parse(await Read("ocr/lines.json"), $"{id}/ocr/lines.json");
         var faces = LoadFaces(facesDoc, await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.f16"), ct), subs, fw); // a ghost blob: hydrated first
         var only = a.Get("clusters")?.Split(',').Select(int.Parse).ToHashSet();
         var main = (clustersDoc["clusters"] as JsonArray)!.OfType<JsonObject>().Where(c => c["main"]?.GetValue<bool>() == true).Select(c => c["id"]!.GetValue<int>()).Where(c => only == null || only.Contains(c)).ToList();
@@ -94,10 +94,7 @@ public static class CastCandidates
         {
             var (c, f) = rowOf[Math.Round(t, 3)]; var name = paths.Video(id, $"frames/{c.Chunk}.mjpeg");
             if (rest == null) { var all = store.GetAsync(name, ct).GetAwaiter().GetResult()!.Data; return all.AsSpan((int)f.Off, f.Len).ToArray(); }
-            if (hydrated.Add(name)) NexisAccess.PrepareAsync(rest, name, ct).GetAwaiter().GetResult();
-            using var req = new HttpRequestMessage(HttpMethod.Get, rest.BlobUri(name)); req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(f.Off, f.Off + f.Len - 1);
-            using var r = http.SendAsync(req, ct).GetAwaiter().GetResult(); r.EnsureSuccessStatusCode();
-            return r.Content.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
+            return rest.GetRangeAsync(name, f.Off, f.Len, ct).GetAwaiter().GetResult();   // a ghost chunk is hydrated first
         }
         Rgb? last = null; double lastT = double.NaN;
         var (matched, unmatched, dropped) = Annotate(pool, t => { var im = Imaging.DecodeJpeg(FrameJpeg(t)); return (det.Detect(im), im); }, fh);

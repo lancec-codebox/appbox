@@ -20,7 +20,7 @@ public sealed class AvailabilityStage(Tools tools, IStore store, Func<DateTimeOf
 
     public static JobDescriptor NewSweep(string every = "1d") => new() { Stage = "availability", JobId = SweepId, Kind = "sweep", Name = "availability sweep", Every = every, AddedAt = Protocol.NowUtc() };
 
-    async Task<JsonObject?> J(string name, CancellationToken ct) => await store.GetAsync(name, ct) is { } b ? JsonNode.Parse(b.Data) as JsonObject : null;
+    async Task<JsonObject?> J(string name, CancellationToken ct) => await store.GetAsync(name, ct) is { } b ? StoredJson.Parse(b.Data, name) as JsonObject : null;
 
     public async Task RunAsync(JobContext ctx)
     {

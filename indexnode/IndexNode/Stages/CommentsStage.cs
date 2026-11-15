@@ -84,7 +84,7 @@ public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) 
         var ct = ctx.Token; var job = ctx.Job; var id = job.JobId; var paths = ctx.Paths;
         if (string.IsNullOrEmpty(job.Url)) throw new PermanentFailure("job has no url");
         var marker = await ctx.Store.GetAsync(paths.Video(id, "downloaded.json"), ct);
-        var downloadedAt = DateTimeOffset.TryParse(marker == null ? null : JsonDocument.Parse(marker.Data).RootElement.TryGetProperty("at", out var at) ? at.GetString() : null, out var d)
+        var downloadedAt = DateTimeOffset.TryParse(marker == null ? null : StoredJson.Doc(marker.Data, $"{id}/downloaded.json").RootElement.TryGetProperty("at", out var at) ? at.GetString() : null, out var d)
             ? d : DateTimeOffset.TryParse(job.AddedAt, out var added) ? added : DateTimeOffset.UtcNow;
         int round = job.Round ?? 0;
         int max = job.MaxComments ?? 1000;

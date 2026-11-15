@@ -9,9 +9,9 @@ public sealed class SubtitleBand
     readonly List<(double S, double E, double X0, double Y0, double X1, double Y1)> cues = [];
     SubtitleBand(double width) => Width = width;
 
-    public static SubtitleBand? Parse(byte[]? lines)
+    public static SubtitleBand? Parse(byte[]? lines, string name = "ocr/lines.json")
     {
-        if (lines == null || JsonNode.Parse(lines) is not JsonObject o) return null;
+        if (lines == null || StoredJson.Parse(lines, name) is not JsonObject o) return null;
         var sb = new SubtitleBand(o["band"]?["width"]?.GetValue<double>() ?? 0); if (sb.Width <= 0) return null;
         foreach (var lang in new[] { "en", "zh" })
             foreach (var c in (o[lang] as JsonArray)?.OfType<JsonObject>() ?? [])

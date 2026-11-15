@@ -192,11 +192,11 @@ public static class Publish
         var dir = Path.Combine(outDir, id); var stampFile = Path.Combine(dir, ".stamp"); var ourEn = await src.ReadAsync(Translate.OutVtt, ct); var stamp = Stamp(processedB, describeB, ourEn);
         if (!force && File.Exists(stampFile) && File.ReadAllText(stampFile) == stamp) return new(id, false, "up to date");
         var tmp = dir + ".tmp"; if (Directory.Exists(tmp)) Directory.Delete(tmp, true); Directory.CreateDirectory(Path.Combine(tmp, "cast"));
-        async Task<JsonObject?> J(string f) => await src.ReadAsync(f, ct) is { } b && JsonNode.Parse(b) is JsonObject o ? o : null;
-        async Task<JsonNode?> JN(string f) => await src.ReadAsync(f, ct) is { } b ? JsonNode.Parse(b) : null;
+        async Task<JsonObject?> J(string f) => await src.ReadAsync(f, ct) is { } b && StoredJson.Parse(b, $"{id}/{f}") is JsonObject o ? o : null;
+        async Task<JsonNode?> JN(string f) => await src.ReadAsync(f, ct) is { } b ? StoredJson.Parse(b, $"{id}/{f}") : null;
         var describe = JsonNode.Parse(describeB)!.AsObject(); var processed = JsonNode.Parse(processedB)!.AsObject();
         var info = await J("info.json"); var downloaded = await J("downloaded.json"); var clusters = await J("cast/clusters.json"); var facesDoc = await J("cast/faces.json");
-        var subs = SubtitleBand.Parse(await src.ReadAsync("ocr/lines.json", ct)); double frameW = facesDoc?["source"]?["width"]?.GetValue<double>() ?? 360;
+        var subs = SubtitleBand.Parse(await src.ReadAsync("ocr/lines.json", ct), $"{id}/ocr/lines.json"); double frameW = facesDoc?["source"]?["width"]?.GetValue<double>() ?? 360;
 
         // frames.json + sscd.f16 at 1 fps; clip.f16 + clipFrames.json one row per shot
         var times = await FrameChunks.TimesAsync(src, ct);
@@ -486,7 +486,7 @@ public static class Publish
         {
             if (c == null) return;
             int cid = c["cluster"]!.GetValue<int>();
-            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? JsonNode.Parse(cb) as JsonArray : null; Describe.ApplyMasks(cands, describe, cid); MarkSolo(cands, facesDoc, subs, frameW);
+            var cands = await src.ReadAsync($"cast/cand_{cid}.json", ct) is { } cb ? StoredJson.Parse(cb, $"cast/cand_{cid}.json") as JsonArray : null; Describe.ApplyMasks(cands, describe, cid); MarkSolo(cands, facesDoc, subs, frameW);
             int? pk = picks?[cid.ToString()]?["portrait"] is JsonValue pv && pv.TryGetValue<int>(out var p) ? p : null;
             var shot = PickCoverShot(cands, pk, cutoff, dur, ExpressionScores(describe, cid.ToString()));
             if (shot is not { } s || await src.ReadAsync($"cast/cand_{cid}_{s.K}.jpg", ct) is not { } img) return; // no shot before the late limit: no cover (the portrait has no known time)

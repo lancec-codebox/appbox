@@ -332,8 +332,8 @@ public static class Commands
             foreach (var st in Protocol.StepStages.Append("process"))
                 if (await store.GetTagsAsync(paths.Job(st, id), default) is { } t && t.GetValueOrDefault(Tags.State) is "pending" or "leased") { queued = true; break; }
             if (queued) continue;
-            var info = await store.GetAsync(paths.Video(id, "info.json"), default) is { } ib ? System.Text.Json.Nodes.JsonNode.Parse(ib.Data) : null;
-            var dl = await store.GetAsync(paths.Video(id, "downloaded.json"), default) is { } db ? System.Text.Json.Nodes.JsonNode.Parse(db.Data) : null;
+            var info = await store.GetAsync(paths.Video(id, "info.json"), default) is { } ib ? StoredJson.Parse(ib.Data, paths.Video(id, "info.json")) : null;
+            var dl = await store.GetAsync(paths.Video(id, "downloaded.json"), default) is { } db ? StoredJson.Parse(db.Data, paths.Video(id, "downloaded.json")) : null;
             Console.WriteLine($"{id}  {(info?["duration"]?.GetValue<double>() is { } d ? $"{d / 60:F0} min" : "?"),7}  missing {string.Join(',', missing),-40}  {info?["title"]}");
             n++;
         }
