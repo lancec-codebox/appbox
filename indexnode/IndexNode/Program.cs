@@ -81,6 +81,7 @@ public static class Program
                 "search" => await Commands.SearchAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await Commands.RequeueAsync(a),
+                "availability" => await Commands.AvailabilityAsync(a),
                 "control" => await Commands.ControlAsync(a),
                 "config" => Commands.Config(a),
                 "browser" => await Commands.BrowserAsync(a),
@@ -159,6 +160,7 @@ public static class Commands
             ["process"] = new ProcessStage(tools, store, cfg, http),
             ["comments"] = new CommentsStage(tools, store, gate),
             ["watch"] = new WatchStage(tools, store),
+            ["availability"] = new AvailabilityStage(tools, store),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
@@ -311,6 +313,17 @@ public static class Commands
             }
         }
         Console.WriteLine($"{added} added, {existed} already existed");
+        return 0;
+    }
+
+    /// <summary>`availability start [--every 1d]`: creates the daily availability sweep (run by a node with --stages ...,availability; it needs yt-dlp).</summary>
+    public static async Task<int> AvailabilityAsync(Args a)
+    {
+        if (a.Positional.FirstOrDefault() != "start") throw new ArgumentException("availability start [--every 1d]");
+        var (_, store, paths, http) = Open(a); using var _h = http;
+        var job = AvailabilityStage.NewSweep(a.Get("every") ?? "1d"); WatchStage.ParseEvery(job.Every);
+        bool made = await store.PutAsync(paths.Job("availability", job.JobId), job.ToBytes(), Tags.Job("availability", "pending", job.AddedAt), null, true, default);
+        Console.WriteLine(made ? $"availability sweep created (every {job.Every}); a yt-dlp node runs it with --stages ...,availability" : "the availability sweep already exists");
         return 0;
     }
 
