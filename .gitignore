@@ -1,1 +1,4 @@
 .hexad/
+
+# local build outputs
+out-*/
