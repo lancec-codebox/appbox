@@ -12,7 +12,7 @@ public static partial class Protocol
     /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
     public static readonly string[] StepStages = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe"];
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
-    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch", "classify"];
+    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch", "classify", "availability"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
