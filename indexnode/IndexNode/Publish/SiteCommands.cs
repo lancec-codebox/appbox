@@ -36,31 +36,11 @@ public static class SiteCommands
                 jobs.Add(sj);
             }
         }
-        if (a.Has("dry-roles"))
-        {
-            // publish --dry-roles: no packs; counts the roleAtStart lines the spoiler-safe fallback replaces, by what replaced them
-            int cast = 0, byDesc = 0, byLabel = 0, byRole = 0;
-            foreach (var j in jobs)
-            {
-                if (await j.ReadAsync("describe.json", ct) is not { } db || System.Text.Json.Nodes.JsonNode.Parse(db) is not System.Text.Json.Nodes.JsonObject dj) continue;
-                foreach (var c in (dj["cast"] as System.Text.Json.Nodes.JsonArray) ?? [])
-                {
-                    if (c is not System.Text.Json.Nodes.JsonObject co) continue; cast++;
-                    var v = Publish.SafeRoleAtStart(co, out var rep); if (!rep) continue;
-                    var line = v?.ToString();
-                    if (line == (co["description"]?.ToString())) byDesc++; else if (line == (co["label"]?["en"]?.ToString())) byLabel++; else byRole++;
-                    Console.WriteLine($"{j.JobId} c{co["cluster"]}: \"{co["roleAtStart"]}\" -> \"{line}\"");
-                }
-            }
-            Console.WriteLine($"dry roles: {jobs.Count} describes, {cast} cast entries, replaced {byDesc + byLabel + byRole} (description {byDesc}, label {byLabel}, role line {byRole})");
-            return 0;
-        }
         int written = 0, skipped = 0;
         foreach (var j in jobs)
         {
             var r = await Publish.PublishOneAsync(tools, j, outDir, force, ct);
             Console.WriteLine(r.Written ? $"{r.Id}: published" : $"{r.Id}: skipped ({r.Skipped})");
-            foreach (var w in r.Warnings ?? []) Console.WriteLine(w);
             if (r.Written) written++; else skipped++;
         }
         Publish.WriteIndex(outDir);
@@ -71,14 +51,12 @@ public static class SiteCommands
     /// <summary>`process --job &lt;id&gt; --steps cast,describe`: redo steps of one already-processed job in the store (needs the SAS; describe needs the AI endpoint). Nothing is queued or leased; processed.json is not rewritten.</summary>
     public static async Task<int> ProcessAsync(Args a)
     {
-        var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps frames,...] [--threads N] [--ai-... ]  (no --steps: the steps whose outputs are missing; --steps: rerun those, replacing their outputs)");
+        var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps cast,describe] [--threads N] [--ai-... ]");
         var cfg = NodeConfig.Load(); if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
-        // no --steps: process an unqueued video, running only what is missing; --steps: rerun exactly those steps
-        bool redo = a.Get("steps") != null;
-        var steps = (a.Get("steps") ?? string.Join(',', ProcessStage.FullSteps)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
+        var steps = (a.Get("steps") ?? "cast,describe").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
         foreach (var s in steps) if (!ProcessStage.KnownSteps.Contains(s)) throw new ArgumentException($"unknown step '{s}' (known: {string.Join(',', ProcessStage.KnownSteps)})");
         ProcessStage.Ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
-        if ((steps.Contains("describe") || steps.Contains("translate")) && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe and translate need an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
+        if (steps.Contains("describe") && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe needs an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
         var http = Commands.NewHttp(); var tools = new Tools(http, cfg); var store = new RestStore(http, cfg.Sas); var paths = new Paths(a.Get("prefix") ?? "index/");
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         var threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
@@ -87,55 +65,32 @@ public static class SiteCommands
             Job = new JobDescriptor { Stage = "process", JobId = id, Steps = steps }, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = store, Paths = paths, NodeId = cfg.NodeId ?? "cli",
             Token = cts.Token, ThreadShare = () => threads, Report = (step, p) => Console.WriteLine($"  {step} {p}"),
         };
-        await new ProcessStage(tools, store, cfg, http) { Redo = redo }.RunAsync(ctx);
-        Console.WriteLine($"process {id}: {string.Join(',', steps)} done ({(redo ? "outputs replaced" : "missing outputs made")} in the store; run 'indexnode publish --job {id}' next)");
+        await new ProcessStage(tools, store, cfg, http) { Redo = true }.RunAsync(ctx);
+        Console.WriteLine($"process {id}: {string.Join(',', steps)} done (outputs replaced in the store; run 'indexnode publish --job {id}' next)");
         return 0;
     }
 
     public static async Task<int> DescribeAsync(Args a)
     {
-        var local = a.Get("local") ?? (a.Get("job") != null ? null : throw new ArgumentException("describe --local <job folder> | --job <id> [--dry] [--out <file>] [--raw-dir <dir>] [--ai-... ]  (--job reads the store, writes only --out)"));
-        if (local == null && a.Get("out") == null) throw new ArgumentException("describe --job <id> needs --out <file>: it never writes the store");
+        var local = a.Get("local") ?? throw new ArgumentException("describe --local <job folder> [--dry] [--out <file>] [--ai-... ]");
         var cfg = NodeConfig.Load(); var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable); var ct = CancellationToken.None;
         var work = Path.Combine(Path.GetTempPath(), "indexnode", "describe-" + Guid.NewGuid().ToString("N")[..8]);
         try
         {
-            IJobSource src;
-            if (local != null) src = new LocalJob(local, a.Get("job") ?? Path.GetFileName(Path.GetFullPath(local)));
-            else
-            {
-                if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
-                src = new StoreJob(new RestStore(Commands.NewHttp(), cfg.Sas), new Paths(a.Get("prefix") ?? "index/"), a.Get("job")!);
-            }
+            var src = new LocalJob(local, a.Get("job") ?? Path.GetFileName(Path.GetFullPath(local)));
             var d = await DescribeJob.GatherAsync(src, work, ct);
             if (a.Has("dry"))
             {
-                var req = DescribeJob.Dry(d, ai); var dest = a.Get("out") ?? Path.Combine(local!, "describe.request.json");
+                var req = DescribeJob.Dry(d, ai); var dest = a.Get("out") ?? Path.Combine(local, "describe.request.json");
                 File.WriteAllText(dest, req); Console.WriteLine($"describe (dry): request written to {dest} ({req.Length} chars, 0 AI calls)");
                 return 0;
             }
             if (!ai.Configured) { Console.WriteLine("describe: skipped (no ai.* configured)"); return 0; }
-            IChat chat = new AiClient(Commands.NewHttp(), ai);
-            if (a.Get("raw-dir") is { } rawDir) chat = new RecordingChat(chat, rawDir); // each JSON answer of the model, as received, before the post-processing
-            var bytes = await DescribeJob.RunAsync(chat, ai, d, ct);
-            File.WriteAllBytes(a.Get("out") ?? Path.Combine(local!, "describe.json"), bytes!);
+            var bytes = await DescribeJob.RunAsync(new AiClient(Commands.NewHttp(), ai), ai, d, ct);
+            File.WriteAllBytes(a.Get("out") ?? Path.Combine(local, "describe.json"), bytes!);
             Console.WriteLine("describe: done"); return 0;
         }
         finally { try { Directory.Delete(work, true); } catch { } }
-    }
-
-    /// <summary>Keeps every JSON answer of the model in a folder (describe --raw-dir), to look at what the post-processing was given.</summary>
-    sealed class RecordingChat : IChat
-    {
-        readonly IChat inner; readonly string dir; int n;
-        public RecordingChat(IChat inner, string dir) { this.inner = inner; this.dir = dir; Directory.CreateDirectory(dir); }
-        public Task<string> ChatAsync(string model, System.Text.Json.Nodes.JsonNode content, CancellationToken ct) => inner.ChatAsync(model, content, ct);
-        public async Task<System.Text.Json.Nodes.JsonObject> JsonAsync(string model, System.Text.Json.Nodes.JsonNode content, string tool, CancellationToken ct)
-        {
-            var r = await inner.JsonAsync(model, content, tool, ct);
-            File.WriteAllText(Path.Combine(dir, $"{Interlocked.Increment(ref n):D2}-{tool}.json"), r.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
-            return r;
-        }
     }
 
     public static int MedusaSetup(Args a)

@@ -200,7 +200,7 @@ public static class DevCommands
                 double cut = res["cutoffSeconds"]?.GetValue<double>() ?? 0; var t0 = sw.Elapsed.TotalSeconds;
                 try
                 {
-                    var check = await chat.JsonAsync(model, System.Text.Json.Nodes.JsonValue.Create(Describe.BuildCheck(res, cut, model).Prompt)!, "submit_check", ct);
+                    var check = Describe.ParseObject(await chat.ChatAsync(model, System.Text.Json.Nodes.JsonValue.Create(Describe.BuildCheck(res, cut, model).Prompt)!, ct));
                     Console.WriteLine(new System.Text.Json.Nodes.JsonObject { ["model"] = model, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds - t0, 1), ["teaserReveals"] = check["teaserReveals"]?.DeepClone(), ["flaggedCast"] = check["flaggedCast"]?.DeepClone(), ["flaggedRelations"] = check["flaggedRelations"]?.DeepClone(), ["reasons"] = check["reasons"]?.DeepClone() }.ToJsonString());
                 }
                 catch (Exception e) { Console.WriteLine(new System.Text.Json.Nodes.JsonObject { ["model"] = model, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds - t0, 1), ["error"] = e.Message.Contains("content_filter") ? "content_filter" : e.Message[..Math.Min(200, e.Message.Length)] }.ToJsonString()); }
