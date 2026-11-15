@@ -141,4 +141,21 @@ public class CoverTests
             Assert.Equal(splitAt > 0.02, left > 128); Assert.Equal(splitAt < 0.98, right > 128);
         }
     }
+
+    [Fact]
+    public void SoloRule_SkipsCrowdedFrame_AndFallbackCropsTight()
+    {
+        var faces = System.Text.Json.Nodes.JsonNode.Parse("""{"faces":[{"t":10,"box":[100,100,100,100]},{"t":10,"box":[220,100,100,100]},{"t":20,"box":[100,100,100,100]},{"t":20,"box":[300,10,20,20]}]}""")!.AsObject();
+        var c = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"box":[100,100,100,100]},{"k":1,"t":20,"quality":0.5,"masked":false,"box":[100,100,100,100]}]""");
+        Publish.MarkSolo(c, faces);
+        Assert.False(Publish.IsCrowded(c[1] as System.Text.Json.Nodes.JsonObject)); // 4% background face is fine
+        Assert.True(Publish.IsCrowded(c[0] as System.Text.Json.Nodes.JsonObject));
+        Assert.Equal(1, Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);
+        Assert.Equal(1, Publish.PickLeadShot(c, 0)!.Value.K);
+        // none solo: today's choice, window excludes the neighbour
+        var only = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"box":[100,100,100,100]}]"""); Publish.MarkSolo(only, faces);
+        Assert.Equal(0, Publish.PickByExpression(only, 0, 1000, 9080, new int?[] { 9 })!.Value.K);
+        var (crop, _) = Publish.TightWindow([100, 100, 100, 100], Publish.OtherBoxes(only[0] as System.Text.Json.Nodes.JsonObject), 1.25, 250, 0.45, 360, 640);
+        Assert.True((crop[0] + crop[2]) * 360 <= 220.01);
+    }
 }
