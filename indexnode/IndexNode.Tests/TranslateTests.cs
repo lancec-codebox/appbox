@@ -22,7 +22,7 @@ public class TranslateTests
             if (tool == "submit_glossary")
             {
                 Interlocked.Increment(ref GlossaryCalls);
-                return Task.FromResult(JsonNode.Parse("""{"entries":[{"zh":"霍湛","en":"Wrong Name","kind":"character"},{"zh":"嫂嫂","en":"Sister-in-law","kind":"address"},{"zh":"侯府","en":"Marquis Manor","kind":"place"}]}""")!.AsObject());
+                return Task.FromResult(JsonNode.Parse("""{"plot":"Huo Zhan secretly is the prince; his wife is the bride.","entries":[{"zh":"霍湛","en":"Wrong Name","kind":"character"},{"zh":"嫂嫂","en":"Sister-in-law","kind":"address"},{"zh":"侯府","en":"Marquis Manor","kind":"place"}]}""")!.AsObject());
             }
             Interlocked.Increment(ref BatchCalls);
             var arr = new JsonArray();
@@ -64,7 +64,9 @@ public class TranslateTests
         Assert.Equal(1, f.GlossaryCalls); Assert.Equal(3, f.BatchCalls); Assert.Equal(4, r.Calls);
         var batch = f.Prompts.Where(p => p.Contains("GLOSSARY:")).ToList();
         Assert.Equal(3, batch.Count);
-        foreach (var p in batch) { Assert.Contains("霍湛 => Huo Zhan", p); Assert.DoesNotContain("Wrong Name", p); Assert.Contains("嫂嫂 => Sister-in-law", p); Assert.Contains("A bride and a marquis.", p); }
+        foreach (var p in batch) { Assert.Contains("霍湛 => Huo Zhan", p); Assert.DoesNotContain("Wrong Name", p); Assert.Contains("嫂嫂 => Sister-in-law", p); Assert.Contains("A bride and a marquis.", p); Assert.Contains("Huo Zhan secretly is the prince", p); }
+        var published = System.Text.Encoding.UTF8.GetString(r.Vtt!); Assert.DoesNotContain("secretly", published);
+        Assert.Contains("secretly is the prince", System.Text.Encoding.UTF8.GetString(r.Json!)); // the summary lives in en.json only
         Assert.DoesNotContain("Wrong Name", System.Text.Encoding.UTF8.GetString(r.Json!));
         // the glossary prompt carries describe's English names and roles
         var gp = f.Prompts.Single(p => p.Contains("preparing the name glossary"));
