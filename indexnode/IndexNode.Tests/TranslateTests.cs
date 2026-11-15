@@ -44,7 +44,8 @@ public class TranslateTests
 
     static JsonObject Describe() => JsonNode.Parse("""
         {"title":{"en":"Marquis Bride"},"synopsis":{"en":"A bride and a marquis."},
-         "cast":[{"character":{"zh":"霍湛","pinyin":"Huo Zhan","en":"Huo Zhan"},"label":{"en":"Huo Zhan, the marquis"},"roleAtStart":"male lead"}]}
+         "cast":[{"cluster":0,"character":{"zh":"霍湛","pinyin":"Huo Zhan","en":"Huo Zhan"},"label":{"en":"Huo Zhan, the marquis"},"roleAtStart":"male lead"},{"cluster":1,"character":{"zh":"苏婉","pinyin":"Su Wan","en":"Su Wan"},"label":{"en":"Su Wan, the bride"},"roleAtStart":"female lead"}],
+         "relations":[{"from":0,"to":1,"type":"spouse","label":{"en":"secretly the prince's wife"},"spoiler":true}]}
         """)!.AsObject();
 
     static TranslateInput Input(int n, JsonObject? describe = null) => new() { JobId = "j", Ocr = Zh(n), Asr = [new ShapeCue(0, n * 3.0, "说话")], Describe = describe };
@@ -64,9 +65,7 @@ public class TranslateTests
         Assert.Equal(1, f.GlossaryCalls); Assert.Equal(3, f.BatchCalls); Assert.Equal(4, r.Calls);
         var batch = f.Prompts.Where(p => p.Contains("GLOSSARY:")).ToList();
         Assert.Equal(3, batch.Count);
-        foreach (var p in batch) { Assert.Contains("霍湛 => Huo Zhan", p); Assert.DoesNotContain("Wrong Name", p); Assert.Contains("嫂嫂 => Sister-in-law", p); Assert.Contains("A bride and a marquis.", p); Assert.Contains("Huo Zhan secretly is the prince", p); }
-        var published = System.Text.Encoding.UTF8.GetString(r.Vtt!); Assert.DoesNotContain("secretly", published);
-        Assert.Contains("secretly is the prince", System.Text.Encoding.UTF8.GetString(r.Json!)); // the summary lives in en.json only
+        foreach (var p in batch) { Assert.Contains("霍湛 => Huo Zhan", p); Assert.DoesNotContain("Wrong Name", p); Assert.Contains("嫂嫂 => Sister-in-law", p); Assert.Contains("A bride and a marquis.", p); Assert.Contains("[REVEAL]", p); Assert.DoesNotContain("Plot of the whole drama", p); }
         Assert.DoesNotContain("Wrong Name", System.Text.Encoding.UTF8.GetString(r.Json!));
         // the glossary prompt carries describe's English names and roles
         var gp = f.Prompts.Single(p => p.Contains("preparing the name glossary"));
