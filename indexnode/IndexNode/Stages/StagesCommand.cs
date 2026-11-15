@@ -152,9 +152,9 @@ public static class StagesCommand
                     }
                     case "thumbs":
                     {
-                        P(stage, "fetching frames"); var fs = await FrameSet();
-                        var n = await Thumbs.RunAsync(tools, store, paths, id, fs, m => P(stage, m), ct);
-                        Console.WriteLine($"thumbs: {n} thumbnails in {sw.Elapsed.TotalSeconds:F1}s");
+                        var tm = new Thumbs.Timing();
+                        var n = await Thumbs.RunStoredAsync(tools, store, paths, id, a.Get("threads") is { } tt ? int.Parse(tt) : Environment.ProcessorCount, m => P(stage, m), ct, tm);
+                        Console.WriteLine($"thumbs: {n} thumbnails in {sw.Elapsed.TotalSeconds:F1}s ({tm})");
                         break;
                     }
                     case "sscd":

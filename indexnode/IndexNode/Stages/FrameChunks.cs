@@ -66,6 +66,17 @@ public static class FrameChunks
     });
 
     /// <summary>Splits a raw MJPEG stream (concatenated JPEGs, as ffmpeg's mjpeg muxer writes them) into one byte range per frame, at each SOI marker FF D8 FF.</summary>
+    /// <summary>One chunk's index JSON (NNNN.json) as rows.</summary>
+    public static ChunkInfo ParseChunk(string n, byte[] json, string name)
+    {
+        var j = StoredJson.Doc(json, name).RootElement;
+        return new ChunkInfo(n, j.GetProperty("start").GetDouble(), j.GetProperty("frames").EnumerateArray().Select(f => new ChunkFrame(
+            f.GetProperty("i").GetInt32(), f.GetProperty("t").GetDouble(), f.GetProperty("pts").GetDouble(),
+            f.TryGetProperty("spans", out var sp) ? sp.EnumerateArray().Select(x => new[] { x[0].GetDouble(), x[1].GetDouble() }).ToList() : [],
+            f.TryGetProperty("rep", out var rp) && rp.ValueKind == JsonValueKind.Number ? rp.GetInt32() : null,
+            f.TryGetProperty("off", out var of) ? of.GetInt64() : -1, f.TryGetProperty("len", out var ln) ? ln.GetInt32() : 0)).ToList());
+    }
+
     public static List<(int Off, int Len)> SplitJpegs(byte[] data)
     {
         var starts = new List<int>();
@@ -217,12 +228,7 @@ public sealed class ChunkDir
         foreach (var c in man.GetProperty("chunks").EnumerateArray())
         {
             var n = c.GetProperty("chunk").GetString()!;
-            var j = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(dir, n + ".json"))).RootElement;
-            chunks.Add(new ChunkInfo(n, j.GetProperty("start").GetDouble(), j.GetProperty("frames").EnumerateArray().Select(f => new ChunkFrame(
-                f.GetProperty("i").GetInt32(), f.GetProperty("t").GetDouble(), f.GetProperty("pts").GetDouble(),
-                f.TryGetProperty("spans", out var sp) ? sp.EnumerateArray().Select(x => new[] { x[0].GetDouble(), x[1].GetDouble() }).ToList() : [],
-                f.TryGetProperty("rep", out var rp) && rp.ValueKind == JsonValueKind.Number ? rp.GetInt32() : null,
-                f.TryGetProperty("off", out var of) ? of.GetInt64() : -1, f.TryGetProperty("len", out var ln) ? ln.GetInt32() : 0)).ToList()));
+            chunks.Add(FrameChunks.ParseChunk(n, File.ReadAllBytes(Path.Combine(dir, n + ".json")), n + ".json"));
         }
         int w = man.TryGetProperty("width", out var we) ? we.GetInt32() : 0, h = man.TryGetProperty("height", out var he) ? he.GetInt32() : 0;
         var container = man.TryGetProperty("container", out var co) ? co.GetString() ?? "mp4" : "mp4";

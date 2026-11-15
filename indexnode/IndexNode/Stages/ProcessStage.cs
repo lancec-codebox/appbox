@@ -165,8 +165,9 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             if (need["thumbs"])
             {   // after sscd: the same stored frames (hydrated on read), the sscd pass has rewritten their index but not their rows
                 ctx.Report("thumbs", null);
-                var fs = await FrameSet();
-                int n = await Thumbs.RunAsync(tools, wst, paths, id, fs, m => ctx.Report("thumbs", m), ct);
+                var tm = new Thumbs.Timing();
+                int n = await Thumbs.RunStoredAsync(tools, wst, paths, id, Math.Max(1, ctx.ThreadShare()), m => ctx.Report("thumbs", m), ct, tm);
+                Log.Info($"process {id}: thumbs {tm}");
                 Log.Info($"process {id}: thumbs {n} thumbnails");
             }
             if (need["clip"])
