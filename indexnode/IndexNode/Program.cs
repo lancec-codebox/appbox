@@ -159,6 +159,7 @@ public static class Commands
             ["process"] = new ProcessStage(tools, store, cfg, http),
             ["comments"] = new CommentsStage(tools, store, gate),
             ["watch"] = new WatchStage(tools, store),
+            ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
         var limits = BuildLimits(a, cfg, nodeId);
