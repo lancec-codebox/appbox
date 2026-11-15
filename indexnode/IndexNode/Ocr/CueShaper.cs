@@ -223,6 +223,7 @@ public static class CueShaper
         {
             bool zh = IsZh(c.Text);
             var text = c.CharTimes != null ? c.Text : Regex.Replace(c.Text.Trim(), @"\s*\r?\n\s*", zh ? "" : " ");
+            if (c.CharTimes == null && !zh) text = BreakLongWords(text);
             var times = c.CharTimes is { } ct && ct.Length == text.Length ? ct : Proportional(text, c.Start, Math.Max(c.End, c.Start + 0.05));
             var gloss = new List<(int, int)>();
             foreach (var g in glossary ?? []) if (g.Length > 1) for (int i = text.IndexOf(g, StringComparison.Ordinal); i >= 0; i = text.IndexOf(g, i + 1, StringComparison.Ordinal)) gloss.Add((i, i + g.Length));
@@ -245,6 +246,10 @@ public static class CueShaper
         }
         return res;
     }
+
+    /// <summary>A Latin word longer than a line (a long laugh or scream, a run of letters) cannot be wrapped: cut into line-sized parts at spaces so every line fits.</summary>
+    public static string BreakLongWords(string text) =>
+        Regex.Replace(text, @"\S{" + (LatinLine + 1) + ",}", m => string.Join(" ", Enumerable.Range(0, (m.Length + LatinLine - 1) / LatinLine).Select(i => m.Value.Substring(i * LatinLine, Math.Min(LatinLine, m.Length - i * LatinLine)))));
 
     public static ShapeStats Stats(IReadOnlyList<ShapeCue> cues)
     {

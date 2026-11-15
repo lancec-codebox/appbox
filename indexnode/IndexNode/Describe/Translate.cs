@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -289,7 +290,7 @@ public static partial class Translate
     }
 
     /// <summary>The answers of one reply: id → English for the usable ones, with the reasons for the rest (missing, duplicated and different, unusable).</summary>
-    public static (Dictionary<int, string> Good, Dictionary<int, string> Bad) Validate(JsonObject reply, IReadOnlyCollection<int> asked, IReadOnlyList<ShapeCue> cues)
+    public static (Dictionary<int, string> Good, Dictionary<int, string> Bad) Validate(JsonObject reply, IReadOnlyCollection<int> asked, IReadOnlyList<ShapeCue> cues, Dictionary<int, string>? unusable = null)
     {
         var good = new Dictionary<int, string>(); var bad = new Dictionary<int, string>(); var seen = new Dictionary<int, string?>(); var dup = new HashSet<int>(); var skips = new HashSet<int>();
         var arr = reply["cues"] as JsonArray ?? reply["translations"] as JsonArray ?? reply.Select(kv => kv.Value).OfType<JsonArray>().FirstOrDefault() ?? [];
@@ -309,7 +310,14 @@ public static partial class Translate
             if (!seen.TryGetValue(id, out var en)) { bad[id] = "missing"; continue; }
             if (dup.Contains(id)) { bad[id] = "answered twice with different text"; continue; }
             var ok = Accept(cues[id].Text, en, skips.Contains(id), out var why);
-            if (ok == null) bad[id] = why!; else good[id] = ok;
+            if (ok == null)
+            {
+                bad[id] = why!;
+                // the answer itself, cleaned, for a cue that never gets a better one (kept unless empty or still Chinese)
+                var t = en == null ? "" : Regex.Replace(Bracketed().Replace(en, " "), @"\s+", " ").Trim();
+                if (unusable != null && t.Length > 0 && !Cjk().IsMatch(t)) unusable[id] = t;
+            }
+            else good[id] = ok;
         }
         return (good, bad);
     }
@@ -327,10 +335,17 @@ public static partial class Translate
         return keep.Select(i => (i, set.Contains(i))).ToList();
     }
 
+    /// <summary>A cue that got no usable answer: the model's last non-empty answer is kept (Kept), else it stays untranslated.</summary>
+    public sealed record Unresolved(int Id, bool Kept, string Why);
+
+    /// <summary>Longest a batch is split when the whole of it comes back unusable: halves, then quarters.</summary>
+    public const int MaxSplitDepth = 2;
+
     static async Task TranslateBatchAsync(IChat chat, string model, IReadOnlyList<ShapeCue> cues, int from, int to, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string relations, string plot, string title,
-        string?[] result, Counter counter, int batchNo, int batches, Action<string> progress, CancellationToken ct)
+        string?[] result, ConcurrentBag<Unresolved> unresolved, Counter counter, int batchNo, int batches, Action<string> progress, CancellationToken ct, int depth = 0)
     {
-        var pending = Enumerable.Range(from, to - from).ToList(); var known = new Dictionary<int, string>(); string lastWhy = "";
+        var pending = Enumerable.Range(from, to - from).ToList(); var known = new Dictionary<int, string>(); string lastWhy = ""; var lastAnswer = new Dictionary<int, string>(); var whys = new Dictionary<int, string>();
+        int total = pending.Count;
         for (int attempt = 0; attempt <= MaxReasks; attempt++)
         {
             // first ask: the batch with ~10 cues of context on each side; a re-ask: only the bad ids, each with a few neighbours and the English already accepted
@@ -341,10 +356,14 @@ public static partial class Translate
             try
             {
                 var reply = await chat.JsonAsync(model, JsonValue.Create(prompt)!, "submit_translation", ct);
-                var (good, bad) = Validate(reply, pending, cues);
+                var unusable = new Dictionary<int, string>();
+                var (good, bad) = Validate(reply, pending, cues, unusable);
                 foreach (var (id, en) in good) { known[id] = en; result[id] = en; }
+                foreach (var (id, t) in unusable) lastAnswer[id] = t;
+                foreach (var (id, w) in bad) whys[id] = w;
                 pending = pending.Where(id => !good.ContainsKey(id)).ToList();
                 lastWhy = string.Join("; ", bad.Take(5).Select(kv => $"{kv.Key}: {kv.Value}"));
+                if (good.Count == 0) { lastWhy = "nothing usable; the model returned: " + AiJson.Short(Redact.Sas(reply.ToJsonString())) + (lastWhy.Length > 0 ? " (" + lastWhy + ")" : ""); Log.Info($"translate batch {batchNo}/{batches}: call {attempt + 1} gave no usable cue ({lastWhy})"); }
             }
             catch (Exception e) when (e is FormatException or InvalidOperationException or HttpRequestException)
             {
@@ -355,10 +374,36 @@ public static partial class Translate
             if (pending.Count == 0) { progress($"batch {batchNo}/{batches}: {to - from} cues translated in {attempt + 1} call(s)"); return; }
             progress($"batch {batchNo}/{batches}: {pending.Count} cue(s) missing or unusable after call {attempt + 1}{(attempt < MaxReasks ? ", asking again" : "")}");
         }
-        throw new InvalidOperationException($"translate: batch {batchNo}/{batches} still has {pending.Count} cue(s) missing or unusable after {MaxReasks + 1} calls (ids {string.Join(',', pending.Take(10))}; Chinese: {string.Join(" | ", pending.Take(5).Select(id => cues[id].Text))}): {lastWhy}");
+        // the whole batch unusable (the model refused, answered nothing or a wrong schema): ask for the halves, then the quarters; each half keeps its context overlap
+        if (pending.Count == total && total > 1 && depth < MaxSplitDepth)
+        {
+            int mid = from + total / 2;
+            progress($"batch {batchNo}/{batches}: the whole batch was unusable ({lastWhy}); splitting {from}-{to - 1} in two");
+            await TranslateBatchAsync(chat, model, cues, from, mid, glossary, synopsis, relations, plot, title, result, unresolved, counter, batchNo, batches, progress, ct, depth + 1);
+            await TranslateBatchAsync(chat, model, cues, mid, to, glossary, synopsis, relations, plot, title, result, unresolved, counter, batchNo, batches, progress, ct, depth + 1);
+            return;
+        }
+        foreach (var id in pending)
+        {
+            bool kept = lastAnswer.TryGetValue(id, out var t);
+            if (kept) result[id] = t;
+            unresolved.Add(new Unresolved(id, kept, whys.GetValueOrDefault(id, lastWhy)));
+        }
+        progress($"batch {batchNo}/{batches}: {pending.Count} cue(s) unresolved after {MaxReasks + 1} calls (ids {string.Join(',', pending.Take(10))}): {lastWhy}");
     }
 
+    /// <summary>More unresolved cues than this share of all cues fails the drama.</summary>
+    public const double MaxUnresolvedFraction = 0.02;
+
+    public static bool TooManyUnresolved(int unresolved, int cues) => unresolved > Math.Max(0, cues * MaxUnresolvedFraction);
+
     // ---------- the step ----------
+
+    static string Offenders(IReadOnlyList<ShapeCue> shaped)
+    {
+        var bad = shaped.Where(c => c.Text.Split('\n').Length > CueShaper.MaxLines || c.Text.Split('\n').Any(l => l.Length > CueShaper.LineLimit(c.Text))).Take(3).ToList();
+        return bad.Count == 0 ? "" : ": " + string.Join(" | ", bad.Select(c => $"{c.Start:F1}s [{AiJson.Short(c.Text.Replace('\n', '/'))}]"));
+    }
 
     static readonly JsonSerializerOptions Opt = new() { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
@@ -393,21 +438,24 @@ public static partial class Translate
 
         var synopsis = SynopsisOf(input.Describe); var relations = Relations(input.Describe); var title = input.Describe?["title"]?["en"]?.GetValue<string>() ?? "";
         var cues = src.Cues; int batches = (cues.Count + BatchCues - 1) / BatchCues;
-        var en = new string?[cues.Count]; var gate = new SemaphoreSlim(Parallelism); var lockObj = new object(); int done = 0;
+        var en = new string?[cues.Count]; var unresolved = new ConcurrentBag<Unresolved>(); var gate = new SemaphoreSlim(Parallelism); var lockObj = new object(); int done = 0;
         void P(string m) { lock (lockObj) progress(m); }
         var tasks = Enumerable.Range(0, batches).Select(async b =>
         {
             await gate.WaitAsync(ct);
-            try { await TranslateBatchAsync(chat, model, cues, b * BatchCues, Math.Min(cues.Count, (b + 1) * BatchCues), glossary, synopsis, relations, plot, title, en, counter, b + 1, batches, P, ct); Interlocked.Increment(ref done); }
+            try { await TranslateBatchAsync(chat, model, cues, b * BatchCues, Math.Min(cues.Count, (b + 1) * BatchCues), glossary, synopsis, relations, plot, title, en, unresolved, counter, b + 1, batches, P, ct); Interlocked.Increment(ref done); }
             finally { gate.Release(); }
         }).ToList();
         await Task.WhenAll(tasks);
+        var unres = unresolved.OrderBy(u => u.Id).ToList();
+        if (TooManyUnresolved(unres.Count, cues.Count))
+            throw new InvalidOperationException($"translate: {unres.Count} of {cues.Count} cue(s) unresolved after retries and splitting, over {MaxUnresolvedFraction:P0} (ids {string.Join(',', unres.Take(10).Select(u => u.Id))}): {unres[0].Why}");
 
         // keep the Chinese cue times, then the one shaping pass with the Latin limits; names are never cut
         var names = glossary.Where(g => g.Kind is "character" or "place" or "title").Select(g => g.En).Where(n => n.Length > 1).Distinct().ToList();
         var shaped = CueShaper.Shape(Enumerable.Range(0, cues.Count).Where(i => !string.IsNullOrWhiteSpace(en[i])).Select(i => new ShapeCue(cues[i].Start, cues[i].End, en[i]!)), names);
         var stats = CueShaper.Stats(shaped);
-        if (stats.Over6s != 0 || stats.OverChars != 0 || stats.Overlaps != 0) throw new InvalidOperationException($"translate: shaping left {stats.Over6s} cue(s) over 6 s, {stats.OverChars} over the character limit, {stats.Overlaps} overlapping (a bug)");
+        if (stats.Over6s != 0 || stats.OverChars != 0 || stats.Overlaps != 0) throw new InvalidOperationException($"translate: shaping left {stats.Over6s} cue(s) over 6 s, {stats.OverChars} over the character limit, {stats.Overlaps} overlapping (a bug){Offenders(shaped)}");
         var vtt = Encoding.UTF8.GetBytes(CueShaper.ToVtt(shaped));
         // shortRead, by how far the cue is short of its reading time (the shaper is unchanged)
         int sr05 = 0, srMid = 0, sr1 = 0;
@@ -424,9 +472,9 @@ public static partial class Translate
             cues = Enumerable.Range(0, cues.Count).Select(i => new { start = Math.Round(cues[i].Start, 3), end = Math.Round(cues[i].End, 3), zh = cues[i].Text, hash = CleanHash(cues[i].Text), en = en[i] ?? "" }), batches, aiCalls = counter.Calls,
             tokens = ai2 == null ? null : new { input = ai2.InputTokens, output = ai2.OutputTokens },
             shape = stats.ToJson(), shortReadBy = new { upTo0_5s = sr05, from0_5To1s = srMid, over1s = sr1 },
-            dropped = dropped.Count, droppedCues = dropped.Select(i => new { i, start = Math.Round(cues[i].Start, 3), zh = cues[i].Text }), seconds = Math.Round(sw.Elapsed.TotalSeconds, 1), at = Protocol.NowUtc(),
+            unresolved = unres.Count, unresolvedCues = unres.Select(u => new { i = u.Id, kept = u.Kept, why = AiJson.Short(u.Why) }), dropped = dropped.Count, droppedCues = dropped.Select(i => new { i, start = Math.Round(cues[i].Start, 3), zh = cues[i].Text }), seconds = Math.Round(sw.Elapsed.TotalSeconds, 1), at = Protocol.NowUtc(),
         }, Opt);
-        progress($"shaped: {stats.Cues} cues, over6s {stats.Over6s}, overChars {stats.OverChars}, overlaps {stats.Overlaps}, shortRead {stats.ShortRead} (up to 0.5 s short {sr05}, 0.5-1 s {srMid}, over 1 s {sr1}); dropped {dropped.Count}");
+        progress($"shaped: {stats.Cues} cues, over6s {stats.Over6s}, overChars {stats.OverChars}, overlaps {stats.Overlaps}, shortRead {stats.ShortRead} (up to 0.5 s short {sr05}, 0.5-1 s {srMid}, over 1 s {sr1}); unresolved {unres.Count}; dropped {dropped.Count}");
         return new TranslateResult(false, null, vtt, json, stats, counter.Calls, batches, sw.Elapsed.TotalSeconds);
     }
 }

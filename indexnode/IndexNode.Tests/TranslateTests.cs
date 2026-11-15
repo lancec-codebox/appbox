@@ -134,8 +134,54 @@ public class TranslateTests
     {
         var f = new Fake { Override = (id, _) => id == 3 ? "<drop>" : null };
         var e = await Assert.ThrowsAsync<InvalidOperationException>(() => Run(Input(10), f));
-        Assert.Contains("still has 1 cue", e.Message);
+        Assert.Contains("1 of 10 cue(s) unresolved", e.Message); // 10% unresolved, over the 2% allowance
         Assert.Equal(1 + 3, f.GlossaryCalls + f.BatchCalls); // glossary + first ask + 2 re-asks
+    }
+
+    static readonly string LongZh = "他走进了那间昏暗的屋子桌上放着一封信，他犹豫了很久才伸手去拿"; // 30 characters
+
+    [Fact]
+    public async Task One_unusable_cue_never_fails_the_drama_the_last_answer_is_kept_and_counted()
+    {
+        // -8ZsrYNsVlk: "batch 9/27 still has 1 cue(s) missing or unusable after 3 calls: far too short"
+        var f = new Fake { Override = (id, _) => id == 5 ? "Hi" : id == 6 ? "<drop>" : "A long enough line number " + id };
+        var i = new TranslateInput { JobId = "j", Ocr = Zh(200, 3.0, LongZh), Asr = [new ShapeCue(0, 600, "说话")] };
+        var (r, _) = await Run(i, f); // 2 of 200 = 1%: under the allowance
+        var j = JsonNode.Parse(r.Json!)!;
+        Assert.Equal(2, j["unresolved"]!.GetValue<int>());
+        var u = j["unresolvedCues"]!.AsArray();
+        Assert.Equal(5, u[0]!["i"]!.GetValue<int>()); Assert.True(u[0]!["kept"]!.GetValue<bool>());
+        Assert.Equal(6, u[1]!["i"]!.GetValue<int>()); Assert.False(u[1]!["kept"]!.GetValue<bool>());
+        Assert.Equal("Hi", j["cues"]![5]!["en"]!.GetValue<string>()); Assert.Equal("", j["cues"]![6]!["en"]!.GetValue<string>());
+        Assert.Equal(1, j["dropped"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void More_than_two_percent_unresolved_fails()
+    {
+        Assert.False(Translate.TooManyUnresolved(2, 100)); Assert.True(Translate.TooManyUnresolved(3, 100)); Assert.False(Translate.TooManyUnresolved(0, 5)); Assert.True(Translate.TooManyUnresolved(1, 5));
+    }
+
+    [Fact]
+    public async Task A_batch_that_comes_back_wholly_unusable_is_split_in_halves_then_quarters()
+    {
+        // -h3uSj7Jdmk / 14Y_adwhw1A: a whole batch of 200 came back unusable after 3 calls
+        var f = new Fake { Override = (_, at) => at <= 3 ? "<drop>" : null };
+        var (r, _) = await Run(Input(40), f);
+        Assert.Equal(1 + 3 + 2, r.Calls); // glossary + 3 whole-batch asks + the two halves
+        var vtt = System.Text.Encoding.UTF8.GetString(r.Vtt!);
+        for (int k = 0; k < 40; k++) Assert.Contains("Line " + k, vtt);
+        Assert.Equal(0, JsonNode.Parse(r.Json!)!["unresolved"]!.GetValue<int>());
+        // the second half still carries the first half as context
+        Assert.Contains(f.Prompts, p => p.Contains("TRANSLATE [20] ") && p.Contains("CONTEXT [19] ") && !p.Contains("TRANSLATE [19] "));
+    }
+
+    [Fact]
+    public async Task A_whole_batch_that_never_answers_fails_after_splitting_with_the_reason()
+    {
+        var f = new Fake { Override = (_, _) => "<drop>" };
+        var e = await Assert.ThrowsAsync<InvalidOperationException>(() => Run(Input(8), f));
+        Assert.Contains("unresolved", e.Message);
     }
 
     [Fact]
@@ -272,5 +318,14 @@ public class TranslateTests
             Assert.Single(i.Ocr); Assert.Equal("你好", i.Ocr[0].Text); Assert.Single(i.Asr); Assert.Equal(0.4, i.SyncOffset); Assert.Null(i.Describe);
         }
         finally { if (Directory.Exists(dir)) Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void A_model_object_with_repeated_or_junk_keys_still_parses_first_wins()
+    {
+        // 1_ZMLz6R9RQ: "An item with the same key has already been added. Key: }"
+        var o = IndexNode.Describe.ParseObject("{\"entries\":[{\"zh\":\"霍湛\",\"en\":\"Huo Zhan\",\"en\":\"Other\",\"}\":1,\"}\":2,\"\":3,\"...\":4}],\"plot\":\"a\",\"plot\":\"b\"}");
+        var e = o["entries"]![0]!.AsObject();
+        Assert.Equal("Huo Zhan", e["en"]!.GetValue<string>()); Assert.Equal(2, e.Count); Assert.Equal("a", o["plot"]!.GetValue<string>());
     }
 }
