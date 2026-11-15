@@ -327,7 +327,7 @@ public static class Publish
         {
             if ((c["box"] as JsonArray)?.Select(v => v!.GetValue<double>()).ToArray() is not { Length: 4 } b) continue;
             var others = (byT.GetValueOrDefault(Math.Round(c["t"]?.GetValue<double>() ?? 0, 2)) ?? []).Where(o => Math.Abs(o[0] + o[2] / 2 - (b[0] + b[2] / 2)) > 2 || Math.Abs(o[1] + o[3] / 2 - (b[1] + b[3] / 2)) > 2).ToList();
-            c["solo"] = !others.Any(o => o[2] * o[3] > SoloMaxRatio * b[2] * b[3]);
+            if (c["solo"] == null) c["solo"] = !others.Any(o => o[2] * o[3] > SoloMaxRatio * b[2] * b[3]); // cast (new dramas) judged every detection of the frame, faces.json holds only kept faces
             c["others"] = new JsonArray(others.Select(o => (JsonNode)new JsonArray(o.Select(v => (JsonNode)v).ToArray())).ToArray());
         }
     }

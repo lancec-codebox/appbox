@@ -9,6 +9,10 @@ public sealed class FaceRec
     /// <summary>Quality in 0..1: size, detector score, sharpness and frontality together.</summary>
     public double Quality { get; set; }
     public int Cluster { get; set; } = -1;
+    /// <summary>The largest other detected face in the same frame, as a fraction of this face's area (0: none).</summary>
+    public double Other { get; set; }
+    public bool Solo => Other <= SoloMaxRatio;
+    public const double SoloMaxRatio = 0.25;
     public bool Masked { get; set; }
     public double MaskScore { get; set; }
     public float[] Emb { get; set; } = [];
@@ -169,9 +173,19 @@ public static class CastLogic
     /// <summary>12 diverse faces for the AI contact sheet: highest quality first, then each next pick maximises its distance to the picks so far (greedy farthest point, in embedding space and time).</summary>
     public static List<FaceRec> Diverse(IReadOnlyList<FaceRec> cluster, int count = 12)
     {
-        var pool = cluster.Where(f => f.Quality > 0).OrderByDescending(f => f.Quality).ToList();
-        if (pool.Count <= count) return pool.OrderBy(f => f.T).ToList();
-        var picked = new List<FaceRec> { pool[0] };
+        // candidates come from frames where the person is alone (no other face above 25% of theirs); other frames only fill what is missing
+        var all = cluster.Where(f => f.Quality > 0).OrderByDescending(f => f.Quality).ToList();
+        var solo = all.Where(f => f.Solo).ToList();
+        var picked = Greedy(solo, [], count);
+        if (picked.Count < count) picked = Greedy(all.Where(f => !f.Solo).ToList(), picked, count);
+        return picked.OrderBy(f => f.T).ToList();
+    }
+
+    static List<FaceRec> Greedy(List<FaceRec> pool, List<FaceRec> start, int count)
+    {
+        var picked = new List<FaceRec>(start);
+        if (pool.Count <= count - picked.Count) { picked.AddRange(pool); return picked; }
+        if (picked.Count == 0) picked.Add(pool[0]);
         while (picked.Count < count)
         {
             FaceRec? best = null; double bs = -1;
@@ -184,7 +198,7 @@ public static class CastLogic
             }
             picked.Add(best!);
         }
-        return picked.OrderBy(f => f.T).ToList();
+        return picked;
     }
 
     /// <summary>Zero-shot mask decision from the two prompt similarities: masked when the "mask" prompt scores higher (SigLIP logit scale applied by the caller).</summary>

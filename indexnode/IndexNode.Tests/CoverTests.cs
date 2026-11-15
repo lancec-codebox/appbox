@@ -158,4 +158,16 @@ public class CoverTests
         var (crop, _) = Publish.TightWindow([100, 100, 100, 100], Publish.OtherBoxes(only[0] as System.Text.Json.Nodes.JsonObject), 1.25, 250, 0.45, 360, 640);
         Assert.True((crop[0] + crop[2]) * 360 <= 220.01);
     }
+
+    [Fact]
+    public void Cast_candidates_come_from_solo_frames_first()
+    {
+        var emb = (int n) => { var v = new float[8]; v[n % 8] = 1; return v; };
+        var faces = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i * 100, Quality = i < 10 ? 0.95 : 0.5, Other = i < 10 ? 1.0 : 0, Emb = emb(i), Cluster = 0 }).ToList();
+        var pick = CastLogic.Diverse(faces, 12);
+        Assert.Equal(12, pick.Count);
+        Assert.Equal(10, pick.Count(f => f.Solo));            // all ten solo frames, though lower quality
+        Assert.Equal(2, pick.Count(f => !f.Solo));            // crowded ones only fill the gap
+        Assert.All(CastLogic.Diverse(faces.Take(10).Concat(faces.Skip(10).Take(15)).ToList(), 5), f => Assert.True(f.Solo));
+    }
 }
