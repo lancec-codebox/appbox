@@ -51,9 +51,11 @@ public static class SiteCommands
     /// <summary>`process --job &lt;id&gt; --steps cast,describe`: redo steps of one already-processed job in the store (needs the SAS; describe needs the AI endpoint). Nothing is queued or leased; processed.json is not rewritten.</summary>
     public static async Task<int> ProcessAsync(Args a)
     {
-        var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps cast,describe] [--threads N] [--ai-... ]");
+        var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps frames,...] [--threads N] [--ai-... ]  (no --steps: the steps whose outputs are missing; --steps: rerun those, replacing their outputs)");
         var cfg = NodeConfig.Load(); if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
-        var steps = (a.Get("steps") ?? "cast,describe").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
+        // no --steps: process an unqueued video, running only what is missing; --steps: rerun exactly those steps
+        bool redo = a.Get("steps") != null;
+        var steps = (a.Get("steps") ?? string.Join(',', ProcessStage.FullSteps)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
         foreach (var s in steps) if (!ProcessStage.KnownSteps.Contains(s)) throw new ArgumentException($"unknown step '{s}' (known: {string.Join(',', ProcessStage.KnownSteps)})");
         ProcessStage.Ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
         if (steps.Contains("describe") && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe needs an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
@@ -65,8 +67,8 @@ public static class SiteCommands
             Job = new JobDescriptor { Stage = "process", JobId = id, Steps = steps }, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = store, Paths = paths, NodeId = cfg.NodeId ?? "cli",
             Token = cts.Token, ThreadShare = () => threads, Report = (step, p) => Console.WriteLine($"  {step} {p}"),
         };
-        await new ProcessStage(tools, store, cfg, http) { Redo = true }.RunAsync(ctx);
-        Console.WriteLine($"process {id}: {string.Join(',', steps)} done (outputs replaced in the store; run 'indexnode publish --job {id}' next)");
+        await new ProcessStage(tools, store, cfg, http) { Redo = redo }.RunAsync(ctx);
+        Console.WriteLine($"process {id}: {string.Join(',', steps)} done ({(redo ? "outputs replaced" : "missing outputs made")} in the store; run 'indexnode publish --job {id}' next)");
         return 0;
     }
 
