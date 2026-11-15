@@ -79,6 +79,17 @@ public class DescribeTests
         Assert.Throws<FormatException>(() => Describe.ParseObject("no json here"));
     }
 
+    [Fact]
+    public async Task A_reply_that_does_not_parse_is_asked_again_with_the_error()
+    {
+        var chat = new FakeChat("sorry, here: {\"a\":1,,,", "{\"a\":2}");
+        var o = await ((IChat)chat).JsonAsync("m", JsonValue.Create("give json")!, "submit", default);
+        Assert.Equal(2, (int)o["a"]!);
+        Assert.Equal(2, chat.Calls.Count);
+        Assert.Contains("could not be used", chat.Calls[1].Content.GetValue<string>());
+        await Assert.ThrowsAsync<FormatException>(() => ((IChat)new FakeChat("nope")).JsonAsync("m", JsonValue.Create("give json")!, "submit", default));
+    }
+
     static DescribeInput Input(string dir)
     {
         File.WriteAllBytes(Path.Combine(dir, "s0.jpg"), [1, 2, 3]); File.WriteAllBytes(Path.Combine(dir, "s1.jpg"), [4, 5]); File.WriteAllBytes(Path.Combine(dir, "t.jpg"), [9]); File.WriteAllBytes(Path.Combine(dir, "p.jpg"), [7]);

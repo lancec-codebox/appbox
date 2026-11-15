@@ -4,7 +4,41 @@ using System.Text.RegularExpressions;
 
 namespace IndexNode;
 
-public interface IChat { Task<string> ChatAsync(string model, JsonNode content, CancellationToken ct); }
+public interface IChat
+{
+    Task<string> ChatAsync(string model, JsonNode content, CancellationToken ct);
+    /// <summary>A JSON-object answer. The default asks for text and parses it, retrying with the parse error; AiClient asks for it as a forced tool call.</summary>
+    Task<JsonObject> JsonAsync(string model, JsonNode content, string tool, CancellationToken ct) => AiJson.ViaTextAsync(this, model, content, ct);
+}
+
+/// <summary>JSON answers from a model: parse failures are retried with the error passed back (owner 2026-11-14: one bad reply failed a whole describe).</summary>
+public static class AiJson
+{
+    public const int Retries = 2;
+
+    /// <summary>The original request plus the failed reply and why it failed, asking for a corrected object.</summary>
+    public static JsonNode WithError(JsonNode content, string reply, string error)
+    {
+        var note = "\n\nYour previous answer could not be used: " + error + "\nPrevious answer (start):\n" + (reply.Length > 1500 ? reply[..1500] : reply)
+                 + "\nAnswer again with ONLY the corrected, complete JSON object.";
+        if (content is JsonArray parts) { var c = (JsonArray)parts.DeepClone(); c.Add(new JsonObject { ["type"] = "text", ["text"] = note.TrimStart() }); return c; }
+        return JsonValue.Create(content.GetValue<string>() + note)!;
+    }
+
+    public static async Task<JsonObject> ViaTextAsync(IChat chat, string model, JsonNode content, CancellationToken ct)
+    {
+        string? last = null; Exception? err = null;
+        for (int k = 0; k <= Retries; k++)
+        {
+            last = await chat.ChatAsync(model, k == 0 ? content : WithError(content, last!, err!.Message), ct);
+            try { return Describe.ParseObject(last); }
+            catch (Exception e) when (e is JsonException or FormatException) { err = e; Log.Info($"ai {model}: reply {k + 1} did not parse ({Short(e.Message)}); {(k < Retries ? "asking again with the error" : "giving up")}"); }
+        }
+        throw new FormatException($"the AI reply did not parse after {Retries + 1} tries: {err!.Message}");
+    }
+
+    public static string Short(string s) => s.Length > 160 ? s[..160] + "..." : s;
+}
 
 /// <summary>One batched AI call: its prompt text and the image files it carries.</summary>
 public sealed record AiCall(string Name, string Model, string Prompt, IReadOnlyList<(string Label, string File)> Images);
@@ -230,13 +264,13 @@ flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check
         int calls = 0;
         for (int round = 0; round < 2; round++)
         {
-            var check = ParseObject(await chat.ChatAsync(model, JsonValue.Create(BuildCheck(res, Cutoff(d.Duration), model).Prompt)!, ct)); calls++;
+            var check = await chat.JsonAsync(model, JsonValue.Create(BuildCheck(res, Cutoff(d.Duration), model).Prompt)!, "submit_check", ct); calls++;
             foreach (var i in (check["flaggedRelations"] as JsonArray) ?? [])
                 if (i is JsonValue v && v.TryGetValue<int>(out var ix) && ix >= 0 && ix < res["relations"]!.AsArray().Count) res["relations"]![ix]!["spoiler"] = true;
             bool teaser = check["teaserReveals"] is JsonValue tv && tv.TryGetValue<bool>(out var tb) && tb;
             var fc = (check["flaggedCast"] as JsonArray) ?? [];
             if (!teaser && fc.Count == 0) { res["spoilerCheck"] = new JsonObject { ["rounds"] = round + 1, ["clean"] = true }; return calls; }
-            var rw = ParseObject(await chat.ChatAsync(model, JsonValue.Create(BuildRewrite(res, check, model).Prompt)!, ct)); calls++;
+            var rw = await chat.JsonAsync(model, JsonValue.Create(BuildRewrite(res, check, model).Prompt)!, "submit_rewrite", ct); calls++;
             if (teaser && rw["teaser"]?.GetValue<string>() is { Length: > 0 } nt) res["teaser"] = new JsonObject { ["en"] = Bad.Replace(nt, "").Trim() };
             foreach (var e in (rw["cast"] as JsonArray) ?? [])
             {
@@ -255,8 +289,7 @@ flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check
     public static async Task<JsonObject> RunAsync(IChat chat, string textModel, string visionModel, DescribeInput d, CancellationToken ct)
     {
         var main = BuildMain(d, visionModel);
-        var reply = await chat.ChatAsync(visionModel, ToContent(main), ct);
-        var res = Normalize(ParseObject(reply), d);
+        var res = Normalize(await chat.JsonAsync(visionModel, ToContent(main), "submit_description", ct), d);
         int calls = 1;
         // the spoiler check runs on the text model; a provider content filter there (drama plots trip them) moves it to the vision model, which already read the whole drama
         try { calls += await SpoilerCheckAsync(chat, textModel, res, d, ct); }
