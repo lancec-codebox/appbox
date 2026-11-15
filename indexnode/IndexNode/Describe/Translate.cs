@@ -36,6 +36,8 @@ public static partial class Translate
 {
     public const string PromptVersion = "translate-1";
     public const int BatchCues = 200, ContextCues = 10, Parallelism = 4, MaxReasks = 2;
+    /// <summary>Context on each side of a batch: at least this many cues AND at least this many seconds (whichever reaches further), so an exchange split by a boundary is seen whole.</summary>
+    public const double ContextSeconds = 30;
     /// <summary>The OCR is the source when at least this share of the transcript's speech time has an OCR cue on screen.</summary>
     public const double MinCoverage = 0.6;
     const double CoverPad = 0.3;
@@ -77,6 +79,9 @@ public static partial class Translate
         var cues = useOcr ? o : a; var track = useOcr ? "ocr" : "asr";
         return new TranslateSource(track, cov, Math.Round(speech, 1), cues, Hash(track, cues));
     }
+
+    /// <summary>Hash of the cue text's letters and digits only (as AvSync.Clean), 16 hex characters.</summary>
+    public static string CleanHash(string zh) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(AvSync.Clean(zh)))).ToLowerInvariant()[..16];
 
     static string Hash(string track, IReadOnlyList<ShapeCue> cues)
     {
@@ -264,10 +269,16 @@ public static partial class Translate
         return (good, bad);
     }
 
-    static List<(int Id, bool Ask)> Window(int count, IReadOnlyCollection<int> ask, int before, int after)
+    /// <summary>The asked ids with context-only cues on both sides: at least <paramref name="minCues"/> cues and at least <paramref name="minSeconds"/> seconds from the nearest asked cue, whichever reaches further.</summary>
+    static List<(int Id, bool Ask)> Window(IReadOnlyList<ShapeCue> cues, IReadOnlyCollection<int> ask, int minCues, double minSeconds)
     {
-        var sorted = ask.OrderBy(i => i).ToList(); var set = ask.ToHashSet(); var keep = new SortedSet<int>();
-        foreach (var i in sorted) for (int k = Math.Max(0, i - before); k <= Math.Min(count - 1, i + after); k++) keep.Add(k);
+        var set = ask.ToHashSet(); var keep = new SortedSet<int>(ask);
+        foreach (var i in ask)
+        {
+            if (set.Contains(i - 1) && set.Contains(i + 1)) continue; // inside a run: only run ends need context
+            if (!set.Contains(i - 1)) for (int k = i - 1, n = 0; k >= 0 && (n < minCues || cues[i].Start - cues[k + 1].Start < minSeconds); k--, n++) keep.Add(k);
+            if (!set.Contains(i + 1)) for (int k = i + 1, n = 0; k < cues.Count && (n < minCues || cues[k - 1].End - cues[i].End < minSeconds); k++, n++) keep.Add(k);
+        }
         return keep.Select(i => (i, set.Contains(i))).ToList();
     }
 
@@ -278,7 +289,7 @@ public static partial class Translate
         for (int attempt = 0; attempt <= MaxReasks; attempt++)
         {
             // first ask: the batch with ~10 cues of context on each side; a re-ask: only the bad ids, each with a few neighbours and the English already accepted
-            var window = attempt == 0 ? Window(cues.Count, pending, ContextCues, ContextCues) : Window(cues.Count, pending, 4, 4);
+            var window = attempt == 0 ? Window(cues, pending, ContextCues, ContextSeconds) : Window(cues, pending, 4, 10);
             var known2 = attempt == 0 ? new Dictionary<int, string>() : known;
             var prompt = BatchPrompt(cues, window, known2, glossary, synopsis, title);
             Interlocked.Increment(ref counter.Calls);
@@ -359,7 +370,9 @@ public static partial class Translate
             v = 1, promptVersion = PromptVersion, model, api = ai2?.ApiFor(model) ?? ai.EffectiveApi,
             glossaryHash = gHash, glossarySeedHash = seedHash, glossary = glossary.Select(g => new { zh = g.Zh, en = g.En, kind = g.Kind }),
             sourceTrack = src.Track, sourceHash = src.Hash, coverage = src.Coverage, speechSeconds = src.SpeechSeconds, sourceCues = cues.Count, syncOffset = input.SyncOffset,
-            describeUsed = input.Describe != null, batches, aiCalls = counter.Calls,
+            describeUsed = input.Describe != null,
+            // the pairs before shaping, for reuse by time alignment: start, end, Chinese, hash of its letters and digits, our English ("" for non-speech)
+            cues = Enumerable.Range(0, cues.Count).Select(i => new { start = Math.Round(cues[i].Start, 3), end = Math.Round(cues[i].End, 3), zh = cues[i].Text, hash = CleanHash(cues[i].Text), en = en[i] ?? "" }), batches, aiCalls = counter.Calls,
             tokens = ai2 == null ? null : new { input = ai2.InputTokens, output = ai2.OutputTokens },
             shape = stats.ToJson(), seconds = Math.Round(sw.Elapsed.TotalSeconds, 1), at = Protocol.NowUtc(),
         }, Opt);
