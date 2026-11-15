@@ -347,7 +347,7 @@ public static partial class Translate
             if (pending.Count == 0) { progress($"batch {batchNo}/{batches}: {to - from} cues translated in {attempt + 1} call(s)"); return; }
             progress($"batch {batchNo}/{batches}: {pending.Count} cue(s) missing or unusable after call {attempt + 1}{(attempt < MaxReasks ? ", asking again" : "")}");
         }
-        throw new InvalidOperationException($"translate: batch {batchNo}/{batches} still has {pending.Count} cue(s) missing or unusable after {MaxReasks + 1} calls (ids {string.Join(',', pending.Take(10))}): {lastWhy}");
+        throw new InvalidOperationException($"translate: batch {batchNo}/{batches} still has {pending.Count} cue(s) missing or unusable after {MaxReasks + 1} calls (ids {string.Join(',', pending.Take(10))}; Chinese: {string.Join(" | ", pending.Take(5).Select(id => cues[id].Text))}): {lastWhy}");
     }
 
     // ---------- the step ----------
