@@ -28,6 +28,9 @@ public sealed class DownloadGate(Func<TimeSpan, CancellationToken, Task>? delay 
 
 public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) : IStageHandler
 {
+    /// <summary>False (`indexnode download --no-process`): the video is stored but no processing jobs are queued; `indexnode unprocessed` lists it.</summary>
+    public bool QueueProcessing { get; init; } = true;
+
     /// <summary>English (en, en-US, ...) and Chinese uploaded subtitles; zh-orig is the original-language automatic track.</summary>
     public const string SubLangs = "en.*,zh,zh-Hans,zh-Hant,zh-CN,zh-TW,zh-HK,zh-orig";
     private static readonly string[] LangOrder = ["zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh-HK", "zh", "zh-orig", "en"];
@@ -183,12 +186,13 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
     }
 
     /// <summary>The process job and the first comments job (due at once), each only where it does not exist yet.</summary>
-    private static async Task EnsureFollowUpJobs(JobContext ctx)
+    private async Task EnsureFollowUpJobs(JobContext ctx)
     {
         var c = JobDescriptor.NewComments(ctx.Job.JobId, ctx.Job.Url ?? "https://www.youtube.com/watch?v=" + ctx.Job.JobId);
         var made = await ctx.Store.PutAsync(ctx.Paths.Job("comments", ctx.Job.JobId), c.ToBytes(), Tags.Job("comments", "pending", c.AddedAt), null, true, ctx.Token);
         Log.Info($"download {ctx.Job.JobId}: comments job {(made ? "created" : "already exists")}");
-        await EnsureProcessJob(ctx);
+        if (QueueProcessing) await EnsureProcessJob(ctx);
+        else Log.Info($"download {ctx.Job.JobId}: processing not queued (--no-process)");
     }
 
     private static async Task EnsureProcessJob(JobContext ctx)
