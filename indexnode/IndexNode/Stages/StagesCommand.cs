@@ -14,7 +14,7 @@ namespace IndexNode;
 /// </summary>
 public static class StagesCommand
 {
-    static readonly string[] Known = ["frames", "sscd", "transcribe", "text", "cast", "sync", "describe"];
+    static readonly string[] Known = ["frames", "sscd", "thumbs", "transcribe", "text", "cast", "sync", "describe"];
 
     /// <summary>
     /// `stages translate --job &lt;id&gt; --out &lt;dir&gt;`: the translate step as a trial. Reads the inputs from the store, writes en.vtt and en.json to &lt;dir&gt; only (never to the store) and always runs.
@@ -148,6 +148,13 @@ public static class StagesCommand
                         var bytes = await DescribeJob.RunAsync(new AiClient(http, ai), ai, d, ct);
                         if (bytes != null) await Put("describe.json", bytes, "application/json");
                         Console.WriteLine($"describe: {(bytes == null ? "skipped" : "written")}; total {sw.Elapsed.TotalSeconds:F1}s");
+                        break;
+                    }
+                    case "thumbs":
+                    {
+                        P(stage, "fetching frames"); var fs = await FrameSet();
+                        var n = await Thumbs.RunAsync(tools, store, paths, id, fs, m => P(stage, m), ct);
+                        Console.WriteLine($"thumbs: {n} thumbnails in {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }
                     case "sscd":

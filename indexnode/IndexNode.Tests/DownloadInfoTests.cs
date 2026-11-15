@@ -134,7 +134,7 @@ public class DownloadInfoTests
     public void Follow_up_process_job_has_the_new_default_steps_and_no_compress_block()
     {
         var j = JobDescriptor.NewProcess("abcdefghij1");
-        Assert.Equal(["frames", "sscd", "transcribe", "ocrsubs"], j.Steps);
+        Assert.Equal(["frames", "sscd", "thumbs", "transcribe", "ocrsubs"], j.Steps);
         Assert.Null(j.Compress);
         Assert.DoesNotContain("compress", System.Text.Encoding.UTF8.GetString(j.ToBytes()));
     }

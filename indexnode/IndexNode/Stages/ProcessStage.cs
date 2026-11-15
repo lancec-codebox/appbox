@@ -20,16 +20,16 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
     public static string[] SkippedAiSteps(AiConfig? ai) => ai is { Configured: true } ? [] : AiSteps;
 
     /// <summary>Every step of a fully processed video (sync is computed after transcribe + ocrsubs; clip is dropped).</summary>
-    public static readonly string[] FullSteps = ["frames", "sscd", "transcribe", "ocrsubs", "cast", "describe", "translate"];
-    public static readonly string[] KnownSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "translate", "sync"];
+    public static readonly string[] FullSteps = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs", "cast", "describe", "translate"];
+    public static readonly string[] KnownSteps = ["frames", "sscd", "thumbs", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "translate", "sync"];
 
     /// <summary>The outputs that make a video fully processed, per step: the node that writes the last one also writes processed.json.</summary>
-    static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("clip", "clip/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
+    static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("clip", "clip/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
 
     /// <summary>What each step derives, as paths under the video's folder (a trailing / is a folder). Never a source file: video.mp4, info.json, description.txt, thumb.jpg, subs/ (except our own subs/ai/), comments/, downloaded.json. sync.json is not listed: a redo never reruns sync.</summary>
     public static readonly IReadOnlyDictionary<string, string[]> Owned = new Dictionary<string, string[]>
     {
-        ["frames"] = ["frames/", "keyframes/"], ["sscd"] = ["sscd/"], ["clip"] = ["clip/"], ["transcribe"] = ["asr/"], ["ocrsubs"] = ["ocr/"],
+        ["frames"] = ["frames/", "keyframes/"], ["sscd"] = ["sscd/"], ["thumbs"] = ["thumbs/"], ["clip"] = ["clip/"], ["transcribe"] = ["asr/"], ["ocrsubs"] = ["ocr/"],
         ["cast"] = ["cast/"], ["describe"] = ["describe.json"], ["translate"] = ["subs/ai/"], ["compress"] = ["compact.mp4"],
     };
 
@@ -98,6 +98,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
         {
             ["frames"] = steps.Contains("frames") && !Has("frames/manifest.json"),
             ["sscd"] = steps.Contains("sscd") && !Has("sscd/manifest.json"),
+            ["thumbs"] = steps.Contains("thumbs") && !Has("thumbs/manifest.json"),
             ["clip"] = steps.Contains("clip") && !Has("clip/manifest.json"),
             ["transcribe"] = steps.Contains("transcribe") && !Has("asr/" + Transcribe.ModelName + ".zh.json"),
             ["ocrsubs"] = steps.Contains("ocrsubs") && !Has("ocr/lines.json"),
@@ -160,6 +161,13 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 var (keep, rep) = FrameChunks.SscdPass(fs.Times, bytes, Sscd.Dim, fset.SscdCosine, fset.LookbackSeconds);
                 await FrameChunks.ApplySscdPassAsync(wst, paths, id, fs, rep, keep, fset.SscdCosine, fset.LookbackSeconds, ct);
                 Log.Info($"process {id}: sscd pass kept {keep.Count} of {rep.Length} frames");
+            }
+            if (need["thumbs"])
+            {   // after sscd: the same stored frames (hydrated on read), the sscd pass has rewritten their index but not their rows
+                ctx.Report("thumbs", null);
+                var fs = await FrameSet();
+                int n = await Thumbs.RunAsync(tools, wst, paths, id, fs, m => ctx.Report("thumbs", m), ct);
+                Log.Info($"process {id}: thumbs {n} thumbnails");
             }
             if (need["clip"])
             {

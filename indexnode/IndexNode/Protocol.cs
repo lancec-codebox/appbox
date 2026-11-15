@@ -10,16 +10,16 @@ public static partial class Protocol
 {
     public const string ApiVersion = "2021-12-02";
     /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
-    public static readonly string[] StepStages = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"];
+    public static readonly string[] StepStages = ["frames", "sscd", "thumbs", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"];
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
     public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch", "classify", "availability"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
-    public static readonly string[] HeavyStages = ["process", "frames", "sscd", "clip", "transcribe", "ocrsubs", "cast"];
+    public static readonly string[] HeavyStages = ["process", "frames", "sscd", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
     /// <summary>Files (relative to videos/&lt;id&gt;/) a step job waits for before a node claims it.</summary>
     public static string[] NeedsOf(string step) => step switch
     {
-        "sscd" or "clip" => ["frames/manifest.json"],
+        "sscd" or "clip" or "thumbs" => ["frames/manifest.json"],
         // 0.7: cast reads the stored frames (no keyframes), after the SSCD pass has rewritten their index; jobs created before keep their stored needs
         "cast" => ["frames/manifest.json", "sscd/manifest.json"],
         "sync" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json"],
@@ -37,7 +37,7 @@ public static partial class Protocol
     public static string[] ExpandStages(IEnumerable<string> stages) =>
         stages.SelectMany(s => s == "process" ? new[] { "process" }.Concat(StepStages) : [s]).Distinct().ToArray();
     // owner 2026-11-14: search vectors (clip) dropped from the default pipeline (weak matches; screenshot search is SSCD). The step still runs when asked for explicitly.
-    public static readonly string[] DefaultSteps = ["frames", "sscd", "transcribe", "ocrsubs"];
+    public static readonly string[] DefaultSteps = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs"];
     public const int LeaseSeconds = 60;
     public const int MaxAttempts = 3;
 
