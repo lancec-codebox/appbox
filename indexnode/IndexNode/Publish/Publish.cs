@@ -10,6 +10,8 @@ public interface IJobSource
 {
     string JobId { get; }
     Task<byte[]?> ReadAsync(string file, CancellationToken ct);
+    /// <summary>The job's files under a folder (relative names), e.g. comments/.</summary>
+    Task<IReadOnlyList<string>> ListAsync(string folder, CancellationToken ct) => Task.FromResult<IReadOnlyList<string>>([]);
 }
 
 public sealed class LocalJob(string dir, string id) : IJobSource
@@ -20,11 +22,18 @@ public sealed class LocalJob(string dir, string id) : IJobSource
         var p = Path.Combine(dir, file.Replace('/', Path.DirectorySeparatorChar));
         return Task.FromResult(File.Exists(p) ? File.ReadAllBytes(p) : null);
     }
+    public Task<IReadOnlyList<string>> ListAsync(string folder, CancellationToken ct)
+    {
+        var d = Path.Combine(dir, folder.Replace('/', Path.DirectorySeparatorChar));
+        return Task.FromResult<IReadOnlyList<string>>(Directory.Exists(d) ? Directory.GetFiles(d).Select(f => folder.TrimEnd('/') + "/" + Path.GetFileName(f)).ToList() : []);
+    }
 }
 
 public sealed class StoreJob(IStore store, Paths paths, string id) : IJobSource
 {
     public string JobId => id;
+    public async Task<IReadOnlyList<string>> ListAsync(string folder, CancellationToken ct) =>
+        (await store.ListAsync(paths.Video(id, folder.TrimEnd('/') + "/"), false, false, ct)).Select(b => b.Name[paths.VideoDir(id).Length..]).ToList();
     public async Task<byte[]?> ReadAsync(string file, CancellationToken ct) => await FrameChunks.ReadAsync(store, paths.Video(id, file), ct, file.EndsWith(".f16") || file.EndsWith(".jpgs") || file.EndsWith(".mp4"));
 }
 
@@ -140,7 +149,7 @@ public static class Publish
             ["channel"] = info?["channel"]?.GetValue<string>() ?? info?["uploader"]?.GetValue<string>() ?? "", ["durationSeconds"] = dur,
             ["originalTitle"] = info?["title"]?.GetValue<string>() ?? "",
             ["title"] = describe["title"]!.DeepClone(), ["fullTitle"] = describe["fullTitle"]!.DeepClone(), ["teaser"] = describe["teaser"]!.DeepClone(), ["synopsis"] = describe["synopsis"]!.DeepClone(),
-            ["era"] = describe["era"]?.DeepClone(), ["fantasy"] = describe["fantasy"]?.DeepClone() ?? false, ["aiGenerated"] = describe["aiGenerated"]?["level"]?.DeepClone(), ["tags"] = describe["tags"]!.DeepClone(),
+            ["era"] = describe["era"]?.DeepClone(), ["fantasy"] = describe["fantasy"]?.DeepClone() ?? false, ["aiGenerated"] = describe["aiGenerated"]?["level"]?.DeepClone(), ["aiFlag"] = describe["aiGenerated"]?["level"]?.ToString() is "partly" or "yes", ["tags"] = describe["tags"]!.DeepClone(),
             ["cast"] = cast, ["relations"] = rel, ["cutoffSeconds"] = cut,
             ["sources"] = new JsonObject { ["text"] = textSource, ["asrModel"] = processed?["asrModel"]?.DeepClone(), ["ocr"] = hasOcr },
             ["made"] = new JsonObject { ["at"] = Protocol.NowUtc(), ["by"] = by, ["notes"] = $"describe {describe["promptVersion"]}, models {describe["models"]?.ToJsonString()}" },
@@ -415,7 +424,7 @@ public static class Publish
         {
             var f = Path.Combine(d, "drama.json"); if (!File.Exists(f)) continue;
             var j = JsonNode.Parse(File.ReadAllText(f))!.AsObject();
-            packs.Add(new JsonObject { ["packId"] = Path.GetFileName(d), ["title"] = j["title"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["aiGenerated"] = j["aiGenerated"]?.DeepClone(), ["durationSeconds"] = j["durationSeconds"]?.DeepClone(), ["madeAt"] = j["made"]?["at"]?.DeepClone() });
+            packs.Add(new JsonObject { ["packId"] = Path.GetFileName(d), ["title"] = j["title"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["aiGenerated"] = j["aiGenerated"]?.DeepClone(), ["aiFlag"] = j["aiFlag"]?.DeepClone(), ["durationSeconds"] = j["durationSeconds"]?.DeepClone(), ["madeAt"] = j["made"]?["at"]?.DeepClone() });
         }
         File.WriteAllText(Path.Combine(outDir, "packs.json"), new JsonObject { ["v"] = 0, ["packs"] = packs }.ToJsonString(Opt));
     }
