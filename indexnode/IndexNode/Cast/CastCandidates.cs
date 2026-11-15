@@ -25,9 +25,12 @@ public static class CastCandidates
     }
 
     /// <summary>The stored faces of faces.json (+ faces.f16 embeddings), in file order.</summary>
-    public static List<FaceRec> LoadFaces(JsonObject doc, byte[]? f16, SubtitleBand? subs, double frameW)
+    public static List<FaceRec> LoadFaces(JsonObject doc, byte[]? f16, SubtitleBand? subs, double frameW, string blob = "cast/faces.f16")
     {
         int dim = doc["dim"]?.GetValue<int>() ?? 512; var list = new List<FaceRec>(); int i = 0;
+        int n = (doc["faces"] as JsonArray)?.Count ?? 0;
+        if (n > 0 && (f16 == null || f16.Length == 0)) throw new InvalidOperationException($"stored blob {blob} is empty (0 bytes) but cast/faces.json lists {n} faces: a Nexis ghost that was not hydrated, or an interrupted write; expected {(long)n * dim * 2} bytes");
+        if (n > 0 && f16!.Length < (long)n * dim * 2) throw new InvalidOperationException($"stored blob {blob} is too short: {f16.Length} bytes for {n} faces of {dim} dimensions (expected {(long)n * dim * 2})");
         foreach (var f in (doc["faces"] as JsonArray)?.OfType<JsonObject>() ?? [])
         {
             var b = (f["box"] as JsonArray)!.Select(v => v!.GetValue<float>()).ToArray(); double t = f["t"]!.GetValue<double>();
@@ -71,7 +74,7 @@ public static class CastCandidates
         var clustersDoc = StoredJson.Object(await Read("cast/clusters.json") ?? throw new InvalidOperationException($"{id}: no cast/clusters.json"), $"{id}/cast/clusters.json");
         int fw = facesDoc["source"]?["width"]?.GetValue<int>() ?? 360, fh = facesDoc["source"]?["height"]?.GetValue<int>() ?? 640;
         var subs = SubtitleBand.Parse(await Read("ocr/lines.json"), $"{id}/ocr/lines.json");
-        var faces = LoadFaces(facesDoc, await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.f16"), ct), subs, fw); // a ghost blob: hydrated first
+        var faces = LoadFaces(facesDoc, await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.f16"), ct), subs, fw, $"{id}/cast/faces.f16"); // a ghost blob: hydrated first
         var only = a.Get("clusters")?.Split(',').Select(int.Parse).ToHashSet();
         var main = (clustersDoc["clusters"] as JsonArray)!.OfType<JsonObject>().Where(c => c["main"]?.GetValue<bool>() == true).Select(c => c["id"]!.GetValue<int>()).Where(c => only == null || only.Contains(c)).ToList();
         var pool = faces.Where(f => main.Contains(f.Cluster) && f.Emb.Length > 0).ToList();

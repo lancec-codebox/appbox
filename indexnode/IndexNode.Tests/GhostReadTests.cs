@@ -95,6 +95,17 @@ public class GhostReadTests
     }
 
     [Fact]
+    public void An_empty_or_short_faces_f16_is_a_clear_error_not_a_NullReferenceException()
+    {
+        var doc = System.Text.Json.Nodes.JsonNode.Parse("""{"dim":4,"faces":[{"box":[0,0,1,1],"t":1.0,"score":0.9,"blur":1,"quality":1,"cluster":1}]}""")!.AsObject();
+        var e = Assert.Throws<InvalidOperationException>(() => CastCandidates.LoadFaces(doc, [], null, 360, "j/cast/faces.f16"));
+        Assert.Contains("j/cast/faces.f16", e.Message); Assert.Contains("0 bytes", e.Message);
+        Assert.Throws<InvalidOperationException>(() => CastCandidates.LoadFaces(doc, null, null, 360));
+        var s = Assert.Throws<InvalidOperationException>(() => CastCandidates.LoadFaces(doc, new byte[5], null, 360, "j/cast/faces.f16")); Assert.Contains("too short", s.Message);
+        Assert.Single(CastCandidates.LoadFaces(doc, new byte[8], null, 360));
+    }
+
+    [Fact]
     public void An_empty_stored_json_names_the_blob_not_a_bare_JsonReaderException()
     {
         var e = Assert.Throws<StoredJson.EmptyBlobException>(() => IndexNode.SubtitleBand.Parse([], "j/ocr/lines.json"));
