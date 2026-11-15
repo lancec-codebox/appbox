@@ -12,7 +12,7 @@ public static partial class Protocol
     /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
     public static readonly string[] StepStages = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe"];
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
-    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch"];
+    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch", "classify"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
@@ -28,7 +28,9 @@ public static partial class Protocol
     };
     public static readonly TimeSpan NeedsRetry = TimeSpan.FromMinutes(2);
     /// <summary>What a desktop node runs by default: downloads go to the phone, so download is opt-in (--stages).</summary>
-    public static readonly string[] DefaultNodeStages = ["watch", "process", "comments"]; // "process" stands for every step stage too (see ExpandStages)
+    // owner 2026-11-14: only the yt-dlp nodes (residential downloaders) touch YouTube: download, watch and comments are opt-in there
+    // (--stages download,watch,comments); processing nodes run the steps and classify (which needs an AI endpoint)
+    public static readonly string[] DefaultNodeStages = ["process", "classify"]; // "process" stands for every step stage too (see ExpandStages)
 
     /// <summary>"process" means the legacy stage and all step stages.</summary>
     public static string[] ExpandStages(IEnumerable<string> stages) =>
@@ -132,6 +134,8 @@ public sealed class JobDescriptor
     public string? LastPolled { get; set; }
     /// <summary>Video ids already seen in this source, newest first, capped at 500. Null until the first poll.</summary>
     public List<string>? Seen { get; set; }
+    /// <summary>classify jobs: the channel uploads to decide on (listed by the downloader's watch job <see cref="Source"/>).</summary>
+    public List<ClassifyEntry>? Entries { get; set; }
     /// <summary>How many new videos this source has produced so far.</summary>
     public int? Found { get; set; }
     /// <summary>On a download job: the watch job that found the video.</summary>
@@ -161,10 +165,23 @@ public sealed class JobDescriptor
         Stage = step, JobId = jobId, Steps = [step], Needs = Protocol.NeedsOf(step) is { Length: > 0 } n ? n : null, AddedAt = Protocol.NowUtc(),
     };
 
+    public static JobDescriptor NewClassify(JobDescriptor watch, List<ClassifyEntry> entries, string addedAt) => new()
+    {
+        Stage = "classify", JobId = $"{watch.JobId}-{addedAt.Replace(":", "").Replace("-", "")}", Kind = "channel", Id = watch.Id, Name = watch.Name, Source = watch.JobId,
+        MaxHeight = watch.MaxHeight, Entries = entries, AddedAt = addedAt, Attempts = 0,
+    };
+
     public static JobDescriptor NewProcess(string jobId) => new()
     {
         Stage = "process", JobId = jobId, Steps = Protocol.DefaultSteps, AddedAt = Protocol.NowUtc(),
     };
+}
+
+public sealed class ClassifyEntry
+{
+    public string Id { get; set; } = "";
+    public string? Title { get; set; }
+    public double? Duration { get; set; }
 }
 
 public sealed class CompressSettings

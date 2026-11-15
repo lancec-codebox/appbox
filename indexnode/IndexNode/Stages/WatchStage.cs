@@ -12,7 +12,9 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
     public const int SeenCap = 500;
     private readonly Func<DateTimeOffset> now = clock ?? (() => DateTimeOffset.UtcNow);
 
-    public sealed record Entry(string Id, string? ChannelId, string? ChannelName);
+    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null);
+    /// <summary>A channel's first poll looks this far back: its back catalogue goes to classification too.</summary>
+    public const int ChannelFirstList = 100;
 
     [GeneratedRegex(@"^(\d+)\s*([smhd])$", RegexOptions.IgnoreCase)]
     private static partial Regex EveryRegex();
@@ -39,7 +41,8 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         var id = p[0].Trim();
         if (!Regex.IsMatch(id, @"^[A-Za-z0-9_-]{11}$")) return null;
         string? Field(int i) => p.Length > i && p[i].Trim() is { Length: > 0 } v && v != "NA" ? v : null;
-        return new Entry(id, Field(1), Field(2));
+        double? dur = Field(3) is { } d && double.TryParse(d, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var dv) ? dv : null;
+        return new Entry(id, Field(1), Field(2), dur, p.Length > 4 && Field(4) != null ? string.Join(' ', p[4..]).Trim() : null);
     }
 
     public async Task<List<Entry>> ListAsync(JobDescriptor j, int end, CancellationToken ct)
@@ -49,7 +52,7 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         var urls = ListingUrls(j);
         foreach (var url in urls)
         {
-            var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--playlist-end", end.ToString(), "--print", "%(id)s\t%(channel_id)s\t%(channel)s", url], ct);
+            var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--playlist-end", end.ToString(), "--print", "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(title)s", url], ct);
             if (r.ExitCode != 0) { failed++; lastError = r.Stderr; continue; }
             foreach (var line in r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 if (ParseLine(line) is { } e && all.All(x => x.Id != e.Id)) all.Add(e);
@@ -70,14 +73,21 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         int backfill = Math.Max(0, job.Backfill ?? 0);
         ctx.Report("poll", job.Name);
 
-        var listed = await ListAsync(job, first ? Math.Max(ListSize, backfill) : ListSize, ct);
+        var listed = await ListAsync(job, first ? Math.Max(job.Kind == "channel" ? ChannelFirstList : ListSize, backfill) : ListSize, ct);
         var seen = new HashSet<string>(job.Seen ?? []);
         var fresh = listed.Where(e => !seen.Contains(e.Id)).ToList();
         int made = 0, skipped = 0;
         var addedAt = Protocol.Utc(now());
 
         // which of the fresh videos get a download job: on the first poll only the newest `backfill`, afterwards all of them
-        var toDownload = first ? fresh.Take(backfill).ToList() : fresh;
+        // a playlist is the owner's curation: its videos are downloaded; a channel's uploads are classified first (classify stage, on a node with AI)
+        var toDownload = job.Kind == "channel" ? [] : first ? fresh.Take(backfill).ToList() : fresh;
+        if (job.Kind == "channel" && fresh.Count > 0)
+        {
+            var cj = JobDescriptor.NewClassify(job, fresh.Select(e => new ClassifyEntry { Id = e.Id, Title = e.Title, Duration = e.Duration }).ToList(), addedAt);
+            await store.PutAsync(paths.Job("classify", cj.JobId), cj.ToBytes(), Tags.Job("classify", "pending", addedAt), null, true, ct);
+            Log.Info($"watch {job.JobId}: {fresh.Count} new uploads handed to classify/{cj.JobId}");
+        }
         foreach (var e in toDownload)
         {
             if (await KnownAsync(paths, e.Id, ct)) { skipped++; continue; }
@@ -100,7 +110,7 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
                     if (line != null && line[0].Trim() is { Length: > 0 } c && c != "NA") { cid = c; cname ??= line.Length > 1 && line[1].Trim() != "NA" ? line[1].Trim() : null; }
                 }
                 if (cid == null || !done.Add(cid)) continue;
-                var ch = JobDescriptor.NewWatch("channel", cid, cname ?? cid, job.Every ?? "1h", job.Tabs is { Length: > 0 } t ? t : ["videos", "shorts"], false, 0, job.MaxHeight ?? 480);
+                var ch = JobDescriptor.NewWatch("channel", cid, cname ?? cid, job.Every ?? "1h", ["videos"], false, 0, job.MaxHeight ?? 480); // Shorts are never dramas
                 ch.Source = job.JobId; ch.AddedAt = addedAt;
                 if (await store.PutAsync(paths.Job("watch", ch.JobId), ch.ToBytes(), Tags.Job("watch", "pending", addedAt), null, true, ct))
                     Log.Info($"watch {job.JobId}: now following channel {ch.Name} ({cid})");
