@@ -22,7 +22,7 @@ public class TranslateTests
             if (tool == "submit_glossary")
             {
                 Interlocked.Increment(ref GlossaryCalls);
-                return Task.FromResult(JsonNode.Parse("""{"plot":"Huo Zhan secretly is the prince; his wife is the bride.","entries":[{"zh":"霍湛","en":"Wrong Name","kind":"character"},{"zh":"嫂嫂","en":"Sister-in-law","kind":"address"},{"zh":"侯府","en":"Marquis Manor","kind":"place"}]}""")!.AsObject());
+                return Task.FromResult(JsonNode.Parse("""{"plot":"Huo Zhan secretly is the prince; his wife is the bride.","entries":[{"zh":"霍湛","en":"Wrong Name","kind":"character"},{"zh":"嫂嫂","en":"Sister-in-law","kind":"address","refers":"Su Wan"},{"zh":"昭姐姐","en":"Sister Zhao","kind":"address","refers":"Gu Zhao"},{"zh":"侯府","en":"Marquis Manor","kind":"place"}]}""")!.AsObject());
             }
             Interlocked.Increment(ref BatchCalls);
             var arr = new JsonArray();
@@ -31,6 +31,7 @@ public class TranslateTests
                 int id = int.Parse(m.Groups[1].Value); int at = Attempts.AddOrUpdate(id, 1, (_, v) => v + 1);
                 var text = Override?.Invoke(id, at) ?? "Line " + id;
                 if (text == "<drop>") continue;
+                if (text == "<skip>") { arr.Add(new JsonObject { ["i"] = id, ["en"] = "", ["skip"] = true }); continue; }
                 arr.Add(new JsonObject { ["i"] = id, ["en"] = text });
             }
             return Task.FromResult(new JsonObject { ["cues"] = arr });
@@ -185,6 +186,35 @@ public class TranslateTests
     }
 
     [Fact]
+    public async Task Garbled_ocr_marked_skip_is_dropped_and_counted_and_nothing_is_invented()
+    {
+        var f = new Fake { Override = (id, _) => id == 2 ? "<skip>" : null };
+        var i = Input(6); i.Ocr = i.Ocr.Select((c, k) => k == 2 ? c with { Text = "未" } : c).ToList();
+        var (r, _) = await Run(i, f);
+        var vtt = System.Text.Encoding.UTF8.GetString(r.Vtt!);
+        Assert.DoesNotContain("Line 2", vtt); Assert.Contains("Line 1", vtt); Assert.Contains("Line 3", vtt);
+        var j = JsonNode.Parse(r.Json!)!; Assert.Equal(1, j["dropped"]!.GetValue<int>()); Assert.Equal("未", j["droppedCues"]![0]!["zh"]!.GetValue<string>());
+        Assert.Equal(6, j["cues"]!.AsArray().Count); Assert.Equal("", j["cues"]![2]!["en"]!.GetValue<string>());
+        Assert.Equal(2, r.Calls); // a skip is an answer, not a re-ask
+        var sr = j["shortReadBy"]!; Assert.Equal(j["shape"]!["shortRead"]!.GetValue<int>(), sr["upTo0_5s"]!.GetValue<int>() + sr["from0_5To1s"]!.GetValue<int>() + sr["over1s"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Address_forms_are_kept_apart_from_names_in_the_glossary_and_the_prompts()
+    {
+        var (r, f) = await Run(Input(10, Describe()));
+        var gp = f.Prompts.Single(p => p.Contains("preparing the name glossary"));
+        Assert.Contains("Never put a form of address", gp); Assert.Contains("\"refers\"", gp);
+        foreach (var p in f.Prompts.Where(p => p.Contains("GLOSSARY:")))
+        {
+            Assert.Contains("昭姐姐 => Sister Zhao [address form; refers to Gu Zhao, context only]", p);
+            Assert.Contains("NEVER swap in the person's full name", p); Assert.Contains("\"skip\":true", p);
+        }
+        var e = JsonNode.Parse(r.Json!)!["glossary"]!.AsArray().Single(x => x!["zh"]!.GetValue<string>() == "昭姐姐")!;
+        Assert.Equal("address", e["kind"]!.GetValue<string>()); Assert.Equal("Gu Zhao", e["refers"]!.GetValue<string>());
+    }
+
+    [Fact]
     public async Task Redo_only_when_source_or_glossary_seed_changes()
     {
         var (r1, _) = await Run(Input(20, Describe()));
@@ -214,16 +244,17 @@ public class TranslateTests
         Assert.Equal("ocr", j["sourceTrack"]!.GetValue<string>()); Assert.Equal("m", j["model"]!.GetValue<string>());
         Assert.NotNull(j["glossaryHash"]); Assert.NotNull(j["sourceHash"]); Assert.Equal(1, j["batches"]!.GetValue<int>()); Assert.Equal(2, j["aiCalls"]!.GetValue<int>());
         Assert.False(j["describeUsed"]!.GetValue<bool>()); Assert.Equal(10, j["shape"]!["cues"]!.GetValue<int>());
-        Assert.True(j["glossary"]!.AsArray().Count == 3);
+        Assert.Equal(4, j["glossary"]!.AsArray().Count);
     }
 
     [Fact]
     public void Accept_rules()
     {
-        Assert.Equal("", Translate.Accept("（音乐）", "", out _));
-        Assert.Null(Translate.Accept("你好吗", "", out var why)); Assert.Equal("empty", why);
-        Assert.Equal("Hello there", Translate.Accept("你好", "Hello [softly] there", out _));
-        Assert.Null(Translate.Accept("你好", "你好", out _));
+        Assert.Equal("", Translate.Accept("（音乐）", "", false, out _));
+        Assert.Null(Translate.Accept("你好吗", "", false, out var why)); Assert.StartsWith("empty", why);
+        Assert.Equal("", Translate.Accept("未", "", true, out _)); // marked skip: garbled OCR is dropped, not invented
+        Assert.Equal("Hello there", Translate.Accept("你好", "Hello [softly] there", false, out _));
+        Assert.Null(Translate.Accept("你好", "你好", false, out _));
     }
 
     [Fact]
