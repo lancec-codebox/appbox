@@ -58,7 +58,9 @@ public class CoverTests
         var c = Cands("""[{"k":0,"t":100,"quality":3,"masked":false},{"k":1,"t":200,"quality":8,"masked":false},{"k":2,"t":300,"quality":5,"masked":false}]""");
         Assert.Equal(2, Publish.PickByExpression(c, 2, 1000, 9080, new int?[] { 8, 8, 8 })!.Value.K);      // tie: describe's pick
         Assert.Equal(1, Publish.PickByExpression(c, null, 1000, 9080, new int?[] { 8, 8, 8 })!.Value.K);   // tie: quality
-        Assert.Null(Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 5, 2, null }));                // mid-speech, startled, unscored: none
+        var low = Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 5, 2, null })!.Value;           // nothing scores 6: the best overall, flagged "low"
+        Assert.Equal(0, low.K); Assert.Equal("low", low.Window);
+        Assert.Null(Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { null, null, null }));          // unscored: none
     }
 
     [Fact]
@@ -67,7 +69,7 @@ public class CoverTests
         var c = Cands("""[{"k":0,"t":500,"quality":9,"masked":false},{"k":1,"t":2500,"quality":4,"masked":false},{"k":2,"t":900,"quality":9,"masked":true}]""");
         var s = Publish.PickByExpression(c, 0, 1089.6, 9080, new int?[] { 3, 8, 10 })!.Value;   // 0 is blinking (3), 2 is masked
         Assert.Equal(1, s.K); Assert.Equal("half", s.Window);
-        Assert.Null(Publish.PickByExpression(Cands("""[{"k":0,"t":6000,"quality":9,"masked":false}]"""), 0, 1089.6, 9080, new int?[] { 10 })); // only after 50% and past the late limit
+        Assert.Null(Publish.PickByExpression(Cands("""[{"k":0,"t":7000,"quality":9,"masked":false}]"""), 0, 1089.6, 9080, new int?[] { 10 })); // past the late limit (75%)
     }
 
     [Fact]
@@ -200,8 +202,10 @@ public class CoverTests
         // describe picked 3 (score 7), but 1 and 2 score 9 and pass: describe's pick only breaks ties; 0 scores 10 but has a subtitle
         var p = Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 9, 9, 7 })!.Value; Assert.Equal(1, p.K);   // tie 1 v 2: quality
         Assert.Equal(2, Publish.PickPortrait(c, 2, 9080, new int?[] { 10, 9, 9, 7 })!.Value.K);           // tie: describe's pick
-        Assert.Equal(4, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.Score);       // under 6 is still returned (the caller warns)... best passing is 4 (candidate 1)
-        Assert.Equal(1, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.K);
+        // the score floor comes first: 0 has a subtitle but scores 10, and no solo frame scores 6, so 0 beats the low-scoring clean ones
+        Assert.Equal(0, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.K);
+        // nothing scores 6 anywhere: the best score overall (the caller warns)
+        var w = Publish.PickPortrait(c, 3, 9080, new int?[] { 5, 4, 3, 2 })!.Value; Assert.Equal(0, w.K); Assert.Equal(5, w.Score);
         Assert.Equal(0, Publish.PickPortrait(Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""), 0, 9080, new int?[] { 5 })!.Value.K);
         Assert.Null(Publish.PickPortrait(c, 3, 9080, new int?[] { null, null, null, null }));
     }
@@ -259,5 +263,22 @@ public class CoverTests
         Assert.Equal("A powerful chief minister.", (string)o["cast"]![0]!["roleAtStart"]!);
         Assert.Equal("A powerful chief minister.", (string)o["cast"]![0]!["description"]!);
         Assert.Equal("The prince's friend.", (string)o["cast"]![1]!["roleAtStart"]!);
+    }
+
+    [Fact]
+    public void Score_floor_comes_before_the_solo_and_subtitle_tiers()
+    {
+        // 0: alone, clean, scores 2;  1: crowded two-shot, scores 9;  2: alone with a subtitle, scores 7
+        var c = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"solo":true,"box":[110,200,100,120]},{"k":1,"t":20,"quality":0.9,"masked":false,"solo":false,"box":[110,200,100,120]},{"k":2,"t":30,"quality":0.9,"masked":false,"solo":true,"sub":[0,400,360,60],"box":[110,200,100,120]}]""");
+        var sc = new int?[] { 2, 9, 7 };
+        Assert.Equal(2, Publish.PickPortrait(c, 0, 9080, sc)!.Value.K);                 // tier 2 (alone, 7) beats the clean solo scoring 2 and the two-shot scoring 9 (tier 3)
+        Assert.Equal(2, Publish.PickByExpression(c, 0, 1089.6, 9080, sc)!.Value.K);
+        // with the alone+clean frame at 6+ it wins over higher scores in looser tiers
+        Assert.Equal(0, Publish.PickPortrait(c, 0, 9080, new int?[] { 6, 9, 10 })!.Value.K);
+        // only a crowded frame passes the floor: tier 3
+        Assert.Equal(1, Publish.PickPortrait(c, 0, 9080, new int?[] { 2, 9, 3 })!.Value.K);
+        // nothing passes: best overall
+        var w = Publish.PickPortrait(c, 0, 9080, new int?[] { 2, 5, 3 })!.Value; Assert.Equal(1, w.K); Assert.Equal(5, w.Score);
+        var cv = Publish.PickByExpression(c, 0, 1089.6, 9080, new int?[] { 2, 5, 3 })!.Value; Assert.Equal(1, cv.K); Assert.Equal("low", cv.Window); // covers too: best overall
     }
 }
