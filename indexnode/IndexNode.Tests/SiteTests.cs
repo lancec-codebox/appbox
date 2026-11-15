@@ -79,17 +79,6 @@ public class DescribeTests
         Assert.Throws<FormatException>(() => Describe.ParseObject("no json here"));
     }
 
-    [Fact]
-    public async Task A_reply_that_does_not_parse_is_asked_again_with_the_error()
-    {
-        var chat = new FakeChat("sorry, here: {\"a\":1,,,", "{\"a\":2}");
-        var o = await ((IChat)chat).JsonAsync("m", JsonValue.Create("give json")!, "submit", default);
-        Assert.Equal(2, (int)o["a"]!);
-        Assert.Equal(2, chat.Calls.Count);
-        Assert.Contains("could not be used", chat.Calls[1].Content.GetValue<string>());
-        await Assert.ThrowsAsync<FormatException>(() => ((IChat)new FakeChat("nope")).JsonAsync("m", JsonValue.Create("give json")!, "submit", default));
-    }
-
     static DescribeInput Input(string dir)
     {
         File.WriteAllBytes(Path.Combine(dir, "s0.jpg"), [1, 2, 3]); File.WriteAllBytes(Path.Combine(dir, "s1.jpg"), [4, 5]); File.WriteAllBytes(Path.Combine(dir, "t.jpg"), [9]); File.WriteAllBytes(Path.Combine(dir, "p.jpg"), [7]);
@@ -126,7 +115,7 @@ public class DescribeTests
         Assert.Equal(4, arr.Count(x => x!["type"]!.GetValue<string>() == "image_url"));
         var prompt = arr[0]!["text"]!.GetValue<string>();
         Assert.Contains("新娘重生 #shorts FULL", prompt); Assert.Contains("主演：张三", prompt); Assert.Contains("第7句", prompt); Assert.Contains("ENGLISH ONLY", prompt); Assert.Contains("never invent", prompt, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal("describe-5", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
+        Assert.Equal("describe-3", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
     }
 
     [Fact]
@@ -174,7 +163,7 @@ public class DescribeTests
         Assert.Equal(2, dry.GetProperty("calls").GetArrayLength());
         var imgs = dry.GetProperty("calls")[0].GetProperty("images"); Assert.Equal(4, imgs.GetArrayLength());
         Assert.Contains("第7句", dry.GetProperty("calls")[0].GetProperty("prompt").GetString());
-        Assert.Contains(ProcessStage.AiSteps, s => s == "describe"); Assert.Contains(ProcessStage.AiSteps, s => s == "translate"); Assert.Contains("translate", ProcessStage.FullSteps); Assert.Contains("translate", ProcessStage.KnownSteps);
+        Assert.Contains(ProcessStage.AiSteps, s => s == "describe");
         Assert.Contains("describe", ProcessStage.SkippedAiSteps(null));
     }
 
@@ -247,6 +236,16 @@ public class PublishTests
     }
 
     [Fact]
+    public void Poster_two_shot_must_show_both_lead_clusters()
+    {
+        var c = System.Text.Json.Nodes.JsonNode.Parse("""[{"k":0,"clusters":[2,5],"score":0.9},{"k":1,"clusters":[0,1],"score":0.8},{"k":2,"clusters":[1,0],"score":0.7}]""")!.AsArray();
+        Assert.Equal(1, Publish.PickTwoShot(c, 0, 1, null));   // best-scoring candidate with both leads
+        Assert.Equal(2, Publish.PickTwoShot(c, 0, 1, 2));      // describe's pick, when it has both leads
+        Assert.Equal(1, Publish.PickTwoShot(c, 0, 1, 0));      // describe's pick lacks a lead: ignored
+        Assert.Null(Publish.PickTwoShot(c, 0, 7, null));       // no candidate has both: portrait fallback
+    }
+
+    [Fact]
     public void Cluster_merge_joins_close_centroids_and_borderline_ones_only_when_the_crops_agree()
     {
         FaceRec F(int cl, float[] e, float[]? v) => new() { Cluster = cl, Emb = e, Vis = v };
@@ -300,24 +299,6 @@ public class PublishTests
         File.WriteAllText(Path.Combine(job, "describe.json"), File.ReadAllText(Path.Combine(job, "describe.json")).Replace("A premise.", "A new premise."));
         Assert.True((await Publish.PublishOneAsync(tools, new LocalJob(job, "j1"), outDir, false, default)).Written);
         Publish.WriteIndex(outDir); Assert.Equal("j1", (string)JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, "packs.json")))!["packs"]![0]!["packId"]!);
-    }
-
-    [Fact]
-    public async Task Our_translation_is_the_default_english_and_the_burned_in_english_stays_as_original()
-    {
-        var job = Fixture(); var outDir = Directory.CreateTempSubdirectory().FullName;
-        var tools = new Tools(new HttpClient(), new NodeConfig());
-        Directory.CreateDirectory(Path.Combine(job, "subs", "ai"));
-        File.WriteAllText(Path.Combine(job, "subs", "ai", "en.vtt"), "WEBVTT\n\n00:00:10.000 --> 00:00:13.000\nOur hello, world\n");
-        var r = await Publish.PublishOneAsync(tools, new LocalJob(job, "j"), outDir, false, default);
-        Assert.True(r.Written);
-        var p = Path.Combine(outDir, "j");
-        Assert.Contains("Our hello", File.ReadAllText(Path.Combine(p, "subs.en.vtt")));
-        Assert.Contains("Hello, world", File.ReadAllText(Path.Combine(p, "subs.en-orig.vtt")));
-        // a changed translation republishes; an unchanged one is up to date
-        Assert.Equal("up to date", (await Publish.PublishOneAsync(tools, new LocalJob(job, "j"), outDir, false, default)).Skipped);
-        File.WriteAllText(Path.Combine(job, "subs", "ai", "en.vtt"), "WEBVTT\n\n00:00:10.000 --> 00:00:13.000\nBetter hello\n");
-        Assert.True((await Publish.PublishOneAsync(tools, new LocalJob(job, "j"), outDir, false, default)).Written);
     }
 
     [Fact]

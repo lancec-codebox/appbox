@@ -59,7 +59,7 @@ public class PlacementTests
     {
         var delays = new Queue<int>([50, 10, 200, 30, 20]);
         var rtt = await Placement.StorageRttAsync("h", 5, (_, t) => Task.Delay(delays.Dequeue(), t), default);
-        Assert.InRange(rtt!.Value, 25, 120); // median of 10,20,30,50,200 = 30 (plus scheduling)
+        Assert.InRange(rtt!.Value, 25, 60); // median of 10,20,30,50,200 = 30 (plus scheduling)
         Assert.Null(await Placement.StorageRttAsync("h", 3, (_, _) => throw new SocketException(), default));
     }
 }

@@ -54,28 +54,16 @@ public static class StageSteps
 
     /// <summary>Faces from the stored frames (one per shot, buffalo_s), plus the credits read from the stored frames of the first and last 3 minutes.</summary>
     public static async Task<string> CastAsync(Tools tools, HttpClient http, ChunkDir frames, byte[]? shots, double duration, int threads, string work, Put put, Action<string> progress, CancellationToken ct,
-        string? det = null, string? rec = null, string? alsoRec = null, byte[]? ocrLines = null)
+        string? det = null, string? rec = null, string? alsoRec = null)
     {
         var sw = Stopwatch.StartNew();
         if (det == null || rec == null) { var s = await Models.EnsureBuffaloSAsync(http, ct); det ??= s.Det; rec ??= s.Rec; }
         var cm = CastLogic.BuffaloS; var outDir = Path.Combine(work, "cast-out"); if (Directory.Exists(outDir)) Directory.Delete(outDir, true);
-        var msg = await CastFrames.RunAsync(tools, frames, shots, outDir, new CastFrames.Settings(det, rec, cm.Id, cm.Threshold, cm.Merge, Math.Max(1, threads), AlsoRec: alsoRec), progress, ct, null, ocrLines);
+        var msg = await CastFrames.RunAsync(tools, frames, shots, outDir, new CastFrames.Settings(det, rec, cm.Id, cm.Threshold, cm.Merge, Math.Max(1, threads), AlsoRec: alsoRec), progress, ct);
         var credits = await CastFrames.CreditsAsync(tools, http, frames, duration, Math.Max(1, threads), progress, ct);
         await File.WriteAllTextAsync(Path.Combine(outDir, "cast", "credits.json"), JsonSerializer.Serialize(new { v = 1, source = "frames", lines = credits.Select(c => new { start = c.Start, end = c.End, text = c.Text }) }), ct);
         foreach (var f in Directory.GetFiles(Path.Combine(outDir, "cast"))) await put("cast/" + Path.GetFileName(f), await File.ReadAllBytesAsync(f, ct), TypeOf(f));
         return $"{msg}, {credits.Count} credit lines, {sw.Elapsed.TotalSeconds:F1}s";
-    }
-
-    /// <summary>English subtitles from the Chinese (OCR or transcript) with a glossary: subs/ai/en.vtt and en.json. Skipped when the source text and the glossary seed are unchanged (unless <paramref name="force"/>).</summary>
-    public static async Task<string> TranslateAsync(IChat chat, AiConfig ai, IJobSource src, Put put, bool force, Action<string> progress, CancellationToken ct, bool readExisting = true)
-    {
-        var input = await Translate.GatherAsync(src, ct);
-        var existing = force || !readExisting ? null : await src.ReadAsync(Translate.OutJson, ct);
-        var r = await Translate.RunAsync(chat, ai, input, existing, force, progress, ct);
-        if (r.Skipped) return "skipped: " + r.Reason;
-        await put(Translate.OutVtt, r.Vtt!, "text/vtt");
-        await put(Translate.OutJson, r.Json!, "application/json");
-        return $"{r.Stats!.Cues} cues, {r.Batches} batches, {r.Calls} AI calls, {r.Seconds:F1}s, shaping over6s {r.Stats.Over6s} overChars {r.Stats.OverChars} overlaps {r.Stats.Overlaps} shortRead {r.Stats.ShortRead}";
     }
 
     /// <summary>True when the job's frames are the JPEG chunks with a shot list (0.7 frames): cast can read them instead of the video.</summary>

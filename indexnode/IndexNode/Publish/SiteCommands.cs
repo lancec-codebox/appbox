@@ -41,7 +41,6 @@ public static class SiteCommands
         {
             var r = await Publish.PublishOneAsync(tools, j, outDir, force, ct);
             Console.WriteLine(r.Written ? $"{r.Id}: published" : $"{r.Id}: skipped ({r.Skipped})");
-            foreach (var w in r.Warnings ?? []) Console.WriteLine(w);
             if (r.Written) written++; else skipped++;
         }
         Publish.WriteIndex(outDir);
@@ -52,14 +51,12 @@ public static class SiteCommands
     /// <summary>`process --job &lt;id&gt; --steps cast,describe`: redo steps of one already-processed job in the store (needs the SAS; describe needs the AI endpoint). Nothing is queued or leased; processed.json is not rewritten.</summary>
     public static async Task<int> ProcessAsync(Args a)
     {
-        var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps frames,...] [--threads N] [--ai-... ]  (no --steps: the steps whose outputs are missing; --steps: rerun those, replacing their outputs)");
+        var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps cast,describe] [--threads N] [--ai-... ]");
         var cfg = NodeConfig.Load(); if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
-        // no --steps: process an unqueued video, running only what is missing; --steps: rerun exactly those steps
-        bool redo = a.Get("steps") != null;
-        var steps = (a.Get("steps") ?? string.Join(',', ProcessStage.FullSteps)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
+        var steps = (a.Get("steps") ?? "cast,describe").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
         foreach (var s in steps) if (!ProcessStage.KnownSteps.Contains(s)) throw new ArgumentException($"unknown step '{s}' (known: {string.Join(',', ProcessStage.KnownSteps)})");
         ProcessStage.Ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
-        if ((steps.Contains("describe") || steps.Contains("translate")) && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe and translate need an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
+        if (steps.Contains("describe") && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe needs an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
         var http = Commands.NewHttp(); var tools = new Tools(http, cfg); var store = new RestStore(http, cfg.Sas); var paths = new Paths(a.Get("prefix") ?? "index/");
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         var threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
@@ -68,8 +65,8 @@ public static class SiteCommands
             Job = new JobDescriptor { Stage = "process", JobId = id, Steps = steps }, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = store, Paths = paths, NodeId = cfg.NodeId ?? "cli",
             Token = cts.Token, ThreadShare = () => threads, Report = (step, p) => Console.WriteLine($"  {step} {p}"),
         };
-        await new ProcessStage(tools, store, cfg, http) { Redo = redo }.RunAsync(ctx);
-        Console.WriteLine($"process {id}: {string.Join(',', steps)} done ({(redo ? "outputs replaced" : "missing outputs made")} in the store; run 'indexnode publish --job {id}' next)");
+        await new ProcessStage(tools, store, cfg, http) { Redo = true }.RunAsync(ctx);
+        Console.WriteLine($"process {id}: {string.Join(',', steps)} done (outputs replaced in the store; run 'indexnode publish --job {id}' next)");
         return 0;
     }
 

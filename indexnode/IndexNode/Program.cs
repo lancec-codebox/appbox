@@ -39,7 +39,7 @@ public static class Program
 {
     public const string Usage = """
         indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
-                      [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
+                      [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
         indexnode ai test [--ai-base-url ...]
@@ -73,8 +73,6 @@ public static class Program
             {
                 "run" => await Commands.RunAsync(a),
                 "enqueue" => await Commands.EnqueueAsync(a),
-                "download" => await Commands.DownloadAsync(a),
-                "unprocessed" => await Commands.UnprocessedAsync(a),
                 "seeds" => await Commands.SeedsAsync(a),
                 "dev" => await DevCommands.RunAsync(a),
                 "stages" => await StagesCommand.RunAsync(a),
@@ -83,7 +81,6 @@ public static class Program
                 "search" => await Commands.SearchAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await Commands.RequeueAsync(a),
-                "availability" => await Commands.AvailabilityAsync(a),
                 "control" => await Commands.ControlAsync(a),
                 "config" => Commands.Config(a),
                 "browser" => await Commands.BrowserAsync(a),
@@ -162,8 +159,6 @@ public static class Commands
             ["process"] = new ProcessStage(tools, store, cfg, http),
             ["comments"] = new CommentsStage(tools, store, gate),
             ["watch"] = new WatchStage(tools, store),
-            ["availability"] = new AvailabilityStage(tools, store),
-            ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
         var limits = BuildLimits(a, cfg, nodeId);
@@ -286,59 +281,6 @@ public static class Commands
         return 0;
     }
 
-    /// <summary>
-    /// `download <url|id>... [--no-process] [--max-height 480] [--format F]`: a one-off download on this node (a yt-dlp node), no queue. The video is
-    /// stored like a queued download and recorded as a finished download job (so it is known and tracked); its processing is queued unless --no-process.
-    /// </summary>
-    public static async Task<int> DownloadAsync(Args a)
-    {
-        var (cfg, store, paths, http) = Open(a); using var _h = http;
-        if (a.Positional.Count == 0) throw new ArgumentException("download <url|id>... [--no-process] [--max-height 480] [--format F]");
-        var tools = new Tools(http, cfg); int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480; bool queue = !a.Has("no-process");
-        using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-        int failed = 0;
-        foreach (var input in a.Positional)
-        {
-            var id = System.Text.RegularExpressions.Regex.IsMatch(input, @"^[A-Za-z0-9_-]{11}$") ? input : YtDlp.VideoId(input) ?? throw new ArgumentException($"not a video url or id: {input}");
-            var job = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", maxHeight, a.Get("format")); job.JobId = id; job.Source = "one-off";
-            var ctx = new JobContext { Job = job, Stage = "download", BlobName = paths.Job("download", id), LeaseId = "", Worker = 0, Store = store, Paths = paths, NodeId = cfg.NodeId ?? "", Token = cts.Token, ThreadShare = () => 1, Report = (s, p) => Console.WriteLine($"  {s} {p}") };
-            try
-            {
-                await new DownloadStage(tools, store, new DownloadGate()) { QueueProcessing = queue }.RunAsync(ctx);
-                job.FinishedAt = Protocol.NowUtc();
-                await store.PutAsync(paths.Job("download", id), job.ToBytes(), Tags.Job("download", "done", job.AddedAt), null, false, cts.Token);
-                Console.WriteLine($"{id}: downloaded{(queue ? ", processing queued" : " (processing not queued: `indexnode process --job " + id + "` runs it)")}");
-            }
-            catch (Exception e) when (e is not OperationCanceledException) { failed++; Console.Error.WriteLine($"{id}: {Redact.Sas(e.Message)}"); }
-        }
-        return failed == 0 ? 0 : 1;
-    }
-
-    /// <summary>`unprocessed`: downloaded videos missing a step's output, with no processing job queued or running (e.g. `download --no-process`).</summary>
-    public static async Task<int> UnprocessedAsync(Args a)
-    {
-        var (_, store, paths, http) = Open(a); using var _h = http; Console.OutputEncoding = System.Text.Encoding.UTF8;
-        (string Step, string File)[] outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json")];
-        var ids = (await store.ListAsync(paths.JobsDir("download"), true, false, default)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "done").Select(b => Path.GetFileNameWithoutExtension(b.Name)).ToList();
-        int n = 0;
-        foreach (var id in ids)
-        {
-            var missing = new List<string>();
-            foreach (var (step, file) in outputs) if (await store.GetTagsAsync(paths.Video(id, file), default) == null) missing.Add(step);
-            if (missing.Count == 0) continue;
-            bool queued = false;
-            foreach (var st in Protocol.StepStages.Append("process"))
-                if (await store.GetTagsAsync(paths.Job(st, id), default) is { } t && t.GetValueOrDefault(Tags.State) is "pending" or "leased") { queued = true; break; }
-            if (queued) continue;
-            var info = await store.GetAsync(paths.Video(id, "info.json"), default) is { } ib ? System.Text.Json.Nodes.JsonNode.Parse(ib.Data) : null;
-            var dl = await store.GetAsync(paths.Video(id, "downloaded.json"), default) is { } db ? System.Text.Json.Nodes.JsonNode.Parse(db.Data) : null;
-            Console.WriteLine($"{id}  {(info?["duration"]?.GetValue<double>() is { } d ? $"{d / 60:F0} min" : "?"),7}  missing {string.Join(',', missing),-40}  {info?["title"]}");
-            n++;
-        }
-        Console.WriteLine($"{n} unprocessed and unqueued of {ids.Count} downloaded (process one with: indexnode process --job <id>)");
-        return 0;
-    }
-
     public static async Task<int> EnqueueAsync(Args a)
     {
         var (cfg, store, paths, http) = Open(a);
@@ -368,17 +310,6 @@ public static class Commands
             }
         }
         Console.WriteLine($"{added} added, {existed} already existed");
-        return 0;
-    }
-
-    /// <summary>`availability start [--every 1d]`: creates the daily availability sweep (run by a node with --stages ...,availability; it needs yt-dlp).</summary>
-    public static async Task<int> AvailabilityAsync(Args a)
-    {
-        if (a.Positional.FirstOrDefault() != "start") throw new ArgumentException("availability start [--every 1d]");
-        var (_, store, paths, http) = Open(a); using var _h = http;
-        var job = AvailabilityStage.NewSweep(a.Get("every") ?? "1d"); WatchStage.ParseEvery(job.Every);
-        bool made = await store.PutAsync(paths.Job("availability", job.JobId), job.ToBytes(), Tags.Job("availability", "pending", job.AddedAt), null, true, default);
-        Console.WriteLine(made ? $"availability sweep created (every {job.Every}); a yt-dlp node runs it with --stages ...,availability" : "the availability sweep already exists");
         return 0;
     }
 

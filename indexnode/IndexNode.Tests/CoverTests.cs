@@ -58,9 +58,7 @@ public class CoverTests
         var c = Cands("""[{"k":0,"t":100,"quality":3,"masked":false},{"k":1,"t":200,"quality":8,"masked":false},{"k":2,"t":300,"quality":5,"masked":false}]""");
         Assert.Equal(2, Publish.PickByExpression(c, 2, 1000, 9080, new int?[] { 8, 8, 8 })!.Value.K);      // tie: describe's pick
         Assert.Equal(1, Publish.PickByExpression(c, null, 1000, 9080, new int?[] { 8, 8, 8 })!.Value.K);   // tie: quality
-        var low = Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 5, 2, null })!.Value;           // nothing scores 6: the best overall, flagged "low"
-        Assert.Equal(0, low.K); Assert.Equal("low", low.Window);
-        Assert.Null(Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { null, null, null }));          // unscored: none
+        Assert.Null(Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 5, 2, null }));                // mid-speech, startled, unscored: none
     }
 
     [Fact]
@@ -69,7 +67,17 @@ public class CoverTests
         var c = Cands("""[{"k":0,"t":500,"quality":9,"masked":false},{"k":1,"t":2500,"quality":4,"masked":false},{"k":2,"t":900,"quality":9,"masked":true}]""");
         var s = Publish.PickByExpression(c, 0, 1089.6, 9080, new int?[] { 3, 8, 10 })!.Value;   // 0 is blinking (3), 2 is masked
         Assert.Equal(1, s.K); Assert.Equal("half", s.Window);
-        Assert.Null(Publish.PickByExpression(Cands("""[{"k":0,"t":7000,"quality":9,"masked":false}]"""), 0, 1089.6, 9080, new int?[] { 10 })); // past the late limit (75%)
+        Assert.Null(Publish.PickByExpression(Cands("""[{"k":0,"t":6000,"quality":9,"masked":false}]"""), 0, 1089.6, 9080, new int?[] { 10 })); // only after 50% and past the late limit
+    }
+
+    [Fact]
+    public void Two_shot_needs_both_faces_flattering_and_takes_the_best_score()
+    {
+        var c = Cands("""[{"k":0,"clusters":[1,2]},{"k":1,"clusters":[1,2]},{"k":2,"clusters":[1,2]},{"k":3,"clusters":[1,5]}]""");
+        Assert.Equal(1, Publish.PickTwoShot(c, [1], [2], 0, new int?[] { 6, 9, 9, 10 }));   // k=3 lacks the second lead; 1 and 2 tie, the first listed wins
+        Assert.Equal(2, Publish.PickTwoShot(c, [1], [2], 2, new int?[] { 6, 9, 9, 10 }));   // tie: describe's pick
+        Assert.Null(Publish.PickTwoShot(c, [1], [2], 0, new int?[] { 5, 3, null, 10 }));    // none flattering: no together cover
+        Assert.Equal(0, Publish.PickTwoShot(c, [1], [2], 0));                               // no scores (older describe): the old rule
     }
 
     [Fact]
@@ -129,156 +137,20 @@ public class CoverTests
     }
 
     [Fact]
-    public void Cover_is_cut_in_process_360x640_centred_on_the_face_and_clamped()
+    public async Task Cover_filter_gives_a_360x640_crop_centred_and_clamped()
     {
-        foreach (var (w, h, cx, cy) in new (int, int, double?, double?)[] { (1280, 720, 900, 300), (1280, 720, null, null), (1280, 720, 5, 5), (720, 1280, 360, 400), (1000, 1000, 990, 990) })
+        var ff = await RealFfmpegAsync(); if (ff == null) return;
+        var dir = Path.Combine(Path.GetTempPath(), "indexnode-cover-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+        try
         {
-            // left half red, right half blue: the crop window must follow the face centre
-            var im = Rgb.Blank(w, h); for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int o = (y * w + x) * 3; if (x < w / 2) im.Data[o] = 255; else im.Data[o + 2] = 255; }
-            var jpg = Publish.CropCover(Imaging.EncodeJpeg(im), cx, cy);
-            Assert.Equal("360x640", JpegSize(jpg));
-            var c = Publish.CoverCrop(w, h, cx, cy); var o2 = Imaging.DecodeJpeg(jpg);
-            double splitAt = (w / 2.0 - c[0] * w) / (c[2] * w); // where the colour edge falls across the crop, 0..1
-            var left = o2.Data[(o2.H / 2 * o2.W + 2) * 3]; var right = o2.Data[(o2.H / 2 * o2.W + o2.W - 3) * 3 + 2];
-            Assert.Equal(splitAt > 0.02, left > 128); Assert.Equal(splitAt < 0.98, right > 128);
+            foreach (var (w, h, cx, cy) in new (int, int, double?, double?)[] { (1280, 720, 900, 300), (1280, 720, null, null), (1280, 720, 5, 5), (720, 1280, 360, 400), (1000, 1000, 990, 990) })
+            {
+                var src = Path.Combine(dir, "s.jpg"); var o = Path.Combine(dir, $"o{w}x{h}.jpg");
+                var r = await Proc.RunAsync(ff, ["-v", "error", "-y", "-f", "lavfi", "-i", $"testsrc=size={w}x{h}:rate=1", "-frames:v", "1", src], default); Assert.Equal(0, r.ExitCode);
+                r = await Proc.RunAsync(ff, ["-v", "error", "-y", "-i", src, "-vf", Publish.CoverFilter(cx, cy), "-frames:v", "1", o], default); Assert.True(r.ExitCode == 0, r.Stderr);
+                Assert.Equal("360x640", JpegSize(File.ReadAllBytes(o))); // read from the file itself: other tests change PATH, so no ffprobe lookup
+            }
         }
-    }
-
-    [Fact]
-    public void SoloRule_SkipsCrowdedFrame_AndFallbackCropsTight()
-    {
-        var faces = System.Text.Json.Nodes.JsonNode.Parse("""{"faces":[{"t":10,"box":[100,100,100,100]},{"t":10,"box":[220,100,100,100]},{"t":20,"box":[100,100,100,100]},{"t":20,"box":[300,10,20,20]}]}""")!.AsObject();
-        var c = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"box":[100,100,100,100]},{"k":1,"t":20,"quality":0.5,"masked":false,"box":[100,100,100,100]}]""");
-        Publish.MarkSolo(c, faces);
-        Assert.False(Publish.IsCrowded(c[1] as System.Text.Json.Nodes.JsonObject)); // 4% background face is fine
-        Assert.True(Publish.IsCrowded(c[0] as System.Text.Json.Nodes.JsonObject));
-        Assert.Equal(1, Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);
-        Assert.Equal(1, Publish.PickLeadShot(c, 0)!.Value.K);
-        // none solo: today's choice, window excludes the neighbour
-        var only = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"box":[100,100,100,100]}]"""); Publish.MarkSolo(only, faces);
-        Assert.Equal(0, Publish.PickByExpression(only, 0, 1000, 9080, new int?[] { 9 })!.Value.K);
-        var (crop, _) = Publish.TightWindow([100, 100, 100, 100], Publish.OtherBoxes(only[0] as System.Text.Json.Nodes.JsonObject), 1.25, 250, 0.45, 360, 640);
-        Assert.True((crop[0] + crop[2]) * 360 <= 220.01);
-    }
-
-    [Fact]
-    public void Cast_candidates_come_from_solo_frames_first()
-    {
-        var emb = (int n) => { var v = new float[8]; v[n % 8] = 1; return v; };
-        var faces = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i * 100, Quality = i < 10 ? 0.95 : 0.5, Other = i < 10 ? 1.0 : 0, Emb = emb(i), Cluster = 0 }).ToList();
-        var pick = CastLogic.Diverse(faces, 12);
-        Assert.Equal(12, pick.Count);
-        Assert.Equal(10, pick.Count(f => f.Solo));            // all ten solo frames, though lower quality
-        Assert.Equal(2, pick.Count(f => !f.Solo));            // crowded ones only fill the gap
-        Assert.All(CastLogic.Diverse(faces.Take(10).Concat(faces.Skip(10).Take(15)).ToList(), 5), f => Assert.True(f.Solo));
-    }
-
-    [Fact]
-    public void Subtitle_free_frames_win_and_the_fallback_crops_the_band_away()
-    {
-        var lines = System.Text.Encoding.UTF8.GetBytes("""{"band":{"y":570,"height":62,"width":480},"en":[{"start":10,"end":12,"boxes":[{"x0":100,"y0":440,"x1":260,"y1":470}]}],"zh":[]}""");
-        var subs = SubtitleBand.Parse(lines)!;
-        Assert.NotNull(subs.At(10.4, 360)); Assert.Null(subs.At(30, 360));
-        Assert.Equal(75, subs.At(11, 360)![0], 1);            // scaled from the 480 px OCR video to a 360 px frame
-        var c = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"box":[110,200,100,120]}]""");
-        Publish.MarkSolo(c, null, subs, 360);
-        Assert.True(Publish.HasSub(c[0] as System.Text.Json.Nodes.JsonObject)); Assert.False(Publish.HasSub(c[1] as System.Text.Json.Nodes.JsonObject));
-        Assert.Equal(1, Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);   // lower score, but no subtitle
-        Assert.Equal(1, Publish.PickLeadShot(c, 0)!.Value.K);
-        var only = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""); Publish.MarkSolo(only, null, subs, 360);
-        Assert.Equal(0, Publish.PickByExpression(only, 0, 1000, 9080, new int?[] { 9 })!.Value.K);  // only a subtitled frame: still used, cropped
-        var (crop, _) = Publish.TightWindow([110, 200, 100, 120], Publish.Avoid(only[0] as System.Text.Json.Nodes.JsonObject), 1.25, 250, 0.45, 360, 640);
-        Assert.True((crop[1] + crop[3]) * 640 <= 330.01);       // the band starts at y=330
-        var f = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i, Quality = i < 10 ? 0.95 : 0.5, Sub = i < 10 ? [0, 500, 100, 30] : null, Emb = new float[8] { i, 0, 0, 0, 0, 0, 0, 1 }, Cluster = 0 }).ToList();
-        Assert.Equal(10, CastLogic.Diverse(f, 10).Count(x => x.Sub == null));
-    }
-
-    [Fact]
-    public void Portrait_is_the_best_expression_among_candidates_that_pass_the_rules()
-    {
-        var lines = System.Text.Encoding.UTF8.GetBytes("""{"band":{"y":570,"height":62,"width":480},"en":[{"start":10,"end":12,"boxes":[{"x0":100,"y0":440,"x1":260,"y1":470}]}],"zh":[]}""");
-        var c = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"box":[110,200,100,120]},{"k":2,"t":50,"quality":0.4,"masked":false,"box":[110,200,100,120]},{"k":3,"t":70,"quality":0.9,"masked":false,"box":[110,200,100,120]}]""");
-        Publish.MarkSolo(c, null, SubtitleBand.Parse(lines), 360);
-        // describe picked 3 (score 7), but 1 and 2 score 9 and pass: describe's pick only breaks ties; 0 scores 10 but has a subtitle
-        var p = Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 9, 9, 7 })!.Value; Assert.Equal(1, p.K);   // tie 1 v 2: quality
-        Assert.Equal(2, Publish.PickPortrait(c, 2, 9080, new int?[] { 10, 9, 9, 7 })!.Value.K);           // tie: describe's pick
-        // the score floor comes first: 0 has a subtitle but scores 10, and no solo frame scores 6, so 0 beats the low-scoring clean ones
-        Assert.Equal(0, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.K);
-        // nothing scores 6 anywhere: the best score overall (the caller warns)
-        var w = Publish.PickPortrait(c, 3, 9080, new int?[] { 5, 4, 3, 2 })!.Value; Assert.Equal(0, w.K); Assert.Equal(5, w.Score);
-        Assert.Equal(0, Publish.PickPortrait(Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""), 0, 9080, new int?[] { 5 })!.Value.K);
-        Assert.Null(Publish.PickPortrait(c, 3, 9080, new int?[] { null, null, null, null }));
-    }
-
-    [Theory]
-    [InlineData(0, 0, 40, 50, 360, 640)]       // top-left corner
-    [InlineData(320, 590, 40, 50, 360, 640)]   // bottom-right corner
-    [InlineData(330, 300, 30, 40, 360, 640)]   // right edge
-    [InlineData(90, 150, 180, 230, 360, 640)]  // a huge face: the 2.5x box is wider than the frame
-    [InlineData(800, 20, 50, 60, 854, 480)]    // landscape frame, face near the right edge
-    public void Head_window_never_leaves_the_frame_so_nothing_is_padded(double x, double y, double w, double h, int fw, int fh)
-    {
-        var (wx, wy, ww, wh) = CastStage.HeadWindow(x, y, w, h, fw, fh, (double)CastStage.PortraitH / CastStage.PortraitW);
-        Assert.True(wx >= -1e-9 && wy >= -1e-9 && wx + ww <= fw + 1e-9 && wy + wh <= fh + 1e-9, $"{wx},{wy},{ww},{wh}");
-        Assert.Equal((double)CastStage.PortraitH / CastStage.PortraitW, wh / ww, 6);           // still 4:5
-        Assert.True(wx <= x && x + w <= wx + ww + 1e-9 && wy <= y && y + h <= wy + wh + 1e-9);  // the face is inside
-        var (crop, focus) = Publish.HeadCrop([x, y, w, h], fw, fh);
-        Assert.True(crop[0] >= 0 && crop[1] >= 0 && crop[0] + crop[2] <= 1 + 1e-9 && crop[1] + crop[3] <= 1 + 1e-9);
-        // the real image path: pixel-exact, no grey: a white frame cropped stays white
-        var im = new Rgb(Enumerable.Repeat((byte)255, fw * fh * 3).ToArray(), fw, fh);
-        var o = CastStage.HeadShoulders(im, new FaceRec { X = (float)x, Y = (float)y, W = (float)w, H = (float)h });
-        Assert.Equal(CastStage.PortraitW, o.W); Assert.Equal(CastStage.PortraitH, o.H); Assert.All(o.Data, b => Assert.True(b >= 250));
-    }
-
-    [Fact]
-    public void Tight_cover_window_stays_inside_the_frame()
-    {
-        var (crop, _) = Publish.TightWindow([330, 590, 30, 40], [], 16.0 / 9, 360, 0, 360, 640);
-        Assert.True(crop[0] >= 0 && crop[1] >= 0 && crop[0] + crop[2] <= 1 + 1e-9 && crop[1] + crop[3] <= 1 + 1e-9);
-        var cc = Publish.CoverCrop(360, 640, 355, 635); Assert.True(cc[0] + cc[2] <= 1 + 1e-9 && cc[1] + cc[3] <= 1 + 1e-9);
-    }
-
-    [Theory]
-    [InlineData("Not introduced in the opening scenes.", true)]
-    [InlineData("Not yet introduced", true)]
-    [InlineData("not yet introduced at the opening.", true)]
-    [InlineData("Not identified in the opening", true)]
-    [InlineData("Not yet established", true)]
-    [InlineData("A woman whose role is not yet clear.", true)]
-    [InlineData("A woman in the household whose exact place in the family is not yet clear.", true)]
-    [InlineData("An unidentified young court scholar.", true)]
-    [InlineData("A woman introduced as An Ya.", false)]
-    [InlineData("A wealthy suitor from the Jin family, introduced during marriage discussions.", false)]
-    [InlineData("", true)]
-    [InlineData("A powerful chief minister.", false)]
-    [InlineData("Nothing but trouble: the court physician", false)]
-    [InlineData("supporting", false)]
-    public void Not_introduced_lines_are_recognised(string s, bool expected) => Assert.Equal(expected, Publish.NotIntroduced(s));
-
-    [Fact]
-    public void Drama_json_shows_the_description_where_the_opening_role_says_not_introduced()
-    {
-        var d = System.Text.Json.Nodes.JsonNode.Parse("""{"cutoffSeconds":10,"title":{"en":"t"},"fullTitle":{"en":"t"},"teaser":{"en":"t"},"synopsis":{"en":"s"},"tags":[],"cast":[{"cluster":1,"role":"male lead","roleAtStart":"Not introduced in the opening scenes.","description":"A powerful chief minister.","label":{"en":"x"}},{"cluster":2,"role":"main","roleAtStart":"The prince's friend.","description":"d","label":{"en":"y"}}],"relations":[]}""")!.AsObject();
-        var o = Publish.BuildDrama(d, null, null, null, null, "j", "transcript", false, new Dictionary<int, List<(string, double, bool)>>(), "t");
-        Assert.Equal("A powerful chief minister.", (string)o["cast"]![0]!["roleAtStart"]!);
-        Assert.Equal("A powerful chief minister.", (string)o["cast"]![0]!["description"]!);
-        Assert.Equal("The prince's friend.", (string)o["cast"]![1]!["roleAtStart"]!);
-    }
-
-    [Fact]
-    public void Score_floor_comes_before_the_solo_and_subtitle_tiers()
-    {
-        // 0: alone, clean, scores 2;  1: crowded two-shot, scores 9;  2: alone with a subtitle, scores 7
-        var c = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"solo":true,"box":[110,200,100,120]},{"k":1,"t":20,"quality":0.9,"masked":false,"solo":false,"box":[110,200,100,120]},{"k":2,"t":30,"quality":0.9,"masked":false,"solo":true,"sub":[0,400,360,60],"box":[110,200,100,120]}]""");
-        var sc = new int?[] { 2, 9, 7 };
-        Assert.Equal(2, Publish.PickPortrait(c, 0, 9080, sc)!.Value.K);                 // tier 2 (alone, 7) beats the clean solo scoring 2 and the two-shot scoring 9 (tier 3)
-        Assert.Equal(2, Publish.PickByExpression(c, 0, 1089.6, 9080, sc)!.Value.K);
-        // with the alone+clean frame at 6+ it wins over higher scores in looser tiers
-        Assert.Equal(0, Publish.PickPortrait(c, 0, 9080, new int?[] { 6, 9, 10 })!.Value.K);
-        // only a crowded frame passes the floor: tier 3
-        Assert.Equal(1, Publish.PickPortrait(c, 0, 9080, new int?[] { 2, 9, 3 })!.Value.K);
-        // nothing passes: best overall
-        var w = Publish.PickPortrait(c, 0, 9080, new int?[] { 2, 5, 3 })!.Value; Assert.Equal(1, w.K); Assert.Equal(5, w.Score);
-        var cv = Publish.PickByExpression(c, 0, 1089.6, 9080, new int?[] { 2, 5, 3 })!.Value; Assert.Equal(1, cv.K); Assert.Equal("low", cv.Window); // covers too: best overall
+        finally { Directory.Delete(dir, true); }
     }
 }

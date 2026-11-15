@@ -31,9 +31,8 @@ public static class CastFrames
         return rows.Distinct().Order().ToList();
     }
 
-    public static async Task<string> RunAsync(Tools tools, ChunkDir frames, byte[]? shotsJson, string outDir, Settings s, Action<string> progress, CancellationToken ct, string? modelsDir = null, byte[]? ocrLines = null)
+    public static async Task<string> RunAsync(Tools tools, ChunkDir frames, byte[]? shotsJson, string outDir, Settings s, Action<string> progress, CancellationToken ct, string? modelsDir = null)
     {
-        var subs = SubtitleBand.Parse(ocrLines); // burned-in subtitles (ocr/lines.json), so head shots can avoid them
         var stats = new StepStats("cast"); var wall = Stopwatch.StartNew();
         var all = frames.Chunks.SelectMany(c => c.Frames.Select(f => (C: c, F: f))).ToList();
         var rows = Rows(shotsJson, all.Count);
@@ -86,9 +85,6 @@ public static class CastFrames
                         var (yaw, roll) = FaceMath.Pose(d.Kps);
                         var f = new FaceRec { T = Math.Round(t, 3), X = d.X, Y = d.Y, W = d.W, H = d.H, Score = d.Score, Yaw = Math.Round(yaw, 3), Roll = Math.Round(roll, 1), Kps = d.Kps, Blur = Math.Round(CastStage.FaceBlur(im, d), 1) };
                         if (f.Blur < CastLogic.MinBlur || f.Yaw > CastLogic.MaxYaw || f.Roll > CastLogic.MaxRoll) continue;
-                        double fa = Math.Max(1.0, (double)d.W * d.H);
-                        f.Other = Math.Round(dets.Where(o => !ReferenceEquals(o, d) && o.H >= minH).Select(o => o.W * o.H / fa).DefaultIfEmpty(0).Max(), 3); // every detection of the frame counts, not only kept faces
-                        f.Sub = subs?.At(t, w);
                         pass.Add((f, Imaging.AlignFace(im, d.Kps)));
                     }
                     var t3 = Stopwatch.GetTimestamp();
@@ -165,7 +161,7 @@ public static class CastFrames
                 await File.WriteAllBytesAsync(Path.Combine(castDir, $"cand_{g.Key}_{k}.jpg"), FrameJpeg(rowOf[cand[k]]), ct);
                 await File.WriteAllBytesAsync(Path.Combine(castDir, $"cand_hs_{g.Key}_{k}.jpg"), hsJpeg[cand[k]], ct);
             }
-            await File.WriteAllTextAsync(Path.Combine(castDir, $"cand_{g.Key}.json"), JsonSerializer.Serialize(cand.Select((f, k) => new { k, t = f.T, quality = f.Quality, masked = false, solo = f.Solo, sub = f.Sub?.Select(v => Math.Round(v, 1)), box = new[] { f.X, f.Y, f.W, f.H } })), ct);
+            await File.WriteAllTextAsync(Path.Combine(castDir, $"cand_{g.Key}.json"), JsonSerializer.Serialize(cand.Select((f, k) => new { k, t = f.T, quality = f.Quality, masked = false, box = new[] { f.X, f.Y, f.W, f.H } })), ct);
         }
         int dim = faces.FirstOrDefault()?.Emb.Length ?? 512;
         await File.WriteAllBytesAsync(Path.Combine(castDir, "faces.f16"), CastStage.FacesF16(faces, dim), ct);
@@ -173,7 +169,7 @@ public static class CastFrames
             await File.WriteAllBytesAsync(Path.Combine(castDir, "faces_alt.f16"), CastStage.FacesF16(faces.Select(f => new FaceRec { Emb = altOf[f] }).ToList(), altOf[faces[0]].Length), ct);
         var source = new { frames = "frames/ (1 fps JPEG)", width = w, height = h, rows = rows.Count, detector = Path.GetFileName(s.Det), embedder = Path.GetFileName(s.Rec) };
         await File.WriteAllTextAsync(Path.Combine(castDir, "faces.json"), JsonSerializer.Serialize(new { v = 1, model = s.ModelId, dim, threshold = s.Threshold, keyframes = rows.Count, source,
-            faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, other = f.Other, sub = f.Sub != null, cluster = f.Cluster, masked = (bool?)null }) }), ct);
+            faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, cluster = f.Cluster, masked = (bool?)null }) }), ct);
         await File.WriteAllTextAsync(Path.Combine(castDir, "clusters.json"), JsonSerializer.Serialize(new { v = 1, model = s.ModelId, threshold = s.Threshold, mergeAt = s.Merge, borderAt = 0, rawClusters, source,
             merges = merges.Select(m => new { into = m.Into, from = m.From, dist = m.Dist, vis = m.Vis }), clusters }), ct);
         outputs.Dispose();
