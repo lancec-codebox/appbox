@@ -16,8 +16,40 @@ public static class StagesCommand
 {
     static readonly string[] Known = ["frames", "sscd", "transcribe", "text", "cast", "sync", "describe"];
 
+    /// <summary>
+    /// `stages translate --job &lt;id&gt; --out &lt;dir&gt;`: the translate step as a trial. Reads the inputs from the store, writes en.vtt and en.json to &lt;dir&gt; only (never to the store) and always runs.
+    ///   [--prefix index/] [--local &lt;dir&gt;] [--ai-base-url U --ai-key K --ai-text-model M --ai-api responses --ai-session-id S]
+    /// </summary>
+    public static async Task<int> TranslateAsync(Args a)
+    {
+        var id = a.Get("job") ?? throw new ArgumentException("stages translate --job <id> --out <dir> [--local <dir>] [--prefix index/] [--ai-...]");
+        var outDir = a.Get("out") ?? throw new ArgumentException("--out <dir> is required (the trial writes en.vtt and en.json there, never to the store)");
+        var cfg = NodeConfig.Load(); var http = Commands.NewHttp();
+        var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
+        if (!ai.Configured) throw new InvalidOperationException("translate needs an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model");
+        IJobSource src;
+        if (a.Get("local") is { } local) src = new LocalJob(Path.Combine(Path.GetFullPath(local), "videos", id), id);
+        else
+        {
+            if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
+            src = new StoreJob(new RestStore(http, cfg.Sas), new Paths(a.Get("prefix") ?? "index/"), id);
+        }
+        using var cts = a.Get("timeout") is { } to ? new CancellationTokenSource(TimeSpan.FromSeconds(double.Parse(to, System.Globalization.CultureInfo.InvariantCulture))) : new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        var sw = Stopwatch.StartNew(); Directory.CreateDirectory(outDir);
+        Task Put(string name, byte[] data, string type) { File.WriteAllBytes(Path.Combine(outDir, Path.GetFileName(name)), data); return Task.CompletedTask; }
+        try
+        {
+            var msg = await StageSteps.TranslateAsync(new AiClient(http, ai), ai, src, Put, true, m => Console.Error.WriteLine($"{sw.Elapsed.TotalSeconds,6:F1}s [translate] {m}"), cts.Token);
+            Console.WriteLine($"translate: {msg} -> {outDir}");
+            return 0;
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested) { Console.Error.WriteLine($"{sw.Elapsed.TotalSeconds,6:F1}s [translate] TIMED OUT"); return 124; }
+    }
+
     public static async Task<int> RunAsync(Args a)
     {
+        if (a.Positional.FirstOrDefault() == "translate") return await TranslateAsync(a);
         if (a.Positional.FirstOrDefault() != "run") throw new ArgumentException("stages run --video <id> --stages frames,sscd [--local <dir>] [--out-prefix P] [--threads N] [--timeout S]");
         var id = a.Get("video") ?? throw new ArgumentException("--video <id> is required");
         var stages = (a.Get("stages") ?? throw new ArgumentException("--stages is required")).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);

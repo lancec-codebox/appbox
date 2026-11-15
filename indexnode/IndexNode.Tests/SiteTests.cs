@@ -174,7 +174,7 @@ public class DescribeTests
         Assert.Equal(2, dry.GetProperty("calls").GetArrayLength());
         var imgs = dry.GetProperty("calls")[0].GetProperty("images"); Assert.Equal(4, imgs.GetArrayLength());
         Assert.Contains("第7句", dry.GetProperty("calls")[0].GetProperty("prompt").GetString());
-        Assert.Contains(ProcessStage.AiSteps, s => s == "describe");
+        Assert.Contains(ProcessStage.AiSteps, s => s == "describe"); Assert.Contains(ProcessStage.AiSteps, s => s == "translate"); Assert.Contains("translate", ProcessStage.FullSteps); Assert.Contains("translate", ProcessStage.KnownSteps);
         Assert.Contains("describe", ProcessStage.SkippedAiSteps(null));
     }
 
@@ -310,6 +310,24 @@ public class PublishTests
         File.WriteAllText(Path.Combine(job, "describe.json"), File.ReadAllText(Path.Combine(job, "describe.json")).Replace("A premise.", "A new premise."));
         Assert.True((await Publish.PublishOneAsync(tools, new LocalJob(job, "j1"), outDir, false, default)).Written);
         Publish.WriteIndex(outDir); Assert.Equal("j1", (string)JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, "packs.json")))!["packs"]![0]!["packId"]!);
+    }
+
+    [Fact]
+    public async Task Our_translation_is_the_default_english_and_the_burned_in_english_stays_as_original()
+    {
+        var job = Fixture(); var outDir = Directory.CreateTempSubdirectory().FullName;
+        var tools = new Tools(new HttpClient(), new NodeConfig());
+        Directory.CreateDirectory(Path.Combine(job, "subs", "ai"));
+        File.WriteAllText(Path.Combine(job, "subs", "ai", "en.vtt"), "WEBVTT\n\n00:00:10.000 --> 00:00:13.000\nOur hello, world\n");
+        var r = await Publish.PublishOneAsync(tools, new LocalJob(job, "j"), outDir, false, default);
+        Assert.True(r.Written);
+        var p = Path.Combine(outDir, "j");
+        Assert.Contains("Our hello", File.ReadAllText(Path.Combine(p, "subs.en.vtt")));
+        Assert.Contains("Hello, world", File.ReadAllText(Path.Combine(p, "subs.en-orig.vtt")));
+        // a changed translation republishes; an unchanged one is up to date
+        Assert.Equal("up to date", (await Publish.PublishOneAsync(tools, new LocalJob(job, "j"), outDir, false, default)).Skipped);
+        File.WriteAllText(Path.Combine(job, "subs", "ai", "en.vtt"), "WEBVTT\n\n00:00:10.000 --> 00:00:13.000\nBetter hello\n");
+        Assert.True((await Publish.PublishOneAsync(tools, new LocalJob(job, "j"), outDir, false, default)).Written);
     }
 
     [Fact]

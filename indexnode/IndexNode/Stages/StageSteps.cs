@@ -66,6 +66,18 @@ public static class StageSteps
         return $"{msg}, {credits.Count} credit lines, {sw.Elapsed.TotalSeconds:F1}s";
     }
 
+    /// <summary>English subtitles from the Chinese (OCR or transcript) with a glossary: subs/ai/en.vtt and en.json. Skipped when the source text and the glossary seed are unchanged (unless <paramref name="force"/>).</summary>
+    public static async Task<string> TranslateAsync(IChat chat, AiConfig ai, IJobSource src, Put put, bool force, Action<string> progress, CancellationToken ct, bool readExisting = true)
+    {
+        var input = await Translate.GatherAsync(src, ct);
+        var existing = force || !readExisting ? null : await src.ReadAsync(Translate.OutJson, ct);
+        var r = await Translate.RunAsync(chat, ai, input, existing, force, progress, ct);
+        if (r.Skipped) return "skipped: " + r.Reason;
+        await put(Translate.OutVtt, r.Vtt!, "text/vtt");
+        await put(Translate.OutJson, r.Json!, "application/json");
+        return $"{r.Stats!.Cues} cues, {r.Batches} batches, {r.Calls} AI calls, {r.Seconds:F1}s, shaping over6s {r.Stats.Over6s} overChars {r.Stats.OverChars} overlaps {r.Stats.Overlaps} shortRead {r.Stats.ShortRead}";
+    }
+
     /// <summary>True when the job's frames are the JPEG chunks with a shot list (0.7 frames): cast can read them instead of the video.</summary>
     public static bool FramesAreJpeg(ChunkDir frames, byte[]? shots) => frames.Container == "mjpeg" && shots != null;
 

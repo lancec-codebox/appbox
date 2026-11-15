@@ -10,7 +10,7 @@ public static partial class Protocol
 {
     public const string ApiVersion = "2021-12-02";
     /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
-    public static readonly string[] StepStages = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe"];
+    public static readonly string[] StepStages = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"];
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
     public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch", "classify", "availability"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
@@ -24,6 +24,7 @@ public static partial class Protocol
         "cast" => ["frames/manifest.json", "sscd/manifest.json"],
         "sync" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json"],
         "describe" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json", "cast/clusters.json"],
+        "translate" => ["describe.json"],
         _ => [],
     };
     public static readonly TimeSpan NeedsRetry = TimeSpan.FromMinutes(2);

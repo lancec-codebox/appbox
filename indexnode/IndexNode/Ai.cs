@@ -36,11 +36,28 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
         using var res = await http.SendAsync(req, ct);
         var text = await res.Content.ReadAsStringAsync(ct);
         Counters.Add(Traffic.AiIn, Encoding.UTF8.GetByteCount(text));
+        if (res.IsSuccessStatusCode) CountTokens(text);
         return new Reply(res.IsSuccessStatusCode, (int)res.StatusCode, text);
     }
 
     /// <summary>Output budget per call: describe replies are whole JSON documents (64 cut them off before the closing brace).</summary>
-    public const int MaxOutputTokens = 8192;
+    public const int MaxOutputTokens = 32768;
+
+    /// <summary>Tokens the endpoint reported over this client's life (0 when it reports none).</summary>
+    public long InputTokens => Interlocked.Read(ref inTokens);
+    public long OutputTokens => Interlocked.Read(ref outTokens);
+    private long inTokens, outTokens;
+
+    private void CountTokens(string body)
+    {
+        try
+        {
+            if (JsonNode.Parse(body)?["usage"] is not JsonObject u) return;
+            long i = (u["input_tokens"] ?? u["prompt_tokens"])?.GetValue<long>() ?? 0, o = (u["output_tokens"] ?? u["completion_tokens"])?.GetValue<long>() ?? 0;
+            Interlocked.Add(ref inTokens, i); Interlocked.Add(ref outTokens, o);
+        }
+        catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException) { }
+    }
 
     /// <summary>A body that is really an error ({"error":{...}} or {"error":"..."}): its message, else null.</summary>
     public static string? ErrorMessage(string body)
