@@ -7,9 +7,10 @@ namespace IndexNode;
 public sealed record ShapeCue(double Start, double End, string Text, double[]? CharTimes = null);
 
 /// <summary>What every written track records in its sidecar; all but <c>Cues</c> are 0 after shaping, and a non-zero count is a bug.</summary>
-public sealed record ShapeStats(int Cues, int Over6s, int OverChars, int Overlaps)
+public sealed record ShapeStats(int Cues, int Over6s, int OverChars, int Overlaps, int ShortRead = 0)
 {
-    public object ToJson() => new { cues = Cues, over6s = Over6s, overChars = OverChars, overlaps = Overlaps };
+    /// <summary>shortRead is information, not a bug: cues shown for less than their reading time because the next cue starts first (fast exchanges).</summary>
+    public object ToJson() => new { cues = Cues, over6s = Over6s, overChars = OverChars, overlaps = Overlaps, shortRead = ShortRead };
 }
 
 /// <summary>
@@ -20,7 +21,16 @@ public sealed record ShapeStats(int Cues, int Over6s, int OverChars, int Overlap
 /// </summary>
 public static class CueShaper
 {
-    public const double MaxSeconds = 6, MinSeconds = 0.7, SoftSeconds = 4, HoldSeconds = 0.5, SilenceSeconds = 1.5, TailSeconds = 0.6;
+    public const double MaxSeconds = 6, MinSeconds = 0.8, SoftSeconds = 4, HoldSeconds = 0.5, SilenceSeconds = 1.5, TailSeconds = 0.6;
+    /// <summary>Reading time (owner, 2026-11-14): a cue stays up until it can be read, into the gap before the next cue (ending GapSeconds before it), at most MaxSeconds.</summary>
+    public const double ZhCharsPerSecond = 9, LatinCharsPerSecond = 17, GapSeconds = 0.1;
+
+    /// <summary>How long the text needs on screen: at least MinSeconds, else its characters (line breaks not counted) at reading speed.</summary>
+    public static double ReadingSeconds(string text)
+    {
+        int n = text.Count(ch => ch != (char)10 && ch != (char)13);
+        return Math.Max(MinSeconds, n / (IsZh(text) ? ZhCharsPerSecond : LatinCharsPerSecond));
+    }
     public const int ZhLine = 18, LatinLine = 42, MaxLines = 2;
 
     // ---- script and line wrapping ----
@@ -223,9 +233,12 @@ public static class CueShaper
         for (int i = 0; i < pieces.Count; i++)
         {
             double s = Math.Round(pieces[i].Start, 3), ns = i + 1 < pieces.Count ? Math.Round(pieces[i + 1].Start, 3) : double.MaxValue;
-            double e = Math.Min(pieces[i].End, ns);
-            if (e - s < MinSeconds) e = Math.Min(s + MinSeconds, ns);
-            e = Math.Min(Math.Min(e + HoldSeconds, ns), s + MaxSeconds);
+            // the cue stays at least until the speech ends, then lingers HoldSeconds, and longer when its reading time needs it: into the gap
+            // before the next cue (ending GapSeconds before it), never past MaxSeconds; a fast exchange keeps the speech end
+            double spoken = Math.Min(pieces[i].End, ns);
+            double want = Math.Max(pieces[i].End + HoldSeconds, s + ReadingSeconds(pieces[i].Text));
+            double e = Math.Max(spoken, Math.Min(want, Math.Min(ns - GapSeconds, s + MaxSeconds)));
+            e = Math.Min(e, Math.Min(ns, s + MaxSeconds));
             e = Math.Round(e, 3);
             if (e <= s + 0.001) continue;
             res.Add(new ShapeCue(s, e, pieces[i].Text));
@@ -235,7 +248,7 @@ public static class CueShaper
 
     public static ShapeStats Stats(IReadOnlyList<ShapeCue> cues)
     {
-        int over6 = 0, overChars = 0, overlaps = 0;
+        int over6 = 0, overChars = 0, overlaps = 0, shortRead = 0;
         var sorted = cues.OrderBy(c => c.Start).ToList();
         for (int i = 0; i < sorted.Count; i++)
         {
@@ -244,8 +257,9 @@ public static class CueShaper
             var lines = c.Text.Split('\n'); int lim = LineLimit(c.Text);
             if (lines.Length > MaxLines || lines.Any(l => l.Length > lim)) overChars++;
             if (i + 1 < sorted.Count && c.End > sorted[i + 1].Start + 0.0005) overlaps++;
+            if (c.End - c.Start < ReadingSeconds(c.Text) - 0.0005) shortRead++;
         }
-        return new ShapeStats(sorted.Count, over6, overChars, overlaps);
+        return new ShapeStats(sorted.Count, over6, overChars, overlaps, shortRead);
     }
 
     // ---- VTT ----

@@ -81,4 +81,46 @@ public class CueShaperTests
         Assert.Equal(0, o.GetProperty("zhHans").GetProperty("overChars").GetInt32());
         Assert.Equal(0, o.GetProperty("en").GetProperty("cues").GetInt32());
     }
+
+    // ---- reading time (owner, 2026-11-14): a cue stays up until it can be read, into the gap before the next cue ----
+
+    [Fact]
+    public void QuickLineStaysForItsReadingTime()
+    {
+        var c = CueShaper.Shape([new ShapeCue(0, 0.6, "你好吗我很好谢谢你啊"), new ShapeCue(5, 6, "再见")]);
+        Assert.Equal(10 / 9.0, c[0].End, 2);               // 10 characters at 9/s, more than speech end + 0.5 s hold
+    }
+
+    [Fact]
+    public void ReadingTimeStopsShortOfTheNextCue()
+    {
+        var c = CueShaper.Shape([new ShapeCue(0, 1.0, "他把信折好放进怀里转身走出门去夜风吹"), new ShapeCue(1.5, 2.5, "好的")]);
+        Assert.Equal(1.4, c[0].End, 3);                     // wants 2 s, ends 0.1 s before the next cue
+        Assert.True(c[0].End <= c[1].Start);
+    }
+
+    [Fact]
+    public void EnglishReadsAtItsOwnSpeed()
+    {
+        var c = CueShaper.Shape([new ShapeCue(0, 1.0, "I will be waiting by the old well tonight")]);
+        Assert.Equal(41 / 17.0, c[0].End, 2);
+    }
+
+    [Fact]
+    public void FastExchangeKeepsTheSpeechEnd()
+    {
+        var c = CueShaper.Shape([new ShapeCue(0, 1.0, "你到底想怎么样我受够了"), new ShapeCue(1.0, 2.0, "你听我解释")]);
+        Assert.Equal(1.0, c[0].End, 3);                     // no time before the next cue: it ends where the speech ends
+        Assert.True(c[0].End - c[0].Start < CueShaper.ReadingSeconds(c[0].Text));
+        Assert.Equal(1, CueShaper.Stats(c).ShortRead);
+        Assert.Equal(0, CueShaper.Stats(c).Overlaps);
+    }
+
+    [Fact]
+    public void ReadingTimeNeverPassesSixSeconds()
+    {
+        var text = "他犹豫了很久才伸手去拿桌上的信";                  // 15 characters: 1.7 s to read, spoken over 5.8 s
+        var c = CueShaper.Shape([new ShapeCue(0, 5.8, text)]);
+        Assert.True(c.All(x => x.End - x.Start <= CueShaper.MaxSeconds + 1e-6));
+    }
 }

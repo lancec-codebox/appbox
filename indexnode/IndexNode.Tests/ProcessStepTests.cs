@@ -87,26 +87,36 @@ public class OcrPostTests
     private static FrameText F(double t, params (string Text, int Y)[] lines) =>
         new(t, lines.Select(l => new OcrBox(10, l.Y, 400, l.Y + 20, l.Text, 0.9)).ToList());
 
+    // samples every 0.5 s (OcrCues.Fps = 2, owner 2026-11-14): a cue ends half a second after its last sample
     [Fact]
-    public void Cues_merge_runs_with_edit_distance_up_to_two_and_pick_the_majority_text()
+    public void Cues_merge_runs_with_a_small_relative_edit_distance_and_pick_the_majority_text()
     {
-        var frames = new List<FrameText> { F(0, ("你好吗朋友", 5)), F(.25, ("你好吗朋友", 5)), F(.5, ("你好吗朋支", 5)), F(.75, ("你好吗朋友", 5)), F(1.0, ("再见朋友们吧", 5)), F(1.25, ("再见朋友们吧", 5)) };
+        var frames = new List<FrameText> { F(0, ("你好吗朋友", 5)), F(.5, ("你好吗朋友", 5)), F(1.0, ("你好吗朋支", 5)), F(1.5, ("你好吗朋友", 5)), F(2.0, ("再见朋友们吧", 5)), F(2.5, ("再见朋友们吧", 5)) };
         var cues = OcrCues.Merge(frames, false);
         Assert.Equal(2, cues.Count);
-        Assert.Equal(("你好吗朋友", 0.0, 1.0), (cues[0].Text, cues[0].Start, cues[0].End));
-        Assert.Equal(("再见朋友们吧", 1.0, 1.5), (cues[1].Text, cues[1].Start, cues[1].End));
+        Assert.Equal(("你好吗朋友", 0.0, 2.0), (cues[0].Text, cues[0].Start, cues[0].End));
+        Assert.Equal(("再见朋友们吧", 2.0, 3.0), (cues[1].Text, cues[1].Start, cues[1].End));
         Assert.Equal(4, cues[0].Frames);
     }
 
     [Fact]
-    public void A_distance_of_three_starts_a_new_cue_a_single_frame_is_dropped_and_one_empty_frame_is_bridged()
+    public void A_distance_of_three_starts_a_new_cue_single_samples_count_and_one_empty_sample_is_bridged()
     {
-        var frames = new List<FrameText> { F(0, ("abc你好", 5)), F(.25, ("abc你好", 5)), F(.5), F(.75, ("abc你好", 5)), F(1, ("xyz你好", 5)), F(1.25), F(1.5), F(1.75, ("单独一帧", 5)) };
+        var frames = new List<FrameText> { F(0, ("abc你好", 5)), F(.5, ("abc你好", 5)), F(1.0), F(1.5, ("abc你好", 5)), F(2.0, ("xyz你好", 5)), F(2.5), F(3.0), F(3.5, ("单独一帧", 5)) };
         var cues = OcrCues.Merge(frames, false);
-        // "abc你好" x3 with a one-frame gap bridged; "xyz你好" is one frame: flicker; later single frame: flicker
-        var c = Assert.Single(cues);
-        Assert.Equal((0.0, 1.0), (c.Start, c.End));
-        Assert.Equal(3, c.Frames);
+        // "abc你好" x3 with a one-sample gap bridged; at 0.5 s sampling a single sample is a real cue (every cue lasts >= 0.5 s)
+        Assert.Equal(3, cues.Count);
+        Assert.Equal((0.0, 2.0, 3), (cues[0].Start, cues[0].End, cues[0].Frames));
+        Assert.Equal(("xyz你好", 2.0, 2.5), (cues[1].Text, cues[1].Start, cues[1].End));
+        Assert.Equal(("单独一帧", 3.5, 4.0), (cues[2].Text, cues[2].Start, cues[2].End));
+    }
+
+    [Fact]
+    public void A_line_read_while_fading_in_joins_the_full_line_and_the_longer_reading_wins()
+    {
+        var frames = new List<FrameText> { F(0, ("换", 5)), F(.5, ("换一个", 5)) };
+        var c = Assert.Single(OcrCues.Merge(frames, false));
+        Assert.Equal("换一个", c.Text);
     }
 
     [Fact]
@@ -128,11 +138,11 @@ public class OcrPostTests
     [Fact]
     public void Two_chinese_lines_join_top_to_bottom_and_the_vtt_has_both_scripts()
     {
-        var f = new[] { F(0, ("第二行", 40), ("第一行", 5)), F(.25, ("第二行", 40), ("第一行", 5)) };
+        var f = new[] { F(0, ("第二行", 40), ("第一行", 5)), F(.5, ("第二行", 40), ("第一行", 5)) };
         var cues = OcrCues.Merge(f, false);
         Assert.Equal("第一行第二行", cues[0].Text);
         cues[0].Text = "顧長淵"; OcrCues.Simplify(cues, OpenCc.T2S);
-        Assert.Equal("WEBVTT\n\n00:00:00.000 --> 00:00:01.200\n顧長淵\n\n", OcrCues.ToVtt(cues, false));
+        Assert.Equal("WEBVTT\n\n00:00:00.000 --> 00:00:01.500\n顧長淵\n\n", OcrCues.ToVtt(cues, false));
         Assert.Contains("顾长渊", OcrCues.ToVtt(cues, true));
         Assert.Equal("01:02:03.050", OcrCues.Timestamp(3723.05));
     }

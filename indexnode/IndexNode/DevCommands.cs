@@ -202,6 +202,7 @@ public static class DevCommands
                 var before = CueShaper.Stats(segs.Select(s => new ShapeCue(s.Start, s.End, s.Text.Trim())).ToList());
                 int b6 = segs.Count(s => s.End - s.Start > 6); double longest = segs.Max(s => s.End - s.Start); int longChars = segs.Max(s => s.Text.Trim().Length);
                 var cues = Transcribe.Shape(segs); var after = CueShaper.Stats(cues);
+                if (a.Get("vtt") is { } sv) File.WriteAllText(sv, CueShaper.ToVtt(cues)); // --vtt: --out is the dev output folder
                 Console.WriteLine($"before: {System.Text.Json.JsonSerializer.Serialize(before.ToJson())} longest {longest:F1}s {longChars} chars");
                 Console.WriteLine($"after:  {System.Text.Json.JsonSerializer.Serialize(after.ToJson())} longest {cues.Max(c => c.End - c.Start):F1}s {cues.Max(c => c.Text.Split('\n').Max(l => l.Length))} chars/line");
                 // breaks (between cues, and between the two lines of a cue) that fall inside a word of the original text
