@@ -360,8 +360,11 @@ public static class Publish
 
     /// <summary>The candidate pool: the solo ones when there are any, else all (today's choice; the picture is then cut tight).</summary>
     static List<JsonObject> SoloPool(List<JsonObject> all) =>
-        all.Where(c => c["solo"]?.GetValue<bool>() != false && !HasSub(c)).ToList() is { Count: > 0 } a ? a
+        all.Where(c => c["solo"]?.GetValue<bool>() != false && !SubOnFace(c)).ToList() is { Count: > 0 } a ? a
         : all.Where(c => c["solo"]?.GetValue<bool>() != false).ToList() is { Count: > 0 } s ? s : all;
+
+    /// <summary>True when the candidate's subtitle band overlaps its face box: the only subtitle that counts against a frame (a band elsewhere is cropped out).</summary>
+    public static bool SubOnFace(JsonObject? c) => SubBox(c) is { } s && (c!["box"] as JsonArray) is { Count: 4 } b && b.Select(v => v!.GetValue<double>()).ToArray() is var f && s[0] < f[0] + f[2] && s[0] + s[2] > f[0] && s[1] < f[1] + f[3] && s[1] + s[3] > f[1];
 
     public static bool HasSub(JsonObject? c) => c?["sub"] is JsonArray { Count: 4 };
 
@@ -433,8 +436,8 @@ public static class Publish
         return null;
     }
 
-    /// <summary>The tiers, strictest first: alone and no subtitle, alone, any frame.</summary>
-    static readonly Func<JsonObject, bool>[] Tiers = [c => !IsCrowded(c) && !HasSub(c), c => !IsCrowded(c), _ => true];
+    /// <summary>The tiers, strictest first: alone with no subtitle on the face, alone, any frame. A subtitle elsewhere on the frame never rules a candidate out (the crop keeps the band outside).</summary>
+    static readonly Func<JsonObject, bool>[] Tiers = [c => !IsCrowded(c) && !SubOnFace(c), c => !IsCrowded(c), _ => true];
 
     /// <summary>Unmasked, scored candidates passing a tier and at least the floor, best first: score, then describe's pick, then quality.</summary>
     static IEnumerable<(JsonObject C, int K, int S)> Ranked(List<JsonObject> all, int? picked, IReadOnlyList<int?> scores, Func<JsonObject, bool> tier, int floor) =>

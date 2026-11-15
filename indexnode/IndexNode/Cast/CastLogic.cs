@@ -6,6 +6,8 @@ public sealed class FaceRec
     public double T { get; set; }
     public float X, Y, W, H, Score;
     public double Blur, Yaw, Roll;
+    /// <summary>Pitch (looking up or down) as the landmark ratio off frontal (signed; 0 = frontal) and the gradient energy around the eyes (0 when not measured); see FaceMath.Pitch / EyeEnergy.</summary>
+    public double Pitch, Eyes;
     /// <summary>Quality in 0..1: size, detector score, sharpness and frontality together.</summary>
     public double Quality { get; set; }
     public int Cluster { get; set; } = -1;
@@ -15,6 +17,8 @@ public sealed class FaceRec
     /// <summary>The burned-in subtitle on screen in this face's frame, [x, y, w, h] in frame pixels; null when there is none.</summary>
     public double[]? Sub { get; set; }
     public const double SoloMaxRatio = 0.25;
+    /// <summary>True when the burned-in subtitle of this frame overlaps the face box itself (a band elsewhere on the frame is no reason to drop a frame: the crop puts it outside).</summary>
+    public bool SubOnFace => Sub is { Length: 4 } s && s[0] < X + W && s[0] + s[2] > X && s[1] < Y + H && s[1] + s[3] > Y;
     public bool Masked { get; set; }
     public double MaskScore { get; set; }
     public float[] Emb { get; set; } = [];
@@ -31,6 +35,8 @@ public static class CastLogic
 {
     public const int MinHeight = 60;
     public const double MinScore = 0.6, MinBlur = 40, MaxYaw = 0.45, MaxRoll = 30;
+    /// <summary>Pitch: the nose's place between the eye line and the mouth line of a frontal face (calibrated on stored crops), and the largest |pitch| a face may have.</summary>
+    public const double PitchFront = 0.55, MaxPitch = 0.25, EyeRef = 24;
 
     /// <summary>Per model: the cosine-distance threshold of average linkage (found on input.mp4, see README), then the second-pass merge limits.</summary>
     public static readonly CastModel Default = new("buffalo_l", 0.65, 512, 0.50, 0), YuNetSFace = new("yunet-sface", 0.50, 128, 0.50, 0),
@@ -96,13 +102,15 @@ public static class CastLogic
 
     /// <summary>The filter before clustering: tall enough, confident, sharp and roughly frontal.</summary>
     public static bool Passes(FaceRec f) =>
-        f.H >= MinHeight && f.Score >= MinScore && f.Blur >= MinBlur && f.Yaw <= MaxYaw && f.Roll <= MaxRoll;
+        f.H >= MinHeight && f.Score >= MinScore && f.Blur >= MinBlur && f.Yaw <= MaxYaw && f.Roll <= MaxRoll && Math.Abs(f.Pitch) <= MaxPitch;
 
     public static double QualityOf(FaceRec f, int frameHeight)
     {
         double size = Math.Min(1, f.H / (0.25 * Math.Max(1, frameHeight)));
         double sharp = Math.Min(1, f.Blur / 300), front = Math.Max(0, 1 - f.Yaw / MaxYaw);
-        return Math.Round(0.35 * size + 0.25 * Math.Clamp((f.Score - 0.5) / 0.5, 0, 1) + 0.25 * sharp + 0.15 * front, 4);
+        // pitch: 1 for a level face, 0 at MaxPitch (looking up or down); eyes: gradient energy around the eye landmarks against EyeRef (not measured: neutral)
+        double level = Math.Max(0, 1 - Math.Abs(f.Pitch) / MaxPitch), eyes = f.Eyes > 0 ? Math.Min(1, f.Eyes / EyeRef) : 0.5;
+        return Math.Round(0.28 * size + 0.2 * Math.Clamp((f.Score - 0.5) / 0.5, 0, 1) + 0.17 * sharp + 0.1 * front + 0.15 * level * level + 0.1 * eyes, 4);
     }
 
     public static double Cosine(float[] a, float[] b) { double s = 0; for (int i = 0; i < a.Length; i++) s += a[i] * b[i]; return s; }
@@ -175,11 +183,11 @@ public static class CastLogic
     /// <summary>12 diverse faces for the AI contact sheet: highest quality first, then each next pick maximises its distance to the picks so far (greedy farthest point, in embedding space and time).</summary>
     public static List<FaceRec> Diverse(IReadOnlyList<FaceRec> cluster, int count = 12)
     {
-        // candidates come from frames where the person is alone (no other face above 25% of theirs); other frames only fill what is missing
-        // and, within those, from frames with no burned-in subtitle on screen (a subtitle can be cropped away; a second person is harder)
+        // candidates come from frames where the person is alone (no other face above 25% of theirs); other frames only fill what is missing.
+        // A burned-in subtitle elsewhere in the frame is no reason to leave a frame out (the crop keeps the band outside); only one that overlaps the face counts against it, last.
         var all = cluster.Where(f => f.Quality > 0).OrderByDescending(f => f.Quality).ToList();
         var picked = new List<FaceRec>();
-        foreach (var tier in new[] { all.Where(f => f.Solo && f.Sub == null), all.Where(f => f.Solo && f.Sub != null), all.Where(f => !f.Solo) })
+        foreach (var tier in new[] { all.Where(f => f.Solo && !f.SubOnFace), all.Where(f => !f.SubOnFace), all })
             if (picked.Count < count) picked = Greedy(tier.ToList(), picked, count);
         return picked.OrderBy(f => f.T).ToList();
     }

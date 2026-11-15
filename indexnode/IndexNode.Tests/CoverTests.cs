@@ -183,14 +183,20 @@ public class CoverTests
         var c = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"box":[110,200,100,120]}]""");
         Publish.MarkSolo(c, null, subs, 360);
         Assert.True(Publish.HasSub(c[0] as System.Text.Json.Nodes.JsonObject)); Assert.False(Publish.HasSub(c[1] as System.Text.Json.Nodes.JsonObject));
-        Assert.Equal(1, Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);   // lower score, but no subtitle
-        Assert.Equal(1, Publish.PickLeadShot(c, 0)!.Value.K);
+        Assert.False(Publish.SubOnFace(c[0] as System.Text.Json.Nodes.JsonObject));        // the band (y 330..) is below the face (y 200..320): no reason to drop the frame
+        Assert.Equal(0, Publish.PickByExpression(c, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);   // higher score wins; the subtitle is cropped out
+        var onFace = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"solo":true,"sub":[100,250,100,40],"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"solo":true,"box":[110,200,100,120]}]""");
+        Assert.True(Publish.SubOnFace(onFace[0] as System.Text.Json.Nodes.JsonObject));
+        Assert.Equal(1, Publish.PickByExpression(onFace, 0, 1000, 9080, new int?[] { 9, 7 })!.Value.K);   // a subtitle over the face still counts against the frame
+        Assert.Equal(0, Publish.PickLeadShot(c, 0)!.Value.K);
         var only = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""); Publish.MarkSolo(only, null, subs, 360);
         Assert.Equal(0, Publish.PickByExpression(only, 0, 1000, 9080, new int?[] { 9 })!.Value.K);  // only a subtitled frame: still used, cropped
         var (crop, _) = Publish.TightWindow([110, 200, 100, 120], Publish.Avoid(only[0] as System.Text.Json.Nodes.JsonObject), 1.25, 250, 0.45, 360, 640);
         Assert.True((crop[1] + crop[3]) * 640 <= 330.01);       // the band starts at y=330
-        var f = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i, Quality = i < 10 ? 0.95 : 0.5, Sub = i < 10 ? [0, 500, 100, 30] : null, Emb = new float[8] { i, 0, 0, 0, 0, 0, 0, 1 }, Cluster = 0 }).ToList();
-        Assert.Equal(10, CastLogic.Diverse(f, 10).Count(x => x.Sub == null));
+        var f = Enumerable.Range(0, 20).Select(i => new FaceRec { T = i, Quality = i < 10 ? 0.95 : 0.5, Sub = i < 10 ? [0, 500, 100, 30] : null, Emb = new float[8] { MathF.Cos(i * 0.3f), MathF.Sin(i * 0.3f), 0, 0, 0, 0, 0, 0 }, Cluster = 0 }).ToList();
+        Assert.True(CastLogic.Diverse(f, 10).Count(x => x.Sub != null) >= 5);   // a subtitle elsewhere on the frame no longer leaves frames out: the better-quality half is in the pool
+        var g = f.Select(x => { x.X = 0; x.Y = 490; x.W = 80; x.H = 80; return x; }).ToList();      // the band now sits on the face: those frames go last
+        Assert.Equal(10, CastLogic.Diverse(g, 10).Count(x => x.Sub == null));
     }
 
     [Fact]
@@ -199,10 +205,10 @@ public class CoverTests
         var lines = System.Text.Encoding.UTF8.GetBytes("""{"band":{"y":570,"height":62,"width":480},"en":[{"start":10,"end":12,"boxes":[{"x0":100,"y0":440,"x1":260,"y1":470}]}],"zh":[]}""");
         var c = Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]},{"k":1,"t":30,"quality":0.5,"masked":false,"box":[110,200,100,120]},{"k":2,"t":50,"quality":0.4,"masked":false,"box":[110,200,100,120]},{"k":3,"t":70,"quality":0.9,"masked":false,"box":[110,200,100,120]}]""");
         Publish.MarkSolo(c, null, SubtitleBand.Parse(lines), 360);
-        // describe picked 3 (score 7), but 1 and 2 score 9 and pass: describe's pick only breaks ties; 0 scores 10 but has a subtitle
-        var p = Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 9, 9, 7 })!.Value; Assert.Equal(1, p.K);   // tie 1 v 2: quality
-        Assert.Equal(2, Publish.PickPortrait(c, 2, 9080, new int?[] { 10, 9, 9, 7 })!.Value.K);           // tie: describe's pick
-        // the score floor comes first: 0 has a subtitle but scores 10, and no solo frame scores 6, so 0 beats the low-scoring clean ones
+        // describe picked 3 (score 7), but 1 and 2 score 9 and pass: describe's pick only breaks ties; 0 scores 10 and its subtitle (below the face) is no reason to leave it out
+        var p = Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 9, 9, 7 })!.Value; Assert.Equal(0, p.K);
+        var p9 = Publish.PickPortrait(c, 3, 9080, new int?[] { 8, 9, 9, 7 })!.Value; Assert.Equal(1, p9.K);   // tie 1 v 2: quality
+        Assert.Equal(2, Publish.PickPortrait(c, 2, 9080, new int?[] { 8, 9, 9, 7 })!.Value.K);           // tie: describe's pick
         Assert.Equal(0, Publish.PickPortrait(c, 3, 9080, new int?[] { 10, 4, 3, 2 })!.Value.K);
         // nothing scores 6 anywhere: the best score overall (the caller warns)
         var w = Publish.PickPortrait(c, 3, 9080, new int?[] { 5, 4, 3, 2 })!.Value; Assert.Equal(0, w.K); Assert.Equal(5, w.Score);
@@ -290,8 +296,8 @@ public class CoverTests
     [Fact]
     public void Score_floor_comes_before_the_solo_and_subtitle_tiers()
     {
-        // 0: alone, clean, scores 2;  1: crowded two-shot, scores 9;  2: alone with a subtitle, scores 7
-        var c = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"solo":true,"box":[110,200,100,120]},{"k":1,"t":20,"quality":0.9,"masked":false,"solo":false,"box":[110,200,100,120]},{"k":2,"t":30,"quality":0.9,"masked":false,"solo":true,"sub":[0,400,360,60],"box":[110,200,100,120]}]""");
+        // 0: alone, clean, scores 2;  1: crowded two-shot, scores 9;  2: alone with a subtitle over the face, scores 7
+        var c = Cands("""[{"k":0,"t":10,"quality":0.9,"masked":false,"solo":true,"box":[110,200,100,120]},{"k":1,"t":20,"quality":0.9,"masked":false,"solo":false,"box":[110,200,100,120]},{"k":2,"t":30,"quality":0.9,"masked":false,"solo":true,"sub":[100,250,200,60],"box":[110,200,100,120]}]""");
         var sc = new int?[] { 2, 9, 7 };
         Assert.Equal(2, Publish.PickPortrait(c, 0, 9080, sc)!.Value.K);                 // tier 2 (alone, 7) beats the clean solo scoring 2 and the two-shot scoring 9 (tier 3)
         Assert.Equal(2, Publish.PickByExpression(c, 0, 1089.6, 9080, sc)!.Value.K);

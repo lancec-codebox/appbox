@@ -92,6 +92,7 @@ public static class Program
                 "sources" => await Commands.SourcesAsync(a),
                 "ai" => await Commands.AiAsync(a),
                 "publish" => await SiteCommands.PublishAsync(a),
+                "cast-candidates" => await CastCandidates.RunAsync(a),
                 "describe" => await SiteCommands.DescribeAsync(a),
                 "process" => await SiteCommands.ProcessAsync(a),
                 "medusa-setup" => SiteCommands.MedusaSetup(a),

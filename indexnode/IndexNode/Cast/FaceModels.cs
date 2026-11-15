@@ -60,6 +60,33 @@ public static class FaceMath
         double mx = (k[0] + k[2]) / 2;
         return (Math.Abs(k[4] - mx) / eye, Math.Abs(Math.Atan2(ey, ex) * 180 / Math.PI));
     }
+
+    /// <summary>Pitch from the 5 landmarks (eyes, nose, mouth corners): the nose's place on the eye line to mouth line axis, (nose - eyes) / (mouth - eyes), measured along the face's own vertical (roll-proof). Frontal faces sit near <see cref="CastLogic.PitchFront"/>; looking down or up moves it away either way. Returns the signed ratio minus that, 0 = frontal; 9 when the landmarks are degenerate.</summary>
+    public static double Pitch(float[] k)
+    {
+        double ex = (k[0] + k[2]) / 2, ey = (k[1] + k[3]) / 2, mx = (k[6] + k[8]) / 2, my = (k[7] + k[9]) / 2;
+        double ax = mx - ex, ay = my - ey, len = Math.Sqrt(ax * ax + ay * ay); if (len < 1) return 9;
+        double r = ((k[4] - ex) * ax + (k[5] - ey) * ay) / (len * len);
+        return r - CastLogic.PitchFront;
+    }
+
+    /// <summary>Eye visibility 0..1 from the pixels around the two eye landmarks: mean gradient energy of the grey patch (half the eye distance wide), against a reference energy. Closed, lowered or shadowed eyes (a downcast face) read low, open eyes high.</summary>
+    public static double EyeEnergy(Rgb im, float[] k)
+    {
+        double ex = k[2] - k[0], ey = k[3] - k[1], d = Math.Sqrt(ex * ex + ey * ey); if (d < 4) return 0;
+        int half = Math.Max(2, (int)Math.Round(d * 0.22)); double sum = 0; int n = 0;
+        for (int e = 0; e < 2; e++)
+        {
+            int cx = (int)Math.Round(k[e * 2]), cy = (int)Math.Round(k[e * 2 + 1]);
+            for (int y = Math.Max(1, cy - half); y < Math.Min(im.H - 1, cy + half); y++)
+                for (int x = Math.Max(1, cx - half); x < Math.Min(im.W - 1, cx + half); x++)
+                {
+                    double g(int xx, int yy) { int o = (yy * im.W + xx) * 3; return 0.299 * im.Data[o] + 0.587 * im.Data[o + 1] + 0.114 * im.Data[o + 2]; }
+                    sum += Math.Abs(g(x + 1, y) - g(x - 1, y)) + Math.Abs(g(x, y + 1) - g(x, y - 1)); n++;
+                }
+        }
+        return n == 0 ? 0 : Math.Round(sum / n / 2, 2);
+    }
 }
 
 /// <summary>OpenCV zoo YuNet (Apache-2.0): 640x640 BGR 0..255 in; per stride 8/16/32: cls, obj, bbox, kps.</summary>
