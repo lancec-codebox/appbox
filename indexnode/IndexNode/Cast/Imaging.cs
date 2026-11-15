@@ -61,7 +61,7 @@ public static class Imaging
     }
     static byte Clamp8(double v) => (byte)Math.Clamp(Math.Round(v), 0, 255);
 
-    /// <summary>Encodes rgb24 as a JPEG. quality 1..100; 90 is about what ffmpeg's mjpeg -q:v 3 gives.</summary>
+    /// <summary>Encodes rgb24 as a JPEG. quality 1..100; 85 is about what ffmpeg's mjpeg -q:v 3 gives.</summary>
     public static byte[] EncodeJpeg(Rgb im, int quality = JpegQuality)
     {
         var rows = new BitMiracle.LibJpeg.SampleRow[im.H];
@@ -71,7 +71,7 @@ public static class Imaging
         img.WriteJpeg(ms, new BitMiracle.LibJpeg.CompressionParameters { Quality = quality });
         return ms.ToArray();
     }
-    public const int JpegQuality = 90;
+    public const int JpegQuality = 85;
 
     static double Lanczos3(double x) { x = Math.Abs(x); if (x < 1e-9) return 1; if (x >= 3) return 0; var px = Math.PI * x; return 3 * Math.Sin(px) * Math.Sin(px / 3) / (px * px); }
 
