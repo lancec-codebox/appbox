@@ -152,7 +152,10 @@ public class WatchTests
         var job = JobDescriptor.NewWatch("channel", c, "x", "1h", ["videos", "shorts"], false, 5, 480);
         await Poll(s, f, job);
         Assert.Equal(2, f.Calls.Count);
-        Assert.Equal(2, s.Blobs.Keys.Count(k => k.Contains("/jobs/download/")));
+        // a channel's uploads are not downloaded directly: they go to one classify job (decided on a node with AI)
+        Assert.Empty(s.Blobs.Keys.Where(k => k.Contains("/jobs/download/")));
+        var cj = s.Job(Assert.Single(s.Blobs.Keys, k => k.Contains("/jobs/classify/")));
+        Assert.Equal(2, cj.Entries!.Count); Assert.Equal("ch-" + c, cj.Source);
     }
 
     [Fact]
