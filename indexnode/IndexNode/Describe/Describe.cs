@@ -54,6 +54,8 @@ public sealed class DescribeInput
     public string TextSource { get; set; } = "transcript";
     public IReadOnlyList<ShapeCue> Cues { get; set; } = [];
     public IReadOnlyList<string> Credits { get; set; } = [];
+    /// <summary>Viewer comments that mention AI (a hint for aiGenerated; viewers can be wrong).</summary>
+    public IReadOnlyList<string> AiComments { get; set; } = [];
     public IReadOnlyList<MainCluster> Clusters { get; set; } = [];
     public string? Thumb { get; set; }
     /// <summary>Contact sheet file per main cluster (12 candidate crops each).</summary>
@@ -115,6 +117,7 @@ public static class Describe
         sb.AppendLine($"Upload description:\n{Trunc(d.Description, 3000)}");
         sb.AppendLine($"Text track ({d.TextSource}; burned-in subtitles where they exist, else our speech recognition), [m:ss] text:\n{TextTrack.Compress(d.Cues)}");
         if (d.Credits.Count > 0) sb.AppendLine("Credits lines read from the video (主演/饰/领衔):\n" + string.Join('\n', d.Credits));
+        if (d.AiComments.Count > 0) sb.AppendLine("Viewer comments that mention AI (a hint for aiGenerated only; viewers can be wrong):\n" + string.Join('\n', d.AiComments.Select(c => "- " + c)));
         sb.AppendLine("Main face clusters (cluster id, screen seconds, first seen s): " + string.Join("; ", d.Clusters.Select(c => $"{c.Id}: {c.ScreenSeconds:F0}s, {c.FirstSeen:F0}")));
         sb.AppendLine("Images, in order: the upload thumbnail, then one contact sheet per cluster (12 numbered candidate head shots, row by row from 0), then the poster candidate sheet (numbered frames).");
         sb.AppendLine(@"Rules:
