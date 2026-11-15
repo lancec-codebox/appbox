@@ -22,7 +22,8 @@ public sealed class TranslateInput
 /// <summary>The chosen Chinese source: which track, how much of the speech it covers, and its cues with their own times.</summary>
 public sealed record TranslateSource(string Track, double? Coverage, double SpeechSeconds, IReadOnlyList<ShapeCue> Cues, string Hash);
 
-public sealed record GlossaryEntry(string Zh, string En, string Kind);
+/// <summary>One glossary line. Kind "address" is a form of address (how it is SAID in English); <c>Refers</c> says whom it refers to, for context only.</summary>
+public sealed record GlossaryEntry(string Zh, string En, string Kind, string Refers = "");
 
 /// <summary>The glossary call's answer: the entries and the private plot summary (kept in en.json only, never published).</summary>
 public sealed record GlossaryResult(List<GlossaryEntry> Entries, string Plot);
@@ -37,7 +38,7 @@ public sealed record TranslateResult(bool Skipped, string? Reason, byte[]? Vtt, 
 /// </summary>
 public static partial class Translate
 {
-    public const string PromptVersion = "translate-1";
+    public const string PromptVersion = "translate-2";
     public const int BatchCues = 200, ContextCues = 10, Parallelism = 4, MaxReasks = 2;
     /// <summary>Context on each side of a batch: at least this many cues AND at least this many seconds (whichever reaches further), so an exchange split by a boundary is seen whole.</summary>
     public const double ContextSeconds = 30;
@@ -165,7 +166,7 @@ public static partial class Translate
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(PromptVersion + "\n" + Seed(describe).Text + "\n" + SynopsisOf(describe) + "\n" + Relations(describe)))).ToLowerInvariant()[..16];
 
     public static string GlossaryHash(IReadOnlyList<GlossaryEntry> g) =>
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', g.OrderBy(e => e.Zh, StringComparer.Ordinal).Select(e => $"{e.Kind}\t{e.Zh}\t{e.En}")))))
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', g.OrderBy(e => e.Zh, StringComparer.Ordinal).Select(e => $"{e.Kind}\t{e.Zh}\t{e.En}\t{e.Refers}")))))
             .ToLowerInvariant()[..16];
 
     /// <summary>The whole Chinese script, one cue per line, evenly thinned when it would not fit (a 2 h drama is about 50k characters).</summary>
@@ -181,18 +182,18 @@ public static partial class Translate
     static string GlossaryPrompt(string seed, string synopsis, string script, bool wantPlot)
     {
         var plotLine = wantPlot ? "Also write \"plot\": a short PRIVATE plot summary of the whole drama, end to end, about 100 to 150 words in English, spoilers allowed: who the main characters are (use the glossary spellings), how they relate (spouse, sibling, master and servant, rank) and any hidden identity or reveal that changes how people address each other. It is only a briefing for the translators." : "";
-        var shape = wantPlot ? "{\"plot\":\"\",\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\"}]}" : "{\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\"}]}";
+        var shape = wantPlot ? "{\"plot\":\"\",\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\",\"refers\":\"\"}]}" : "{\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\",\"refers\":\"\"}]}";
         return $$"""
         You are preparing the name glossary for the English subtitles of a Chinese drama. Read the whole Chinese script below and list every proper name and recurring form of address that must be rendered the same way in every line.
 
         Include:
-        - kind "character": every character name (and the nicknames or short forms the others call them), as ONE English spelling: pinyin without tone marks, given name then surname unless the known list below says otherwise (use the known spelling exactly when the character is listed there).
+        - kind "character": a character's NAME only (full name, or the name as the Chinese writes it), as ONE English spelling: pinyin without tone marks, given name then surname unless the known list below says otherwise (use the known spelling exactly when the character is listed there). Never put a form of address, a pet name or a nickname here.
         - kind "place": places, palaces, mansions, cities, schools, sects.
         - kind "title": official titles, ranks, noble titles and honorifics used with or instead of a name (e.g. 世子, 侯爷, 王爷, 将军).
-        - kind "address": recurring forms of address and kin terms (e.g. 嫂嫂, 母亲, 夫君, 娘子, 师父) with the ONE natural English rendering to use every time (e.g. "Sister-in-law", "Mother", "Husband").
+        - kind "address": every recurring FORM OF ADDRESS, kin term, pet name or short form of a name used to call someone (e.g. 嫂嫂, 母亲, 夫君, 师父, 昭姐姐, 阿战, 小可爱, 为善少爷). "en" is how it is SAID in English, as an address, not the person's full name: 昭姐姐 => "Sister Zhao", 阿战 => "A-Zhan" or "Zhan", 嫂嫂 => "Sister-in-law", 小可爱 => "sweetie" or "little one", 母亲 => "Mother", 世子 => "Your Highness" when said to him. "refers" is the English name of the person it usually refers to (context only; it is never substituted into the line). If one form is used differently by different speakers, give the commonest rendering.
         - kind "other": anything else that must stay consistent (organisations, named objects, techniques).
 
-        Rules: "en" is plain English letters (no Chinese, no notes, no brackets); one entry per Chinese form; give only entries that occur in the script; at most 250 entries, most frequent first.
+        Rules: keep names and address forms apart: a name entry maps a name to its spelling, an address entry maps an address form to how it is said. "en" is plain English letters (no Chinese, no notes, no brackets); one entry per Chinese form; give only entries that occur in the script; at most 250 entries, most frequent first.
 
         Known drama facts (English spellings chosen for this drama; keep them):
         Synopsis: {{(synopsis.Length > 0 ? synopsis : "(none)")}}
@@ -219,7 +220,7 @@ public static partial class Translate
             string zh = e["zh"]?.ToString().Trim() ?? "", en = e["en"]?.ToString().Trim() ?? "", kind = (e["kind"]?.ToString() ?? "other").Trim().ToLowerInvariant();
             if (zh.Length == 0 || en.Length == 0 || Cjk().IsMatch(en)) continue;
             if (kind is not ("character" or "place" or "title" or "address")) kind = "other";
-            map.TryAdd(zh, new GlossaryEntry(zh, en, kind));
+            map.TryAdd(zh, new GlossaryEntry(zh, en, kind, kind == "address" ? (e["refers"]?.ToString() ?? "").Trim() : ""));
         }
         // describe's spellings win for its characters, whatever the model wrote
         foreach (var f in fixedNames) map[f.Zh] = f;
@@ -232,7 +233,9 @@ public static partial class Translate
     sealed class Counter { public int Calls; }
 
     static string GlossaryText(IReadOnlyList<GlossaryEntry> g) =>
-        g.Count == 0 ? "(none)" : string.Join('\n', g.Select(e => $"{e.Zh} => {e.En} [{e.Kind}]"));
+        g.Count == 0 ? "(none)" : string.Join('\n', g.Select(e => e.Kind == "address"
+            ? $"{e.Zh} => {e.En} [address form{(e.Refers.Length > 0 ? $"; refers to {e.Refers}, context only" : "")}]"
+            : $"{e.Zh} => {e.En} [{e.Kind}]"));
 
     static string BatchPrompt(IReadOnlyList<ShapeCue> cues, IReadOnlyList<(int Id, bool Ask)> window, IReadOnlyDictionary<int, string> known, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string relations, string plot, string title)
     {
@@ -242,10 +245,12 @@ public static partial class Translate
 
             Rules:
             - Natural, spoken English that an audience reads at a glance. Keep each speaker's register (formal court speech, family talk, slang, anger, tenderness).
-            - Use the glossary EXACTLY for names, places, titles and forms of address: the English in the glossary is the only spelling to use, every time.
+            - Use the glossary EXACTLY for names, places and titles: the English in the glossary is the only spelling to use, every time.
+            - A form of address stays a form of address: translate it as the address, in the speaker's register, using the glossary's English for that form (昭姐姐 => "Sister Zhao", 阿战 from his mother => "Zhan" or "A-Zhan", 小可爱 => "sweetie"). NEVER swap in the person's full name for an address. Use a full name only where the Chinese itself uses the name. "refers to" is context only, so you know who is meant.
+            - Garbled or stray OCR: a lone character or fragment that is not a word in this context (an OCR error) is not translated. Answer it with "en": "" and "skip": true. Do not guess or invent text for it. Real short words and names are translated normally.
             - No notes, no explanations, no brackets, no speaker labels, no quotation of the Chinese. Do not add words that are not said.
             - One sentence may run across several cues: translate each cue's own part so that the cues read right in sequence (do not repeat the whole sentence in each cue).
-            - A cue that is only a sound effect, music or non-speech gets an empty string.
+            - A cue that is only a sound effect, music or non-speech gets an empty string ("skip": true).
             - Lines marked CONTEXT are only there to help you; do NOT translate them. Lines marked TRANSLATE are the ones to answer.
 
             """);
@@ -261,18 +266,19 @@ public static partial class Translate
             sb.Append('\n');
         }
         var ids = window.Where(w => w.Ask).Select(w => w.Id).ToList();
-        sb.Append("\nAnswer with ONE JSON object: {\"cues\":[{\"i\":<id>,\"en\":\"<English>\"}]} with exactly one entry for each of the ").Append(ids.Count)
+        sb.Append("\nAnswer with ONE JSON object: {\"cues\":[{\"i\":<id>,\"en\":\"<English>\"}]} (for a garbled or non-speech cue: {\"i\":<id>,\"en\":\"\",\"skip\":true}) with exactly one entry for each of the ").Append(ids.Count)
           .Append(" TRANSLATE ids: ").Append(string.Join(',', ids)).Append(". Nothing else.");
         return sb.ToString();
     }
 
     /// <summary>Cleans one answer: single line, no bracketed notes. Null when it cannot be used (why in <paramref name="why"/>).</summary>
-    public static string? Accept(string zh, string? en, out string? why)
+    public static string? Accept(string zh, string? en, bool skip, out string? why)
     {
         why = null;
+        if (skip) return ""; // the model marked it as garbled OCR or non-speech: dropped, never invented
         if (en == null) { why = "no text"; return null; }
         var t = Regex.Replace(Bracketed().Replace(en, " "), @"\s+", " ").Trim();
-        if (t.Length == 0) { if (IsNonSpeech(zh)) return ""; why = "empty"; return null; }
+        if (t.Length == 0) { if (IsNonSpeech(zh)) return ""; why = "empty (answer skip:true for garbled OCR)"; return null; }
         if (Cjk().IsMatch(t)) { why = "still has Chinese"; return null; }
         int n = zh.Count(ch => !char.IsWhiteSpace(ch));
         if (t.Length > 12 * n + 40) { why = "far too long"; return null; }
@@ -283,7 +289,7 @@ public static partial class Translate
     /// <summary>The answers of one reply: id → English for the usable ones, with the reasons for the rest (missing, duplicated and different, unusable).</summary>
     public static (Dictionary<int, string> Good, Dictionary<int, string> Bad) Validate(JsonObject reply, IReadOnlyCollection<int> asked, IReadOnlyList<ShapeCue> cues)
     {
-        var good = new Dictionary<int, string>(); var bad = new Dictionary<int, string>(); var seen = new Dictionary<int, string?>(); var dup = new HashSet<int>();
+        var good = new Dictionary<int, string>(); var bad = new Dictionary<int, string>(); var seen = new Dictionary<int, string?>(); var dup = new HashSet<int>(); var skips = new HashSet<int>();
         var arr = reply["cues"] as JsonArray ?? reply["translations"] as JsonArray ?? reply.Select(kv => kv.Value).OfType<JsonArray>().FirstOrDefault() ?? [];
         var askedSet = asked.ToHashSet();
         foreach (var item in arr.OfType<JsonObject>())
@@ -294,13 +300,13 @@ public static partial class Translate
             if (!askedSet.Contains(id)) continue;
             string? en = item["en"] is JsonValue ev && ev.TryGetValue<string>(out var es) ? es : item["en"]?.ToString();
             if (seen.TryGetValue(id, out var prev)) { if (prev != en) dup.Add(id); continue; }
-            seen[id] = en;
+            seen[id] = en; if (item["skip"] is JsonValue sk && sk.TryGetValue<bool>(out var skb) && skb) skips.Add(id);
         }
         foreach (var id in asked)
         {
             if (!seen.TryGetValue(id, out var en)) { bad[id] = "missing"; continue; }
             if (dup.Contains(id)) { bad[id] = "answered twice with different text"; continue; }
-            var ok = Accept(cues[id].Text, en, out var why);
+            var ok = Accept(cues[id].Text, en, skips.Contains(id), out var why);
             if (ok == null) bad[id] = why!; else good[id] = ok;
         }
         return (good, bad);
@@ -401,19 +407,24 @@ public static partial class Translate
         var stats = CueShaper.Stats(shaped);
         if (stats.Over6s != 0 || stats.OverChars != 0 || stats.Overlaps != 0) throw new InvalidOperationException($"translate: shaping left {stats.Over6s} cue(s) over 6 s, {stats.OverChars} over the character limit, {stats.Overlaps} overlapping (a bug)");
         var vtt = Encoding.UTF8.GetBytes(CueShaper.ToVtt(shaped));
+        // shortRead, by how far the cue is short of its reading time (the shaper is unchanged)
+        int sr05 = 0, srMid = 0, sr1 = 0;
+        foreach (var sc in shaped) { double gap = CueShaper.ReadingSeconds(sc.Text) - (sc.End - sc.Start); if (gap <= 0.0005) continue; if (gap <= 0.5) sr05++; else if (gap <= 1.0) srMid++; else sr1++; }
+        var dropped = Enumerable.Range(0, cues.Count).Where(i => string.IsNullOrWhiteSpace(en[i])).ToList();
         var ai2 = chat as AiClient;
         var json = JsonSerializer.SerializeToUtf8Bytes(new
         {
             v = 1, promptVersion = PromptVersion, model, api = ai2?.ApiFor(model) ?? ai.EffectiveApi,
-            briefing = input.Describe != null ? "describe" : "glossary-call", plot = plot.Length > 0 ? plot : null, glossaryHash = gHash, glossarySeedHash = seedHash, glossary = glossary.Select(g => new { zh = g.Zh, en = g.En, kind = g.Kind }),
+            briefing = input.Describe != null ? "describe" : "glossary-call", plot = plot.Length > 0 ? plot : null, glossaryHash = gHash, glossarySeedHash = seedHash, glossary = glossary.Select(g => new { zh = g.Zh, en = g.En, kind = g.Kind, refers = g.Refers.Length > 0 ? g.Refers : null }),
             sourceTrack = src.Track, sourceHash = src.Hash, coverage = src.Coverage, speechSeconds = src.SpeechSeconds, sourceCues = cues.Count, syncOffset = input.SyncOffset,
             describeUsed = input.Describe != null,
             // the pairs before shaping, for reuse by time alignment: start, end, Chinese, hash of its letters and digits, our English ("" for non-speech)
             cues = Enumerable.Range(0, cues.Count).Select(i => new { start = Math.Round(cues[i].Start, 3), end = Math.Round(cues[i].End, 3), zh = cues[i].Text, hash = CleanHash(cues[i].Text), en = en[i] ?? "" }), batches, aiCalls = counter.Calls,
             tokens = ai2 == null ? null : new { input = ai2.InputTokens, output = ai2.OutputTokens },
-            shape = stats.ToJson(), seconds = Math.Round(sw.Elapsed.TotalSeconds, 1), at = Protocol.NowUtc(),
+            shape = stats.ToJson(), shortReadBy = new { upTo0_5s = sr05, from0_5To1s = srMid, over1s = sr1 },
+            dropped = dropped.Count, droppedCues = dropped.Select(i => new { i, start = Math.Round(cues[i].Start, 3), zh = cues[i].Text }), seconds = Math.Round(sw.Elapsed.TotalSeconds, 1), at = Protocol.NowUtc(),
         }, Opt);
-        progress($"shaped: {stats.Cues} cues, over6s {stats.Over6s}, overChars {stats.OverChars}, overlaps {stats.Overlaps}, shortRead {stats.ShortRead}");
+        progress($"shaped: {stats.Cues} cues, over6s {stats.Over6s}, overChars {stats.OverChars}, overlaps {stats.Overlaps}, shortRead {stats.ShortRead} (up to 0.5 s short {sr05}, 0.5-1 s {srMid}, over 1 s {sr1}); dropped {dropped.Count}");
         return new TranslateResult(false, null, vtt, json, stats, counter.Calls, batches, sw.Elapsed.TotalSeconds);
     }
 }
