@@ -87,6 +87,11 @@ public static class Publish
 
     public static string Id(int cluster) => "c" + cluster;
 
+    static readonly System.Text.RegularExpressions.Regex NotIntro = new(@"^\s*(not\s+(yet\s+)?(introduced|identified|established|seen|shown|named|known|present|appear\w*|revealed)|(yet\s+)?to\s+be\s+introduced|unknown|unidentified|n/?a|none)\b|^\s*(an?|the)\s+unidentified\b|\b(role|place|identity|standing)\b[^.]*\bis\s+not\s+(yet\s+)?(clear|known|established|revealed)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>A roleAtStart that says the character is not introduced / not yet seen / unknown (older describes): not a line the spoiler-safe view can show.</summary>
+    public static bool NotIntroduced(string? roleAtStart) => string.IsNullOrWhiteSpace(roleAtStart) || NotIntro.IsMatch(roleAtStart);
+
     /// <summary>Where a picture came from, so it can be re-cut from a full-HD copy of the same moment: { upload, t, crop: [x, y, w, h] as fractions of the source frame, focus: [x, y] as fractions of the picture }.</summary>
     public static JsonObject Source(string upload, double t, double[] crop, double[] focus) => new()
     {
@@ -97,9 +102,9 @@ public static class Publish
     /// <summary>The head-and-shoulders crop of the cast stage (CastStage.HeadShoulders: box widened 2.5x, 4:5) as fractions of a w x h frame, clamped to the frame; focus is the face centre inside that crop.</summary>
     public static (double[] Crop, double[] Focus) HeadCrop(double[] box, int w, int h)
     {
-        double bw = box[2], bh = box[3], cw = Math.Max(bw, bh * 0.8) * 2.5, ch = cw * CastStage.PortraitH / CastStage.PortraitW, fx = box[0] + bw / 2, fy = box[1] + bh / 2, cy = fy + bh * 0.45;
-        double x0 = Math.Max(fx - cw / 2, 0), y0 = Math.Max(cy - ch / 2, 0), x1 = Math.Min(fx + cw / 2, w), y1 = Math.Min(cy + ch / 2, h);
-        return ([x0 / w, y0 / h, (x1 - x0) / w, (y1 - y0) / h], [Math.Clamp((fx - x0) / (x1 - x0), 0, 1), Math.Clamp((fy - y0) / (y1 - y0), 0, 1)]);
+        var (x0, y0, cw, ch) = CastStage.HeadWindow(box[0], box[1], box[2], box[3], w, h, (double)CastStage.PortraitH / CastStage.PortraitW);
+        double fx = box[0] + box[2] / 2, fy = box[1] + box[3] / 2;
+        return ([x0 / w, y0 / h, cw / w, ch / h], [Math.Clamp((fx - x0) / cw, 0, 1), Math.Clamp((fy - y0) / ch, 0, 1)]);
     }
 
     /// <summary>The 9:16 cover crop (CoverFilter's window) as fractions of a w x h frame.</summary>
@@ -135,7 +140,7 @@ public static class Publish
             var st = new JsonArray(); foreach (var s in stills.GetValueOrDefault(id) ?? []) { var so = new JsonObject { ["file"] = s.File, ["t"] = s.T, ["spoiler"] = s.Spoiler }; if (sources?.GetValueOrDefault(s.File) is { } src0) so["source"] = src0.DeepClone(); st.Add(so); }
             cast.Add(new JsonObject
             {
-                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = c["roleAtStart"]?.DeepClone(), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
+                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = NotIntroduced(c["roleAtStart"]?.GetValue<string>()) && c["description"]?.GetValue<string>() is { Length: > 0 } dsc ? dsc : c["roleAtStart"]?.DeepClone(), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
                 ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = Describe.ClusterMasked(describe, id) is { } dm ? dm : f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
                 ["portrait"] = sources?.GetValueOrDefault($"cast/{Id(id)}.jpg") is { } ps0 ? new JsonObject { ["file"] = $"cast/{Id(id)}.jpg", ["source"] = ps0.DeepClone() } : null,
             });
@@ -221,6 +226,7 @@ public static class Publish
                 if (pb != null && ps.Box is { } pbox && await src.ReadAsync($"cast/cand_{cid}_{ps.K}.jpg", ct) is { } full && JpegSize(full) is var (fw, fh))
                 {
                     var (pc, pf) = HeadCrop(pbox, fw, fh);
+                    pb = CropTo(full, pc, CastStage.PortraitW, CastStage.PortraitH); // cut from the full frame: never the stored head shot (older ones are padded)
                     if (IsCrowded(pcand) || HasSub(pcand)) // no solo / subtitle-free frame: cut tight so the other faces and the subtitle band are out
                     {
                         (pc, pf) = TightWindow(pbox, Avoid(pcand), (double)CastStage.PortraitH / CastStage.PortraitW, Math.Max(pbox[2], pbox[3] * 0.8) * 2.5, 0.45, fw, fh);
