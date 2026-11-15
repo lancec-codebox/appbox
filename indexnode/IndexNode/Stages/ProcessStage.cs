@@ -11,17 +11,17 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
     public bool Redo { get; init; }
 
     /// <summary>Steps that need a model. None exist yet (merging subtitle text and transcript, naming the cast and checking doubtful OCR lines come later); each will be listed here.</summary>
-    public static readonly string[] AiSteps = ["describe"];
+    public static readonly string[] AiSteps = ["describe", "translate"];
 
     /// <summary>The AI steps this run cannot do for lack of an endpoint; they go under "skipped" in processed.json, they do not fail the job.</summary>
     public static string[] SkippedAiSteps(AiConfig? ai) => ai is { Configured: true } ? [] : AiSteps;
 
     /// <summary>Every step of a fully processed video (sync is computed after transcribe + ocrsubs; clip is dropped).</summary>
-    public static readonly string[] FullSteps = ["frames", "sscd", "transcribe", "ocrsubs", "cast", "describe"];
-    public static readonly string[] KnownSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "sync"];
+    public static readonly string[] FullSteps = ["frames", "sscd", "transcribe", "ocrsubs", "cast", "describe", "translate"];
+    public static readonly string[] KnownSteps = ["frames", "sscd", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "translate", "sync"];
 
     /// <summary>The outputs that make a video fully processed, per step: the node that writes the last one also writes processed.json.</summary>
-    static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("clip", "clip/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json")];
+    static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("clip", "clip/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
 
     /// <summary>The steps this node can run: the ones without models always, the model steps when their files are installed or may be downloaded.</summary>
     public static string[] SupportedSteps(NodeConfig cfg, string? modelsDir = null) =>
@@ -54,7 +54,7 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
         {
             // compatibility path: a legacy process job fans out into step jobs (only where they do not exist yet) and is done
             var made = new List<string>();
-            foreach (var step in Protocol.StepStages.Where(x => steps.Contains(x) || x is "sync" or "describe" or "cast"))
+            foreach (var step in Protocol.StepStages.Where(x => steps.Contains(x) || x is "sync" or "describe" or "cast" or "translate"))
             {
                 var sj = JobDescriptor.NewStep(step, id);
                 if (await ctx.Store.PutAsync(paths.Job(step, id), sj.ToBytes(), Tags.Job(step, "pending", sj.AddedAt), null, true, ct)) made.Add(step);
@@ -83,6 +83,8 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             ["compress"] = steps.Contains("compress") && !Has("compact.mp4"),
             ["cast"] = steps.Contains("cast") && !Has("cast/clusters.json"),
             ["describe"] = steps.Contains("describe") && !Has("describe.json") && Ai is { Configured: true },
+            // the step itself skips when the source text and the glossary seed are unchanged; the step needs only what the source has when describe.json is missing
+            ["translate"] = steps.Contains("translate") && Ai is { Configured: true },
             ["sync"] = stepJob && job.Stage == "sync",
         };
         // sscd, clip and cast read the stored frames/keyframes chunks; only the frames step (and transcribe, ocrsubs, compress, the cast credits) decode the video
@@ -179,6 +181,11 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
                 var bytes = await DescribeJob.RunAsync(new AiClient(http, Ai!), Ai, d, ct);
                 if (bytes != null) await ctx.Store.PutAsync(paths.Video(id, "describe.json"), bytes, null, null, false, ct);
             }
+            if (need["translate"])
+            {
+                ctx.Report("translate", null);
+                Log.Info($"process {id}: translate {await StageSteps.TranslateAsync(new AiClient(http, Ai!), Ai!, new StoreJob(store, paths, id), (n, b, type) => ctx.Store.PutAsync(paths.Video(id, n), b, null, null, false, ct, type), Redo, m => Log.Info($"process {id}: translate {m}"), ct)}");
+            }
             long compactBytes = 0;
             if (need["compress"])
             {
@@ -195,11 +202,13 @@ public sealed class ProcessStage(Tools tools, RestStore store, NodeConfig config
             {
                 // the node that finishes the last step writes processed.json
                 var after = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Select(b => b.Name).ToHashSet();
-                bool aiOff = !after.Contains(paths.Video(id, "describe.json")) && Ai is not { Configured: true };
-                if (Outputs.Any(o => !(o.Step == "describe" && aiOff) && !after.Contains(paths.Video(id, o.File)))) { Log.Info($"process {id}: step {job.Stage} done"); return; }
-                steps = Protocol.DefaultSteps.Concat(["cast", "sync", "describe"]).ToArray();
+                bool aiOff = Ai is not { Configured: true };
+                if (Outputs.Any(o => !(aiOff && AiSteps.Contains(o.Step)) && !after.Contains(paths.Video(id, o.File)))) { Log.Info($"process {id}: step {job.Stage} done"); return; }
+                steps = Protocol.DefaultSteps.Concat(["cast", "sync", "describe", "translate"]).ToArray();
                 Log.Info($"process {id}: step {job.Stage} was the last one");
             }
+            // a redo (`process --job --steps`) replaces the listed outputs only: processed.json and the video stay as they are
+            if (Redo) { Log.Info($"process {id}: redone {string.Join(',', steps)} (processed.json left alone)"); return; }
             if (frameCount == 0 && steps.Contains("frames") && await store.GetAsync(paths.Video(id, "frames/manifest.json"), ct) is { } fm)
                 frameCount = JsonDocument.Parse(fm.Data).RootElement.GetProperty("count").GetInt32();
             // speech language and OCR cue count come from the outputs, whether this run made them or an earlier one did

@@ -157,8 +157,9 @@ public static class Publish
     }
 
     /// <summary>The fingerprint of a pack's inputs: when it is unchanged the pack is up to date.</summary>
-    public static string Stamp(byte[]? processed, byte[]? describe) =>
-        Version + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(processed ?? [])) + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(describe ?? []));
+    public static string Stamp(byte[]? processed, byte[]? describe, byte[]? ourEn = null) =>
+        Version + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(processed ?? [])) + "|" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(describe ?? []))
+        + (ourEn == null ? "" : "|en:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(ourEn)));
 
     public sealed record Result(string Id, bool Written, string? Skipped);
 
@@ -168,7 +169,7 @@ public static class Publish
         var processedB = await src.ReadAsync("processed.json", ct); var describeB = await src.ReadAsync("describe.json", ct);
         if (processedB == null) return new(id, false, "no processed.json");
         if (describeB == null) return new(id, false, "no describe.json");
-        var dir = Path.Combine(outDir, id); var stampFile = Path.Combine(dir, ".stamp"); var stamp = Stamp(processedB, describeB);
+        var dir = Path.Combine(outDir, id); var stampFile = Path.Combine(dir, ".stamp"); var ourEn = await src.ReadAsync(Translate.OutVtt, ct); var stamp = Stamp(processedB, describeB, ourEn);
         if (!force && File.Exists(stampFile) && File.ReadAllText(stampFile) == stamp) return new(id, false, "up to date");
         var tmp = dir + ".tmp"; if (Directory.Exists(tmp)) Directory.Delete(tmp, true); Directory.CreateDirectory(Path.Combine(tmp, "cast"));
         async Task<JsonObject?> J(string f) => await src.ReadAsync(f, ct) is { } b && JsonNode.Parse(b) is JsonObject o ? o : null;
@@ -199,7 +200,9 @@ public static class Publish
         var merged = TextTrack.Merge(ocrZh, asr);
         File.WriteAllText(Path.Combine(tmp, "subs.zh.vtt"), CueShaper.ToVtt(merged));
         byte[]? en = null; foreach (var f in new[] { "subs.en.vtt", "subs.en.srt", "ocr/subs.en.vtt" }) { en = await src.ReadAsync(f, ct); if (en != null) { if (f.EndsWith(".srt")) en = Encoding.UTF8.GetBytes(Srt2Vtt(Encoding.UTF8.GetString(en))); break; } }
-        if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en))));
+        // our own translation (translate step, subs/ai/en.vtt) is the default English track; existing English (uploaded or burned-in) stays as the separate "original English" track
+        if (ourEn != null) { File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(ourEn)))); if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en-orig.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en)))); }
+        else if (en != null) File.WriteAllText(Path.Combine(tmp, "subs.en.vtt"), CueShaper.ToVtt(CueShaper.Shape(Vtt(en))));
         // pictures: portraits, stills (spoiler after the cutoff), thumb
         double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? 0; double dur0 = info?["duration"]?.GetValue<double>() ?? downloaded?["durationSeconds"]?.GetValue<double>() ?? 0; var stills = new Dictionary<int, List<(string, double, bool)>>(); var picks = describe["picks"] as JsonObject; var sources = new Dictionary<string, JsonObject>();
         foreach (var c in (describe["cast"] as JsonArray) ?? [])

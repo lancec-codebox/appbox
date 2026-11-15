@@ -58,7 +58,7 @@ public static class SiteCommands
         var steps = (a.Get("steps") ?? string.Join(',', ProcessStage.FullSteps)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToArray();
         foreach (var s in steps) if (!ProcessStage.KnownSteps.Contains(s)) throw new ArgumentException($"unknown step '{s}' (known: {string.Join(',', ProcessStage.KnownSteps)})");
         ProcessStage.Ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
-        if (steps.Contains("describe") && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe needs an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
+        if ((steps.Contains("describe") || steps.Contains("translate")) && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe and translate need an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
         var http = Commands.NewHttp(); var tools = new Tools(http, cfg); var store = new RestStore(http, cfg.Sas); var paths = new Paths(a.Get("prefix") ?? "index/");
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         var threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
