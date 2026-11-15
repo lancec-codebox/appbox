@@ -71,16 +71,6 @@ public class CoverTests
     }
 
     [Fact]
-    public void Two_shot_needs_both_faces_flattering_and_takes_the_best_score()
-    {
-        var c = Cands("""[{"k":0,"clusters":[1,2]},{"k":1,"clusters":[1,2]},{"k":2,"clusters":[1,2]},{"k":3,"clusters":[1,5]}]""");
-        Assert.Equal(1, Publish.PickTwoShot(c, [1], [2], 0, new int?[] { 6, 9, 9, 10 }));   // k=3 lacks the second lead; 1 and 2 tie, the first listed wins
-        Assert.Equal(2, Publish.PickTwoShot(c, [1], [2], 2, new int?[] { 6, 9, 9, 10 }));   // tie: describe's pick
-        Assert.Null(Publish.PickTwoShot(c, [1], [2], 0, new int?[] { 5, 3, null, 10 }));    // none flattering: no together cover
-        Assert.Equal(0, Publish.PickTwoShot(c, [1], [2], 0));                               // no scores (older describe): the old rule
-    }
-
-    [Fact]
     public void Expression_scores_are_cleaned_and_read_back()
     {
         var o = Describe.CleanExpression(JsonNode.Parse("""{"0":[11,-3,7.6,"x",null],"poster":[8]}"""));
@@ -137,20 +127,18 @@ public class CoverTests
     }
 
     [Fact]
-    public async Task Cover_filter_gives_a_360x640_crop_centred_and_clamped()
+    public void Cover_is_cut_in_process_360x640_centred_on_the_face_and_clamped()
     {
-        var ff = await RealFfmpegAsync(); if (ff == null) return;
-        var dir = Path.Combine(Path.GetTempPath(), "indexnode-cover-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
-        try
+        foreach (var (w, h, cx, cy) in new (int, int, double?, double?)[] { (1280, 720, 900, 300), (1280, 720, null, null), (1280, 720, 5, 5), (720, 1280, 360, 400), (1000, 1000, 990, 990) })
         {
-            foreach (var (w, h, cx, cy) in new (int, int, double?, double?)[] { (1280, 720, 900, 300), (1280, 720, null, null), (1280, 720, 5, 5), (720, 1280, 360, 400), (1000, 1000, 990, 990) })
-            {
-                var src = Path.Combine(dir, "s.jpg"); var o = Path.Combine(dir, $"o{w}x{h}.jpg");
-                var r = await Proc.RunAsync(ff, ["-v", "error", "-y", "-f", "lavfi", "-i", $"testsrc=size={w}x{h}:rate=1", "-frames:v", "1", src], default); Assert.Equal(0, r.ExitCode);
-                r = await Proc.RunAsync(ff, ["-v", "error", "-y", "-i", src, "-vf", Publish.CoverFilter(cx, cy), "-frames:v", "1", o], default); Assert.True(r.ExitCode == 0, r.Stderr);
-                Assert.Equal("360x640", JpegSize(File.ReadAllBytes(o))); // read from the file itself: other tests change PATH, so no ffprobe lookup
-            }
+            // left half red, right half blue: the crop window must follow the face centre
+            var im = Rgb.Blank(w, h); for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int o = (y * w + x) * 3; if (x < w / 2) im.Data[o] = 255; else im.Data[o + 2] = 255; }
+            var jpg = Publish.CropCover(Imaging.EncodeJpeg(im), cx, cy);
+            Assert.Equal("360x640", JpegSize(jpg));
+            var c = Publish.CoverCrop(w, h, cx, cy); var o2 = Imaging.DecodeJpeg(jpg);
+            double splitAt = (w / 2.0 - c[0] * w) / (c[2] * w); // where the colour edge falls across the crop, 0..1
+            var left = o2.Data[(o2.H / 2 * o2.W + 2) * 3]; var right = o2.Data[(o2.H / 2 * o2.W + o2.W - 3) * 3 + 2];
+            Assert.Equal(splitAt > 0.02, left > 128); Assert.Equal(splitAt < 0.98, right > 128);
         }
-        finally { Directory.Delete(dir, true); }
     }
 }

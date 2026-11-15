@@ -36,6 +36,88 @@ public static class Imaging
         return o;
     }
 
+
+    // ---- in-process JPEG (BitMiracle.LibJpeg.NET, BSD-3, managed) and a Lanczos resampler: no ffmpeg ----
+
+    /// <summary>Decodes a JPEG (grayscale, YCbCr, CMYK all handled) to packed rgb24.</summary>
+    public static Rgb DecodeJpeg(byte[] jpg)
+    {
+        using var img = new BitMiracle.LibJpeg.JpegImage(new MemoryStream(jpg));
+        int w = img.Width, h = img.Height; var d = new byte[w * h * 3];
+        var cs = img.Colorspace; int nc = img.ComponentsPerSample;
+        for (int y = 0; y < h; y++)
+        {
+            var row = img.GetRow(y).ToBytes();
+            for (int x = 0; x < w; x++)
+            {
+                int o = (y * w + x) * 3;
+                if (nc == 1) d[o] = d[o + 1] = d[o + 2] = row[x];
+                else if (nc >= 3 && cs == BitMiracle.LibJpeg.Colorspace.RGB) { d[o] = row[x * nc]; d[o + 1] = row[x * nc + 1]; d[o + 2] = row[x * nc + 2]; }
+                else if (nc >= 3) { double Y = row[x * nc], cb = row[x * nc + 1] - 128, cr = row[x * nc + 2] - 128; d[o] = Clamp8(Y + 1.402 * cr); d[o + 1] = Clamp8(Y - 0.344136 * cb - 0.714136 * cr); d[o + 2] = Clamp8(Y + 1.772 * cb); }
+                else throw new InvalidDataException("jpeg: unsupported component count " + nc);
+            }
+        }
+        return new Rgb(d, w, h);
+    }
+    static byte Clamp8(double v) => (byte)Math.Clamp(Math.Round(v), 0, 255);
+
+    /// <summary>Encodes rgb24 as a JPEG. quality 1..100; 90 is about what ffmpeg's mjpeg -q:v 3 gives.</summary>
+    public static byte[] EncodeJpeg(Rgb im, int quality = JpegQuality)
+    {
+        var rows = new BitMiracle.LibJpeg.SampleRow[im.H];
+        for (int y = 0; y < im.H; y++) rows[y] = new BitMiracle.LibJpeg.SampleRow(im.Data.AsSpan(y * im.W * 3, im.W * 3).ToArray(), im.W, 8, 3);
+        using var img = new BitMiracle.LibJpeg.JpegImage(rows, BitMiracle.LibJpeg.Colorspace.RGB);
+        using var ms = new MemoryStream();
+        img.WriteJpeg(ms, new BitMiracle.LibJpeg.CompressionParameters { Quality = quality });
+        return ms.ToArray();
+    }
+    public const int JpegQuality = 90;
+
+    static double Lanczos3(double x) { x = Math.Abs(x); if (x < 1e-9) return 1; if (x >= 3) return 0; var px = Math.PI * x; return 3 * Math.Sin(px) * Math.Sin(px / 3) / (px * px); }
+
+    /// <summary>Weights for one output axis: per output pixel the first source index and the normalised Lanczos-3 taps (the kernel widens when shrinking, so it filters instead of aliasing).</summary>
+    static (int First, float[] W)[] Taps(double start, double len, int outN, int srcN)
+    {
+        var res = new (int, float[])[outN]; double scale = len / outN, support = 3 * Math.Max(1, scale);
+        for (int i = 0; i < outN; i++)
+        {
+            double c = start + (i + 0.5) * scale; int lo = (int)Math.Floor(c - support + 0.5), hi = (int)Math.Floor(c + support + 0.5);
+            var w = new float[hi - lo + 1]; double sum = 0;
+            for (int k = 0; k < w.Length; k++) { double v = Lanczos3((lo + k + 0.5 - c) / Math.Max(1, scale)); w[k] = (float)v; sum += v; }
+            for (int k = 0; k < w.Length; k++) w[k] = (float)(w[k] / sum);
+            res[i] = (lo, w);
+        }
+        return res;
+    }
+
+    /// <summary>The region (x, y, w, h in source pixels, fractional ok) resampled to ow x oh with a Lanczos-3 filter (separable, edge pixels repeated).</summary>
+    public static Rgb CropResizeLanczos(Rgb im, double x, double y, double w, double h, int ow, int oh)
+    {
+        var tx = Taps(x, w, ow, im.W); var ty = Taps(y, h, oh, im.H);
+        // horizontal pass over only the source rows the vertical pass needs
+        int y0 = Math.Max(0, ty.Min(t => t.First)), y1 = Math.Min(im.H - 1, ty.Max(t => t.First + t.W.Length - 1));
+        var mid = new float[(y1 - y0 + 1) * ow * 3];
+        for (int sy = y0; sy <= y1; sy++)
+            for (int i = 0; i < ow; i++)
+            {
+                var (f, ws) = tx[i]; float r = 0, g = 0, b = 0;
+                for (int k = 0; k < ws.Length; k++) { int sx = Math.Clamp(f + k, 0, im.W - 1); int o = (sy * im.W + sx) * 3; r += ws[k] * im.Data[o]; g += ws[k] * im.Data[o + 1]; b += ws[k] * im.Data[o + 2]; }
+                int m = ((sy - y0) * ow + i) * 3; mid[m] = r; mid[m + 1] = g; mid[m + 2] = b;
+            }
+        var o2 = Rgb.Blank(ow, oh);
+        for (int j = 0; j < oh; j++)
+        {
+            var (f, ws) = ty[j];
+            for (int i = 0; i < ow; i++)
+            {
+                float r = 0, g = 0, b = 0;
+                for (int k = 0; k < ws.Length; k++) { int sy = Math.Clamp(f + k, y0, y1); int m = ((sy - y0) * ow + i) * 3; r += ws[k] * mid[m]; g += ws[k] * mid[m + 1]; b += ws[k] * mid[m + 2]; }
+                int o = (j * ow + i) * 3; o2.Data[o] = Clamp8(r); o2.Data[o + 1] = Clamp8(g); o2.Data[o + 2] = Clamp8(b);
+            }
+        }
+        return o2;
+    }
+
     public static Rgb Resize(Rgb im, int ow, int oh) => CropResize(im, 0, 0, im.W, im.H, ow, oh);
 
     /// <summary>The square crop around a face box: centred on it, <paramref name="scale"/> times its longer side, at size x size.</summary>
