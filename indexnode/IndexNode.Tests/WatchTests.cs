@@ -143,6 +143,21 @@ public class WatchTests
     }
 
     [Fact]
+    public async Task An_admin_add_request_becomes_a_watch_job_on_the_next_poll_and_is_marked_done()
+    {
+        var s = new FakeStore(); var f = new Fake();
+        const string url = "https://www.youtube.com/playlist?list=PLreq";
+        f.Listings[url] = "My Dramas\tNA\tUCrrrrrrrrrrrrrrrrrrrrrr\tChan\n";
+        f.Listings[PlUrl("PLa")] = Lines(Id('a'));
+        await s.PutAsync(WatchStage.RequestsDir(P) + "r1.json", System.Text.Encoding.UTF8.GetBytes($$"""{"v":1,"url":"{{url}}","mode":"ingest","followChannels":true,"state":"pending"}"""), null, null, false, default);
+        await Poll(s, f, Playlist("PLa"));
+        var w = s.Job(P.Job("watch", "pl-PLreq"));
+        Assert.Equal("My Dramas", w.Name); Assert.True(w.FollowChannels); Assert.Equal(200, w.Backfill);   // curated: its videos so far are downloaded
+        var req = System.Text.Json.Nodes.JsonNode.Parse(s.Blobs[WatchStage.RequestsDir(P) + "r1.json"].Data)!;
+        Assert.Equal("done", req["state"]!.ToString()); Assert.Equal("pl-PLreq", req["jobId"]!.ToString());
+    }
+
+    [Fact]
     public async Task A_channel_source_lists_its_tabs()
     {
         var s = new FakeStore(); var f = new Fake();
