@@ -154,7 +154,8 @@ public static class OcrSubs
 
         Log.Info($"ocrsubs: {total} frames in {sw.Elapsed.TotalSeconds:F0}s = {total / Math.Max(0.001, sw.Elapsed.TotalSeconds):F1} frames/s on {plan.Count} segments (thread share {workers}, {Environment.ProcessorCount} cores, 1 intra-op thread each; ffmpeg decodes the full frame, the band is cropped in the filter)");
         Log.Info($"ocrsubs: style gate: {nRead} read, {nReused} reused, {nEmpty} empty, {nSafety} safety reads, {nMiss} style misses; redundant (same text as the reading before): {nSameRead} of the reads, {nSameSafety} of the safety reads");
-        var frames = perSeg.SelectMany(x => x).OrderBy(f => f.T).ToList();
+        var (frames, marks) = OcrCues.StripWatermarks(perSeg.SelectMany(x => x).OrderBy(f => f.T).ToList());
+        if (marks.Count > 0) Log.Info($"ocrsubs: watermarks dropped before merging: {string.Join(" | ", marks)}");
         var zh = OcrCues.Merge(frames, false);
         var en = OcrCues.Merge(frames, true);
         OcrCues.Simplify(zh, OpenCc.T2S);

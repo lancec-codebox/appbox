@@ -63,6 +63,38 @@ public static partial class OcrCues
         return (P(zh, ""), P(en, " "));
     }
 
+    /// <summary>A reading taken while the line faded in or out: the longer text starts or ends with the shorter one (anywhere inside would chain different lines through a shared watermark).</summary>
+    static bool Holds(string longer, string shorter) => shorter.Length > 0 && longer.Length > shorter.Length && (longer.StartsWith(shorter, StringComparison.Ordinal) || longer.EndsWith(shorter, StringComparison.Ordinal));
+
+    /// <summary>
+    /// Watermarks: text that stays on screen beside the subtitles (a disclaimer, a channel name) is read in sample after sample across the video.
+    /// A line of at least 4 characters seen in at least <paramref name="minSamples"/> samples spread over at least 3 five-minute windows, and once for 20 s without a break (<paramref name="minRun"/> samples), is a watermark;
+    /// it and its misreadings (a line sharing 6 characters in a row with it) are dropped before cues are merged. Returns the frames and the watermarks found.
+    /// </summary>
+    public static (List<FrameText> Frames, List<string> Marks) StripWatermarks(IReadOnlyList<FrameText> frames, int minSamples = 120, int minRun = 40)
+    {
+        // a subtitle stays a few seconds; a watermark stays on screen without a break: it must also have a run of at least minRun consecutive samples
+        var count = new Dictionary<string, int>(); var windows = new Dictionary<string, HashSet<int>>(); var run = new Dictionary<string, (int Last, int Len, int Max)>();
+        for (int k = 0; k < frames.Count; k++)
+            foreach (var t in frames[k].Lines.Select(l => l.Text.Trim()).Where(t => t.Length >= 4).Distinct())
+            {
+                count[t] = count.GetValueOrDefault(t) + 1; (windows.TryGetValue(t, out var w) ? w : windows[t] = []).Add((int)(frames[k].T / 300));
+                var r = run.TryGetValue(t, out var rv) ? rv : (Last: -10, Len: 0, Max: 0); int len = k <= r.Last + 2 ? r.Len + (k - r.Last) : 1; // a missed read or two does not break a run
+                run[t] = (k, len, Math.Max(r.Max, len));
+            }
+        var marks = count.Where(kv => kv.Value >= minSamples && windows[kv.Key].Count >= 3 && run[kv.Key].Max >= minRun).Select(kv => kv.Key).ToList();
+        if (marks.Count == 0) return (frames.ToList(), marks);
+        bool IsMark(string t) { t = t.Trim(); return marks.Any(m => t == m || SharesRun(t, m, Math.Min(6, m.Length))); }
+        return (frames.Select(f => f with { Lines = f.Lines.Where(l => !IsMark(l.Text)).ToList() }).ToList(), marks);
+    }
+
+    static bool SharesRun(string a, string b, int n)
+    {
+        if (a.Length < n || b.Length < n) return false;
+        for (int i = 0; i + n <= b.Length; i++) if (a.Contains(b.Substring(i, n), StringComparison.Ordinal)) return true;
+        return false;
+    }
+
     public static List<Cue> Merge(IEnumerable<FrameText> frames, bool english)
     {
         var done = new List<List<(double T, Part P)>>();
@@ -75,7 +107,7 @@ public static partial class OcrCues
             // same cue when the text differs by at most 2 edits AND at most a quarter of its length: short lines ("什么" vs "你说什么") stay apart
             // or when one reading holds the other (a line read while fading in or out: "换" next to "换一个")
             if (v != null && cur != null && gap <= 1 && (Levenshtein(v.Text, cur[^1].P.Text) <= Math.Min(MaxEdit, Math.Max(v.Text.Length, cur[^1].P.Text.Length) / 4)
-                || v.Text.Contains(cur[^1].P.Text) || cur[^1].P.Text.Contains(v.Text))) { cur.Add((f.T, v)); gap = 0; continue; }
+                || Holds(v.Text, cur[^1].P.Text) || Holds(cur[^1].P.Text, v.Text))) { cur.Add((f.T, v)); gap = 0; continue; }
             if (v != null)
             {
                 if (cur != null) done.Add(cur);

@@ -112,6 +112,33 @@ public class OcrPostTests
     }
 
     [Fact]
+    public void A_watermark_beside_the_subtitles_is_dropped_and_does_not_chain_different_lines()
+    {
+        // a disclaimer at y=80 in every sample for 40 minutes, subtitles at y=5 changing every 2 s
+        const string mark = "剧情演绎无不良引导请勿模仿";
+        string[] subs = ["你今天去哪里了", "我去城里买东西", "怎么不叫上我呢", "下次一定带你去"];
+        var frames = new List<FrameText>();
+        for (int k = 0; k < 4800; k++)
+        {
+            double t = k * 0.5; var sub = subs[k / 4 % subs.Length];
+            frames.Add(k % 400 == 7 ? F(t, (sub, 5), ("剧情演绎无不区仿", 80)) : F(t, (sub, 5), (mark, 80)));   // now and then a misreading of the watermark
+        }
+        var (clean, marks) = OcrCues.StripWatermarks(frames);
+        Assert.Equal([mark], marks);
+        Assert.All(clean, f => Assert.Single(f.Lines));
+        var cues = OcrCues.Merge(clean, false);
+        Assert.Equal(1200, cues.Count);                                           // one cue per 2 s subtitle, none chained
+        Assert.DoesNotContain(cues, c => c.Text.Contains("剧情"));
+    }
+
+    [Fact]
+    public void Lines_that_only_share_a_middle_part_stay_apart()
+    {
+        var cues = OcrCues.Merge([F(0, ("他说好的", 5)), F(.5, ("好的", 5)), F(1.0, ("我说好的吧", 5))], false);
+        Assert.Equal(2, cues.Count);                                              // "好的" ends "他说好的" (fade): joins it; "我说好的吧" only holds it inside
+    }
+
+    [Fact]
     public void A_line_read_while_fading_in_joins_the_full_line_and_the_longer_reading_wins()
     {
         var frames = new List<FrameText> { F(0, ("换", 5)), F(.5, ("换一个", 5)) };
