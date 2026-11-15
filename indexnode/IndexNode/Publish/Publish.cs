@@ -92,6 +92,21 @@ public static class Publish
     /// <summary>A roleAtStart that says the character is not introduced / not yet seen / unknown (older describes): not a line the spoiler-safe view can show.</summary>
     public static bool NotIntroduced(string? roleAtStart) => string.IsNullOrWhiteSpace(roleAtStart) || NotIntro.IsMatch(roleAtStart);
 
+    static string? Str(JsonNode? n) => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : n is JsonObject o && o["en"] is JsonValue ev && ev.TryGetValue<string>(out var es) ? es : null;
+
+    /// <summary>The roleAtStart to publish: the model's own line, else (when it says "not introduced") the description, else the label, else a plain line from the role.
+    /// 24FQCFLd7K8 c2: the detector matched, but the description said the same "Not introduced in the opening scenes.", so the line stayed; each fallback is checked in turn.
+    /// <paramref name="replaced"/> is true when the model's line was not used.</summary>
+    public static JsonNode? SafeRoleAtStart(JsonObject c, out bool replaced)
+    {
+        var own = Str(c["roleAtStart"]); replaced = false;
+        if (!NotIntroduced(own)) return c["roleAtStart"]?.DeepClone();
+        replaced = true;
+        if (Str(c["description"]) is { } d && !NotIntroduced(d)) return d;
+        if (Str(c["label"]) is { } l && !NotIntroduced(l)) return l;
+        return Str(c["role"]) switch { "male lead" or "female lead" => "One of the leads.", "main" => "A main character.", _ => "A supporting character." };
+    }
+
     /// <summary>Where a picture came from, so it can be re-cut from a full-HD copy of the same moment: { upload, t, crop: [x, y, w, h] as fractions of the source frame, focus: [x, y] as fractions of the picture }.</summary>
     public static JsonObject Source(string upload, double t, double[] crop, double[] focus) => new()
     {
@@ -140,7 +155,7 @@ public static class Publish
             var st = new JsonArray(); foreach (var s in stills.GetValueOrDefault(id) ?? []) { var so = new JsonObject { ["file"] = s.File, ["t"] = s.T, ["spoiler"] = s.Spoiler }; if (sources?.GetValueOrDefault(s.File) is { } src0) so["source"] = src0.DeepClone(); st.Add(so); }
             cast.Add(new JsonObject
             {
-                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = NotIntroduced(c["roleAtStart"]?.GetValue<string>()) && c["description"]?.GetValue<string>() is { Length: > 0 } dsc ? dsc : c["roleAtStart"]?.DeepClone(), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
+                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = SafeRoleAtStart(c.AsObject(), out _), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
                 ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = Describe.ClusterMasked(describe, id) is { } dm ? dm : f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
                 ["portrait"] = sources?.GetValueOrDefault($"cast/{Id(id)}.jpg") is { } ps0 ? new JsonObject { ["file"] = $"cast/{Id(id)}.jpg", ["source"] = ps0.DeepClone() } : null,
             });
