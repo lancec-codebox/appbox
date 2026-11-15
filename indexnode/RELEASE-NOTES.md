@@ -1,5 +1,12 @@
 # IndexNode release notes
 
+## 0.7.2
+
+- **Translate**: one unusable cue no longer fails a drama (the model's last non-empty answer is kept, else the cue stays untranslated; en.json has `unresolved` and `unresolvedCues`; more than 2% unresolved fails); a wholly unusable batch is retried split in halves, then quarters, and the model's actual reply is logged; a Latin word longer than a line is cut so shaping never leaves an over-long line (the "shaping left" check was right: it was the character limit, the message's first count was just 0).
+- **AI JSON with repeated or junk keys** (`An item with the same key has already been added. Key: }`) parses, first wins, junk keys dropped.
+- **Describe**: the spoiler rewrite answer may give text fields as objects or arrays (`The node must be of type 'JsonValue'`); read tolerantly. `describe --job <id> --out <file> [--raw-dir <dir>]` runs from the store and never writes it.
+- **Publish**: a "not introduced" roleAtStart whose description says the same falls back to the label, then to a plain role line. `publish --dry-roles` counts them.
+
 ## 0.7.1
 
 Everything since 0.7.0 (the 0.7 stages pipeline):
