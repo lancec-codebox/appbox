@@ -195,7 +195,7 @@ public static class CastLogic
     static List<FaceRec> Greedy(List<FaceRec> pool, List<FaceRec> start, int count)
     {
         var picked = new List<FaceRec>(start);
-        if (pool.Count <= count - picked.Count) { picked.AddRange(pool); return picked; }
+        if (pool.Count <= count - picked.Count) { picked.AddRange(pool.Where(f => !picked.Contains(f))); return picked; }   // a later tier repeats the earlier ones: never twice
         if (picked.Count == 0) picked.Add(pool[0]);
         while (picked.Count < count)
         {
@@ -207,7 +207,8 @@ public static class CastLogic
                 double score = dist * (0.5 + f.Quality);
                 if (score > bs) { bs = score; best = f; }
             }
-            picked.Add(best!);
+            if (best == null) break;   // the pool has nothing left that is not picked already (a later tier repeats the earlier ones): fewer than count candidates
+            picked.Add(best);
         }
         return picked;
     }

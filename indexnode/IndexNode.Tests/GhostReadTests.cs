@@ -95,6 +95,16 @@ public class GhostReadTests
     }
 
     [Fact]
+    public void Diverse_with_fewer_usable_faces_than_candidates_returns_them_without_a_null()
+    {
+        // 14 faces: 3 solo, 11 not; the quality filter leaves them all, the tiers overlap, and the pool runs dry before 12 are picked
+        var faces = Enumerable.Range(0, 14).Select(i => new FaceRec { T = i * 10, Quality = 0.5 + i * 0.01, Other = i < 3 ? 0 : 1, Emb = [1f, i * 0.1f, 0f, 0f] }).ToList();
+        var pick = CastLogic.Diverse(faces, 20);
+        Assert.Equal(14, pick.Count); Assert.DoesNotContain(null, pick);
+        var few = CastLogic.Diverse(faces.Take(2).ToList(), 12); Assert.Equal(2, few.Count);
+    }
+
+    [Fact]
     public void An_empty_or_short_faces_f16_is_a_clear_error_not_a_NullReferenceException()
     {
         var doc = System.Text.Json.Nodes.JsonNode.Parse("""{"dim":4,"faces":[{"box":[0,0,1,1],"t":1.0,"score":0.9,"blur":1,"quality":1,"cluster":1}]}""")!.AsObject();
