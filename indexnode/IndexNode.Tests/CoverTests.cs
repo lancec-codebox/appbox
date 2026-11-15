@@ -205,4 +205,59 @@ public class CoverTests
         Assert.Equal(0, Publish.PickPortrait(Cands("""[{"k":0,"t":11,"quality":0.9,"masked":false,"box":[110,200,100,120]}]"""), 0, 9080, new int?[] { 5 })!.Value.K);
         Assert.Null(Publish.PickPortrait(c, 3, 9080, new int?[] { null, null, null, null }));
     }
+
+    [Theory]
+    [InlineData(0, 0, 40, 50, 360, 640)]       // top-left corner
+    [InlineData(320, 590, 40, 50, 360, 640)]   // bottom-right corner
+    [InlineData(330, 300, 30, 40, 360, 640)]   // right edge
+    [InlineData(90, 150, 180, 230, 360, 640)]  // a huge face: the 2.5x box is wider than the frame
+    [InlineData(800, 20, 50, 60, 854, 480)]    // landscape frame, face near the right edge
+    public void Head_window_never_leaves_the_frame_so_nothing_is_padded(double x, double y, double w, double h, int fw, int fh)
+    {
+        var (wx, wy, ww, wh) = CastStage.HeadWindow(x, y, w, h, fw, fh, (double)CastStage.PortraitH / CastStage.PortraitW);
+        Assert.True(wx >= -1e-9 && wy >= -1e-9 && wx + ww <= fw + 1e-9 && wy + wh <= fh + 1e-9, $"{wx},{wy},{ww},{wh}");
+        Assert.Equal((double)CastStage.PortraitH / CastStage.PortraitW, wh / ww, 6);           // still 4:5
+        Assert.True(wx <= x && x + w <= wx + ww + 1e-9 && wy <= y && y + h <= wy + wh + 1e-9);  // the face is inside
+        var (crop, focus) = Publish.HeadCrop([x, y, w, h], fw, fh);
+        Assert.True(crop[0] >= 0 && crop[1] >= 0 && crop[0] + crop[2] <= 1 + 1e-9 && crop[1] + crop[3] <= 1 + 1e-9);
+        // the real image path: pixel-exact, no grey: a white frame cropped stays white
+        var im = new Rgb(Enumerable.Repeat((byte)255, fw * fh * 3).ToArray(), fw, fh);
+        var o = CastStage.HeadShoulders(im, new FaceRec { X = (float)x, Y = (float)y, W = (float)w, H = (float)h });
+        Assert.Equal(CastStage.PortraitW, o.W); Assert.Equal(CastStage.PortraitH, o.H); Assert.All(o.Data, b => Assert.True(b >= 250));
+    }
+
+    [Fact]
+    public void Tight_cover_window_stays_inside_the_frame()
+    {
+        var (crop, _) = Publish.TightWindow([330, 590, 30, 40], [], 16.0 / 9, 360, 0, 360, 640);
+        Assert.True(crop[0] >= 0 && crop[1] >= 0 && crop[0] + crop[2] <= 1 + 1e-9 && crop[1] + crop[3] <= 1 + 1e-9);
+        var cc = Publish.CoverCrop(360, 640, 355, 635); Assert.True(cc[0] + cc[2] <= 1 + 1e-9 && cc[1] + cc[3] <= 1 + 1e-9);
+    }
+
+    [Theory]
+    [InlineData("Not introduced in the opening scenes.", true)]
+    [InlineData("Not yet introduced", true)]
+    [InlineData("not yet introduced at the opening.", true)]
+    [InlineData("Not identified in the opening", true)]
+    [InlineData("Not yet established", true)]
+    [InlineData("A woman whose role is not yet clear.", true)]
+    [InlineData("A woman in the household whose exact place in the family is not yet clear.", true)]
+    [InlineData("An unidentified young court scholar.", true)]
+    [InlineData("A woman introduced as An Ya.", false)]
+    [InlineData("A wealthy suitor from the Jin family, introduced during marriage discussions.", false)]
+    [InlineData("", true)]
+    [InlineData("A powerful chief minister.", false)]
+    [InlineData("Nothing but trouble: the court physician", false)]
+    [InlineData("supporting", false)]
+    public void Not_introduced_lines_are_recognised(string s, bool expected) => Assert.Equal(expected, Publish.NotIntroduced(s));
+
+    [Fact]
+    public void Drama_json_shows_the_description_where_the_opening_role_says_not_introduced()
+    {
+        var d = System.Text.Json.Nodes.JsonNode.Parse("""{"cutoffSeconds":10,"title":{"en":"t"},"fullTitle":{"en":"t"},"teaser":{"en":"t"},"synopsis":{"en":"s"},"tags":[],"cast":[{"cluster":1,"role":"male lead","roleAtStart":"Not introduced in the opening scenes.","description":"A powerful chief minister.","label":{"en":"x"}},{"cluster":2,"role":"main","roleAtStart":"The prince's friend.","description":"d","label":{"en":"y"}}],"relations":[]}""")!.AsObject();
+        var o = Publish.BuildDrama(d, null, null, null, null, "j", "transcript", false, new Dictionary<int, List<(string, double, bool)>>(), "t");
+        Assert.Equal("A powerful chief minister.", (string)o["cast"]![0]!["roleAtStart"]!);
+        Assert.Equal("A powerful chief minister.", (string)o["cast"]![0]!["description"]!);
+        Assert.Equal("The prince's friend.", (string)o["cast"]![1]!["roleAtStart"]!);
+    }
 }
