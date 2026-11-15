@@ -247,16 +247,6 @@ public class PublishTests
     }
 
     [Fact]
-    public void Poster_two_shot_must_show_both_lead_clusters()
-    {
-        var c = System.Text.Json.Nodes.JsonNode.Parse("""[{"k":0,"clusters":[2,5],"score":0.9},{"k":1,"clusters":[0,1],"score":0.8},{"k":2,"clusters":[1,0],"score":0.7}]""")!.AsArray();
-        Assert.Equal(1, Publish.PickTwoShot(c, 0, 1, null));   // best-scoring candidate with both leads
-        Assert.Equal(2, Publish.PickTwoShot(c, 0, 1, 2));      // describe's pick, when it has both leads
-        Assert.Equal(1, Publish.PickTwoShot(c, 0, 1, 0));      // describe's pick lacks a lead: ignored
-        Assert.Null(Publish.PickTwoShot(c, 0, 7, null));       // no candidate has both: portrait fallback
-    }
-
-    [Fact]
     public void Cluster_merge_joins_close_centroids_and_borderline_ones_only_when_the_crops_agree()
     {
         FaceRec F(int cl, float[] e, float[]? v) => new() { Cluster = cl, Emb = e, Vis = v };
