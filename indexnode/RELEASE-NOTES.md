@@ -1,5 +1,13 @@
 # IndexNode release notes
 
+## 0.8.2
+
+- New opt-in step `dino` (not in the default or full steps; `process --job=<id> --steps dino`, or `stages run --video <id> --stages dino`): one DINOv2-small vector per stored frame, from the stored `frames/NNNN.mjpeg` chunks (Nexis ghosts hydrated as in 0.7.5), after sscd. Output `dino/NNNN.f16` (float16, 384 per row, same chunks and row order as `frames/`, CLS token, L2-normalised) and `dino/manifest.json` (written last: dim, model id and sha256, input size, preprocessing, chunk list).
+- Model: onnx-community/dinov2-small `onnx/model.onnx` (Meta DINOv2, Apache-2.0), fetched like the other models, sha256 f22797ea...50c20a checked. `model_int8.onnx` is pinned too (`stages run --stages dino --int8`, for speed experiments only).
+- Preprocessing as the reference (drama-index `fixtures/dino_rank.py`): RGB, bicubic resize to 224x392 (portrait) or 392x224 (landscape), /255, ImageNet mean/std. Frames are fully decoded and resized by ffmpeg (no -lowres), in slices of one model batch, up to `--threads` slices at once; downloads and uploads overlap with the model as in `thumbs`.
+- Parity with onnxruntime + PIL bicubic on 20 real frames of each of 3 dramas: minimum cosine 0.9959 (mean 0.9995-0.9997).
+- Hidden `dino-bench` command (fetches real chunks, runs the step's code on a few frames).
+
 ## 0.8.1
 
 - `thumbs` is about 30-40x faster (a drama of 6-10k frames: 12-18 s instead of 450-690 s on a 4-core runner). One ffmpeg process per chunk reads the stored `frames/NNNN.mjpeg` as an mjpeg stream with `-lowres 3` (1/8-scale DCT decode), scales with `flags=area` and writes mjpeg; the output is split on SOI and must be exactly one standalone JPEG per row, else the step fails naming the chunk. Chunks are split into runs of whole frames, one ffmpeg each, up to `--threads` (default: cores).
