@@ -57,7 +57,7 @@ public static class Models
     public static readonly ModelFile[] All = [SscdInt8, SscdFp32, ClipVisionFp16, .. Clip, .. Ocr, .. Asr, .. FaceDefault];
 
     /// <summary>The steps a node can run with the model files it has: a node never claims a job that needs a step it cannot run.</summary>
-    public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["ocrsubs"] = Ocr, ["transcribe"] = Asr, ["cast"] = FaceDefault };
+    public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["dino"] = [DinoSmall], ["ocrsubs"] = Ocr, ["transcribe"] = Asr, ["cast"] = FaceDefault };
 
     public static string PathOf(ModelFile m, string? dir = null) => Path.Combine(dir ?? NodeConfig.ToolsDir(), "models", m.File);
 

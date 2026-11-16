@@ -303,7 +303,7 @@ public class StepAdvertisingTests
         var cfg = new NodeConfig { ModelsAutoDownload = false };
         var dir = Dir();
         var none = ProcessStage.SupportedSteps(cfg, dir);
-        Assert.Equal(["frames", "sscd", "thumbs", "compress", "describe", "translate", "sync"], none);
+        Assert.Equal(["frames", "sscd", "thumbs", "compress", "describe", "translate", "sync"], none);   // dino and clip need their model files
         var job = JobDescriptor.NewProcess("abcdefghij1");
         Assert.False(ProcessStage.CanRun(job, none));
         // install the clip model files: clip appears, transcribe and ocrsubs still do not
