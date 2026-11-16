@@ -14,7 +14,7 @@ namespace IndexNode;
 /// </summary>
 public static class StagesCommand
 {
-    static readonly string[] Known = ["frames", "sscd", "thumbs", "transcribe", "text", "cast", "sync", "describe"];
+    static readonly string[] Known = ["frames", "sscd", "dino", "thumbs", "transcribe", "text", "cast", "sync", "describe"];
 
     /// <summary>
     /// `stages translate --job &lt;id&gt; --out &lt;dir&gt;`: the translate step as a trial. Reads the inputs from the store, writes en.vtt and en.json to &lt;dir&gt; only (never to the store) and always runs.
@@ -148,6 +148,13 @@ public static class StagesCommand
                         var bytes = await DescribeJob.RunAsync(new AiClient(http, ai), ai, d, ct);
                         if (bytes != null) await Put("describe.json", bytes, "application/json");
                         Console.WriteLine($"describe: {(bytes == null ? "skipped" : "written")}; total {sw.Elapsed.TotalSeconds:F1}s");
+                        break;
+                    }
+                    case "dino":
+                    {
+                        var dt = new Dino.Timing(); bool i8 = a.Has("int8");
+                        var n = await Dino.RunAsync(tools, http, store, paths, id, threads, m => P(stage, m), ct, dt, i8, a.Get("model"));
+                        Console.WriteLine($"dino{(i8 ? " (int8)" : "")}: {n} vectors in {sw.Elapsed.TotalSeconds:F1}s, {threads} threads, device {OrtOptions.Device} ({dt})");
                         break;
                     }
                     case "thumbs":

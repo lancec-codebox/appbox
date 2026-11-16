@@ -18,6 +18,12 @@ public static class Models
     public static readonly ModelFile ClipText = new("clip-text", "siglip2-base-patch16-224.text_model_int8.onnx", Siglip + "onnx/text_model_int8.onnx", "3a0603d3a00c05a80a6ded4743c16aaac7b1e62cdcc7e362e7ce418659b96400", 283_438_275, "Apache-2.0");
     public static readonly ModelFile ClipTokenizer = new("clip-tokenizer", "siglip2-base-patch16-224.tokenizer.model", Siglip + "tokenizer.model", "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2", 4_241_003, "Apache-2.0");
 
+    private const string DinoRepo = "https://huggingface.co/onnx-community/dinov2-small/resolve/main/onnx/";
+    /// <summary>DINOv2-small (Meta, Apache-2.0), fp32: pixel_values [batch,3,H,W] -> last_hidden_state [batch,tokens,384]; the dino step uses token 0 (CLS).</summary>
+    public static readonly ModelFile DinoSmall = new("dino-small", "dinov2-small.model.onnx", DinoRepo + "model.onnx", "f22797eabf810a75e41de68d378541ebea372122b25c4ce3ef25ff618250c20a", 88_532_934, "Apache-2.0");
+    /// <summary>The int8 export of the same repo (speed experiments only; not what the step writes by default).</summary>
+    public static readonly ModelFile DinoSmallInt8 = new("dino-small-int8", "dinov2-small.model_int8.onnx", DinoRepo + "model_int8.onnx", "dfce54a839b491f395c516350ebb4a78f947e9170a6beac0f2bc5638e0f09d61", 24_446_700, "Apache-2.0");
+
     public static readonly ModelFile OcrDet = new("ocr-det", "ch_PP-OCRv5_det_mobile.onnx", Rapid + "onnx/PP-OCRv5/det/ch_PP-OCRv5_det_mobile.onnx", "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae", 4_819_576, "Apache-2.0");
     public static readonly ModelFile OcrRec = new("ocr-rec", "ch_PP-OCRv5_rec_mobile.onnx", Rapid + "onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile.onnx", "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5", 16_631_306, "Apache-2.0");
     public static readonly ModelFile OcrDict = new("ocr-dict", "ppocrv5_dict.txt", Rapid + "paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile/ppocrv5_dict.txt", "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b", 74_012, "Apache-2.0");
