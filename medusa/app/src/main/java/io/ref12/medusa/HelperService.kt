@@ -97,7 +97,7 @@ class HelperService : Service() {
         val ocr = app.ocr.state?.takeIf { it.active }
         if (ocr != null) {
             val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-            return Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download)
+            return Notification.Builder(this, CHANNEL).setSmallIcon(NotificationIcons.res(NotificationIcons.forServer(jobs.activeCount(), true)))
                 .setContentTitle("Reading subtitles from the picture")
                 .setContentText(OcrUi.notificationText(ocr))
                 .setProgress(100, ocr.percent, ocr.phase == OcrState.Phase.DETECTING)
@@ -112,7 +112,7 @@ class HelperService : Service() {
             Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_DOWNLOADS, true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setSmallIcon(NotificationIcons.res(NotificationIcons.forServer(active, false)))
             .setContentTitle(if (active > 0) "Downloading media" else "Medusa is ready")
             .setContentText(text)
             .setContentIntent(open)

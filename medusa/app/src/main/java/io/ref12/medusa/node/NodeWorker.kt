@@ -68,7 +68,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
             })
             runner = r
             ACTIVE = r
-            StatusNotifier.cancel(ctx) // the foreground notification speaks during the run
+            StatusNotifier.cancel(ctx) // one index-node notification only: the foreground one speaks during the run, and the status is not posted while RUNNING
             // The system ended the work (the Android 15 dataSync time limit, lost constraints, cancel): WorkManager cancels this coroutine, and the runner lets go of the lease.
             settings.lastRunAt = System.currentTimeMillis(); settings.lastRunVersion = BuildConfig.VERSION_NAME; settings.lastRun = "running"; NodeLive.input = StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap)
             var reason = ""
@@ -88,6 +88,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
                 runner = null; ACTIVE = null; NodeLive.input = null
                 settings.lastRunAt = System.currentTimeMillis()
                 settings.lastStatus = ""
+                RUNNING.set(false) // the run is over: the status may take the notification over
                 StatusNotifier.refresh(ctx, settings, if (reason.isNotEmpty()) NodeStatus.afterRun(reason, today(), settings.dailyCap, message = settings.lastControl.substringAfter(" - ", "").ifEmpty { null }) else null)
             }
             Result.success()
@@ -149,7 +150,7 @@ object StatusNotifier {
     private fun build(ctx: Context, text: String, ongoing: Boolean): Notification {
         val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
         val open = launch?.let { PendingIntent.getActivity(ctx, 0, it, PendingIntent.FLAG_IMMUTABLE) }
-        return NotificationCompat.Builder(ctx, NodeWorker.CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle("Index node").setContentText(text)
+        return NotificationCompat.Builder(ctx, NodeWorker.CHANNEL).setSmallIcon(io.ref12.medusa.NotificationIcons.res(io.ref12.medusa.NotificationIcons.forNode())).setContentTitle("Index node").setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text)).setOngoing(ongoing).setOnlyAlertOnce(true).setSilent(true).setPriority(NotificationCompat.PRIORITY_LOW)
             .also { b -> open?.let { b.setContentIntent(it) } }.addAction(0, "Run now", runNowIntent(ctx)).build()
     }
@@ -189,9 +190,10 @@ object StatusNotifier {
     fun statusText(ctx: Context, s: NodeSettings): String = try { NodeStatus.text(statusInput(ctx, s)) } catch (e: Exception) { "Status unavailable" }
 
     /** Posts the status when it changed (a new state, not a timer). [after] is the state at the end of a run; null: work it out from the device. */
-    fun refresh(ctx: Context, s: NodeSettings, after: StatusInput?) {
+    fun refresh(ctx: Context, s: NodeSettings, after: StatusInput?, force: Boolean = false) {
         try {
-            if (!s.enabled || !s.vault.has() || !s.statusNotification) { cancel(ctx); return }
+            if (!s.enabled || !s.vault.has() || !s.statusNotification) { if (!NodeWorker.isRunning) cancel(ctx); return }
+            if (!StatusPolicy.mayPost(NodeWorker.isRunning, force)) return // during a run the foreground notification is the only one
             val text = NodeStatus.text(statusInput(ctx, s, after))
             if (text == s.lastStatus) return
             s.lastStatus = text
@@ -243,3 +245,6 @@ class RunNowReceiver : BroadcastReceiver() {
     }
     companion object { const val ACTION = "io.ref12.medusa.NODE_RUN_NOW" }
 }
+
+/** When the status notification may be posted: never while the node runs (the foreground notification, same id, speaks then), except the run's own final update. */
+object StatusPolicy { fun mayPost(running: Boolean, force: Boolean) = !running || force }
