@@ -40,10 +40,13 @@ public static class Program
     public const string Usage = """
         indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
-        indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480]
-        indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts]
+        indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
+        indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
         indexnode ai test [--ai-base-url ...]
-        indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F]
+        indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F] [--priority N]
+        indexnode priority set <N> --job <id>... | --from <file> | --channel <id|url> [--stage download] [--with-steps]
+        indexnode priority list [--stage S] [--top 20]
+        indexnode sources priority <source id|url|video url> N   (re-tags the source's pending jobs; lists the playlist/channel with yt-dlp to match older jobs: run it on a machine YouTube allows, e.g. a residential one)
         indexnode enqueue --from watch-later [--max-height 480]
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
@@ -90,6 +93,7 @@ public static class Program
                 "gpu" => await Commands.GpuAsync(a),
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
+                "priority" => await Commands.PriorityAsync(a),
                 "ai" => await Commands.AiAsync(a),
                 "publish" => await SiteCommands.PublishAsync(a),
                 "cast-candidates" => await CastCandidates.RunAsync(a),
@@ -231,8 +235,15 @@ public static class Commands
         return new LimitState(nodeId, local, stamp, Path.Combine(NodeConfig.ConfigDir(), "state.json"));
     }
 
+    public static async Task<int> PriorityAsync(Args a)
+    {
+        var (_, store, paths, _) = Open(a);
+        return await PriorityTool.RunAsync(a, store, paths);
+    }
+
     public static async Task<int> SourcesAsync(Args a)
     {
+        int priority = PriorityTool.ParseOption(a.Get("priority"));
         var sub = a.Positional.FirstOrDefault();
         var (cfg, store, paths, http) = Open(a);
         int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480;
@@ -243,6 +254,7 @@ public static class Commands
             {
                 var url = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources add <url>");
                 var job = await Sources.ResolveAsync(new Tools(http, cfg), url, every ?? "1h", Sources.ParseTabs(a.Get("tabs")), a.Has("follow-channels"), a.Get("backfill") is { } bf ? int.Parse(bf) : 0, maxHeight, default);
+                job.Priority = priority;
                 var created = await Sources.AddAsync(store, paths, job, default);
                 Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId}  {job.Kind}  {job.Name}  every={job.Every} backfill={job.Backfill} followChannels={job.FollowChannels}");
                 return 0;
@@ -252,6 +264,22 @@ public static class Commands
                 var list = await Sources.ListAsync(store, paths, default);
                 if (list.Count == 0) Console.WriteLine("(no followed sources)");
                 foreach (var j in list) Console.WriteLine(Sources.FormatRow(j));
+                return 0;
+            }
+            case "priority":
+            {
+                var what = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources priority <source id|url> N");
+                int np = PriorityTool.ParseOption(a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("sources priority <source id|url> N"));
+                var sid = PriorityTool.SourceOrVideoId(what);
+                List<string>? listed = null;
+                if (!sid.StartsWith("v-") && !a.Has("no-list"))
+                {
+                    var w = (await Sources.ListAsync(store, paths, default)).FirstOrDefault(x => x.JobId == sid) ?? throw new ArgumentException($"no source {sid}");
+                    try { listed = await PriorityTool.ListIdsAsync(new Tools(http, cfg), w, default); }
+                    catch (Exception e) { Console.Error.WriteLine($"could not list {sid} with yt-dlp ({e.Message}); only videos with a recorded source are re-tagged (run this on a machine YouTube allows, e.g. a residential one, to match older jobs)"); }
+                }
+                var r = await PriorityTool.SetSourceAsync(store, paths, sid, np, listed, default);
+                Console.WriteLine($"{sid}: priority {np}; {r.Videos} video(s), {r.Changed} job(s) changed, skipped {r.Skipped.Values.Sum()}{(r.Skipped.Count > 0 ? " (" + string.Join(", ", r.Skipped.Select(k => $"{k.Value} {k.Key}")) + ")" : "")}{(r.Matched > 0 ? $"; {r.Matched} older job(s) matched by the listing" : "")}");
                 return 0;
             }
             case "remove":
@@ -266,11 +294,11 @@ public static class Commands
             case "import":
             {
                 var file = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources import <channels.json>");
-                var r = await Sources.ImportAsync(store, paths, File.ReadAllBytes(file), every ?? "1d", Sources.ParseTabs(a.Get("tabs")), maxHeight, default);
+                var r = await Sources.ImportAsync(store, paths, File.ReadAllBytes(file), every ?? "1d", Sources.ParseTabs(a.Get("tabs")), maxHeight, default, priority);
                 Console.WriteLine($"{r.Added} added, {r.Existed} already existed{(r.Skipped > 0 ? $", {r.Skipped} skipped (no channelId)" : "")}");
                 return 0;
             }
-            default: throw new ArgumentException("sources add <url> | list | remove <id> | import <channels.json>");
+            default: throw new ArgumentException("sources add <url> | list | remove <id> | import <channels.json> | priority <source id|url> N");
         }
     }
 
@@ -349,7 +377,7 @@ public static class Commands
         int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480;
         if (a.Has("from")) throw new ArgumentException("enqueue --from watch-later is gone: Watch Later only seeds channels now, use: indexnode seeds watch-later");
         if (a.Positional.Count == 0) throw new ArgumentException("enqueue needs at least one url");
-        var format = a.Get("format");
+        var format = a.Get("format"); int priority = PriorityTool.ParseOption(a.Get("priority"));
         var tools = new Tools(http, cfg);
         int added = 0, existed = 0;
         foreach (var input in a.Positional)
@@ -365,8 +393,8 @@ public static class Commands
             }
             foreach (var url in urls.Distinct())
             {
-                var job = JobDescriptor.NewDownload(url, maxHeight, format);
-                var created = await store.PutAsync(paths.Job("download", job.JobId), job.ToBytes(), Tags.Job("download", "pending", job.AddedAt), null, true, default);
+                var job = JobDescriptor.NewDownload(url, maxHeight, format); job.Priority = priority; if (priority != 0) job.OwnPriority = priority;
+                var created = await store.PutAsync(paths.Job("download", job.JobId), job.ToBytes(), Tags.Job("download", "pending", job.AddedAt, null, priority), null, true, default);
                 if (created) added++; else existed++;
                 Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId} {url}");
             }
@@ -452,7 +480,8 @@ public static class Commands
         {
             var inStage = all.Where(b => b.Tags.GetValueOrDefault(Tags.Stage) == stage).ToList();
             var counts = new[] { "pending", "done", "failed" }.Select(s => $"{s}={inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s)}");
-            Console.WriteLine($"  {stage,-9} {string.Join("  ", counts)}  leased={inStage.Count(b => b.LeaseState == "leased")}");
+            int prio = inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == "pending" && Tags.PriorityOf(b.Tags) != 0);
+            Console.WriteLine($"  {stage,-9} {string.Join("  ", counts)}  leased={inStage.Count(b => b.LeaseState == "leased")}{(prio > 0 ? $"  pending with priority={prio}" : "")}");
         }
         var leased = all.Where(b => b.LeaseState == "leased").ToList();
         if (leased.Count > 0)

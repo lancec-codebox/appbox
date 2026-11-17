@@ -186,10 +186,11 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
     }
 
     /// <summary>The process job and the first comments job (due at once), each only where it does not exist yet.</summary>
-    private async Task EnsureFollowUpJobs(JobContext ctx)
+    internal async Task EnsureFollowUpJobs(JobContext ctx)
     {
         var c = JobDescriptor.NewComments(ctx.Job.JobId, ctx.Job.Url ?? "https://www.youtube.com/watch?v=" + ctx.Job.JobId);
-        var made = await ctx.Store.PutAsync(ctx.Paths.Job("comments", ctx.Job.JobId), c.ToBytes(), Tags.Job("comments", "pending", c.AddedAt), null, true, ctx.Token);
+        c.Priority = ctx.Job.Priority;
+        var made = await ctx.Store.PutAsync(ctx.Paths.Job("comments", ctx.Job.JobId), c.ToBytes(), Tags.Job("comments", "pending", c.AddedAt, null, c.Priority), null, true, ctx.Token);
         Log.Info($"download {ctx.Job.JobId}: comments job {(made ? "created" : "already exists")}");
         if (QueueProcessing) await EnsureProcessJob(ctx);
         else Log.Info($"download {ctx.Job.JobId}: processing not queued (--no-process)");
@@ -201,8 +202,8 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
         var made = new List<string>();
         foreach (var step in Protocol.IngestStepStages)
         {
-            var p = JobDescriptor.NewStep(step, ctx.Job.JobId);
-            if (await ctx.Store.PutAsync(ctx.Paths.Job(step, ctx.Job.JobId), p.ToBytes(), Tags.Job(step, "pending", p.AddedAt), null, true, ctx.Token)) made.Add(step);
+            var p = JobDescriptor.NewStep(step, ctx.Job.JobId); p.Priority = ctx.Job.Priority;
+            if (await ctx.Store.PutAsync(ctx.Paths.Job(step, ctx.Job.JobId), p.ToBytes(), Tags.Job(step, "pending", p.AddedAt, null, p.Priority), null, true, ctx.Token)) made.Add(step);
         }
         Log.Info($"download {ctx.Job.JobId}: step jobs created: {(made.Count == 0 ? "none (all exist)" : string.Join(',', made))}");
     }

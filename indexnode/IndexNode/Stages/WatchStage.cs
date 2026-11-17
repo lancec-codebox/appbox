@@ -115,15 +115,16 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         if (job.Kind == "channel" && fresh.Count > 0)
         {
             var cj = JobDescriptor.NewClassify(job, fresh.Select(e => new ClassifyEntry { Id = e.Id, Title = e.Title, Duration = e.Duration }).ToList(), addedAt);
-            await store.PutAsync(paths.Job("classify", cj.JobId), cj.ToBytes(), Tags.Job("classify", "pending", addedAt), null, true, ct);
+            cj.Priority = job.Priority;
+            await store.PutAsync(paths.Job("classify", cj.JobId), cj.ToBytes(), Tags.Job("classify", "pending", addedAt, null, cj.Priority), null, true, ct);
             Log.Info($"watch {job.JobId}: {fresh.Count} new uploads handed to classify/{cj.JobId}");
         }
         foreach (var e in toDownload)
         {
             if (await KnownAsync(paths, e.Id, ct)) { skipped++; continue; }
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={e.Id}", job.MaxHeight ?? 480, null);
-            d.Source = job.JobId; d.AddedAt = addedAt;
-            if (await store.PutAsync(paths.Job("download", e.Id), d.ToBytes(), Tags.Job("download", "pending", addedAt), null, true, ct)) made++; else skipped++;
+            d.Source = job.JobId; d.Sources = [job.JobId]; d.AddedAt = addedAt; d.Priority = job.Priority;
+            if (await store.PutAsync(paths.Job("download", e.Id), d.ToBytes(), Tags.Job("download", "pending", addedAt, null, d.Priority), null, true, ct)) made++; else skipped++;
         }
 
         if (job.FollowChannels == true)
@@ -141,8 +142,8 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
                 }
                 if (cid == null || !done.Add(cid)) continue;
                 var ch = JobDescriptor.NewWatch("channel", cid, cname ?? cid, job.Every ?? "1h", ["videos"], false, 0, job.MaxHeight ?? 480); // Shorts are never dramas
-                ch.Source = job.JobId; ch.AddedAt = addedAt;
-                if (await store.PutAsync(paths.Job("watch", ch.JobId), ch.ToBytes(), Tags.Job("watch", "pending", addedAt), null, true, ct))
+                ch.Source = job.JobId; ch.AddedAt = addedAt; ch.Priority = job.Priority;
+                if (await store.PutAsync(paths.Job("watch", ch.JobId), ch.ToBytes(), Tags.Job("watch", "pending", addedAt, null, ch.Priority), null, true, ct))
                     Log.Info($"watch {job.JobId}: now following channel {ch.Name} ({cid})");
             }
         }

@@ -1,5 +1,11 @@
 # IndexNode release notes
 
+## 0.8.5
+
+- Job priority: an integer (default 0, -1000..1000, higher first) in the blob tag `idx_priority` (missing or unparsable = 0). Nodes claim by priority descending, then `idx_added`, then name; waits for earlier steps and GPU routing are unchanged. Jobs a job creates inherit its priority (download -> step and comments jobs; watch/classify -> downloads).
+- `enqueue --priority N`, `sources add|import --priority N`, `sources priority <source id|url> N` (re-tags the source's pending download, comments and step jobs; older jobs are matched by a yt-dlp listing, run on a machine YouTube allows), `priority set N --job|--from|--channel [--stage S] [--with-steps]` (pending only, under the lease; reports skipped), `priority list`, `status` counts, `sources list` shows the priority.
+- A video in several sources gets the highest priority; an explicit `priority set` wins until a source priority of the video is changed again. Download jobs record `sources`. Medusa still claims in the old order.
+
 ## 0.8.4
 
 - Spoiler rewrite no longer writes one character's text onto another (4 of 163 dramas had the female lead carrying the male lead's label/roleAtStart/description). The rewrite prompt now names the flagged cluster ids ("one entry for each of these clusters, with its own id: [1, 4]") instead of an example with id 0. Answers are applied only for flagged ids, each once; unflagged ids and repeats are ignored and logged; a flagged id with no answer keeps its original text.

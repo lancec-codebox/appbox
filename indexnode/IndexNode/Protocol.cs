@@ -82,11 +82,28 @@ public sealed class Paths(string prefix)
 
 public static class Tags
 {
-    public const string Stage = "idx_stage", State = "idx_state", Added = "idx_added", Due = "idx_due", Kind = "idx_kind";
+    public const string Stage = "idx_stage", State = "idx_state", Added = "idx_added", Due = "idx_due", Kind = "idx_kind", Priority = "idx_priority";
+
+    public const int MinPriority = -1000, MaxPriority = 1000;
+
+    /// <summary>Throws unless <paramref name="p"/> is within -1000..1000.</summary>
+    public static int CheckPriority(int p) => p is >= MinPriority and <= MaxPriority ? p : throw new ArgumentOutOfRangeException(nameof(p), $"priority {p} is outside {MinPriority}..{MaxPriority}");
+
+    /// <summary>idx_priority of a job blob: a plain integer string; missing, unparsable or out of range counts as 0.</summary>
+    public static int PriorityOf(IReadOnlyDictionary<string, string> tags) =>
+        tags.TryGetValue(Priority, out var s) && int.TryParse(s, System.Globalization.NumberStyles.AllowLeadingSign, System.Globalization.CultureInfo.InvariantCulture, out var p) && p is >= MinPriority and <= MaxPriority ? p : 0;
+
+    /// <summary>Claim order: priority descending, then idx_added ascending, then blob name.</summary>
+    public static IEnumerable<BlobEntry> ClaimOrder(IEnumerable<BlobEntry> blobs) =>
+        blobs.OrderByDescending(b => PriorityOf(b.Tags)).ThenBy(b => b.Tags.GetValueOrDefault(Added) ?? "", StringComparer.Ordinal).ThenBy(b => b.Name, StringComparer.Ordinal);
 
     /// <summary>The full idx_* set of a job blob; idx_due defaults to idx_added.</summary>
-    public static Dictionary<string, string> Job(string stage, string state, string added, string? due = null) =>
-        new() { [Stage] = stage, [State] = state, [Added] = added, [Due] = due ?? added };
+    public static Dictionary<string, string> Job(string stage, string state, string added, string? due = null, int priority = 0)
+    {
+        var t = new Dictionary<string, string> { [Stage] = stage, [State] = state, [Added] = added, [Due] = due ?? added };
+        if (priority != 0) t[Priority] = CheckPriority(priority).ToString(System.Globalization.CultureInfo.InvariantCulture); // 0 is the default: no tag
+        return t;
+    }
 
     /// <summary>Pending jobs of a stage; with <paramref name="nowUtc"/> only those whose idx_due has arrived.</summary>
     public static string PendingWhere(string stage, string? nowUtc = null) =>
@@ -143,6 +160,14 @@ public sealed class JobDescriptor
     public int? Found { get; set; }
     /// <summary>On a download job: the watch job that found the video.</summary>
     public string? Source { get; set; }
+    /// <summary>Claim priority (idx_priority): higher first, default 0. Jobs this job creates carry it; a source's priority goes to its downloads.</summary>
+    public int Priority { get; set; }
+    /// <summary>Every source (watch job id, e.g. "ch-UC..." / "pl-...") this video came from; <see cref="Source"/> is the first. A video in several sources gets the highest of their priorities.</summary>
+    public List<string>? Sources { get; set; }
+    /// <summary>A video added directly (enqueue --priority N, or sources priority &lt;video&gt; N): its own priority, which counts like one more source.</summary>
+    public int? OwnPriority { get; set; }
+    /// <summary>True when the priority was set by "priority set" on this job: it stays until a source priority of this video is changed again.</summary>
+    public bool? Explicit { get; set; }
 
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static JobDescriptor Parse(byte[] b) => JsonSerializer.Deserialize<JobDescriptor>(b, Protocol.Json) ?? throw new InvalidDataException("empty job");

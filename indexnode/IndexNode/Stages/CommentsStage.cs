@@ -27,7 +27,7 @@ public static class CommentsFollowUp
         if (Plan(downloadedAt, job.Round ?? 0, leadNameUnconfirmed) is not { } p) return false;
         job.Round = p.Round; job.Reason = p.Reason; job.Attempts = 0;
         var added = (await store.GetTagsAsync(name, ct))?.GetValueOrDefault(Tags.Added) ?? job.AddedAt;
-        await store.PutAsync(name, job.ToBytes(), Tags.Job("comments", "pending", added, Protocol.Utc(p.Due)), null, false, ct);
+        await store.PutAsync(name, job.ToBytes(), Tags.Job("comments", "pending", added, Protocol.Utc(p.Due), job.Priority), null, false, ct);
         return true;
     }
 }

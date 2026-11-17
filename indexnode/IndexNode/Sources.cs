@@ -45,14 +45,14 @@ public static partial class Sources
     }
 
     public static async Task<bool> AddAsync(IStore store, Paths paths, JobDescriptor job, CancellationToken ct) =>
-        await store.PutAsync(paths.Job("watch", job.JobId), job.ToBytes(), Tags.Job("watch", "pending", job.AddedAt), null, true, ct);
+        await store.PutAsync(paths.Job("watch", job.JobId), job.ToBytes(), Tags.Job("watch", "pending", job.AddedAt, null, job.Priority), null, true, ct);
 
     public sealed record ImportResult(int Added, int Existed, int Skipped);
 
     /// <summary>One watch job per channel of a channels.json ([{channelId, channelName, ...}]); existing ones are left alone.</summary>
-    public static async Task<ImportResult> ImportAsync(IStore store, Paths paths, byte[] json, string every, string[] tabs, int maxHeight, CancellationToken ct)
+    public static async Task<ImportResult> ImportAsync(IStore store, Paths paths, byte[] json, string every, string[] tabs, int maxHeight, CancellationToken ct, int priority = 0)
     {
-        WatchStage.ParseEvery(every);
+        WatchStage.ParseEvery(every); Tags.CheckPriority(priority);
         var items = JsonDocument.Parse(json).RootElement;
         if (items.ValueKind != JsonValueKind.Array) throw new ArgumentException("channels file must be a JSON array");
         int added = 0, existed = 0, skipped = 0;
@@ -61,7 +61,7 @@ public static partial class Sources
             var id = it.TryGetProperty("channelId", out var i) ? i.GetString() : null;
             if (string.IsNullOrWhiteSpace(id) || !Regex.IsMatch(id, @"^UC[A-Za-z0-9_-]{22}$")) { skipped++; continue; }
             var name = it.TryGetProperty("channelName", out var n) ? n.GetString() : null;
-            var job = JobDescriptor.NewWatch("channel", id, string.IsNullOrWhiteSpace(name) ? id : name, every, tabs, false, 0, maxHeight);
+            var job = JobDescriptor.NewWatch("channel", id, string.IsNullOrWhiteSpace(name) ? id : name, every, tabs, false, 0, maxHeight); job.Priority = priority;
             if (await AddAsync(store, paths, job, ct)) added++; else existed++;
         }
         return new ImportResult(added, existed, skipped);
@@ -76,5 +76,5 @@ public static partial class Sources
     }
 
     public static string FormatRow(JobDescriptor j) =>
-        $"{j.JobId,-40} {j.Kind,-8} {j.Every ?? "1h",-4} last polled {(j.LastPolled ?? "never"),-20} new {j.Found ?? 0,4}  {j.Name}";
+        $"{j.JobId,-40} {j.Kind,-8} {j.Every ?? "1h",-4} priority {j.Priority,4}  last polled {(j.LastPolled ?? "never"),-20} new {j.Found ?? 0,4}  {j.Name}";
 }

@@ -66,8 +66,8 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         {
             if (await store.GetTagsAsync(paths.Job("download", id), ct) != null || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0) continue;
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", job.MaxHeight ?? 480, null);
-            d.Source = job.Source; d.AddedAt = at;
-            if (await store.PutAsync(paths.Job("download", id), d.ToBytes(), Tags.Job("download", "pending", at), null, true, ct)) made++;
+            d.Source = job.Source; d.Sources = job.Source == null ? null : [job.Source]; d.AddedAt = at; d.Priority = job.Priority;
+            if (await store.PutAsync(paths.Job("download", id), d.ToBytes(), Tags.Job("download", "pending", at, null, d.Priority), null, true, ct)) made++;
         }
         Log.Info($"classify {job.JobId}: {entries.Count} uploads: {stored} already decided, {rule} too short, {ask.Count} by AI ({aiYes} candidates); {made} download job(s) created");
     }

@@ -78,8 +78,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             var made = new List<string>();
             foreach (var step in Protocol.StepStages.Where(x => steps.Contains(x) || x is "sync" or "describe" or "cast" or "translate"))
             {
-                var sj = JobDescriptor.NewStep(step, id);
-                if (await wst.PutAsync(paths.Job(step, id), sj.ToBytes(), Tags.Job(step, "pending", sj.AddedAt), null, true, ct)) made.Add(step);
+                var sj = JobDescriptor.NewStep(step, id); sj.Priority = job.Priority;
+                if (await wst.PutAsync(paths.Job(step, id), sj.ToBytes(), Tags.Job(step, "pending", sj.AddedAt, null, sj.Priority), null, true, ct)) made.Add(step);
             }
             Log.Info($"process {id}: fanned out into step jobs ({(made.Count == 0 ? "all exist" : string.Join(',', made))})");
             return;

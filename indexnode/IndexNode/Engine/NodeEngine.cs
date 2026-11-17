@@ -431,7 +431,7 @@ public sealed class NodeEngine
     private async Task<Claim?> TryClaimAsync(string stage, CancellationToken ct)
     {
         var found = await FindPendingAsync(stage, ct);
-        var ordered = found.OrderBy(b => b.Tags.GetValueOrDefault(Tags.Added) ?? "", StringComparer.Ordinal).ThenBy(b => b.Name, StringComparer.Ordinal);
+        var ordered = Tags.ClaimOrder(found);
         foreach (var b in ordered)
         {
             if (ignoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) continue;
@@ -454,7 +454,7 @@ public sealed class NodeEngine
                 {
                     // an earlier step has not finished: leave it pending, due a little later
                     var later = Protocol.Utc(DateTimeOffset.UtcNow + Protocol.NeedsRetry);
-                    await store.SetTagsAsync(b.Name, Tags.Job(stage, "pending", tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, later), lease, ct);
+                    await store.SetTagsAsync(b.Name, Tags.Job(stage, "pending", tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, later, Tags.PriorityOf(tags)), lease, ct);
                     await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
                     Log.Info($"[{stage}] {job.JobId} waits for {missing}");
                     continue;
@@ -584,7 +584,7 @@ public sealed class NodeEngine
         if (due.Length == 0) due = added;
         async Task Rewrite(string state, string? newDue = null)
         {
-            await store.PutAsync(claim.BlobName, job.ToBytes(), Tags.Job(stage, state, added, newDue ?? due), claim.LeaseId, false, none);
+            await store.PutAsync(claim.BlobName, job.ToBytes(), Tags.Job(stage, state, added, newDue ?? due, Tags.PriorityOf(claim.Tags)), claim.LeaseId, false, none);
         }
         switch (outcome)
         {
