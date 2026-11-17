@@ -19,6 +19,16 @@ import java.util.Date
 object IndexNodeUi {
     fun build(a: MainActivity, card: LinearLayout) {
         val s = NodeSettings(a)
+        // shown only when Android blocks this app's notifications; the button opens Medusa's notification settings
+        val notifWarnView = LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL; tag = "node-notif-warning"
+            addView(Ui.muted(a, "Notifications are off for Medusa, so the node cannot show its status. The node still runs."))
+            addView(Ui.button(a, "Open notification settings") {
+                a.startActivity(android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, a.packageName))
+            })
+            visibility = if (s.enabled && !StatusNotifier.notificationsAllowed(a)) View.VISIBLE else View.GONE
+        }
+        val notifWarn: View? = notifWarnView
         fun field(hint: String, value: String, tg: String, type: Int = InputType.TYPE_CLASS_TEXT) = EditText(a).apply {
             this.hint = hint; setText(value); tag = tg; contentDescription = hint; textSize = 14f; inputType = type; setSingleLine()
             setTextColor(Ui.color(a, R.color.on_surface)); setHintTextColor(Ui.color(a, R.color.muted))
@@ -26,8 +36,22 @@ object IndexNodeUi {
         card.addView(Ui.muted(a, "Medusa can download videos for the drama index in the background and upload them to the shared storage container. It only runs the download stage."))
         card.addView(CheckBox(a).apply {
             text = "Enable the index node"; tag = "node-enabled"; isChecked = s.enabled; setTextColor(Ui.color(a, R.color.on_surface))
-            setOnCheckedChangeListener { _, on -> s.enabled = on; NodeWorker.schedule(a, s) }
+            setOnCheckedChangeListener { _, on ->
+                s.enabled = on; NodeWorker.schedule(a, s)
+                // Android 13+: ask for the notification permission again when the node is turned on
+                if (on && android.os.Build.VERSION.SDK_INT >= 33 && !StatusNotifier.notificationsAllowed(a)) a.requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 4217)
+                notifWarn?.visibility = if (on && !StatusNotifier.notificationsAllowed(a)) View.VISIBLE else View.GONE
+            }
         })
+        card.addView(CheckBox(a).apply {
+            text = "Show the status notification"; tag = "node-status-notification"; isChecked = s.statusNotification; setTextColor(Ui.color(a, R.color.on_surface))
+            setOnCheckedChangeListener { _, on -> s.statusNotification = on; s.lastStatus = ""; NodeWorker.schedule(a, s) }
+        })
+        card.addView(notifWarnView)
+        card.addView(Ui.button(a, "Run now") {
+            if (!s.enabled || !s.vault.has()) { Toast.makeText(a, "Enable the node and save a SAS first", Toast.LENGTH_LONG).show(); return@button }
+            NodeWorker.runNow(a, s); Toast.makeText(a, "Started one run (Wi-Fi, battery, cap, budget and control still apply)", Toast.LENGTH_LONG).show()
+        }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.muted(a, "Node name"), Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
         val name = field("Node name", s.name, "node-name"); card.addView(name)
         card.addView(Ui.muted(a, "Run when"), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
@@ -82,14 +106,8 @@ object IndexNodeUi {
             NodeWorker.schedule(a, s); refresh(); Toast.makeText(a, "Saved", Toast.LENGTH_SHORT).show()
         }
         card.addView(Ui.button(a, "Save") { save() }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
+        // one scanner: a raw container SAS URL, a medusa://node-setup link or the https hand-off link, all through the same confirmation as the setup path
         card.addView(Ui.button(a, "Scan QR code") {
-            try {
-                com.google.mlkit.vision.codescanner.GmsBarcodeScanning.getClient(a).startScan()
-                    .addOnSuccessListener { b -> val v = b.rawValue ?: ""; if (SasUrl.parse(v) != null) { sasField.setText(v); save() } else Toast.makeText(a, "That QR code is not a container SAS URL", Toast.LENGTH_LONG).show() }
-                    .addOnFailureListener { e -> Toast.makeText(a, "Scan failed: " + Redact.sas(e.message), Toast.LENGTH_LONG).show() }
-            } catch (e: Exception) { Toast.makeText(a, "No QR scanner on this device", Toast.LENGTH_LONG).show() }
-        }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
-        card.addView(Ui.button(a, "Scan setup QR") {
             a.startActivity(android.content.Intent(a, io.ref12.medusa.NodeSetupActivity::class.java).setAction(io.ref12.medusa.NodeSetupActivity.ACTION_SCAN))
         }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.button(a, "Import settings file") {
@@ -124,65 +142,91 @@ object IndexNodeUi {
         refresh()
     }
 
-    /** Sources: follow a playlist or channel (a watch job any node can poll), and the list of followed sources with a remove button each. */
+    const val ADMIN_URL = "https://apps--hexad-project.ref12.dev/local-apps/drama-admin/"
+
+    /** Add by URL (with a priority) and "Added from this phone": what this phone added, its state in the index, remove and change priority. No list of the whole index: that is the Drama admin web app. */
     private fun sourcesSection(a: MainActivity, s: NodeSettings, card: LinearLayout) {
-        card.addView(Ui.header(a, "Sources"), Ui.lp(-1, -2, 0f, 0, 16, 0, 0, a))
-        card.addView(Ui.muted(a, "Followed playlists and channels. Medusa only adds them; whichever node runs the watch stage polls them. Needs a SAS with r, c, w, l, f (and d to remove)."))
-        val url = EditText(a).apply {
-            hint = "YouTube playlist or channel URL"; tag = "source-url"; contentDescription = hint; textSize = 14f; setSingleLine()
+        card.addView(Ui.header(a, "Add to the index"), Ui.lp(-1, -2, 0f, 0, 16, 0, 0, a))
+        card.addView(Ui.muted(a, "Paste or share a YouTube video, playlist or channel URL. Whichever node runs the watch stage polls sources. Needs a SAS with r, c, w, l, f (and d to remove)."))
+        fun edit(hint: String, tg: String, type: Int, value: String = "") = EditText(a).apply {
+            this.hint = hint; setText(value); tag = tg; contentDescription = hint; textSize = 14f; inputType = type; setSingleLine()
             setTextColor(Ui.color(a, R.color.on_surface)); setHintTextColor(Ui.color(a, R.color.muted))
         }
-        card.addView(url)
+        val url = edit("YouTube video, playlist or channel URL", "source-url", InputType.TYPE_CLASS_TEXT); card.addView(url)
         val follow = CheckBox(a).apply { text = "Follow channels of its videos"; tag = "source-follow-channels"; setTextColor(Ui.color(a, R.color.on_surface)) }
         card.addView(follow)
-        card.addView(Ui.muted(a, "Check every"))
+        card.addView(Ui.muted(a, "Priority, -1000 to 1000 (higher downloads first, default 0)"))
+        val prio = edit("0", "source-priority", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED, "0"); card.addView(prio)
+        card.addView(Ui.muted(a, "Check every (playlists and channels)"))
         var everyPick = 0
         card.addView(TrackUi.radios(a, WatchJobs.EVERY, WatchJobs.EVERY.map { "source-every:" + it }, 0) { everyPick = it })
         card.addView(Ui.muted(a, "Backfill: how many existing videos to download first (0: only new ones)"))
-        val backfill = EditText(a).apply {
-            hint = "0"; setText("0"); tag = "source-backfill"; contentDescription = "Backfill"; textSize = 14f; inputType = InputType.TYPE_CLASS_NUMBER; setSingleLine()
-            setTextColor(Ui.color(a, R.color.on_surface)); setHintTextColor(Ui.color(a, R.color.muted))
-        }
-        card.addView(backfill)
+        val backfill = edit("0", "source-backfill", InputType.TYPE_CLASS_NUMBER, "0"); card.addView(backfill)
         val msg = Ui.muted(a, "", 13f)
-        val list = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; tag = "source-list" }
+        val list = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; tag = "added-list" }
         fun client() = s.vault.load()?.let { BlobClient(it) }
         fun reload() {
-            val c = client() ?: run { list.removeAllViews(); list.addView(Ui.muted(a, "Save a SAS first")); return }
-            Thread {
-                val r = try { Result.success(WatchJobs.list(c)) } catch (e: Exception) { Result.failure(e) }
-                a.runOnUiThread {
-                    list.removeAllViews()
-                    r.fold({ all ->
-                        if (all.isEmpty()) list.addView(Ui.muted(a, "No sources followed yet"))
-                        for (src in all) {
-                            val row = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
-                            row.addView(Ui.muted(a, src.name + "\n" + src.kind + " \u00b7 every " + src.every + " \u00b7 polled " + (src.lastPolled ?: "never"), 13f), Ui.lp(0, -2, 1f))
-                            row.addView(Ui.button(a, "Remove", danger = true) {
-                                Thread {
-                                    val m = try { WatchJobs.remove(c, src.jobId); "Removed " + src.name } catch (e: Exception) { "Remove failed: " + Redact.sas(e.message) }
-                                    a.runOnUiThread { msg.text = m; reload() }
-                                }.start()
-                            })
-                            list.addView(row, Ui.lp(-1, -2, 0f, 0, 4, 0, 0, a))
-                        }
-                    }, { e -> list.addView(Ui.muted(a, "Could not list sources: " + Redact.sas(e.message))) })
-                }
-            }.start()
+            list.removeAllViews()
+            val items = s.added.all()
+            if (items.isEmpty()) { list.addView(Ui.muted(a, "Nothing added from this phone yet")); return }
+            val c = client()
+            for (it in items) {
+                val row = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
+                val state = Ui.muted(a, if (c == null) "Save a SAS to see its state" else "checking\u2026", 12f)
+                row.addView(Ui.text(a, it.name, 14f)); 
+                row.addView(Ui.muted(a, it.kind + " \u00b7 " + Ui.date(it.addedAt) + " \u00b7 priority " + it.priority, 12f))
+                row.addView(state)
+                val pf = edit("priority", "added-prio:" + it.jobId, InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED, it.priority.toString())
+                val btns = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
+                btns.addView(pf, Ui.lp(0, -2, 1f))
+                btns.addView(Ui.button(a, "Set priority") { _ ->
+                    val p = pf.text.toString().trim().toIntOrNull()?.takeIf { v -> v in Prio.MIN..Prio.MAX }
+                    if (p == null) { msg.text = "Priority must be a whole number from -1000 to 1000"; return@button }
+                    val cl = client() ?: run { msg.text = "Save a SAS first"; return@button }
+                    msg.text = "Changing priority\u2026"
+                    Thread {
+                        val m = try {
+                            val listed = if (it.kind == "video") null else try { a.app.sources.listIds(SourceRef(it.kind, it.jobId.substring(3))) } catch (e: Exception) { null }
+                            val r = AddedState.changePriority(cl, it, p, listed)
+                            s.added.setPriority(it.jobId, p)
+                            "Priority " + p + ": " + r.videos + " video(s), " + r.changed + " pending job(s) re-tagged" + (if (r.skipped.isNotEmpty()) "; skipped " + r.skipped.entries.joinToString { e -> e.value.toString() + " " + e.key } else "")
+                        } catch (e: Exception) { "Could not change priority: " + Redact.sas(e.message) }
+                        a.runOnUiThread { msg.text = m; reload() }
+                    }.start()
+                })
+                btns.addView(Ui.button(a, "Remove", danger = true) { _ ->
+                    val cl = client()
+                    Thread {
+                        val m = try { if (cl != null) AddedState.removeFromIndex(cl, it) else "Entry removed" } catch (e: Exception) { "Removed from this list; the index said: " + Redact.sas(e.message) }
+                        s.added.remove(it.jobId)
+                        a.runOnUiThread { msg.text = m; reload() }
+                    }.start()
+                })
+                row.addView(btns)
+                list.addView(row, Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
+                if (c != null) Thread { val t = AddedState.describe(it, c); a.runOnUiThread { state.text = t } }.start()
+            }
         }
-        card.addView(Ui.button(a, "Follow") {
+        card.addView(Ui.button(a, "Add") {
             val c = client() ?: run { msg.text = "Save a SAS first"; return@button }
             val raw = url.text.toString().trim()
-            if (raw.isEmpty()) { msg.text = "Paste a playlist or channel URL"; return@button }
-            val opts = FollowOptions(WatchJobs.EVERY[everyPick], backfill.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0, follow.isChecked)
-            msg.text = "Following\u2026"
+            if (raw.isEmpty()) { msg.text = "Paste a video, playlist or channel URL"; return@button }
+            val p = prio.text.toString().trim().ifEmpty { "0" }.toIntOrNull()?.takeIf { v -> v in Prio.MIN..Prio.MAX }
+            if (p == null) { msg.text = "Priority must be a whole number from -1000 to 1000"; return@button }
+            val opts = FollowOptions(WatchJobs.EVERY[everyPick], backfill.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0, follow.isChecked, priority = p)
+            msg.text = "Adding\u2026"
             Thread {
-                val res = SourceFollow.run(c, raw, opts, System.currentTimeMillis()) { a.app.sources.channelId(it) }
-                a.runOnUiThread { msg.text = followMessage(res); if (res is FollowResult.Created) url.setText(""); reload() }
+                val m = IndexAdd.add(c, s.added, raw, opts, p, System.currentTimeMillis(), { a.app.sources.channelId(it) }, { a.app.sources.videoChannelId(it) })
+                a.runOnUiThread { msg.text = m; if (!m.startsWith("Could not") && !m.startsWith("That is not")) url.setText(""); reload() }
             }.start()
         }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
         card.addView(msg, Ui.lp(-1, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.header(a, "Added from this phone"), Ui.lp(-1, -2, 0f, 0, 12, 0, 0, a))
         card.addView(list, Ui.lp(-1, -2, 0f, 0, 6, 0, 0, a))
+        card.addView(Ui.button(a, "Open Drama admin") {
+            try { a.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(ADMIN_URL))) }
+            catch (e: Exception) { Toast.makeText(a, "No browser to open it", Toast.LENGTH_LONG).show() }
+        }, Ui.lp(-2, -2, 0f, 0, 8, 0, 0, a))
         reload()
     }
 

@@ -73,4 +73,20 @@ class NodeSetupTest {
         val s = Store(name = "other", sas = "keep"); NodeSetup.fromJson(json).apply(s)
         assertEquals("old", s.name); assertEquals("keep", s.sas)
     }
+
+    private fun web(json: String) = "https://lancec-codebox.github.io/appbox/setup/#d=" + Base64.getUrlEncoder().withoutPadding().encodeToString(json.toByteArray())
+
+    @Test fun oneScannerAcceptsAllThreeQrForms() {
+        val a = Store(); NodeSetup.fromAny(link(full)).apply(a); assertEquals(SAS, a.sas); assertEquals("pixel", a.name)
+        val b = Store(); NodeSetup.fromAny(web(full)).apply(b); assertEquals(SAS, b.sas); assertEquals("pixel", b.name); assertEquals(50, b.cap)
+        val c = Store(); NodeSetup.fromAny(" " + SAS + "\n").apply(c); assertEquals(SAS, c.sas); assertEquals("pixel".length, 5)
+        // a raw SAS changes nothing but the key, through the same summary the confirmation shows
+        assertTrue(NodeSetup.fromAny(SAS).summary(Store().current()).contains("Storage key: set"))
+        assertFalse(NodeSetup.fromAny(SAS).summary(Store().current()).any { it.contains("SECRETSIGNATURE") })
+    }
+
+    @Test fun otherQrCodesAreRejected() {
+        for (bad in listOf("https://example.com/page", "https://acct.blob.core.windows.net/medusa-index", "hello", "https://lancec-codebox.github.io/appbox/setup/#d=", "https://lancec-codebox.github.io/appbox/setup/#d=@@@", "medusa://other?d=x"))
+            try { NodeSetup.fromAny(bad); fail("accepted: " + bad) } catch (e: SetupRejected) { assertFalse(e.message!!.contains("SECRETSIGNATURE")) }
+    }
 }

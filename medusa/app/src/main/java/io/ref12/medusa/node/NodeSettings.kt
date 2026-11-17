@@ -75,6 +75,15 @@ class NodeSettings(ctx: Context) : NodeState, SetupStore {
     override fun budgetLeft() = prefs.getInt("budgetLeft", 0)
     override fun setBudget(key: String?, left: Int) { prefs.edit().putString("budgetKey", key).putInt("budgetLeft", left).apply() }
 
+    /** The status notification: on by default while the node is enabled. */
+    var statusNotification: Boolean get() = prefs.getBoolean("statusNotification", true); set(v) { prefs.edit().putBoolean("statusNotification", v).apply() }
+    var lastStatus: String get() = prefs.getString("lastStatus", "") ?: ""; set(v) { prefs.edit().putString("lastStatus", v).apply() }
+    /** What this phone added to the index (kept locally; see [AddedItems]). */
+    val added = AddedItems(object : TextStore {
+        override fun load() = prefs.getString("added", null)
+        override fun save(text: String) { prefs.edit().putString("added", text).apply() }
+    })
+
     var maxHeight: Int get() = prefs.getInt("maxHeight", 480); set(v) { prefs.edit().putInt("maxHeight", v.coerceIn(144, 4320)).apply() }
 
     override fun current() = SetupCurrent(name, conditions.wire, dailyCap, budget, schedule, window, maxHeight, vault.has())

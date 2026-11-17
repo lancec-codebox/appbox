@@ -86,18 +86,53 @@ class SourcesTest {
         assertTrue(SourceFollow.run(api, "https://www.youtube.com/@x", FollowOptions(), 1L) { null } is FollowResult.Failed)
     }
 
-    @Test fun theListReadsEachWatchJobAndRemoveDeletesIt() {
+    @Test fun removeDeletesOnlyTheWatchJob() {
         SourceFollow.run(api, "https://www.youtube.com/playlist?list=PLabcdefghijk123", FollowOptions(every = "6h", name = "Drops"), 1_800_000_000_000L) { null }
-        SourceFollow.run(api, "https://www.youtube.com/channel/$UC", FollowOptions(), 1_800_000_000_000L) { null }
-        api.addJob("aaaaaaaaaaa", 1) // a download job is not a source
-        val l = WatchJobs.list(api)
-        assertEquals(2, l.size)
-        val p = l.first { it.kind == "playlist" }
-        assertEquals("Drops", p.name); assertEquals("6h", p.every); assertNull(p.lastPolled)
-        WatchJobs.remove(api, p.jobId)
+        api.addJob("aaaaaaaaaaa", 1)
+        WatchJobs.remove(api, "pl-PLabcdefghijk123")
         assertNull(api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]); assertEquals(1, api.count("delete:"))
-        assertEquals(1, WatchJobs.list(api).size)
         assertNotNull(api.blobs["index/jobs/download/aaaaaaaaaaa.json"])
+    }
+
+    @Test fun aPriorityGoesIntoTheWatchRecordAndTag() {
+        SourceFollow.run(api, "https://www.youtube.com/playlist?list=PLabcdefghijk123", FollowOptions(priority = 40), 1_800_000_000_000L) { null }
+        val b = api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!
+        assertEquals(40, JSONObject(String(b.bytes)).getInt("priority")); assertEquals("40", b.tags["idx_priority"])
+    }
+
+    @Test fun aDirectVideoRecordsOwnPriorityAndTag() {
+        IndexVideo.add(api, "dQw4w9WgXcQ", 1_800_000_000_000L, 25)
+        val b = api.blobs["index/jobs/download/dQw4w9WgXcQ.json"]!!; val o = JSONObject(String(b.bytes))
+        assertEquals(25, o.getInt("priority")); assertEquals(25, o.getInt("ownPriority")); assertEquals("25", b.tags["idx_priority"])
+        IndexVideo.add(api, "eeeeeeeeeee", 1_800_000_000_000L)
+        assertFalse(api.blobs["index/jobs/download/eeeeeeeeeee.json"]!!.tags.containsKey("idx_priority"))
+        try { IndexVideo.add(api, "fffffffffff", 1L, 5000); fail() } catch (e: IllegalArgumentException) { }
+    }
+
+    @Test fun changingASourcePriorityRetagsItsPendingJobsAndStepsOnly() {
+        SourceFollow.run(api, "https://www.youtube.com/playlist?list=PLabcdefghijk123", FollowOptions(), 1_800_000_000_000L) { null }
+        api.addJob("aaaaaaaaaaa", 1, extra = ",\"sources\":[\"pl-PLabcdefghijk123\"]")   // recorded
+        api.addJob("bbbbbbbbbbb", 2)                                                            // only found by the listing
+        api.addJob("ccccccccccc", 3)                                                            // unrelated
+        FollowUps.create(api, "aaaaaaaaaaa", "u", 0, "2026-01-01T00:00:00Z")
+        api.job("aaaaaaaaaaa").tags.let { }
+        api.blobs["index/jobs/sync/aaaaaaaaaaa.json"]!!.tags = api.blobs["index/jobs/sync/aaaaaaaaaaa.json"]!!.tags + ("idx_state" to "done")
+        val r = Priorities.setSource(api, "pl-PLabcdefghijk123", 12, listOf("bbbbbbbbbbb"))
+        assertEquals(2, r.videos); assertEquals(1, r.matched)
+        assertEquals("12", api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!.tags["idx_priority"])
+        assertEquals("12", api.job("aaaaaaaaaaa").tags["idx_priority"]); assertEquals("12", api.job("bbbbbbbbbbb").tags["idx_priority"])
+        assertNull(api.job("ccccccccccc").tags["idx_priority"])
+        assertEquals("12", api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]!!.tags["idx_priority"])
+        assertEquals("12", api.blobs["index/jobs/comments/aaaaaaaaaaa.json"]!!.tags["idx_priority"])
+        assertNull(api.blobs["index/jobs/sync/aaaaaaaaaaa.json"]!!.tags["idx_priority"]) // done: untouched
+        assertTrue(JSONObject(String(api.job("bbbbbbbbbbb").bytes)).getJSONArray("sources").toString().contains("pl-PLabcdefghijk123"))
+        assertEquals("2026-01-01T00:00:00Z", api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]!!.tags["idx_added"])
+    }
+
+    @Test fun aDirectVideoPriorityChangeUsesOwnPriority() {
+        IndexVideo.add(api, "dQw4w9WgXcQ", 1_800_000_000_000L, 3)
+        Priorities.setSource(api, "v-dQw4w9WgXcQ", 8, null)
+        assertEquals("8", api.job("dQw4w9WgXcQ").tags["idx_priority"]); assertEquals(8, api.jobJson("dQw4w9WgXcQ").getInt("ownPriority"))
     }
 
     private val V = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -109,7 +144,7 @@ class SourcesTest {
     }
 
     @Test fun aPlainVideoGetsADownloadJob() {
-        val (r, f) = IndexVideo.share(api, "watch this " + V, false, 1_800_000_000_000L) { fail("no channel lookup"); null }
+        val (r, f) = IndexVideo.share(api, "watch this " + V, false, 1_800_000_000_000L, 0) { fail("no channel lookup"); null }
         assertTrue(r === AddResult.Added); assertNull(f)
         val b = api.blobs["index/jobs/download/dQw4w9WgXcQ.json"]!!; val o = JSONObject(String(b.bytes))
         assertEquals("download", o.getString("stage")); assertEquals("dQw4w9WgXcQ", o.getString("jobId")); assertEquals(V, o.getString("url"))

@@ -30,4 +30,21 @@ class SourceResolver(private val yt: YtDlpFetcher) {
         }
         return null
     }
+
+    /** Video ids of a source by yt-dlp --flat-playlist (what "sources priority" needs to match videos queued before their source was recorded). */
+    fun listIds(ref: SourceRef): List<String> {
+        yt.ensureInit()
+        val urls = if (ref.kind == "playlist") listOf("https://www.youtube.com/playlist?list=" + ref.id)
+            else listOf("videos", "shorts").map { "https://www.youtube.com/channel/" + ref.id + "/" + it }
+        val ids = ArrayList<String>()
+        for (u in urls) {
+            try {
+                val out = YoutubeDL.getInstance().execute(YoutubeDLRequest(u).apply {
+                    addOption("--flat-playlist"); addOption("--print", "%(id)s"); addOption("--no-warnings")
+                }, "medusa-index-list") { _, _, _ -> }.out
+                ids.addAll(out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() })
+            } catch (e: Throwable) { if (ref.kind == "playlist") throw e /* a channel may lack a shorts tab */ }
+        }
+        return ids
+    }
 }

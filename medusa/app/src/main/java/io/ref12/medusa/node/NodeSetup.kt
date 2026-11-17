@@ -66,8 +66,34 @@ class NodeSetup private constructor(
             return fromJson(String(bytes, Charsets.UTF_8))
         }
 
-        /** The link, or the JSON itself (what a file or a pasted text holds). */
-        fun fromAny(text: String): NodeSetup = if (isLink(text)) fromLink(text) else fromJson(text)
+        const val WEB_PREFIX = "https://lancec-codebox.github.io/appbox/setup/#d="
+
+        fun isWebLink(s: String?): Boolean = s != null && s.trim().startsWith(WEB_PREFIX, ignoreCase = true)
+
+        /** The https hand-off page link: its #d= payload is the same one the medusa:// link carries. */
+        fun fromWebLink(link: String): NodeSetup {
+            val t = link.trim()
+            if (!isWebLink(t)) throw SetupRejected("This is not a Medusa node setup link")
+            return fromLink(SCHEME_PREFIX + "?d=" + t.substring(WEB_PREFIX.length).substringBefore('&'))
+        }
+
+        /** A bare container SAS URL: a setup that only sets the storage key. */
+        fun fromSas(text: String): NodeSetup {
+            val t = text.trim()
+            if (SasUrl.parse(t) == null) throw SetupRejected("That is not a container SAS URL")
+            return NodeSetup(t, null, null, null, null, null, null, null)
+        }
+
+        /** What a QR code, a file or pasted text holds: a medusa:// link, the https hand-off link, a raw container SAS URL, or the settings JSON. */
+        fun fromAny(text: String): NodeSetup {
+            val t = text.trim()
+            return when {
+                isLink(t) -> fromLink(t)
+                isWebLink(t) -> fromWebLink(t)
+                t.startsWith("https://", ignoreCase = true) -> if (SasUrl.parse(t) != null) fromSas(t) else throw SetupRejected("This QR code is not a Medusa setup link or a container SAS URL")
+                else -> fromJson(text)
+            }
+        }
 
         fun fromJson(text: String): NodeSetup {
             if (text.length > MAX_BYTES) throw SetupRejected("This file is too large to be node settings")

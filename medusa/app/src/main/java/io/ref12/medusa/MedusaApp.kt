@@ -48,6 +48,7 @@ class MedusaApp : Application() {
         ocr = OcrManager(this, media)
         io.ref12.medusa.node.CrashRedaction.install()
         try { io.ref12.medusa.node.NodeWorker.schedule(this, io.ref12.medusa.node.NodeSettings(this)) } catch (e: Exception) { /* the node is optional */ }
+        try { io.ref12.medusa.node.StatusNotifier.watch(this) } catch (e: Exception) { /* status updates are optional */ }
         val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
         trackDl = TrackDownloads(
             onDevice = { id, t -> media.get(id)?.let { m -> TrackDevice.onDevice(m, t) { l -> media.loadTrack(id, l) != null } } ?: false },

@@ -86,9 +86,7 @@ object SourceUrl {
     }
 }
 
-class FollowOptions(val every: String = "1h", val backfill: Int = 0, val followChannels: Boolean = false, val name: String? = null, val maxHeight: Int = 480)
-
-class Source(val jobId: String, val name: String, val kind: String, val every: String, val lastPolled: String?)
+class FollowOptions(val every: String = "1h", val backfill: Int = 0, val followChannels: Boolean = false, val name: String? = null, val maxHeight: Int = 480, val priority: Int = 0)
 
 object WatchJobs {
     const val STAGE = "watch"
@@ -99,25 +97,16 @@ object WatchJobs {
         .put("v", 1).put("stage", STAGE).put("jobId", ref.jobId).put("kind", ref.kind).put("id", ref.id).put("name", o.name ?: ref.id)
         .put("every", o.every).put("backfill", o.backfill).also { if (ref.kind == "channel") it.put("tabs", org.json.JSONArray(listOf("videos", "shorts"))) }
         .put("followChannels", o.followChannels && ref.kind == "playlist").put("maxHeight", o.maxHeight)
+        .also { if (o.priority != 0) it.put("priority", Prio.check(o.priority)) }
         .put("addedAt", addedAt).put("lastPolled", JSONObject.NULL).put("attempts", 0)
 
-    fun tags(now: String) = mapOf("idx_stage" to STAGE, "idx_state" to "pending", "idx_added" to now, "idx_due" to now)
+    fun tags(now: String, priority: Int = 0) = Prio.jobTags(STAGE, "pending", now, priority)
 
     /** Writes the watch job unless it exists (If-None-Match: *). True when it was created, false when it was already there; an existing job is never touched. */
     fun follow(api: BlobApi, ref: SourceRef, o: FollowOptions, nowMs: Long): Boolean {
         val now = NodeRunner.iso(nowMs)
-        return api.put(ref.path, descriptor(ref, o, now).toString().toByteArray(), "application/json", tags(now), null, true)
+        return api.put(ref.path, descriptor(ref, o, now).toString().toByteArray(), "application/json", tags(now, o.priority), null, true)
     }
-
-    /** Find Blobs by Tags idx_stage='watch', then a read of each. */
-    fun list(api: BlobApi): List<Source> = api.findAll(STAGE).mapNotNull { r ->
-        try {
-            val g = api.get(r.name); if (g.status != 200) return@mapNotNull null
-            val o = JSONObject(g.text)
-            Source(r.id, o.optString("name").ifEmpty { r.id }, o.optString("kind", if (r.id.startsWith("pl-")) "playlist" else "channel"), o.optString("every", "1h"),
-                if (o.isNull("lastPolled")) null else o.optString("lastPolled").ifEmpty { null })
-        } catch (e: Exception) { null }
-    }.sortedBy { it.name.lowercase() }
 
     /** Deletes the watch job; its downloaded videos stay. */
     fun remove(api: BlobApi, jobId: String) = api.delete(path(jobId))
@@ -138,7 +127,7 @@ object SourceFollow {
         val ref = try { SourceUrl.parse(url, resolve) } catch (e: Exception) { null }
         if (ref == null) return if (SourceUrl.isSource(url)) FollowResult.Failed("Could not find the channel id of this URL") else FollowResult.NotASource
         return try {
-            val named = FollowOptions(opts.every, opts.backfill, opts.followChannels, opts.name ?: SourceUrl.nameHint(url, ref), opts.maxHeight)
+            val named = FollowOptions(opts.every, opts.backfill, opts.followChannels, opts.name ?: SourceUrl.nameHint(url, ref), opts.maxHeight, opts.priority)
             if (WatchJobs.follow(api, ref, named, nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref)
         } catch (e: Exception) { FollowResult.Failed(Redact.sas(e.message ?: e.javaClass.simpleName)) }
     }
@@ -154,31 +143,32 @@ sealed class AddResult {
 object IndexVideo {
     fun jobPath(id: String) = "index/jobs/download/$id.json"
 
-    fun descriptor(id: String, addedAt: String): JSONObject = JSONObject()
+    fun descriptor(id: String, addedAt: String, priority: Int = 0): JSONObject = JSONObject()
         .put("v", 1).put("stage", "download").put("jobId", id).put("url", "https://www.youtube.com/watch?v=$id")
         .put("maxHeight", 480).put("format", JSONObject.NULL).put("subs", true).put("source", "medusa-share")
+        .also { if (priority != 0) it.put("priority", Prio.check(priority)).put("ownPriority", priority) }
         .put("addedAt", addedAt).put("attempts", 0)
 
-    fun tags(now: String) = mapOf("idx_stage" to "download", "idx_state" to "pending", "idx_added" to now, "idx_due" to now)
+    fun tags(now: String, priority: Int = 0) = Prio.jobTags("download", "pending", now, priority)
 
-    fun add(api: BlobApi, id: String, nowMs: Long): AddResult = try {
+    fun add(api: BlobApi, id: String, nowMs: Long, priority: Int = 0): AddResult = try {
         when {
             api.get(jobPath(id)).status == 200 || api.listNames("index/videos/$id/", 1).isNotEmpty() -> AddResult.Already
             else -> { val now = NodeRunner.iso(nowMs)
-                if (api.put(jobPath(id), descriptor(id, now).toString().toByteArray(), "application/json", tags(now), null, true)) AddResult.Added else AddResult.Already }
+                if (api.put(jobPath(id), descriptor(id, now, priority).toString().toByteArray(), "application/json", tags(now, priority), null, true)) AddResult.Added else AddResult.Already }
         }
     } catch (e: Exception) { AddResult.Failed(Redact.sas(e.message ?: e.javaClass.simpleName)) }
 
     /** Adds the video; with [alsoChannel], also follows its channel, found by [channelOf] (yt-dlp --print channel_id on the video URL). */
-    fun share(api: BlobApi, raw: String, alsoChannel: Boolean, nowMs: Long, channelOf: (String) -> String?): Pair<AddResult, FollowResult?> {
+    fun share(api: BlobApi, raw: String, alsoChannel: Boolean, nowMs: Long, priority: Int = 0, channelOf: (String) -> String?): Pair<AddResult, FollowResult?> {
         val url = SourceUrl.firstUrl(raw) ?: raw.trim()
         val id = SourceUrl.videoId(url) ?: return AddResult.Failed("That is not a YouTube video URL") to null
-        val added = IndexVideo.add(api, id, nowMs)
+        val added = IndexVideo.add(api, id, nowMs, priority)
         if (!alsoChannel) return added to null
         val ch = try { channelOf("https://www.youtube.com/watch?v=$id")?.lineSequence()?.map { it.trim() }?.firstOrNull { Regex("UC[A-Za-z0-9_-]{22}").matches(it) } } catch (e: Exception) { null }
             ?: return added to FollowResult.Failed("Could not find the channel of this video")
         val ref = SourceRef("channel", ch)
-        return added to try { if (WatchJobs.follow(api, ref, FollowOptions(), nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref) }
+        return added to try { if (WatchJobs.follow(api, ref, FollowOptions(priority = priority), nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref) }
             catch (e: Exception) { FollowResult.Failed(Redact.sas(e.message ?: e.javaClass.simpleName)) }
     }
 }

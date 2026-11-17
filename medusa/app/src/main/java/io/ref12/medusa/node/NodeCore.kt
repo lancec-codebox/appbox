@@ -152,7 +152,7 @@ class NodeRunner(
                 if (gate == Gate.BUDGET_SPENT) { s.endReason = "budget spent"; regState = "budget spent"; break }
                 if (gate == Gate.WAITING) { s.endReason = "waiting for window"; regState = "waiting for window"; break }
                 if (state.doneToday(day(env.clock())) >= cap) { s.endReason = "daily cap reached"; break }
-                val jobs = api.findJobs(STAGE)
+                val jobs = Prio.claimOrder(api.findJobs(STAGE))
                 if (jobs.isEmpty()) { s.endReason = "no work"; break }
                 listener.onWork(jobs.size)
                 var outcome: Outcome? = null
@@ -231,15 +231,8 @@ class NodeRunner(
                         .put("audioLanguage", out.audioLanguage ?: JSONObject.NULL).put("audioNote", out.audioNote ?: JSONObject.NULL)
                         .put("audioTracks", JSONArray().also { a -> out.audioTracks.forEach { a.put(JSONObject().put("language", it.first).put("note", it.second ?: JSONObject.NULL)) } }).put("nodeId", cfg.nodeId).put("at", at)
                     api.put(base + "downloaded.json", marker.toString().toByteArray(), "application/json")
-                    val pj = JSONObject().put("v", 1).put("stage", "process").put("jobId", ref.id)
-                        .put("steps", JSONArray(listOf("frames", "sscd", "clip", "transcribe", "ocrsubs")))
-                        .put("addedAt", at).put("attempts", 0)
-                    api.put("index/jobs/process/${ref.id}.json", pj.toString().toByteArray(), "application/json",
-                        mapOf("idx_stage" to "process", "idx_state" to "pending", "idx_added" to at), null, true)
-                    val cj = JSONObject().put("v", 1).put("stage", "comments").put("jobId", ref.id).put("url", job.url)
-                        .put("maxComments", 1000).put("sort", "top").put("round", 0).put("addedAt", at).put("attempts", 0)
-                    api.put("index/jobs/comments/${ref.id}.json", cj.toString().toByteArray(), "application/json",
-                        mapOf("idx_stage" to "comments", "idx_state" to "pending", "idx_added" to at, "idx_due" to at), null, true)
+                    // as IndexNode's DownloadStage: comments plus one job per ingest step (with needs), all at the download's priority; no legacy process job
+                    FollowUps.create(api, ref.id, job.url, job.priority ?: Prio.of(ref.tags), at)
                     val done = JSONObject(jobText).put("finishedAt", at).put("nodeId", cfg.nodeId).put("elapsedSeconds", (env.clock() - t0) / 1000)
                     api.put(ref.name, done.toString().toByteArray(), "application/json", tagsOf(ref, "done"), leaseId)
                     release(ref.name, leaseId)
@@ -358,7 +351,7 @@ class NodeRunner(
     }
 }
 
-class DownloadJob(val jobId: String, val url: String, val maxHeight: Int, val format: String?, val subs: Boolean) {
+class DownloadJob(val jobId: String, val url: String, val maxHeight: Int, val format: String?, val subs: Boolean, val priority: Int? = null) {
     /** The -f value: a raw format wins, else any video plus compact Opus audio, falling back to a single file. Resolution comes from [sortArgs]. */
     fun selector(): String = format ?: "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b"
 
@@ -372,7 +365,8 @@ class DownloadJob(val jobId: String, val url: String, val maxHeight: Int, val fo
         fun parse(text: String): DownloadJob {
             val o = JSONObject(text)
             return DownloadJob(o.getString("jobId"), o.getString("url"), if (o.isNull("maxHeight")) 480 else o.optInt("maxHeight", 480),
-                if (o.isNull("format")) null else o.optString("format").ifBlank { null }, o.optBoolean("subs", true))
+                if (o.isNull("format")) null else o.optString("format").ifBlank { null }, o.optBoolean("subs", true),
+                if (o.has("priority") && !o.isNull("priority")) o.optInt("priority", 0).takeIf { it in Prio.MIN..Prio.MAX } else null)
         }
     }
 }

@@ -112,12 +112,12 @@ class NodeRunnerTest {
         assertEquals(1, s.done); assertEquals("no work", s.endReason)
         assertEquals("480", f.jobs[0].maxHeight.toString())
         val puts = api.log.filter { it.startsWith("put:") }
-        // outputs first, the marker last of them, then the process job, then the job itself
+        // outputs first, the marker last of them, then the comments and step jobs, then the job itself
         val vid = "put:index/videos/aaaaaaaaaaa/"
         assertTrue(puts.indexOf(vid + "downloaded.json") > puts.indexOf(vid + "video.mp4"))
         assertTrue(puts.indexOf(vid + "downloaded.json") > puts.indexOf(vid + "subs/zh-Hans.vtt"))
-        assertTrue(puts.indexOf("put:index/jobs/process/aaaaaaaaaaa.json") > puts.indexOf(vid + "downloaded.json"))
-        assertTrue(puts.indexOf("put:index/jobs/download/aaaaaaaaaaa.json") > puts.indexOf("put:index/jobs/process/aaaaaaaaaaa.json"))
+        assertTrue(puts.indexOf("put:index/jobs/frames/aaaaaaaaaaa.json") > puts.indexOf(vid + "downloaded.json"))
+        assertTrue(puts.indexOf("put:index/jobs/download/aaaaaaaaaaa.json") > puts.indexOf("put:index/jobs/translate/aaaaaaaaaaa.json"))
         val marker = JSONObject(String(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"]!!.bytes))
         assertEquals(100, marker.getInt("bytes")); assertEquals(480, marker.getInt("height")); assertEquals(61.5, marker.getDouble("durationSeconds"), 0.0); assertEquals("lancecm1-a1b2c3", marker.getString("nodeId"))
         assertEquals(1, marker.getInt("v")); assertEquals("av01.0.00M.08", marker.getString("vcodec")); assertEquals("opus", marker.getString("acodec"))
@@ -128,11 +128,11 @@ class NodeRunnerTest {
           assertEquals("394+251", marker.getString("formatId")); assertEquals(true, marker.getBoolean("embeddable")); assertTrue(marker.has("at"))
         assertEquals("[\"zh-Hans\",\"en\",\"zh-Hans.auto\"]", marker.getJSONArray("subs").toString())
         assertEquals("第一集 hello", String(api.blobs["index/videos/aaaaaaaaaaa/description.txt"]!!.bytes, Charsets.UTF_8))
-        val p = api.blobs["index/jobs/process/aaaaaaaaaaa.json"]!!
-        assertEquals("pending", p.tags["idx_state"]); assertEquals("process", p.tags["idx_stage"]); assertNotNull(p.tags["idx_added"])
-        val pj = JSONObject(String(p.bytes)); assertEquals(0, pj.getInt("attempts")); assertFalse(pj.has("compress"))
+        assertNull(api.blobs["index/jobs/process/aaaaaaaaaaa.json"])
+        val pj = JSONObject(String(api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]!!.bytes))
         val c = api.blobs["index/jobs/comments/aaaaaaaaaaa.json"]!!; val cj = JSONObject(String(c.bytes))
         assertEquals("comments", c.tags["idx_stage"]); assertEquals("pending", c.tags["idx_state"]); assertEquals(pj.getString("addedAt"), c.tags["idx_due"]); assertEquals(c.tags["idx_added"], c.tags["idx_due"])
+        assertFalse(c.tags.containsKey("idx_priority"))
         assertEquals(1000, cj.getInt("maxComments")); assertEquals("top", cj.getString("sort")); assertEquals(0, cj.getInt("round")); assertEquals(0, cj.getInt("attempts")); assertEquals(1, cj.getInt("v"))
         assertTrue(cj.getString("url").isNotEmpty()); assertEquals("aaaaaaaaaaa", cj.getString("jobId"))
         assertEquals(listOf("frames", "sscd", "clip", "transcribe", "ocrsubs"), JSONObject(String(p.bytes)).getJSONArray("steps").let { a -> (0 until a.length()).map { a.getString(it) } })
@@ -159,11 +159,60 @@ class NodeRunnerTest {
         assertEquals(true, p.embeddable); assertNull(NodeInfo.parse("{}").embeddable); assertEquals("", NodeInfo.parse("{}").description)
     }
 
-    @Test fun anExistingProcessJobIsLeftAlone() {
+    @Test fun anExistingFollowUpJobIsLeftAlone() {
         api.addJob("aaaaaaaaaaa", 1)
-        api.blobs["index/jobs/process/aaaaaaaaaaa.json"] = FakeBlobs.B("{\"keep\":1}".toByteArray(), mapOf("idx_state" to "done"))
+        api.blobs["index/jobs/frames/aaaaaaaaaaa.json"] = FakeBlobs.B("{\"keep\":1}".toByteArray(), mapOf("idx_state" to "done"))
         runner(FakeFetcher()).run()
-        assertEquals("{\"keep\":1}", String(api.blobs["index/jobs/process/aaaaaaaaaaa.json"]!!.bytes))
+        assertEquals("{\"keep\":1}", String(api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]!!.bytes))
+    }
+
+    @Test fun followUpsAreTheIngestStepsWithNeedsPriorityAndNoProcessJob() {
+        api.addJob("aaaaaaaaaaa", 1, extra = ",\"priority\":7")
+        api.job("aaaaaaaaaaa").tags = api.job("aaaaaaaaaaa").tags + ("idx_priority" to "7")
+        runner(FakeFetcher()).run()
+        val stages = api.blobs.keys.filter { it.startsWith("index/jobs/") && !it.startsWith("index/jobs/download/") }.map { it.removePrefix("index/jobs/").substringBefore('/') }.toSet()
+        assertEquals(setOf("comments") + FollowUps.INGEST_STEPS, stages)
+        assertFalse("process" in stages); assertFalse("dino" in stages); assertFalse("clip" in stages)
+        for (st in stages) {
+            val b = api.blobs["index/jobs/$st/aaaaaaaaaaa.json"]!!
+            assertEquals("7", b.tags["idx_priority"]); assertEquals(7, JSONObject(String(b.bytes)).getInt("priority")); assertEquals("pending", b.tags["idx_state"])
+        }
+        fun needs(st: String) = JSONObject(String(api.blobs["index/jobs/$st/aaaaaaaaaaa.json"]!!.bytes)).optJSONArray("needs")?.let { a -> (0 until a.length()).map { a.getString(it) } }
+        assertNull(needs("frames")); assertEquals(listOf("frames/manifest.json"), needs("thumbs"))
+        assertEquals(listOf("frames/manifest.json", "sscd/manifest.json"), needs("cast"))
+        assertEquals(listOf("asr/sensevoice.zh.json", "ocr/lines.json"), needs("sync"))
+        assertEquals(listOf("asr/sensevoice.zh.json", "ocr/lines.json", "cast/clusters.json"), needs("describe"))
+        assertEquals(listOf("describe.json"), needs("translate"))
+    }
+
+    @Test fun claimOrderIsPriorityThenAddedThenName() {
+        fun ref(n: String, added: String, p: String?) = JobRef("index/jobs/download/$n.json", listOfNotNull("idx_added" to added, p?.let { "idx_priority" to it }).toMap())
+        val order = Prio.claimOrder(listOf(ref("c", "2026-01-01T00:00:03Z", null), ref("b", "2026-01-01T00:00:02Z", "oops"), ref("a", "2026-01-01T00:00:09Z", "5"),
+            ref("d", "2026-01-01T00:00:01Z", "-3"), ref("e", "2026-01-01T00:00:02Z", "2000"), ref("f", "2026-01-01T00:00:02Z", "0"))).map { it.id }
+        assertEquals(listOf("a", "b", "e", "f", "c", "d"), order)
+    }
+
+    @Test fun theRunnerClaimsTheHighestPriorityFirst() {
+        api.addJob("aaaaaaaaaaa", 1); api.addJob("bbbbbbbbbbb", 2)
+        api.job("bbbbbbbbbbb").tags = api.job("bbbbbbbbbbb").tags + ("idx_priority" to "10")
+        val f = FakeFetcher(); runner(f).run()
+        assertEquals(listOf("bbbbbbbbbbb", "aaaaaaaaaaa"), f.jobs.map { it.jobId })
+    }
+
+    @Test fun retaggingKeepsEveryTagAndOnlyTouchesPendingJobs() {
+        api.addJob("aaaaaaaaaaa", 1)
+        api.job("aaaaaaaaaaa").tags = api.job("aaaaaaaaaaa").tags + ("idx_extra" to "keep")
+        api.addJob("bbbbbbbbbbb", 2); api.job("bbbbbbbbbbb").tags = api.job("bbbbbbbbbbb").tags + ("idx_state" to "done")
+        api.addJob("ccccccccccc", 3); api.acquireLease("index/jobs/download/ccccccccccc.json")
+        val r = Priorities.set(api, 9, listOf("download", "bbbbbbbbbbb", "ccccccccccc", "aaaaaaaaaaa").let { listOf("download" to "aaaaaaaaaaa", "download" to "bbbbbbbbbbb", "download" to "ccccccccccc", "frames" to "aaaaaaaaaaa") })
+        assertEquals(1, r.changed)
+        val t = api.job("aaaaaaaaaaa").tags
+        assertEquals("9", t["idx_priority"]); assertEquals("keep", t["idx_extra"]); assertEquals("pending", t["idx_state"]); assertEquals("download", t["idx_stage"])
+        assertEquals(9, api.jobJson("aaaaaaaaaaa").getInt("priority")); assertNull(api.job("aaaaaaaaaaa").lease)
+        assertNull(api.job("bbbbbbbbbbb").tags["idx_priority"]); assertNull(api.job("ccccccccccc").tags["idx_priority"])
+        assertEquals(mapOf("done" to 1, "leased" to 1, "no such job" to 1), r.skipped)
+        Priorities.set(api, 0, listOf("download" to "aaaaaaaaaaa"))
+        assertFalse(api.job("aaaaaaaaaaa").tags.containsKey("idx_priority")); assertEquals("keep", api.job("aaaaaaaaaaa").tags["idx_extra"])
     }
 
     @Test fun theOldestJobGoesFirstAndAGapSeparatesDownloads() {
@@ -185,7 +234,7 @@ class NodeRunnerTest {
         val o = api.jobJson("aaaaaaaaaaa")
         assertEquals("failed", api.job("aaaaaaaaaaa").tags["idx_state"]); assertTrue(o.getBoolean("permanent")); assertEquals("Video unavailable", o.getString("lastError"))
         assertNull(api.job("aaaaaaaaaaa").lease); assertEquals(1, s.failed); assertNull(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"])
-        assertNull(api.blobs["index/jobs/process/aaaaaaaaaaa.json"]); assertEquals(0, state.doneToday(NodeRunner.day(now)))
+        assertNull(api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]); assertEquals(0, state.doneToday(NodeRunner.day(now)))
     }
 
     @Test fun aTransientFailureCountsAnAttemptAndLetsGoAtOnce() {

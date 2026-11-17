@@ -120,6 +120,7 @@
             android:grantUriPermissions="true" />
 
         <receiver android:name=".InstallResultReceiver" android:exported="false" />
+        <receiver android:name=".node.RunNowReceiver" android:exported="false" />
 
         <!-- the index node's long-running worker is a dataSync foreground service (Android 14+ needs the type) -->
         <service
