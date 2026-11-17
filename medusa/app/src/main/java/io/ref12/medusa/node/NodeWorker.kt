@@ -56,6 +56,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
             val client = BlobClient(sas)
             val today = { settings.doneToday(NodeRunner.day(System.currentTimeMillis())) }
             fun show(status: StatusInput, progressOnly: Boolean) {
+                NodeLive.input = status
                 val text = NodeStatus.text(status)
                 if (throttle.allow(text, progressOnly)) goForeground(text)
             }
@@ -68,7 +69,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
             runner = r
             StatusNotifier.cancel(ctx) // the foreground notification speaks during the run
             // The system ended the work (the Android 15 dataSync time limit, lost constraints, cancel): WorkManager cancels this coroutine, and the runner lets go of the lease.
-            settings.lastRunAt = System.currentTimeMillis(); settings.lastRun = "running"
+            settings.lastRunAt = System.currentTimeMillis(); settings.lastRunVersion = BuildConfig.VERSION_NAME; settings.lastRun = "running"; NodeLive.input = StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap)
             var reason = ""
             try {
                 val s = kotlinx.coroutines.coroutineScope {
@@ -77,13 +78,13 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
                         r.abort(); withContext(NonCancellable) { job.join() }; throw e
                     }
                 }
-                reason = s.endReason
-                settings.lastRun = Redact.sas("done " + s.done + ", failed " + s.failed + ", released " + s.released + " - " + s.endReason)
+                reason = s.endReason; settings.lastEndReason = s.endReason
+                settings.lastRun = Redact.sas(NodeStatus.runSummary(s.done, s.failed, s.released, s.endReason))
             } catch (e: CancellationException) { settings.lastRun = "stopped by the system"; settings.lastRunAt = System.currentTimeMillis(); throw e
             } catch (e: Throwable) {
                 settings.lastRun = Redact.sas("error: " + (e.message ?: e.javaClass.simpleName))
             } finally {
-                runner = null
+                runner = null; NodeLive.input = null
                 settings.lastRunAt = System.currentTimeMillis()
                 settings.lastStatus = ""
                 StatusNotifier.refresh(ctx, settings, if (reason.isNotEmpty()) NodeStatus.afterRun(reason, today(), settings.dailyCap, message = settings.lastControl.substringAfter(" - ", "").ifEmpty { null }) else null)
@@ -167,14 +168,20 @@ object StatusNotifier {
         val wait = deviceWait(ctx, s.conditions == NodeConditions.CHARGING_WIFI)
         val sinceMin = if (s.lastRunAt == 0L) 0 else ((System.currentTimeMillis() - s.lastRunAt) / 60_000).toInt()
         return when {
-            NodeWorker.isRunning -> StatusInput(downloading = true, doneToday = s.doneToday(day), cap = s.dailyCap)
-            s.lastControl.startsWith("stop") -> StatusInput(stoppedByOwner = true, message = s.lastControl.substringAfter(" - ", "").ifEmpty { null })
+            NodeWorker.isRunning -> NodeLive.input ?: StatusInput(downloading = true, doneToday = s.doneToday(day), cap = s.dailyCap)
+            s.backoffUntil() > System.currentTimeMillis() -> StatusInput(backoffUntil = java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(s.backoffUntil())),
+                backoffReason = backoffReason(s))
             wait != Wait.NONE -> StatusInput(wait = wait)
-            after != null -> after
+            s.lastControl.startsWith("stop") -> StatusInput(stoppedByOwner = true, message = s.lastControl.substringAfter(" - ", "").ifEmpty { null })
+            after != null && after.downloading.not() && (after.capReached || after.budgetSpent || after.drain) -> after
             s.doneToday(day) >= s.dailyCap -> StatusInput(doneToday = s.doneToday(day), cap = s.dailyCap, capReached = true)
+            s.lastEndReason == "no work" -> StatusInput(noWork = true, nextCheckMin = (15 - sinceMin).coerceIn(1, 15))
             else -> StatusInput(nextCheckMin = (15 - sinceMin).coerceIn(1, 15))
         }
     }
+
+    /** "bot block on <job>": from the newest back-off entry in the job log. */
+    fun backoffReason(s: NodeSettings): String? = s.recent().firstOrNull { it.result == "bot block" }?.let { "bot block on " + it.jobId }
 
     fun statusText(ctx: Context, s: NodeSettings): String = try { NodeStatus.text(statusInput(ctx, s)) } catch (e: Exception) { "Status unavailable" }
 

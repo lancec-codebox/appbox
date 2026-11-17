@@ -104,6 +104,9 @@ class NodeSettings(ctx: Context) : NodeState, SetupStore {
 
     var lastRun: String get() = prefs.getString("lastRun", "") ?: ""; set(v) { prefs.edit().putString("lastRun", v).apply() }
     var lastRunAt: Long get() = prefs.getLong("lastRunAt", 0); set(v) { prefs.edit().putLong("lastRunAt", v).apply() }
+    var lastRunVersion: String get() = prefs.getString("lastRunVersion", "") ?: ""; set(v) { prefs.edit().putString("lastRunVersion", v).apply() }
+    /** How the last run ended (the runner's reason), so the headline can say "No downloads queued" between runs. */
+    var lastEndReason: String get() = prefs.getString("lastEndReason", "") ?: ""; set(v) { prefs.edit().putString("lastEndReason", v).apply() }
     var lastControl: String get() = prefs.getString("lastControl", "") ?: ""; set(v) { prefs.edit().putString("lastControl", v).apply() }
 
     override fun saveControl(text: String) { lastControl = text }
@@ -114,12 +117,12 @@ class NodeSettings(ctx: Context) : NodeState, SetupStore {
 
     override fun record(entry: JobLogEntry) {
         val a = JSONArray(prefs.getString("recent", "[]"))
-        val n = JSONArray().put(JSONObject().put("id", entry.jobId).put("title", entry.title ?: "").put("result", entry.result).put("at", entry.at).put("msg", Redact.sas(entry.message ?: "")))
+        val n = JSONArray().put(JSONObject().put("id", entry.jobId).put("title", entry.title ?: "").put("result", entry.result).put("at", entry.at).put("msg", Redact.sas(entry.message ?: "")).put("ver", entry.version ?: io.ref12.medusa.BuildConfig.VERSION_NAME))
         for (i in 0 until minOf(a.length(), 19)) n.put(a.get(i))
         prefs.edit().putString("recent", n.toString()).apply()
     }
     fun recent(): List<JobLogEntry> = JSONArray(prefs.getString("recent", "[]")).let { a ->
-        (0 until a.length()).map { val o = a.getJSONObject(it); JobLogEntry(o.getString("id"), o.optString("title").ifEmpty { null }, o.getString("result"), o.getLong("at"), o.optString("msg").ifEmpty { null }) }
+        (0 until a.length()).map { val o = a.getJSONObject(it); JobLogEntry(o.getString("id"), o.optString("title").ifEmpty { null }, o.getString("result"), o.getLong("at"), o.optString("msg").ifEmpty { null }, o.optString("ver").ifEmpty { null }) }
     }
 
     fun config(ctx: Context, version: String) = NodeConfig(nodeId, name, conditions.wire, version,

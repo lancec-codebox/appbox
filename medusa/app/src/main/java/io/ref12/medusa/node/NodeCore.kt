@@ -111,7 +111,7 @@ interface NodeState {
     fun saveLimits(text: String) {}
 }
 
-class JobLogEntry(val jobId: String, val title: String?, val result: String, val at: Long, val message: String?)
+class JobLogEntry(val jobId: String, val title: String?, val result: String, val at: Long, val message: String?, val version: String? = null)
 
 interface NodeListener {
     fun onWork(left: Int) {}

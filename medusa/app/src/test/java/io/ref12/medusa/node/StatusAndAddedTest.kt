@@ -5,22 +5,22 @@ import org.junit.Test
 
 class StatusAndAddedTest {
     @Test fun statusTextsForEachState() {
-        assertEquals("Downloading 3/20 today: Some Title 64%", NodeStatus.text(StatusInput(downloading = true, doneToday = 2, cap = 20, title = "Some Title", progress = "64%")))
+        assertEquals("Downloading: Some Title \u2014 video 64%", NodeStatus.text(StatusInput(downloading = true, doneToday = 2, cap = 20, title = "Some Title", progress = "download 64%")))
         assertEquals("Waiting: not charging", NodeStatus.text(StatusInput(wait = Wait.NOT_CHARGING)))
         assertEquals("Waiting: not on Wi-Fi", NodeStatus.text(StatusInput(wait = Wait.NOT_UNMETERED)))
         assertEquals("Waiting: battery low", NodeStatus.text(StatusInput(wait = Wait.BATTERY_LOW)))
         assertEquals("Waiting: storage low", NodeStatus.text(StatusInput(wait = Wait.STORAGE_LOW)))
-        assertEquals("Daily cap reached: resumes tomorrow", NodeStatus.text(StatusInput(capReached = true)))
+        assertEquals("Daily cap reached (0/20)", NodeStatus.text(StatusInput(capReached = true)))
         assertEquals("Budget spent", NodeStatus.text(StatusInput(budgetSpent = true)))
         assertEquals("Downloads stopped by the owner", NodeStatus.text(StatusInput(stoppedByOwner = true)))
         assertEquals("Idle: next check in 12 min", NodeStatus.text(StatusInput(nextCheckMin = 12)))
     }
 
     @Test fun afterARunTheEndReasonPicksTheStatus() {
-        assertEquals("Daily cap reached: resumes tomorrow", NodeStatus.text(NodeStatus.afterRun("daily cap reached", 20, 20)))
+        assertEquals("Daily cap reached (20/20)", NodeStatus.text(NodeStatus.afterRun("daily cap reached", 20, 20)))
         assertEquals("Budget spent", NodeStatus.text(NodeStatus.afterRun("budget spent", 0, 20)))
         assertEquals("Downloads stopped by the owner", NodeStatus.text(NodeStatus.afterRun("control: stop", 0, 20)))
-        assertEquals("Idle: next check in 15 min", NodeStatus.text(NodeStatus.afterRun("no work", 0, 20)))
+        assertEquals("No downloads queued", NodeStatus.text(NodeStatus.afterRun("no work", 0, 20)))
     }
 
     @Test fun theFirstUnmetConditionIsReported() {

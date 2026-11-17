@@ -60,6 +60,7 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
           val subFiles = LinkedHashMap<String, File>() // upload name -> file
           var subsFailed: List<String> = emptyList()
           if (job.subs && !cancelled) {
+              progress("subtitles", null)
               val plan = SubLangs.plan(if (info.isFile) info.readText() else null)
               subsFailed = SubLangs.fetch(plan) { auto, langs ->
                   if (cancelled) throw InterruptedException()

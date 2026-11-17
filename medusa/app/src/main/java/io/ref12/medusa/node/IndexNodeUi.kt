@@ -137,7 +137,9 @@ object IndexNodeUi {
         val s = NodeSettings(a)
         val line = Ui.text(a, "", 15f, bold = true).apply { tag = "node-status-line" }
         card.addView(line)
+        val clearBackoff = Ui.button(a, "Clear back-off") { s.setBackoffUntil(0L); s.lastStatus = ""; StatusNotifier.refresh(a, s, null); a.runOnUiThread { line.text = StatusNotifier.statusText(a, s) } }.apply { tag = "node-clear-backoff"; visibility = android.view.View.GONE }
         val info = Ui.muted(a, "", 12f).apply { tag = "node-status-info" }
+        card.addView(clearBackoff, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(info, Ui.lp(-1, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.button(a, "Run now") {
             SafeClick.run("Run now", { Toast.makeText(a, it, Toast.LENGTH_LONG).show() }) {
@@ -164,15 +166,17 @@ object IndexNodeUi {
         fun refresh() {
             val now = System.currentTimeMillis()
             line.text = StatusNotifier.statusText(a, s)
+            clearBackoff.visibility = if (s.enabled && !NodeWorker.isRunning && s.backoffUntil() > now) android.view.View.VISIBLE else android.view.View.GONE
             val crash = CrashLog.read(a.filesDir)
             crashLine.text = crash?.line() ?: ""; crashLine.visibility = if (crash != null) android.view.View.VISIBLE else android.view.View.GONE; crashRow.visibility = crashLine.visibility
             info.text = "Node id: " + s.nodeId + "\nControl: " + (s.lastControl.ifEmpty { "not read yet" }) +
                 (if (s.lastLimits.isNotEmpty()) "\nNow: " + s.lastLimits else "") +
                 "\nDownloads today: " + s.doneToday(NodeRunner.day(now)) + " of " + s.dailyCap +
-                (if (s.backoffUntil() > now) "\nBacking off until " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(s.backoffUntil())) else "")
+                ""
             val recent = s.recent()
-            runs.text = "Last run: " + (if (s.lastRunAt == 0L) "never" else DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(s.lastRunAt)) + " - " + s.lastRun) +
-                "\nRecent jobs:" + (if (recent.isEmpty()) " none" else recent.take(8).joinToString("") { "\n  " + it.jobId + " " + (it.title?.take(30) ?: "") + " - " + it.result + (it.message?.let { m -> " (" + m.take(220) + ")" } ?: "") })
+            val fmt = { t: Long -> DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(t)) }
+            runs.text = NodeStatus.lastRunLine(s.lastRunAt, s.lastRunVersion.ifEmpty { null }, s.lastRun, fmt) +
+                "\nRecent jobs:" + (if (recent.isEmpty()) " none" else recent.take(8).joinToString("") { "\n  " + NodeStatus.historyLine(it, fmt) })
         }
         refresh()
         return ::refresh
