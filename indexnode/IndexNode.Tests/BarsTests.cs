@@ -47,7 +47,7 @@ public class BarsTests
     {
         var fr = Many(24, i => i % 2 == 0 ? Frame(64, 36, 120, (0, 6, 0)) : Frame(64, 36, 120));
         Assert.Equal(BarCrop.None, Bars.Detect(fr, 64, 36));
-        var one = Many(24, i => i == 11 ? Frame(64, 36, 120) : Frame(64, 36, 120, (0, 6, 0), (30, 36, 0)));
+        var one = Many(24, i => i % 2 == 1 ? Frame(64, 36, 120) : Frame(64, 36, 120, (0, 6, 0), (30, 36, 0)));
         Assert.Equal(BarCrop.None, Bars.Detect(one, 64, 36));
     }
 
@@ -100,15 +100,24 @@ public class BarsTests
     }
 
     [Fact]
-    public void The_subtitle_band_follows_the_crop_of_the_stored_frames()
+    public void Bars_dark_in_at_least_80_percent_of_the_samples_count_even_with_subtitle_rows()
     {
-        var lines = """{"band":{"y":300,"h":40,"width":640},"zh":[{"start":0,"end":3,"text":"a","boxes":[{"x0":100,"y0":320,"x1":500,"y1":340,"text":"a","score":1}]}],"en":[]}""";
-        var plain = SubtitleBand.Parse(System.Text.Encoding.UTF8.GetBytes(lines))!.At(1, 640)!;
-        Assert.Equal([100, 320, 400, 20], plain);
-        var sb = SubtitleBand.Parse(System.Text.Encoding.UTF8.GetBytes(lines))!; sb.Top = 44; sb.Left = 0;
-        Assert.Equal([100, 276, 400, 20], sb.At(1, 640)!);
-        var o = System.Text.Json.Nodes.JsonNode.Parse("""{"source":{"width":640,"cropLeft":0,"cropTop":44}}""")!.AsObject();
-        Assert.Equal(276, SubtitleBand.Parse(System.Text.Encoding.UTF8.GetBytes(lines))!.WithCropOf(o)!.At(1, 640)![1]);
+        // text rows inside the bottom bar are bright in 4 of 24 samples (17%): the whole bar is still bar
+        var fr = Many(24, i => i < 4 ? Frame(100, 100, 120, (0, 10, 0), (90, 100, 0), (95, 97, 230)) : Frame(100, 100, 120, (0, 10, 0), (90, 100, 0)));
+        Assert.Equal(new BarCrop(10, 10, 0, 0), Bars.Detect(fr, 100, 100));
+        // bright in 5 of 24 (79% dark): the text rows are not bar
+        var fr5 = Many(24, i => i < 5 ? Frame(100, 100, 120, (0, 10, 0), (90, 100, 0), (95, 97, 230)) : Frame(100, 100, 120, (0, 10, 0), (90, 100, 0)));
+        Assert.Equal(2, Bars.Detect(fr5, 100, 100).Bottom); // rows 97-99 only (3), one given back to keep the height even
+    }
+
+    [Fact]
+    public void The_sscd_input_is_the_cropped_picture_resized_to_short_side_288()
+    {
+        var box = new BarCrop(44, 44, 0, 0);
+        Assert.Equal((678, 288), Sscd.InputSize(640, 360, box));
+        Assert.Equal((512, 288), Sscd.InputSize(640, 360, BarCrop.None));
+        Assert.Equal("crop=640:272:0:44,scale=678:288:flags=bicubic", Sscd.Filter(640, 360, box));
+        Assert.Equal((288, 512), Sscd.InputSize(360, 640, BarCrop.None));
     }
 }
 
@@ -156,23 +165,30 @@ public class FramesBarsTests : IDisposable
     static (int W, int H) SizeOf(JsonElement m) => (m.GetProperty("width").GetInt32(), m.GetProperty("height").GetInt32());
 
     [Fact]
-    public async Task A_letterboxed_video_is_stored_without_its_bars_and_the_manifest_says_so()
+    public async Task A_letterboxed_video_is_stored_whole_and_the_manifest_records_the_box()
     {
         if (await RealAsync() is not { } t) return;
-        var v = await MakeAsync(t, "bars.mp4", "testsrc=s=640x272:r=10,pad=640:360:0:44:black");
+        var v = await MakeAsync(t, "bars.mp4", "testsrc2=s=640x272:r=10,pad=640:360:0:44:black");
         var (m, put) = await RunAsync(t, v);
-        Assert.Equal((640, 272), SizeOf(m)); Assert.Equal((44, 44, 0, 0), CropOf(m));
+        Assert.Equal((640, 360), SizeOf(m)); Assert.Equal((44, 44, 0, 0), CropOf(m));
         Assert.Equal(Frames.FramesVersion, m.GetProperty("framesVersion").GetInt32());
-        var src = m.GetProperty("source"); Assert.Equal(640, src.GetProperty("width").GetInt32()); Assert.Equal(360, src.GetProperty("height").GetInt32());
-        Assert.Equal(360, src.GetProperty("scaledHeight").GetInt32());
-        // the chunk index and the stored JPEGs have the cropped size too
+        Assert.Equal(Bars.RuleVersion, m.GetProperty("cropRule").GetInt32());
         var chunk = put.Keys.Single(k => k.StartsWith("frames/") && k.EndsWith(".json") && !k.Contains("manifest") && !k.Contains("shots"));
-        var idx = JsonDocument.Parse(put[chunk]).RootElement; Assert.Equal(272, idx.GetProperty("height").GetInt32());
+        var idx = JsonDocument.Parse(put[chunk]).RootElement; Assert.Equal(360, idx.GetProperty("height").GetInt32());
         var first = put[chunk.Replace(".json", ".mjpeg")]; int len = idx.GetProperty("frames")[0].GetProperty("len").GetInt32();
-        Assert.Equal("640x272", JpegSize(first.AsSpan(0, len).ToArray()));
-        // a later stage opening the stored set learns the crop
+        Assert.Equal("640x360", JpegSize(first.AsSpan(0, len).ToArray()));
         var od = Path.Combine(dir, "opened"); Directory.CreateDirectory(od); foreach (var (n, b) in put) File.WriteAllBytes(Path.Combine(od, Path.GetFileName(n)), b);
-        var cd = ChunkDir.Open(od); Assert.Equal(44, cd.CropTop); Assert.Equal(0, cd.CropLeft); Assert.Equal(272, cd.H);
+        var cd = ChunkDir.Open(od); Assert.Equal(new BarCrop(44, 44, 0, 0), cd.Crop); Assert.Equal(360, cd.H);
+        var tools = new Tools(new HttpClient()); tools.UseFfmpeg(t.Ff, t.Probe);
+        var jd = Path.Combine(dir, "jpgs"); await cd.ExtractAsync(tools, jd, default);
+        var (iw, ih) = Sscd.InputSize(cd.W, cd.H, cd.Crop); Assert.Equal((678, 288), (iw, ih));
+        var raw = Path.Combine(dir, "in.rgb");
+        var r = await Proc.RunAsync(t.Ff, ["-hide_banner", "-loglevel", "error", "-y", "-i", Path.Combine(jd, "000000.jpg"), "-vf", Sscd.Filter(cd.W, cd.H, cd.Crop), "-f", "rawvideo", "-pix_fmt", "rgb24", raw], default);
+        Assert.True(r.ExitCode == 0, r.Stderr);
+        var px = File.ReadAllBytes(raw); Assert.Equal(iw * ih * 3, px.Length);
+        double top = 0; for (int x = 0; x < iw * 3; x++) top += px[x]; Assert.True(top / (iw * 3) > 20, "top row still dark");
+        // an upload without the box in its manifest gets it computed from the stored frames
+        Assert.Equal(new BarCrop(44, 44, 0, 0), FrameChunks.BarsFromFrames(jd, cd.Count, cd.W, cd.H));
     }
 
     [Fact]
@@ -209,11 +225,12 @@ public class FramesBarsTests : IDisposable
     {
         if (await RealAsync() is not { } t) return;
         // a white "subtitle" box inside the bottom bar (rows 322-337 of 360) on some frames
-        var v = await MakeAsync(t, "subs.mp4", "testsrc=s=640x272:r=10,pad=640:360:0:44:black,drawbox=x=120:y=322:w=400:h=16:color=white:t=fill:enable='between(t,2,9)'");
+        var v = await MakeAsync(t, "subs.mp4", "testsrc2=s=640x272:r=10,pad=640:360:0:44:black,drawbox=x=120:y=322:w=400:h=16:color=white:t=fill:enable='between(t,2,3.5)'");
         var (m, _) = await RunAsync(t, v);
         var (T, B, _, _) = CropOf(m);
-        // the bar run stops at the subtitle rows: the top bar goes, the bottom crop is partial (22 rows below the box) and the stored frame still holds the box
-        Assert.Equal(44, T); Assert.True(B <= 22, $"bottom crop {B}"); Assert.Equal(360 - T - B, SizeOf(m).H);
+        // the subtitle box is on for about 2 of 12 s (under 20% of the samples): the whole bottom bar, text rows included, still counts as bar
+        Assert.Equal(44, T); Assert.Equal(360, SizeOf(m).H); // frames stored whole
+        Assert.Equal(44, B);
         // the reader works on the source video at full size, never on the stored frames: its size and its band pixels are those of the source
         var tools = new Tools(new HttpClient()); tools.UseFfmpeg(t.Ff, t.Probe);
         Assert.Equal((640, 360), await OcrSubs.SizeAsync(tools, v, default));

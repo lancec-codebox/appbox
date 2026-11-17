@@ -168,7 +168,7 @@ public static class Frames
                     .. (jpeg
                         // one decode, two outputs: raw rgb for the fingerprints and pruning, and the stored frames as JPEG (no separate encode step).
                         // JPEG decoders assume BT.601 full range: convert with that matrix explicitly (the source is tagged BT.709; leaving it shifted colours, -2 dB), 4:4:4 like a plain RGB->JPEG encode
-                        ? new[] { "-filter_complex_threads", "1", "-filter_complex", $"[0:v]fps=1,scale={SW}:{SH}:flags=bicubicformat=rgb24,split=2[r][j0];[j0]scale=out_color_matrix=bt601:out_range=full,format=yuvj444p[j]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k], "-map", "[j]", "-c:v", "mjpeg", "-q:v", st.JpegQ.ToString(CultureInfo.InvariantCulture), "-f", "mjpeg", files[k] + ".mjpeg" }
+                        ? new[] { "-filter_complex_threads", "1", "-filter_complex", $"[0:v]fps=1,scale={SW}:{SH}:flags=bicubic,format=rgb24,split=2[r][j0];[j0]scale=out_color_matrix=bt601:out_range=full,format=yuvj444p[j]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k], "-map", "[j]", "-c:v", "mjpeg", "-q:v", st.JpegQ.ToString(CultureInfo.InvariantCulture), "-f", "mjpeg", files[k] + ".mjpeg" }
                         : new[] { "-vf", $"fps=1,scale={SW}:{SH}:flags=bicubic", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k] })], ct);
                 if (r.ExitCode != 0) throw new InvalidOperationException($"ffmpeg frames {c}/{k} failed: {r.Stderr.Trim()}");
                 // fingerprint every sampled frame here, in parallel with the other segments (the sequential prune below only compares)

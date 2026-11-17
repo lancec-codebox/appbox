@@ -2,9 +2,9 @@
 
 ## 0.8.3
 
-- `frames` crops fixed black bars baked into the video (letterbox / pillarbox), after the scale and before anything is stored, so sscd, thumbs and cast see bar-free pictures. Rule: 24 frames between 5% and 95% of the duration; a row/column is a bar when its mean luminance is under 20 in every sampled frame; a side pair is cut when it covers at least 2% of the dimension and at least 20% remains; even size. 640x360 with 44+44 bars is stored as 640x272. Subtitles inside a bar stop the bar run (partial crop). `ocrsubs` reads the source video and is unchanged; cast moves the subtitle band by the crop.
-- `frames/manifest.json` gains `framesVersion` (2; absent = 1), `crop` { top, bottom, left, right } in stored-frame pixels (zeros when none) and `source` { width, height, scaledWidth, scaledHeight }.
-- Redo of an existing upload: `indexnode process --job <id> --steps frames,sscd,thumbs,cast` in one run (add `describe,translate` when they exist, `clip`/`dino` if they were made): every one of them is indexed by frame row, and the new frame count/size differs.
+- `frames` records the fixed black bars baked into the video (letterbox / pillarbox) as a box in `frames/manifest.json`; frames are stored unchanged. Rule: 24 frames between 5% and 95% of the duration; a row/column is a bar when its mean luminance is under 20 in at least 80% of the samples (subtitle rows inside a bar count); a side pair is recorded when it covers at least 2% of the dimension and at least 20% remains; even size. `sscd` crops each stored frame by the box, then resizes to short side 288, so a 640x360 frame with 44+44 bars goes to the model as 678x288 (cropped 640x272, then resized). Thumbs, cast, `ocrsubs` and subtitles are unchanged.
+- `frames/manifest.json` gains `cropRule` (2),
+- Redo of an existing upload: only `indexnode process --job <id> --steps sscd`. When the manifest has no `cropRule`, sscd computes the box from the stored frames and writes it to `frames/manifest.json`; frames are not rerun, and no other step depends on the box (the frame size and count do not change).
 - DINOv2 is not part of ingest (duplicates use SSCD): the opt-in `dino` step stays, but `processed.json` no longer waits for `dino`/`clip` outputs (a step-by-step upload without them was never marked processed), a download no longer queues `dino` and `clip` step jobs, and `unprocessed` no longer lists dino as missing.
 
 ## 0.8.2
