@@ -2,8 +2,8 @@
 
 ## 0.8.3
 
-- `frames` records the fixed black bars baked into the video (letterbox / pillarbox) as a box in `frames/manifest.json`; frames are stored unchanged. Rule: 24 frames between 5% and 95% of the duration; a row/column is a bar when its mean luminance is under 20 in at least 80% of the samples (subtitle rows inside a bar count); a side pair is recorded when it covers at least 2% of the dimension and at least 20% remains; even size. `sscd` crops each stored frame by the box, then resizes to short side 288, so a 640x360 frame with 44+44 bars goes to the model as 678x288 (cropped 640x272, then resized). Thumbs, cast, `ocrsubs` and subtitles are unchanged.
-- `frames/manifest.json` gains `cropRule` (2),
+- `frames` records the fixed black bars baked into the video (letterbox / pillarbox) as a box in `frames/manifest.json`; frames are stored unchanged. Rule: 24 frames between 5% and 95% of the duration; a row/column is a bar when at least 70% of its pixels are below 20 in at least 80% of the samples (subtitle strokes cover a minority of a row, so subtitle rows inside a bar count); a side pair is recorded when it covers at least 2% of the dimension and at least 20% remains; even size. `sscd` crops each stored frame by the box, then resizes to short side 288, so a 640x360 frame with 44+44 bars goes to the model as 678x288 (cropped 640x272, then resized). Thumbs, cast, `ocrsubs` and subtitles are unchanged.
+- `frames/manifest.json` gains `cropRule` (3),
 - Redo of an existing upload: only `indexnode process --job <id> --steps sscd`. When the manifest has no `cropRule`, sscd computes the box from the stored frames and writes it to `frames/manifest.json`; frames are not rerun, and no other step depends on the box (the frame size and count do not change).
 - DINOv2 is not part of ingest (duplicates use SSCD): the opt-in `dino` step stays, but `processed.json` no longer waits for `dino`/`clip` outputs (a step-by-step upload without them was never marked processed), a download no longer queues `dino` and `clip` step jobs, and `unprocessed` no longer lists dino as missing.
 

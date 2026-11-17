@@ -111,6 +111,17 @@ public class BarsTests
     }
 
     [Fact]
+    public void A_row_with_subtitle_strokes_on_a_minority_of_its_pixels_is_still_bar_even_when_the_text_is_always_on()
+    {
+        // 100 px wide: 25% of each of rows 92-95 is bright text, in every frame
+        var fr = Many(24, i => { var f = Frame(100, 100, 120, (0, 10, 0), (90, 100, 0)); for (int y = 92; y < 96; y++) for (int x = 30; x < 55; x++) f[y * 100 + x] = 230; return f; });
+        Assert.Equal(new BarCrop(10, 10, 0, 0), Bars.Detect(fr, 100, 100));
+        // 40% bright: not bar
+        var fr2 = Many(24, i => { var f = Frame(100, 100, 120, (0, 10, 0), (90, 100, 0)); for (int y = 92; y < 96; y++) for (int x = 30; x < 70; x++) f[y * 100 + x] = 230; return f; });
+        Assert.Equal(4, Bars.Detect(fr2, 100, 100).Bottom); // only rows 96-99 are bar
+    }
+
+    [Fact]
     public void The_sscd_input_is_the_cropped_picture_resized_to_short_side_288()
     {
         var box = new BarCrop(44, 44, 0, 0);
@@ -195,7 +206,7 @@ public class FramesBarsTests : IDisposable
     public async Task A_video_without_bars_is_stored_as_before_with_a_zero_crop()
     {
         if (await RealAsync() is not { } t) return;
-        var v = await MakeAsync(t, "clean.mp4", "testsrc=s=640x360:r=10");
+        var v = await MakeAsync(t, "clean.mp4", "testsrc2=s=640x360:r=10");
         var (m, _) = await RunAsync(t, v);
         Assert.Equal((640, 360), SizeOf(m)); Assert.Equal((0, 0, 0, 0), CropOf(m));
     }
@@ -215,7 +226,7 @@ public class FramesBarsTests : IDisposable
     public async Task A_dark_edge_in_only_some_frames_is_not_a_bar()
     {
         if (await RealAsync() is not { } t) return;
-        var v = await MakeAsync(t, "vignette.mp4", "testsrc=s=640x360:r=10,drawbox=x=0:y=0:w=640:h=40:color=black:t=fill:enable='lt(t,6)',drawbox=x=0:y=320:w=640:h=40:color=black:t=fill:enable='gt(t,4)'");
+        var v = await MakeAsync(t, "vignette.mp4", "testsrc2=s=640x360:r=10,drawbox=x=0:y=0:w=640:h=40:color=black:t=fill:enable='lt(t,6)',drawbox=x=0:y=320:w=640:h=40:color=black:t=fill:enable='gt(t,4)'");
         var (m, _) = await RunAsync(t, v);
         Assert.Equal((640, 360), SizeOf(m)); Assert.Equal((0, 0, 0, 0), CropOf(m));
     }
@@ -224,11 +235,11 @@ public class FramesBarsTests : IDisposable
     public async Task Subtitles_in_the_bottom_bar_stay_readable_by_the_subtitle_reader()
     {
         if (await RealAsync() is not { } t) return;
-        // a white "subtitle" box inside the bottom bar (rows 322-337 of 360) on some frames
-        var v = await MakeAsync(t, "subs.mp4", "testsrc2=s=640x272:r=10,pad=640:360:0:44:black,drawbox=x=120:y=322:w=400:h=16:color=white:t=fill:enable='between(t,2,3.5)'");
+        // a white "subtitle" box a few words wide inside the bottom bar (rows 322-337 of 360) on most frames
+        var v = await MakeAsync(t, "subs.mp4", "testsrc2=s=640x272:r=10,pad=640:360:0:44:black,drawbox=x=270:y=322:w=100:h=16:color=white:t=fill:enable='between(t,1,10)'");
         var (m, _) = await RunAsync(t, v);
         var (T, B, _, _) = CropOf(m);
-        // the subtitle box is on for about 2 of 12 s (under 20% of the samples): the whole bottom bar, text rows included, still counts as bar
+        // the subtitle box (100 px of 640, centred) is on for 9 of 12 s: its rows are 84% dark, so the whole bottom bar still counts
         Assert.Equal(44, T); Assert.Equal(360, SizeOf(m).H); // frames stored whole
         Assert.Equal(44, B);
         // the reader works on the source video at full size, never on the stored frames: its size and its band pixels are those of the source

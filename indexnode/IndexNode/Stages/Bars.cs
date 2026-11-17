@@ -15,15 +15,15 @@ public readonly record struct BarCrop(int Top, int Bottom, int Left, int Right)
 
 /// <summary>
 /// Fixed black bars baked into a video (letterbox / pillarbox). The rule (owner 2026-11-16, tested on real uploads): on 24 frames sampled evenly between 5% and 95% of the
-/// duration (at the stored frame size), an edge row (column) is "bar" when its mean luminance (0-255) is below 20 in at least 80% of the sampled frames; a side's thickness is the run of
+/// duration (at the stored frame size), an edge row (column) is "bar" when at least 70% of its pixels have luminance (0-255) below 20, in at least 80% of the sampled frames; a side's thickness is the run of
 /// bar rows from that edge inward. A side pair (top+bottom, left+right) is cropped only when it covers at least 2% of that dimension, and never when the remaining
 /// picture would be under 20% of the dimension. The cropped size is kept even. Pure arithmetic on plain 8-bit luminance arrays, so screenshot search can use it as is.
 /// </summary>
 public static class Bars
 {
-    /// <summary>Version of this rule, recorded in frames/manifest.json (cropRule). 2: dark in at least 80% of the samples (1 was every sample).</summary>
-    public const int RuleVersion = 2;
-    public const double MinDarkFraction = 0.8;
+    /// <summary>Version of this rule, recorded in frames/manifest.json (cropRule). 3: a row is bar when at least 70% of its pixels are dark, in at least 80% of the samples (2: mean below 20 in 80% of samples; 1: every sample).</summary>
+    public const int RuleVersion = 3;
+    public const double MinDarkFraction = 0.8, MinDarkPixels = 0.7;
     public const int Samples = 24;
     public const double From = 0.05, To = 0.95;
     public const double MaxMeanLuma = 20;
@@ -38,15 +38,15 @@ public static class Bars
     public static BarCrop Detect(IReadOnlyList<byte[]> frames, int w, int h)
     {
         if (frames.Count < 2 || w <= 0 || h <= 0) return BarCrop.None;
-        // a row/column is bar when its mean is below the limit in at least 80% of the frames: count the dark frames
+        // a row/column is bar in a frame when at least 70% of its pixels are below the limit (subtitle strokes cover a minority of a row); it is bar overall when that holds in at least 80% of the frames
         var rowDark = new int[h]; var colDark = new int[w];
         foreach (var f in frames)
         {
             if (f.Length < w * h) return BarCrop.None;
-            var rows = new double[h]; var cols = new double[w];
-            for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int v = f[y * w + x]; rows[y] += v; cols[x] += v; }
-            for (int y = 0; y < h; y++) if (rows[y] / w < MaxMeanLuma) rowDark[y]++;
-            for (int x = 0; x < w; x++) if (cols[x] / h < MaxMeanLuma) colDark[x]++;
+            var rows = new int[h]; var cols = new int[w];
+            for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) if (f[y * w + x] < MaxMeanLuma) { rows[y]++; cols[x]++; }
+            for (int y = 0; y < h; y++) if (rows[y] >= MinDarkPixels * w - 1e-9) rowDark[y]++;
+            for (int x = 0; x < w; x++) if (cols[x] >= MinDarkPixels * h - 1e-9) colDark[x]++;
         }
         double need = MinDarkFraction * frames.Count - 1e-9;
         var rowMax = rowDark.Select(c => c >= need ? 0.0 : 255.0).ToArray(); var colMax = colDark.Select(c => c >= need ? 0.0 : 255.0).ToArray();
