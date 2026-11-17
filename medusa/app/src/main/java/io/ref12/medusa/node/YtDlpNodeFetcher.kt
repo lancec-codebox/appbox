@@ -18,25 +18,28 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
         dir.deleteRecursively(); dir.mkdirs()
         try { yt.ensureInit() } catch (e: Exception) { throw NodeFetchException(FailureKind.TRANSIENT, e.message ?: "yt-dlp did not start") }
         progress("starting", null)
-        val req = YoutubeDLRequest(job.url).apply {
+        fun request(selector: String?) = YoutubeDLRequest(job.url).apply {
             addOption("--no-playlist"); addOption("--no-warnings")
-            job.sortArgs().chunked(2).forEach { addOption(it[0], it[1]) }
-            addOption("-f", job.selector()); addOption("--merge-output-format", "mp4")
+            // the MP4 retry has its own height limit in the selector; the default request sorts by resolution
+            if (selector == null) job.sortArgs().chunked(2).forEach { addOption(it[0], it[1]) }
+            addOption("-f", selector ?: job.selector()); addOption("--merge-output-format", "mp4")
             addOption("--write-info-json"); addOption("--write-thumbnail"); addOption("--convert-thumbnails", "jpg")
             // the video only: subtitles follow in their own calls, from the exact tracks in the info JSON, so a subtitle failure cannot fail the video
             addOption("-o", File(dir, "video.%(ext)s").absolutePath)
         }
         var title: String? = null
-        try {
-            YoutubeDL.getInstance().execute(req, PID) { pct, _, line ->
-                if (title == null) title = titleFrom(dir)
-                progress("download " + pct.toInt().coerceAtLeast(0) + "%", title)
+        val fallback = Mp4Fallback.run(job, { t, _ -> progress(t, title) }) { selector ->
+            try {
+                YoutubeDL.getInstance().execute(request(selector), PID) { pct, _, line ->
+                    if (title == null) title = titleFrom(dir)
+                    progress("download " + pct.toInt().coerceAtLeast(0) + "%", title)
+                }
+            } catch (e: YoutubeDLException) {
+                if (cancelled) throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
+                throw NodeFetchException(Failures.classify(e.message ?: ""), Failures.errorLine(e.message ?: "yt-dlp failed"))
+            } catch (e: InterruptedException) {
+                throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
             }
-        } catch (e: YoutubeDLException) {
-            if (cancelled) throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
-            throw NodeFetchException(Failures.classify(e.message ?: ""), Failures.errorLine(e.message ?: "yt-dlp failed"))
-        } catch (e: InterruptedException) {
-            throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
         }
         val video = File(dir, "video.mp4").takeIf { it.isFile && it.length() > 0 }
             ?: throw NodeFetchException(FailureKind.TRANSIENT, "yt-dlp did not produce video.mp4")
@@ -78,7 +81,7 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
           val names = NodeInfo.order(subFiles.keys)
           for (n in names) extras.add(Triple("subs/$n.vtt", subFiles[n]!!, "text/vtt"))
           return DownloadedFiles(video, extras, height, dur, parsed?.vcodec, parsed?.acodec, parsed?.formatId, names, parsed?.embeddable,
-              parsed?.audioLanguage, parsed?.audioNote, parsed?.audioTracks ?: emptyList(), subsFailed)
+              parsed?.audioLanguage, parsed?.audioNote, parsed?.audioTracks ?: emptyList(), subsFailed, fallback)
     }
 
     private fun titleFrom(dir: File): String? = try { File(dir, "video.info.json").takeIf { it.isFile }?.let { JSONObject(it.readText()).optString("title").ifEmpty { null } } } catch (e: Exception) { null }

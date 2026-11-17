@@ -115,6 +115,14 @@ class NodeSettings(ctx: Context) : NodeState, SetupStore {
     override fun backoffUntil() = prefs.getLong("backoffUntil", 0)
     override fun setBackoffUntil(t: Long) { prefs.edit().putLong("backoffUntil", t).apply() }
 
+    override fun skipUntil(jobId: String): Long = try { JSONObject(prefs.getString("skip", "{}")).optLong(jobId, 0) } catch (e: Exception) { 0 }
+    override fun skipJob(jobId: String, until: Long) {
+        val o = try { JSONObject(prefs.getString("skip", "{}")) } catch (e: Exception) { JSONObject() }
+        val now = System.currentTimeMillis()
+        o.keys().asSequence().toList().forEach { if (o.optLong(it, 0) < now) o.remove(it) }
+        o.put(jobId, until); prefs.edit().putString("skip", o.toString()).apply()
+    }
+
     override fun record(entry: JobLogEntry) {
         val a = JSONArray(prefs.getString("recent", "[]"))
         val n = JSONArray().put(JSONObject().put("id", entry.jobId).put("title", entry.title ?: "").put("result", entry.result).put("at", entry.at).put("msg", Redact.sas(entry.message ?: "")).put("ver", entry.version ?: io.ref12.medusa.BuildConfig.VERSION_NAME))

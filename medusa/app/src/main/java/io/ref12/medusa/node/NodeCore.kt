@@ -14,7 +14,8 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.atomic.AtomicBoolean
 
-enum class FailureKind { PERMANENT, TRANSIENT, BOT }
+/** FORBIDDEN: HTTP 403 on the video data itself (YouTube withholds some formats): retried once as MP4, never counted as an attempt. */
+enum class FailureKind { PERMANENT, TRANSIENT, BOT, FORBIDDEN }
 
 class NodeFetchException(val kind: FailureKind, message: String) : Exception(Redact.sas(message))
 
@@ -39,7 +40,29 @@ object Failures {
         // a subtitle-track error (any HTTP status) is never a bot block, whatever it says
         if (isSubtitleError(t)) return FailureKind.TRANSIENT
         if (t.contains("not a bot") || t.contains("http error 429") || t.contains("too many requests") || t.contains("sign in to confirm")) return FailureKind.BOT
+        if (t.contains("http error 403")) return FailureKind.FORBIDDEN
         return FailureKind.TRANSIENT
+    }
+}
+
+/** The 403 policy: one retry as MP4, then release. [attempt] runs one yt-dlp download with the given selector (null: the job's own). */
+object Mp4Fallback {
+    const val RETRY_TEXT = "403 on video, retrying as MP4"
+    const val TWICE_TEXT = "403 twice"
+    /** The MP4 selector of Medusa's own downloader; it carries the height limit itself, so no sort arguments go with it. */
+    fun selector(maxHeight: Int) = "bv*[height<=$maxHeight][ext=mp4]+ba[ext=m4a]/b[height<=$maxHeight][ext=mp4]/b[height<=$maxHeight]"
+    /** Retry only a 403 on the video, and only once. A bot block (429, sign in), a subtitle error or anything else is not retried. */
+    fun shouldRetry(e: NodeFetchException, alreadyMp4: Boolean) = e.kind == FailureKind.FORBIDDEN && !alreadyMp4
+    /** Returns "mp4" when the retry was needed (recorded as formatFallback), else null. */
+    fun run(job: DownloadJob, progress: (String?, String?) -> Unit, attempt: (selector: String?) -> Unit): String? {
+        try { attempt(null); return null } catch (e: NodeFetchException) {
+            if (!shouldRetry(e, false)) throw e
+            progress(RETRY_TEXT, null)
+            try { attempt(selector(job.maxHeight)); return "mp4" } catch (e2: NodeFetchException) {
+                if (e2.kind == FailureKind.FORBIDDEN) throw NodeFetchException(FailureKind.FORBIDDEN, TWICE_TEXT + ": " + e2.message)
+                throw e2
+            }
+        }
     }
 }
 
@@ -99,6 +122,9 @@ interface NodeState {
     fun addDone(day: String)
     fun backoffUntil(): Long
     fun setBackoffUntil(t: Long)
+    /** Jobs this node leaves alone until the time (a video that answered 403 twice). */
+    fun skipUntil(jobId: String): Long = 0
+    fun skipJob(jobId: String, until: Long) {}
     fun record(entry: JobLogEntry)
     fun saveControl(text: String)
     /** The local settings of the run limits. */
@@ -163,7 +189,7 @@ class NodeRunner(
                 if (gate == Gate.BUDGET_SPENT) { s.endReason = "budget spent"; regState = "budget spent"; break }
                 if (gate == Gate.WAITING) { s.endReason = "waiting for window"; regState = "waiting for window"; break }
                 if (state.doneToday(day(env.clock())) >= cap) { s.endReason = "daily cap reached"; break }
-                val jobs = Prio.claimOrder(api.findJobs(STAGE))
+                val jobs = Prio.claimOrder(api.findJobs(STAGE)).filter { state.skipUntil(it.id) <= env.clock() }
                 if (jobs.isEmpty()) { s.endReason = "no work"; break }
                 listener.onWork(jobs.size)
                 var outcome: Outcome? = null
@@ -238,7 +264,7 @@ class NodeRunner(
                     val marker = JSONObject().put("v", 1).put("bytes", out.video.length()).put("height", out.height ?: JSONObject.NULL)
                         .put("durationSeconds", out.durationSeconds ?: JSONObject.NULL).put("vcodec", out.vcodec ?: JSONObject.NULL)
                         .put("acodec", out.acodec ?: JSONObject.NULL).put("formatId", out.formatId ?: JSONObject.NULL)
-                        .put("subs", JSONArray(out.subs)).put("subsFailed", JSONArray(out.subsFailed)).put("embeddable", out.embeddable ?: JSONObject.NULL)
+                        .also { m -> out.formatFallback?.let { m.put("formatFallback", it) } }.put("subs", JSONArray(out.subs)).put("subsFailed", JSONArray(out.subsFailed)).put("embeddable", out.embeddable ?: JSONObject.NULL)
                         .put("audioLanguage", out.audioLanguage ?: JSONObject.NULL).put("audioNote", out.audioNote ?: JSONObject.NULL)
                         .put("audioTracks", JSONArray().also { a -> out.audioTracks.forEach { a.put(JSONObject().put("language", it.first).put("note", it.second ?: JSONObject.NULL)) } }).put("nodeId", cfg.nodeId).put("at", at)
                     api.put(base + "downloaded.json", marker.toString().toByteArray(), "application/json")
@@ -290,6 +316,15 @@ class NodeRunner(
         }
         val kind = if (e is NodeFetchException) e.kind else FailureKind.TRANSIENT
         when (kind) {
+            FailureKind.FORBIDDEN -> {
+                // 403 on the video, also as MP4: not the job's fault. Back to pending without an attempt; this node leaves it for 6 hours, other nodes may take it.
+                rewrite(ref, leaseId, jobText, "pending") { it.put("lastError", msg) }
+                state.skipJob(ref.id, env.clock() + SKIP_MS)
+                state.record(JobLogEntry(ref.id, title, "released: " + Mp4Fallback.TWICE_TEXT, env.clock(), msg))
+                s.released++
+                release(ref.name, leaseId)
+                return Outcome.FAILED
+            }
             FailureKind.BOT -> {
                 release(ref.name, leaseId); s.released++
                 state.setBackoffUntil(env.clock() + BACKOFF_MS)
@@ -343,6 +378,7 @@ class NodeRunner(
         const val STAGE = "download"
         const val MAX_ATTEMPTS = 3
         const val BACKOFF_MS = 3_600_000L
+        const val SKIP_MS = 6 * 3_600_000L
 
         fun iso(ms: Long): String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(ms))
         fun day(ms: Long): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(ms))
@@ -389,6 +425,8 @@ class DownloadedFiles(
     val audioLanguage: String? = null, val audioNote: String? = null, val audioTracks: List<Pair<String, String?>> = emptyList(),
     /** Subtitle tracks that were wanted but could not be fetched ("lang" or "lang.auto"); they never fail the job. */
     val subsFailed: List<String> = emptyList(),
+    /** "mp4" when the default selector got a 403 and the MP4 selector was used instead. */
+    val formatFallback: String? = null,
 )
 
 /** What the node reads from yt-dlp's info.json. */
