@@ -233,6 +233,8 @@ public sealed class ControlFile
     public string? ChangedBy { get; set; }
     /// <summary>Per-node run limits; they win over the node's own settings.</summary>
     public Dictionary<string, NodeLimits>? Nodes { get; set; }
+    /// <summary>GPU routing (0.8.6): absent or no hold = off, CPU nodes claim sscd/clip/cast at once and no gpu-ready markers are written.</summary>
+    public GpuControl? Gpu { get; set; }
 
     public static Level ParseLevel(string? s) => s?.ToLowerInvariant() switch
     {
@@ -250,6 +252,12 @@ public sealed class ControlFile
 
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static ControlFile Parse(byte[]? b) => b == null || b.Length == 0 ? new() : JsonSerializer.Deserialize<ControlFile>(b, Protocol.Json) ?? new();
+}
+
+public sealed class GpuControl
+{
+    /// <summary>How long a CPU node holds a marker-stage job for the GPU node, e.g. "30m"; absent = no hold.</summary>
+    public string? Hold { get; set; }
 }
 
 public sealed class NodeLimits

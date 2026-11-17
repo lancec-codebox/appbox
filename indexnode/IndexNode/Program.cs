@@ -38,7 +38,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
@@ -164,10 +164,11 @@ public static class Commands
         try { await tools.CheckFfmpegAsync(stages, default); }
         catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 2; }
         var gate = new DownloadGate();
+        TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
         var handlers = new Dictionary<string, IStageHandler>
         {
             ["download"] = new DownloadStage(tools, store, gate),
-            ["process"] = new ProcessStage(tools, store, cfg, http),
+            ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
             ["comments"] = new CommentsStage(tools, store, gate),
             ["watch"] = new WatchStage(tools, store),
             ["availability"] = new AvailabilityStage(tools, store),
@@ -184,7 +185,7 @@ public static class Commands
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
             Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
             Stages = stages, Jobs = jobs, Threads = threads, Once = a.Has("once"), Gpu = gpu, MaxHeavy = maxHeavy, ExitWhenIdle = exitIdle,
-            GpuFallback = a.Get("gpu-fallback") is { } gf ? WatchStage.ParseEvery(gf) : GpuRouting.CpuFallbackAfter,
+            GpuFallback = gpuFlag,
             Kind = gpu ? "gpu" : "desktop",
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
@@ -446,7 +447,14 @@ public static class Commands
     {
         var (cfg, store, paths, _) = Open(a);
         var level = a.Positional.FirstOrDefault()?.ToLowerInvariant();
-        if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain or stop");
+        if (level == "gpu-hold")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control gpu-hold <duration like 30m>|off");
+            var gc = await ControlWatcher.SetGpuHoldAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: gpu hold = {gc.Gpu?.Hold ?? "off"} (CPU nodes {(gc.Gpu?.Hold == null ? "claim sscd/clip/cast at once and no gpu-ready markers are written" : "wait that long for a GPU node before taking sscd/clip/cast; markers are written")}; a node's --gpu-fallback overrides this)");
+            return 0;
+        }
+        if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain, stop or gpu-hold");
         var stage = a.Get("stage");
         if (stage != null && !Protocol.Stages.Contains(stage)) throw new ArgumentException("--stage must be download, process, comments or watch");
         var c = await ControlWatcher.WriteAsync(store, paths, level, stage, a.Get("message"), cfg.NodeName ?? Environment.UserName, default);

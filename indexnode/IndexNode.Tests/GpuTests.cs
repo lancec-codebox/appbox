@@ -10,7 +10,7 @@ public class GpuTests
     {
         NodeId = "gpu-test", Name = "gpu-test", Stages = stages, Jobs = stages.ToDictionary(s => s, _ => 1), Threads = 8, Once = once,
         PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromSeconds(30), RegistryInterval = TimeSpan.FromSeconds(30), ControlInterval = TimeSpan.FromSeconds(30),
-        Gpu = gpu, MaxHeavy = maxHeavy, GpuFallback = fallback ?? GpuRouting.CpuFallbackAfter, ExitWhenIdle = idle, IdleCheck = TimeSpan.FromMilliseconds(20), HeavyRetry = TimeSpan.FromMilliseconds(10),
+        Gpu = gpu, MaxHeavy = maxHeavy, GpuFallback = fallback, ExitWhenIdle = idle, IdleCheck = TimeSpan.FromMilliseconds(20), HeavyRetry = TimeSpan.FromMilliseconds(10),
     };
 
     private static NodeEngine Engine(FakeStore s, EngineOptions o, Func<JobContext, Task> h) =>
@@ -49,13 +49,14 @@ public class GpuTests
     public void A_cpu_node_takes_a_gpu_stage_job_only_after_30_minutes(bool gpu, string stage, int minutes, bool allowed)
     {
         var now = DateTimeOffset.UtcNow;
-        Assert.Equal(allowed, GpuRouting.MayClaim(gpu, stage, now.AddMinutes(-minutes), now));
+        Assert.Equal(allowed, GpuRouting.MayClaim(gpu, stage, now.AddMinutes(-minutes), now, GpuRouting.CpuFallbackAfter));
     }
 
     [Fact]
     public void A_cpu_node_never_takes_a_marker_job_with_unknown_ready_time()
     {
-        Assert.False(GpuRouting.MayClaim(false, "clip", null, DateTimeOffset.UtcNow));
+        Assert.False(GpuRouting.MayClaim(false, "clip", null, DateTimeOffset.UtcNow, GpuRouting.CpuFallbackAfter));
+        Assert.True(GpuRouting.MayClaim(false, "clip", null, DateTimeOffset.UtcNow)); // no hold: at once
     }
 
     [Fact]
@@ -102,6 +103,9 @@ public class GpuTests
         var s = new FakeStore();
         await Job(s, "sscd", "v1", TimeSpan.Zero); await Job(s, "clip", "v1", TimeSpan.Zero); await Job(s, "cast", "v1", TimeSpan.Zero);
         await s.PutAsync(P.Job("clip", "v1"), JobDescriptor.NewStep("clip", "v1").ToBytes(), Tags.Job("clip", "done", Ago(TimeSpan.Zero)), null, false, default);
+        Assert.Empty(await GpuRouting.WriteReadyMarkersAsync(s, P, "v1", default)); // GPU routing is off by default: no markers
+        Assert.False(s.Exists(GpuRouting.MarkerName(P, "sscd", "v1")));
+        await s.PutAsync(P.Control, new ControlFile { Gpu = new GpuControl { Hold = "30m" } }.ToBytes(), null, null, false, default);
         Assert.Equal(["sscd", "cast"], await GpuRouting.WriteReadyMarkersAsync(s, P, "v1", default));
         Assert.True(s.Exists(GpuRouting.MarkerName(P, "sscd", "v1")));
         Assert.False(s.Exists(GpuRouting.MarkerName(P, "clip", "v1")));
@@ -118,11 +122,75 @@ public class GpuTests
         var s = new FakeStore(); await Frames(s, "v1"); await Job(s, "clip", "v1", TimeSpan.FromMinutes(1));
         await GpuRouting.WriteMarkerAsync(s, P, "clip", "v1", default);
         var cpuRan = 0;
-        await Engine(s, Opts(["clip"]), _ => { cpuRan++; return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        await Engine(s, Opts(["clip"], fallback: GpuRouting.CpuFallbackAfter), _ => { cpuRan++; return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(0, cpuRan); Assert.Equal("pending", s.State(P.Job("clip", "v1")));
         var gpuRan = 0;
         await Engine(s, Opts(["clip"], gpu: true), _ => { gpuRan++; return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(1, gpuRan); Assert.Equal("done", s.State(P.Job("clip", "v1")));
+    }
+
+    private static async Task<int> CpuRuns(FakeStore s, string stage, TimeSpan? flag)
+    {
+        var n = 0;
+        await Engine(s, Opts([stage], fallback: flag), _ => { n++; return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        return n;
+    }
+
+    private static Task Hold(FakeStore s, string? hold) =>
+        s.PutAsync(P.Control, new ControlFile { Gpu = hold == null ? null : new GpuControl { Hold = hold } }.ToBytes(), null, null, false, default);
+
+    [Fact]
+    public async Task By_default_a_cpu_node_claims_sscd_and_cast_at_once()
+    {
+        var s = new FakeStore(); await Frames(s, "a"); await Frames(s, "b");
+        await Job(s, "sscd", "a", TimeSpan.Zero); await Job(s, "cast", "b", TimeSpan.Zero);
+        Assert.Equal(1, await CpuRuns(s, "sscd", null)); Assert.Equal(1, await CpuRuns(s, "cast", null));
+        Assert.Equal("done", s.State(P.Job("sscd", "a"))); Assert.Equal("done", s.State(P.Job("cast", "b")));
+    }
+
+    [Fact]
+    public async Task The_control_switch_turns_the_hold_on_for_cpu_nodes_and_off_again()
+    {
+        var s = new FakeStore(); await Frames(s, "a"); await Job(s, "sscd", "a", TimeSpan.FromMinutes(5));
+        await Hold(s, "30m");
+        Assert.Equal(0, await CpuRuns(s, "sscd", null)); Assert.Equal("pending", s.State(P.Job("sscd", "a")));
+        await Hold(s, null); // off
+        Assert.Equal(1, await CpuRuns(s, "sscd", null));
+    }
+
+    [Fact]
+    public async Task The_node_flag_overrides_the_control_file()
+    {
+        var s = new FakeStore(); await Frames(s, "a"); await Frames(s, "b");
+        await Job(s, "sscd", "a", TimeSpan.FromMinutes(5));
+        await Hold(s, "30m");
+        Assert.Equal(1, await CpuRuns(s, "sscd", TimeSpan.FromMinutes(1))); // flag: a shorter hold than the control file's
+        await Job(s, "sscd", "b", TimeSpan.FromMinutes(5));
+        Assert.Equal(1, await CpuRuns(s, "sscd", GpuRouting.ParseFlag("off"))); // flag off beats a control hold
+        Assert.Equal(TimeSpan.FromMinutes(30), GpuRouting.EffectiveHold(null, new ControlFile { Gpu = new GpuControl { Hold = "30m" } }));
+        Assert.Null(GpuRouting.EffectiveHold(null, new ControlFile { Gpu = new GpuControl { Hold = "off" } }));
+        Assert.Null(GpuRouting.EffectiveHold(null, new ControlFile()));
+    }
+
+    [Fact]
+    public async Task Control_gpu_hold_command_writes_and_clears_the_switch_and_keeps_the_rest()
+    {
+        var s = new FakeStore();
+        await ControlWatcher.WriteAsync(s, P, "drain", null, null, "me", default);
+        var c = await ControlWatcher.SetGpuHoldAsync(s, P, "30m", "me", default);
+        Assert.Equal("30m", c.Gpu!.Hold); Assert.Equal("drain", ControlFile.Parse(s[P.Control].Data).Mode);
+        Assert.Null((await ControlWatcher.SetGpuHoldAsync(s, P, "off", "me", default)).Gpu);
+        await Assert.ThrowsAnyAsync<Exception>(() => ControlWatcher.SetGpuHoldAsync(s, P, "soon", "me", default));
+    }
+
+    [Fact]
+    public async Task The_flag_also_turns_markers_on_without_a_control_file()
+    {
+        var s = new FakeStore(); await Job(s, "sscd", "v1", TimeSpan.Zero);
+        Assert.Empty(await GpuRouting.WriteReadyMarkersAsync(s, P, "v1", default));
+        Assert.Equal(["sscd"], await GpuRouting.WriteReadyMarkersAsync(s, P, "v1", default, TimeSpan.FromMinutes(30)));
+        await Hold(s, "30m"); await s.DeleteAsync(GpuRouting.MarkerName(P, "sscd", "v1"), default);
+        Assert.Empty(await GpuRouting.WriteReadyMarkersAsync(s, P, "v1", default, GpuRouting.ParseFlag("off"))); // flag off beats the control file
     }
 
     [Fact]
@@ -131,7 +199,7 @@ public class GpuTests
         var s = new FakeStore(); await Frames(s, "v1"); await Job(s, "sscd", "v1", TimeSpan.FromHours(3));
         await GpuRouting.WriteMarkerAsync(s, P, "sscd", "v1", default, DateTimeOffset.UtcNow.AddMinutes(-31));
         var ran = 0;
-        await Engine(s, Opts(["sscd"]), _ => { ran++; return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        await Engine(s, Opts(["sscd"], fallback: GpuRouting.CpuFallbackAfter), _ => { ran++; return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(1, ran);
     }
 
@@ -141,7 +209,7 @@ public class GpuTests
         var s = new FakeStore(); await Frames(s, "old"); await Frames(s, "new");
         await Job(s, "cast", "old", TimeSpan.FromMinutes(45)); await Job(s, "cast", "new", TimeSpan.FromMinutes(5));
         var ids = new List<string>();
-        await Engine(s, Opts(["cast"]), c => { ids.Add(c.Job.JobId); return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        await Engine(s, Opts(["cast"], fallback: GpuRouting.CpuFallbackAfter), c => { ids.Add(c.Job.JobId); return Task.CompletedTask; }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(["old"], ids);
     }
 

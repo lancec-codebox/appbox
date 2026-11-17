@@ -1,5 +1,10 @@
 # IndexNode release notes
 
+## 0.8.6
+
+- GPU routing is opt-in. CPU nodes no longer hold sscd/clip/cast for 30 minutes waiting for a GPU node: they claim them at once, and the finished `frames` step writes no `gpu-ready` markers (the event-triggered GPU job has no other trigger, so it is no longer woken or billed by default).
+- Switch: `indexnode control gpu-hold <duration>|off` stores `"gpu": {"hold": "30m"}` in `index/control.json` (absent = off) and takes effect on every CPU node without a restart. A node's `--gpu-fallback <duration>|off` overrides it. `--gpu` nodes are unchanged. After turning it on, `indexnode gpu markers` writes markers for jobs framed while it was off.
+
 ## 0.8.5
 
 - Job priority: an integer (default 0, -1000..1000, higher first) in the blob tag `idx_priority` (missing or unparsable = 0). Nodes claim by priority descending, then `idx_added`, then name; waits for earlier steps and GPU routing are unchanged. Jobs a job creates inherit its priority (download -> step and comments jobs; watch/classify -> downloads).

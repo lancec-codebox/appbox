@@ -36,6 +36,17 @@ public sealed class ControlWatcher(IStore store, Paths paths)
 
     public Level Effective(string stage) => Current.Effective(stage);
 
+    /// <summary>indexnode control gpu-hold &lt;duration&gt;|off: turns GPU routing on for every CPU node (and gpu-ready markers on), or off (no "gpu" entry).</summary>
+    public static async Task<ControlFile> SetGpuHoldAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        if (value.Equals("off", StringComparison.OrdinalIgnoreCase)) cur.Gpu = null;
+        else { var d = WatchStage.ParseEvery(value); if (d <= TimeSpan.Zero) throw new ArgumentException("gpu-hold must be a positive duration or off"); cur.Gpu = new GpuControl { Hold = value }; }
+        cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        return cur;
+    }
+
     /// <summary>indexnode control run|drain|stop [--stage S] [--message M]</summary>
     public static async Task<ControlFile> WriteAsync(IStore store, Paths paths, string level, string? stage, string? message, string changedBy, CancellationToken ct)
     {

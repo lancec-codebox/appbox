@@ -61,7 +61,7 @@ public sealed class EngineOptions
     public Traffic? Traffic { get; init; }
     /// <summary>A GPU node: its stages are the GPU stages and it claims a marker-stage job at once; a CPU node waits <see cref="GpuFallback"/> before taking one.</summary>
     public bool Gpu { get; init; }
-    public TimeSpan GpuFallback { get; init; } = GpuRouting.CpuFallbackAfter;
+    public TimeSpan? GpuFallback { get; init; }
     /// <summary>Concurrent heavy (model) steps on this node, each getting a share of the threads; 0 = no limit. I/O work (download, upload, AI waits, comments, watch, sync, describe) does not count.</summary>
     public int MaxHeavy { get; init; } = 2;
     /// <summary>Stop after this long with no job running (a container job that was started for a marker and has no more work); null: never.</summary>
@@ -435,7 +435,7 @@ public sealed class NodeEngine
         foreach (var b in ordered)
         {
             if (ignoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) continue;
-            if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, o.GpuFallback))
+            if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && GpuRouting.EffectiveHold(o.GpuFallback, Control.Current) is { } hold && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, hold))
             {
                 ignoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(1); // held for the GPU node; look again in a minute
                 continue;

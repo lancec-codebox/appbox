@@ -4,6 +4,8 @@ namespace IndexNode;
 
 public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, HttpClient http) : IStageHandler
 {
+    /// <summary>This node's --gpu-fallback; it overrides control.json gpu.hold when deciding whether to write gpu-ready markers.</summary>
+    public TimeSpan? GpuFlag { get; init; }
     /// <summary>Set by `run` from flag > environment > config; null or unconfigured means AI steps are skipped.</summary>
     public static AiConfig? Ai { get; set; }
 
@@ -143,8 +145,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 var r = await Frames.ProduceAsync(tools, video, work, FrameSettings.From(config), segs, duration, p => ctx.Report("frames", p), (name, bytes, type) => wst.PutAsync(paths.Video(id, name), bytes, null, null, false, ct, type), ct);
                 frameCount = r.Kept;
                 // both manifests are written last, so the three GPU steps are ready now: one marker each wakes the on-demand GPU node
-                var marked = await GpuRouting.WriteReadyMarkersAsync(store, paths, id, ct);
-                Log.Info($"process {id}: gpu-ready markers written for {(marked.Length == 0 ? "(none: no pending GPU step)" : string.Join(',', marked))}");
+                var marked = await GpuRouting.WriteReadyMarkersAsync(store, paths, id, ct, GpuFlag);
+                Log.Info($"process {id}: gpu-ready markers written for {(marked.Length == 0 ? "(none: GPU routing is off or no pending GPU step)" : string.Join(',', marked))}");
                 Log.Info($"process {id}: {r.Kept} frames kept of {r.Sampled} sampled ({r.FrameBytes / 1048576.0:F1} MB AV1) and {r.Keyframes} keyframes ({r.KeyframeBytes / 1048576.0:F1} MB all-intra AV1)");
             }
             // the stored frames, fetched (and hydrated) once for the steps that embed them
