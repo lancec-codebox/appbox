@@ -1,5 +1,12 @@
 # IndexNode release notes
 
+## 0.8.4
+
+- Spoiler rewrite no longer writes one character's text onto another (4 of 163 dramas had the female lead carrying the male lead's label/roleAtStart/description). The rewrite prompt now names the flagged cluster ids ("one entry for each of these clusters, with its own id: [1, 4]") instead of an example with id 0. Answers are applied only for flagged ids, each once; unflagged ids and repeats are ignored and logged; a flagged id with no answer keeps its original text.
+- Identity guard: a rewritten entry is rejected (original label, roleAtStart and description kept) when its label names another cast entry's character (en, pinyin or zh) and not its own, or its roleAtStart / description equals another entry's. Relation labels such as "Pei Zimo's mother" pass.
+- `describe.json` `spoilerCheck.log`: per round, the flagged ids, the answered ids, the rejected ones (with the reason) and the ignored ones.
+- PromptVersion `describe-6`: redo `describe` for the affected dramas (hSNVVbkE6Vk, -HisxTigQLA, 0e2lNKJprjQ, 2MaOKBb0_eU).
+
 ## 0.8.3
 
 - `frames` records the fixed black bars baked into the video (letterbox / pillarbox) as a box in `frames/manifest.json`; frames are stored unchanged. Rule: 24 frames between 5% and 95% of the duration; a row/column is a bar when at least 70% of its pixels are below 20 in at least 80% of the samples (subtitle strokes cover a minority of a row, so subtitle rows inside a bar count); a side pair is recorded when it covers at least 2% of the dimension and at least 20% remains; even size. `sscd` crops each stored frame by the box, then resizes to short side 288, so a 640x360 frame with 44+44 bars goes to the model as 678x288 (cropped 640x272, then resized). Thumbs, cast, `ocrsubs` and subtitles are unchanged.

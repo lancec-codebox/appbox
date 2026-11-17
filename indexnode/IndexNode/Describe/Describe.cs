@@ -68,7 +68,8 @@ public sealed class DescribeInput
 /// <summary>The describe step: titles, tags, era, teaser, synopsis, cast and relations in one batched vision call, then a spoiler check with rewrite.</summary>
 public static class Describe
 {
-    public const string PromptVersion = "describe-5"; // describe-5 (2026-11-15): roleAtStart is always a short spoiler-free line about who the character is, never "not introduced" // describe-4 (2026-11-14): aiGenerated // describe-3 (2026-11-14): marks covered faces per head shot ("masked"); cast no longer scores masks
+    public const string PromptVersion = "describe-6"; // describe-6 (2026-11-16): the rewrite answer example has no concrete cluster id (a "0" in it overwrote the female lead with the male lead's text)
+    // describe-5 (2026-11-15): roleAtStart is always a short spoiler-free line about who the character is, never "not introduced" // describe-4 (2026-11-14): aiGenerated // describe-3 (2026-11-14): marks covered faces per head shot ("masked"); cast no longer scores masks
     public static readonly string[] Eras = ["ancient", "republic", "1950s-60s", "1970s", "1980s-90s", "modern", "futuristic"];
     public const double CutoffFraction = 0.12;
 
@@ -303,9 +304,56 @@ teaser: {res["teaser"]!["en"]}
 cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Select(c => new { cluster = c!["cluster"]!.GetValue<int>(), roleAtStart = c["roleAtStart"]!.GetValue<string>(), description = c["description"]!.GetValue<string>(), label = c["label"]!["en"]!.GetValue<string>() }))}
 relations: {JsonSerializer.Serialize(res["relations"]!.AsArray().Select((r, i) => new { i, from = r!["from"]!.GetValue<int>(), to = r["to"]!.GetValue<int>(), type = r["type"]!.GetValue<string>(), r2 = r["since"]!.GetValue<double>(), spoiler = r["spoiler"]!.GetValue<bool>() }).Where(x => !x.spoiler))}", []);
 
+    /// <summary>The flagged cast cluster ids that exist in the result, in cast order, each once.</summary>
+    public static List<int> FlaggedIdList(JsonObject res, JsonObject check)
+    {
+        var want = ((check["flaggedCast"] as JsonArray) ?? []).Select(x => x is JsonObject o ? AsInt(o["cluster"]) : AsInt(x)).Where(x => x != null).Select(x => x!.Value).ToHashSet();
+        return res["cast"]!.AsArray().Select(c => c!["cluster"]!.GetValue<int>()).Where(want.Contains).Distinct().ToList();
+    }
+    static JsonArray FlaggedIds(JsonObject res, JsonObject check) { var a = new JsonArray(); foreach (var i in FlaggedIdList(res, check)) a.Add(i); return a; }
+
+    static string Norm(string? s) => System.Text.RegularExpressions.Regex.Replace((s ?? "").ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
+
+    static IEnumerable<string> NamesOf(JsonNode c) =>
+        c["character"] is JsonObject ch ? new[] { "en", "pinyin", "zh" }.Select(k => ch[k] is JsonValue v && v.TryGetValue<string>(out var t) ? t.Trim() : "").Where(t => t.Length >= 2) : [];
+
+    /// <summary>True when <paramref name="label"/> contains <paramref name="name"/> other than as the owner of a relation ("Pei Zimo's mother", "裴子墨的母亲").</summary>
+    static bool NamesDirectly(string label, string name)
+    {
+        int i = 0;
+        while ((i = label.IndexOf(name, i, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            int e = i + name.Length; var rest = label[e..];
+            bool poss = rest.StartsWith("'s", StringComparison.Ordinal) || rest.StartsWith("\u2019s", StringComparison.Ordinal) || rest.StartsWith("s'", StringComparison.Ordinal) || rest.StartsWith("\u7684", StringComparison.Ordinal);
+            bool wordStart = i == 0 || !char.IsLetter(label[i - 1]), wordEnd = e >= label.Length || !char.IsLetter(label[e]) || poss;
+            if (wordStart && wordEnd && !poss) return true;
+            i = e;
+        }
+        return false;
+    }
+
+    /// <summary>Why a rewritten entry for <paramref name="tgt"/> must be rejected, or null: its label names another cast entry's character (and not its own), or its roleAtStart / description equals another entry's.</summary>
+    public static string? IdentityProblem(JsonArray cast, JsonNode tgt, string? role, string? desc, string? label)
+    {
+        var own = NamesOf(tgt).ToList();
+        if (label is { Length: > 0 } && !own.Any(n => label.Contains(n, StringComparison.OrdinalIgnoreCase)))
+            foreach (var o in cast)
+            {
+                if (o == null || ReferenceEquals(o, tgt) || o["cluster"]!.GetValue<int>() == tgt["cluster"]!.GetValue<int>()) continue;
+                foreach (var n in NamesOf(o)) if (!own.Any(w => w.Contains(n, StringComparison.OrdinalIgnoreCase)) && NamesDirectly(label, n)) return $"label \"{label}\" names cluster {o["cluster"]}'s character {n}";
+            }
+        foreach (var o in cast)
+        {
+            if (o == null || ReferenceEquals(o, tgt) || o["cluster"]!.GetValue<int>() == tgt["cluster"]!.GetValue<int>()) continue;
+            if (role is { Length: > 0 } && Norm(role) == Norm(o["roleAtStart"]?.GetValue<string>()) && Norm(role).Length > 0) return $"roleAtStart equals cluster {o["cluster"]}'s";
+            if (desc is { Length: > 0 } && Norm(desc) == Norm(o["description"]?.GetValue<string>()) && Norm(desc).Length > 0) return $"description equals cluster {o["cluster"]}'s";
+        }
+        return null;
+    }
+
     public static AiCall BuildRewrite(JsonObject res, JsonObject check, string model) => new("spoiler-rewrite", model, @$"Rewrite the flagged parts so they give nothing away: the teaser must stay a premise only (2-4 sentences, English); flagged cast descriptions and roleAtStart/label must describe only what a viewer knows in the opening. Never use the words villain or antagonist.
 Reasons: {check["reasons"]?.ToJsonString()}
-Answer ONE JSON object: {{""teaser"":""..."",""cast"":[{{""cluster"":0,""roleAtStart"":"""",""description"":"""",""label"":""""}}]}}, listing only the flagged cast entries.
+Answer ONE JSON object: {{""teaser"":""..."",""cast"":[{{""cluster"":<id>,""roleAtStart"":"""",""description"":"""",""label"":""""}}]}} with exactly one cast entry for each of these clusters, each with its own id: {FlaggedIds(res, check).ToJsonString()}. Do not answer for any other cluster. Each entry is about that one character only: keep its own name, never another character's text.
 teaser: {res["teaser"]!["en"]}
 flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check["flaggedCast"] as JsonArray)?.Any(x => AsInt(x) == c!["cluster"]!.GetValue<int>()) == true).Select(c => c!))}", []);
 
@@ -320,19 +368,29 @@ flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check
                 if (i is JsonValue v && v.TryGetValue<int>(out var ix) && ix >= 0 && ix < res["relations"]!.AsArray().Count) res["relations"]![ix]!["spoiler"] = true;
             bool teaser = check["teaserReveals"] is JsonValue tv && tv.TryGetValue<bool>(out var tb) && tb;
             var fc = (check["flaggedCast"] as JsonArray) ?? [];
-            if (!teaser && fc.Count == 0) { res["spoilerCheck"] = new JsonObject { ["rounds"] = round + 1, ["clean"] = true }; return calls; }
+            if (!teaser && fc.Count == 0) { res["spoilerCheck"] = new JsonObject { ["rounds"] = round + 1, ["clean"] = true, ["log"] = res["spoilerRounds"]?.DeepClone() }; res.Remove("spoilerRounds"); return calls; }
             var rw = await chat.JsonAsync(model, JsonValue.Create(BuildRewrite(res, check, model).Prompt)!, "submit_rewrite", ct); calls++;
             if (teaser && Txt(rw["teaser"]) is { Length: > 0 } nt) res["teaser"] = new JsonObject { ["en"] = Bad.Replace(nt, "").Trim() };
+            // apply only what was asked: flagged ids, each once; anything else is ignored and logged; a flagged id without an answer keeps its text
+            var asked = FlaggedIdList(res, check); var came = new List<int>(); var rejected = new JsonArray(); var ignored = new JsonArray(); var seen = new HashSet<int>();
             foreach (var e in (rw["cast"] as JsonArray) ?? [])
             {
-                if (e is not JsonObject c || AsInt(c["cluster"]) is not { } cid) continue;
-                var tgt = res["cast"]!.AsArray().FirstOrDefault(x => x!["cluster"]!.GetValue<int>() == cid); if (tgt == null) continue;
-                if (Txt(c["roleAtStart"]) is { Length: > 0 } r) tgt["roleAtStart"] = Bad.Replace(r, "").Trim();
-                if (Txt(c["description"]) is { Length: > 0 } ds) tgt["description"] = Bad.Replace(ds, "").Trim();
-                if (Txt(c["label"]) is { Length: > 0 } lb) tgt["label"] = new JsonObject { ["en"] = Bad.Replace(lb, "").Trim() };
+                if (e is not JsonObject c || AsInt(c["cluster"]) is not { } cid) { ignored.Add(new JsonObject { ["reason"] = "no cluster id" }); continue; }
+                if (!asked.Contains(cid)) { Log.Info($"describe: rewrite answered for cluster {cid}, which was not flagged: ignored"); ignored.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "not flagged" }); continue; }
+                if (!seen.Add(cid)) { Log.Info($"describe: rewrite answered twice for cluster {cid}: the repeat is ignored"); ignored.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "duplicate" }); continue; }
+                came.Add(cid);
+                var tgt = res["cast"]!.AsArray().First(x => x!["cluster"]!.GetValue<int>() == cid)!;
+                string? r = Txt(c["roleAtStart"]) is { Length: > 0 } r0 ? Bad.Replace(r0, "").Trim() : null, ds = Txt(c["description"]) is { Length: > 0 } d0 ? Bad.Replace(d0, "").Trim() : null, lb = Txt(c["label"]) is { Length: > 0 } l0 ? Bad.Replace(l0, "").Trim() : null;
+                if (IdentityProblem(res["cast"]!.AsArray(), tgt, r, ds, lb) is { } why) { Log.Info($"describe: rewrite for cluster {cid} rejected: {why}"); rejected.Add(new JsonObject { ["cluster"] = cid, ["reason"] = why }); continue; }
+                if (r != null) tgt["roleAtStart"] = r;
+                if (ds != null) tgt["description"] = ds;
+                if (lb != null) tgt["label"] = new JsonObject { ["en"] = lb };
             }
+            var rounds = res["spoilerRounds"] as JsonArray ?? new JsonArray(); res["spoilerRounds"] = rounds;
+            var ja = new JsonArray(); foreach (var i in asked) ja.Add(i); var jc = new JsonArray(); foreach (var i in came) jc.Add(i);
+            rounds.Add(new JsonObject { ["round"] = round + 1, ["flagged"] = ja, ["answered"] = jc, ["rejected"] = rejected, ["ignored"] = ignored });
         }
-        res["spoilerCheck"] = new JsonObject { ["rounds"] = 2, ["clean"] = false };
+        res["spoilerCheck"] = new JsonObject { ["rounds"] = 2, ["clean"] = false, ["log"] = res["spoilerRounds"]?.DeepClone() }; res.Remove("spoilerRounds");
         return calls;
     }
 
