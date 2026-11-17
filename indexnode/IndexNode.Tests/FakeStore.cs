@@ -18,7 +18,12 @@ public sealed class FakeStore : IStore
     public readonly Dictionary<string, int> Renews = new();
     public readonly Dictionary<string, int> Puts = new();
     public readonly List<string> Calls = new();
+    public readonly Dictionary<string, int> LeaseSeconds = new();
+    public readonly List<(string Name, int Seconds)> LeaseLog = new();
+    public readonly System.Collections.Concurrent.ConcurrentQueue<string> Trace = new();
+    private void T(string what, string name, string? extra = null) => Trace.Enqueue($"{DateTime.UtcNow:ss.fff} t{Environment.CurrentManagedThreadId} {what} {name} {extra}");
     public bool ForbidFind;
+    public IReadOnlyList<BlobEntry>? StaleFindResult; // Find Blobs by Tags answers with this fixed (old) result
     public bool StaleFind; // Find Blobs by Tags answers empty, as when the tag index lags
     private readonly object gate = new();
 
@@ -47,10 +52,13 @@ public sealed class FakeStore : IStore
         {
             Calls.Add("find");
             if (ForbidFind) throw new ForbiddenException("no f permission");
+            if (StaleFindResult != null) return Task.FromResult(StaleFindResult);
             if (StaleFind) return Task.FromResult<IReadOnlyList<BlobEntry>>([]);
             var conds = Regex.Matches(where, "\"(?<k>[^\"]+)\"='(?<v>[^']*)'").Select(m => (m.Groups["k"].Value, m.Groups["v"].Value)).ToList();
+            var lt = Regex.Matches(where, "\"(?<k>[^\"]+)\" < '(?<v>[^']*)'").Select(m => (m.Groups["k"].Value, m.Groups["v"].Value)).ToList();
             var le = Regex.Matches(where, "\"(?<k>[^\"]+)\" <= '(?<v>[^']*)'").Select(m => (m.Groups["k"].Value, m.Groups["v"].Value)).ToList();
             IReadOnlyList<BlobEntry> r = Blobs.Where(b => conds.All(c => b.Value.Tags.GetValueOrDefault(c.Item1) == c.Item2)
+                && lt.All(c => b.Value.Tags.TryGetValue(c.Item1, out var tv) && string.CompareOrdinal(tv, c.Item2) < 0)
                 && le.All(c => b.Value.Tags.TryGetValue(c.Item1, out var tv) && string.CompareOrdinal(tv, c.Item2) <= 0)).Select(b => Entry(b.Key, b.Value)).ToList();
             return Task.FromResult(r);
         }
@@ -91,6 +99,7 @@ public sealed class FakeStore : IStore
         lock (gate)
         {
             Puts[name] = Puts.GetValueOrDefault(name) + 1;
+            T("put", name, (tags != null && tags.TryGetValue(Tags.State, out var st) ? st : "-") + " lease=" + leaseId + " new=" + onlyIfNew);
             if (Blobs.TryGetValue(name, out var b))
             {
                 if (onlyIfNew) return Task.FromResult(false);
@@ -116,8 +125,8 @@ public sealed class FakeStore : IStore
         lock (gate)
         {
             var b = Blobs[name];
-            if (b.Lease != null) return Task.FromResult<string?>(null);
-            b.Lease = Guid.NewGuid().ToString();
+            if (b.Lease != null) { T("lease-denied", name); return Task.FromResult<string?>(null); }
+            b.Lease = Guid.NewGuid().ToString(); T("lease", name, b.Lease[..4]);
             return Task.FromResult<string?>(b.Lease);
         }
     }
@@ -134,7 +143,7 @@ public sealed class FakeStore : IStore
 
     public Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct)
     {
-        lock (gate) { if (Blobs.TryGetValue(name, out var b) && b.Lease == leaseId) b.Lease = null; }
+        lock (gate) { T("release", name, leaseId?[..4]); if (Blobs.TryGetValue(name, out var b) && b.Lease == leaseId) b.Lease = null; }
         return Task.CompletedTask;
     }
 
@@ -155,5 +164,24 @@ public sealed class FakeStore : IStore
         return Task.CompletedTask;
     }
 
-    public Task DeleteAsync(string name, CancellationToken ct) { lock (gate) Blobs.Remove(name); return Task.CompletedTask; }
+    public Task<bool> SetTagsIfAsync(string name, IReadOnlyDictionary<string, string> tags, IReadOnlyDictionary<string, string> expect, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            if (!Blobs.TryGetValue(name, out var b) || expect.Any(e => b.Tags.GetValueOrDefault(e.Key) != e.Value)) return Task.FromResult(false);
+            b.Tags = new(tags); TagWrites++;
+            return Task.FromResult(true);
+        }
+    }
+    public int TagWrites;
+
+    public Task DeleteAsync(string name, CancellationToken ct) => DeleteAsync(name, null, ct);
+    public Task DeleteAsync(string name, string? leaseId, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            if (Blobs.TryGetValue(name, out var b) && b.Lease != null && b.Lease != leaseId) throw new StorageException(412, "LeaseIdMissing", "blob is leased");
+            T("delete", name); Blobs.Remove(name); return Task.CompletedTask;
+        }
+    }
 }

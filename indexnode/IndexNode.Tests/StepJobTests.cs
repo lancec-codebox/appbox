@@ -40,7 +40,7 @@ public class StepJobTests
         Assert.False(ran);
         var n = P.Job("sync", "vid");
         Assert.Equal("pending", s.State(n));
-        Assert.True(string.CompareOrdinal(s[n].Tags[Tags.Due], Protocol.NowUtc()) > 0);
+        // workers rank only claimable jobs, so a needs-blocked job is left alone (still pending, never leased)
         Assert.Null(s.LeaseOf(n));
         Assert.Equal(0, s.Job(n).Attempts);
     }

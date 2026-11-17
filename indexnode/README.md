@@ -7,7 +7,7 @@ Protocol (blob layout, jobs, tags, Nexis ghosting): [PROTOCOL.md](IndexNode/PROT
 ## Commands
 
 ```
-indexnode run [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N]
+indexnode run [--once] [--max-jobs N] [--workers N] [--threads N] [--worker-threads N]
               [--sources watch-later --source-every 6h] [--max-height 480]
 indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F]
 indexnode enqueue --from watch-later [--max-height 480]
@@ -92,7 +92,7 @@ Big blobs may be Nexis ghosts. [`IndexNode/Tools/NexisGhost.cs`](IndexNode/Tools
 - **GPU routing is opt-in.** GPU routing is off by default (0.8.6): CPU nodes claim sscd/clip/cast at once and no gpu-ready markers are written, so nothing wakes the GPU job. Turn it on for every CPU node at once, with no restart, by `indexnode control gpu-hold 30m` (`index/control.json` gets `"gpu": {"hold": "30m"}`); turn it off with `indexnode control gpu-hold off`. While it is on, a finished `frames` step writes the markers and a CPU node takes a marker-stage job only after it has been ready for the hold. A node's `--gpu-fallback <duration>` overrides the control file for that node (`--gpu-fallback off` forces no hold); a GPU node (`--gpu`) always claims its stages at once. Jobs that finished `frames` while routing was off have no marker: after switching it on, run `indexnode gpu markers` to write them. The hold counts from the marker's `readyAt` (without a marker, the later of `idx_added` and `idx_due`).
 - **cast on the GPU.** Keyframes are detected in groups of 16 with 4 detector runs at once (the SCRFD model has a fixed batch of 1), and the faces of a group are embedded in one ArcFace batch (up to 64). The credits OCR runs on the GPU OCR sessions, the first and last 3-minute windows at the same time and every 2nd second (CPU nodes: every second, one after the other). Per-drama time: see the release notes for the measured value.
 - **`--exit-when-idle <time>`** stops the node after that long with no job running (a container started for a marker leaves when the work is gone).
-- **`--max-heavy N`** (config `max-heavy`, default 2, 1 on a GPU node, 0 = no limit): concurrent model steps per node; each gets its share of the threads. Downloads, uploads, comments, watch and describe do not count.
+- **`--workers N`** (config `workers`, default 2, 1 on a GPU node): independent workers per node. Each takes the best waiting job across all the stages the node runs (priority, then added, then name), runs it and repeats; no limit is shared between them. `--threads` is split evenly across workers unless `--worker-threads N` is given. `--jobs` and `--max-heavy` are ignored (a warning is printed).
 - **Timing.** Each job ends with `time by step: fetch 3.2s, sscd 41.0s [cuda]`, next to the existing per-phase throughput lines.
 
 ### Container and Azure Container Apps job

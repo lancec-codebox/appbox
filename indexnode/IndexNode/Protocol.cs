@@ -78,6 +78,8 @@ public sealed class Paths(string prefix)
     public string Node(string nodeId) => $"{Prefix}nodes/{nodeId}.json";
     public string Seed(string file) => $"{Prefix}seeds/{file}";
     public string NodesDir => $"{Prefix}nodes/";
+    public string Hold(string videoId) => $"{Prefix}index/holds/{videoId}.json";
+    public string HoldsDir => $"{Prefix}index/holds/";
 }
 
 public static class Tags
@@ -113,6 +115,31 @@ public static class Tags
     public static string DueOf(IReadOnlyDictionary<string, string> tags) =>
         tags.GetValueOrDefault(Due) ?? tags.GetValueOrDefault(Added) ?? "";
     public static string StateWhere(string stage, string state) => $"\"{Stage}\"='{stage}' AND \"{State}\"='{state}'";
+}
+
+/// <summary>A drama's temporary hold (index/holds/&lt;videoId&gt;.json): one blob per held drama, created with If-None-Match *, renewed and taken over with If-Match, deleted when the drama's last batch stage is done or on a clean stop. The same four fields go in the body, in metadata (idx_node, idx_batch, idx_until, idx_since: one List Blobs call shows every hold) and, as hints only, node and until in tags (idx_hold_node, idx_hold_until).</summary>
+public sealed record HoldInfo(string Node, string Batch, string Until, string Since)
+{
+    public const string TagNode = "idx_hold_node", TagUntil = "idx_hold_until";
+    public static HoldInfo New(string node, string batch, string since) => new(node, batch, Protocol.NowUtc(), since);
+    public Dictionary<string, string> Metadata() => new() { ["idx_node"] = Node, ["idx_batch"] = Batch, ["idx_until"] = Until, ["idx_since"] = Since };
+    public Dictionary<string, string> HoldTags() => new() { [TagNode] = Node, [TagUntil] = Until };
+    public byte[] Body() => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { node = Node, batch = Batch, until = Until, since = Since });
+    public static HoldInfo? FromMetadata(IReadOnlyDictionary<string, string> m)
+    {
+        string G(string k) => m.FirstOrDefault(e => string.Equals(e.Key, k, StringComparison.OrdinalIgnoreCase)).Value ?? "";
+        return G("idx_until").Length == 0 ? null : new HoldInfo(G("idx_node"), G("idx_batch"), G("idx_until"), G("idx_since"));
+    }
+    public static HoldInfo? FromBody(byte[] data)
+    {
+        try
+        {
+            using var d = System.Text.Json.JsonDocument.Parse(data); var r = d.RootElement;
+            string S(string k) => r.TryGetProperty(k, out var v) ? v.GetString() ?? "" : "";
+            return S("until").Length == 0 ? null : new HoldInfo(S("node"), S("batch"), S("until"), S("since"));
+        }
+        catch { return null; }
+    }
 }
 
 public sealed class JobDescriptor
@@ -297,7 +324,9 @@ public sealed class NodeInfo
     public string Version { get; set; } = "";
     public string Platform { get; set; } = "";
     public string[] Stages { get; set; } = [];
-    public Dictionary<string, int> Jobs { get; set; } = new();
+    public Dictionary<string, int> Jobs { get; set; } = new(); // old nodes (before 0.8.9) report their per-stage jobs; 0.8.9 reports Workers
+    public int Workers { get; set; }
+    public int WorkerThreads { get; set; }
     public int Threads { get; set; }
     public string? Conditions { get; set; }
     /// <summary>Process steps the node can run; a job needing another step is never claimed by it.</summary>

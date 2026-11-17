@@ -21,8 +21,8 @@ public sealed class OcrEngine : IDisposable
 
     public OcrEngine(string detPath, string recPath, string dictPath, int threads = 1)
     {
-        det = OrtOptions.Session(detPath, threads);
-        rec = OrtOptions.Session(recPath, threads);
+        det = OrtOptions.Shared(detPath, threads);
+        rec = OrtOptions.Shared(recPath, threads);
         ctc = CtcDecoder.FromFile(dictPath);
         detIn = det.InputMetadata.Keys.First(); recIn = rec.InputMetadata.Keys.First();
     }
@@ -194,5 +194,5 @@ public sealed class OcrEngine : IDisposable
         return DbPostProcess.Process(r.First().AsTensor<float>().ToArray(), dh, dw, w, h);
     }
 
-    public void Dispose() { det.Dispose(); rec.Dispose(); }
+    public void Dispose() { } // the sessions are the process's shared ones (OrtOptions.Shared), not this engine's
 }

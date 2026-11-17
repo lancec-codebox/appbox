@@ -186,7 +186,7 @@ public class CommentsTests
         await s.AddJob(P, "process", "skipme", Ago(20));
         await s.AddJob(P, "process", "other", Ago(10));
         var ran = new List<string>();
-        var e = new NodeEngine(s, P, new EngineOptions { NodeId = "n-1", Stages = ["process"], Jobs = new() { ["process"] = 1 }, Once = false, MaxJobs = 2,
+        var e = new NodeEngine(s, P, new EngineOptions { Workers = 1, NodeId = "n-1", Stages = ["process"], Jobs = new() { ["process"] = 1 }, Once = false, MaxJobs = 2,
             PollInterval = TimeSpan.FromMilliseconds(30), ControlInterval = TimeSpan.FromMilliseconds(40), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromSeconds(30) },
             new Dictionary<string, IStageHandler> { ["process"] = new FuncHandler(ctx => { ran.Add(ctx.Job.JobId); return ctx.Job.JobId == "skipme" ? throw new JobSkipped("unknown step") : Task.CompletedTask; }) });
         await e.RunAsync(default).WaitAsync(TimeSpan.FromSeconds(10));

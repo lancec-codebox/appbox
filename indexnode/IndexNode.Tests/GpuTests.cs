@@ -6,11 +6,11 @@ public class GpuTests
     private static readonly Paths P = new("index-test/");
     private static string Ago(TimeSpan t) => Protocol.Utc(DateTimeOffset.UtcNow - t);
 
-    private static EngineOptions Opts(string[] stages, bool gpu = false, int maxHeavy = 2, TimeSpan? fallback = null, TimeSpan? idle = null, bool once = true) => new()
+    private static EngineOptions Opts(string[] stages, bool gpu = false, int workers = 2, TimeSpan? fallback = null, TimeSpan? idle = null, bool once = true) => new()
     {
         NodeId = "gpu-test", Name = "gpu-test", Stages = stages, Jobs = stages.ToDictionary(s => s, _ => 1), Threads = 8, Once = once,
         PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromSeconds(30), RegistryInterval = TimeSpan.FromSeconds(30), ControlInterval = TimeSpan.FromSeconds(30),
-        Gpu = gpu, MaxHeavy = maxHeavy, GpuFallback = fallback, ExitWhenIdle = idle, IdleCheck = TimeSpan.FromMilliseconds(20), HeavyRetry = TimeSpan.FromMilliseconds(10),
+        Gpu = gpu, Workers = workers, GpuFallback = fallback, ExitWhenIdle = idle, IdleCheck = TimeSpan.FromMilliseconds(20),
     };
 
     private static NodeEngine Engine(FakeStore s, EngineOptions o, Func<JobContext, Task> h) =>
@@ -218,7 +218,7 @@ public class GpuTests
     {
         var s = new FakeStore();
         foreach (var id in new[] { "ok", "bad", "rel" }) { await Frames(s, id); await Job(s, "clip", id, TimeSpan.FromMinutes(1)); await GpuRouting.WriteMarkerAsync(s, P, "clip", id, default); }
-        await Engine(s, Opts(["clip"], gpu: true, maxHeavy: 1, once: false, idle: TimeSpan.FromMilliseconds(300)), c =>
+        await Engine(s, Opts(["clip"], gpu: true, workers: 1, once: false, idle: TimeSpan.FromMilliseconds(300)), c =>
         {
             if (c.Job.JobId == "bad") throw new PermanentFailure("nope");
             if (c.Job.JobId == "rel") throw new JobSkipped("not here");
@@ -255,7 +255,7 @@ public class GpuTests
         var s = new FakeStore();
         foreach (var id in new[] { "a", "b", "c", "d", "e", "f" }) { await Frames(s, id); await Job(s, "sscd", id, TimeSpan.FromHours(2)); }
         int now = 0, peak = 0;
-        var o = Opts(["sscd", "clip", "cast"], maxHeavy: 2, once: false, idle: TimeSpan.FromMilliseconds(300));
+        var o = Opts(["sscd", "clip", "cast"], workers: 2, once: false, idle: TimeSpan.FromMilliseconds(300));
         await Engine(s, o, async c =>
         {
             var n = Interlocked.Increment(ref now); lock (s) peak = Math.Max(peak, n);
@@ -271,19 +271,18 @@ public class GpuTests
     {
         var s = new FakeStore();
         foreach (var id in new[] { "a", "b", "c" }) { await Frames(s, id); await Job(s, "sscd", id, TimeSpan.FromHours(2)); }
-        await Engine(s, Opts(["sscd"], maxHeavy: 1, once: false, idle: TimeSpan.FromMilliseconds(300)), c => c.Job.JobId == "a" ? throw new PermanentFailure("x") : Task.CompletedTask)
+        await Engine(s, Opts(["sscd"], workers: 1, once: false, idle: TimeSpan.FromMilliseconds(300)), c => c.Job.JobId == "a" ? throw new PermanentFailure("x") : Task.CompletedTask)
             .RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal("failed", s.State(P.Job("sscd", "a"))); Assert.Equal("done", s.State(P.Job("sscd", "b"))); Assert.Equal("done", s.State(P.Job("sscd", "c")));
     }
 
     [Fact(Skip = "flaky under load (timing-sensitive, 20 s wait): failed in a full local run on 2026-11-14 with the host busy")]
-    public async Task Maxheavy_zero_means_no_limit()
+    public async Task Workers_run_independently_without_a_shared_limit()
     {
         var s = new FakeStore();
         foreach (var id in new[] { "a", "b", "c" }) { await Frames(s, id); await Job(s, "sscd", id, TimeSpan.FromHours(2)); }
         int now = 0, peak = 0;
-        var o = Opts(["sscd"], maxHeavy: 0, once: false, idle: TimeSpan.FromMilliseconds(300));
-        o.Jobs["sscd"] = 3;
+        var o = Opts(["sscd"], workers: 3, once: false, idle: TimeSpan.FromMilliseconds(300));
         await Engine(s, o, async c => { var n = Interlocked.Increment(ref now); lock (s) peak = Math.Max(peak, n); await Task.Delay(150, c.Token); Interlocked.Decrement(ref now); })
             .RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(20));
         Assert.Equal(3, peak);

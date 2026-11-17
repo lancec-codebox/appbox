@@ -20,14 +20,14 @@ public class PriorityTests
 
     private static EngineOptions Opts() => new()
     {
-        NodeId = "test-abc123", Name = "test", Stages = ["download"], Jobs = new() { ["download"] = 1 }, Threads = 8, Once = true,
+        NodeId = "test-abc123", Name = "test", Stages = ["download"], Workers = 1, Threads = 8, Once = true,
         PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100),
         BotBackoff = TimeSpan.FromHours(1), TransientBackoff = _ => TimeSpan.Zero, ControlInterval = TimeSpan.FromMilliseconds(40),
     };
 
     private static EngineOptions OptsFor(string[] stages) => new()
     {
-        NodeId = "test-abc123", Name = "test", Stages = stages, Jobs = stages.ToDictionary(x => x, _ => 1), Threads = 8, Once = true,
+        NodeId = "test-abc123", Name = "test", Stages = stages, Workers = 1, Threads = 8, Once = true,
         PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100),
         BotBackoff = TimeSpan.FromHours(1), TransientBackoff = _ => TimeSpan.Zero, ControlInterval = TimeSpan.FromMilliseconds(40),
     };

@@ -118,6 +118,25 @@ public static class Transcribe
         return f;
     }
 
+    private static readonly Dictionary<string, Lazy<OfflineRecognizer>> recognisers = new();
+    /// <summary>The SenseVoice recogniser, loaded once per process (per model file and thread count) and used by every worker at once: sherpa-onnx's OfflineRecognizer.Decode takes a stream of its own per call and the ONNX Runtime session under it allows concurrent runs, so no lock. Never disposed by the caller.</summary>
+    public static OfflineRecognizer SharedRecognizer(string modelPath, string tokensPath, int threads)
+    {
+        var key = $"{Path.GetFullPath(modelPath)}|{Math.Max(1, threads)}";
+        Lazy<OfflineRecognizer> l;
+        lock (recognisers) { if (!recognisers.TryGetValue(key, out l!)) recognisers[key] = l = new Lazy<OfflineRecognizer>(() => NewRecognizer(modelPath, tokensPath, threads), LazyThreadSafetyMode.ExecutionAndPublication); }
+        return l.Value;
+    }
+
+    /// <summary>Disposes the shared recognisers (a batch does this after the transcribe stage).</summary>
+    public static int UnloadRecognizers()
+    {
+        List<OfflineRecognizer> rs = new();
+        lock (recognisers) { foreach (var l in recognisers.Values) if (l.IsValueCreated) rs.Add(l.Value); recognisers.Clear(); }
+        foreach (var r in rs) try { r.Dispose(); } catch { }
+        return rs.Count;
+    }
+
     static OfflineRecognizer NewRecognizer(string modelPath, string tokensPath, int threads)
     {
         var rc = new OfflineRecognizerConfig();
@@ -189,7 +208,7 @@ public static class Transcribe
         // the recognisers load while voice detection runs (12 copies of the 234 MB model took ~5.5 s)
         // SharedModel: one loaded recogniser, called from every worker at once (ONNX Runtime sessions allow concurrent runs; each stream is its own)
         int nrec = SharedModel ? 1 : Math.Max(1, workers); var recs = new OfflineRecognizer[nrec]; long loadTicks = Stopwatch.GetTimestamp();
-        var loading = Task.Run(() => Parallel.For(0, nrec, i => recs[i] = NewRecognizer(modelPath, tokensPath, threadsPer)), ct);
+        var loading = Task.Run(() => Parallel.For(0, nrec, i => recs[i] = SharedModel ? SharedRecognizer(modelPath, tokensPath, threadsPer) : NewRecognizer(modelPath, tokensPath, threadsPer)), ct);
         var found = new List<(int Start, float[] Samples)>[pieces];
         Parallel.For(0, pieces, new ParallelOptions { MaxDegreeOfParallelism = pieces, CancellationToken = ct }, k =>
         {
@@ -236,7 +255,7 @@ public static class Transcribe
                 if (n / 200 != (n - idx.Count) / 200 || n == segs.Count) progress($"recognition: {n}/{segs.Count} segments");
             }
         });
-        foreach (var rr in recs) rr.Dispose();
+        if (!SharedModel) foreach (var rr in recs) rr.Dispose(); // the shared one lives as long as the process
         Log.Info($"transcribe: {(SharedModel ? "one shared model, " : "")}voice detection {vadSecs:F1}s ({pieces} pieces), recognition {wall.Elapsed.TotalSeconds - vadSecs:F1}s ({segs.Count} segments, {speech:F0}s of speech; {workers} recognisers x {threadsPer} thread(s), batch {batch}), wall {wall.Elapsed.TotalSeconds:F1}s; model load {loadSecs:F1}s (alongside voice detection; {waitLoad:F1}s waited after it), decode time summed over recognisers {decodeSum / (double)Stopwatch.Frequency:F1}s");
         return res.Where(r => r != null).Select(r => r!).ToList();
     }

@@ -87,7 +87,7 @@ public static class Sscd
         var wh = pr.Stdout.Trim().Split('x');
         int sw = int.Parse(wh[0]), sh = int.Parse(wh[1]); var (tw, th) = InputSize(sw, sh, crop); Log.Info($"sscd: stored {sw}x{sh}, bar box {crop}, model input {tw}x{th}");
 
-        using var session = OrtOptions.Session(modelPath, threads);
+        var session = OrtOptions.Shared(modelPath, threads);
         var inputName = session.InputMetadata.Keys.First();
 
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };

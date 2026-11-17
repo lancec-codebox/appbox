@@ -82,24 +82,3 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     }
 }
 
-public sealed class ThreadBudget(int total)
-{
-    private int active;
-    public int Total { get; } = Math.Max(1, total);
-    public int Active => Volatile.Read(ref active);
-
-    /// <summary>The CPU budget divided by the running process jobs, at least 1.</summary>
-    public int Share => Math.Max(1, Total / Math.Max(1, Active));
-
-    public IDisposable Enter()
-    {
-        Interlocked.Increment(ref active);
-        return new Releaser(this);
-    }
-
-    private sealed class Releaser(ThreadBudget b) : IDisposable
-    {
-        private int done;
-        public void Dispose() { if (Interlocked.Exchange(ref done, 1) == 0) Interlocked.Decrement(ref b.active); }
-    }
-}

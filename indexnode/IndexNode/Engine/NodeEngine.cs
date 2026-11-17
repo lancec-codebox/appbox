@@ -62,13 +62,24 @@ public sealed class EngineOptions
     /// <summary>A GPU node: its stages are the GPU stages and it claims a marker-stage job at once; a CPU node waits <see cref="GpuFallback"/> before taking one.</summary>
     public bool Gpu { get; init; }
     public TimeSpan? GpuFallback { get; init; }
-    /// <summary>Concurrent heavy (model) steps on this node, each getting a share of the threads; 0 = no limit. I/O work (download, upload, AI waits, comments, watch, sync, describe) does not count.</summary>
-    public int MaxHeavy { get; init; } = 2;
+    /// <summary>Independent workers on this node (--workers, default 2). Each takes the best waiting job across all the node's stages, runs it and repeats; nothing is shared between them.</summary>
+    public int Workers { get; init; } = 2;
+    /// <summary>Threads each worker's steps may use (--worker-threads); null = <see cref="Threads"/> divided evenly by <see cref="Workers"/>.</summary>
+    public int? WorkerThreads { get; init; }
+    /// <summary>Dramas processed side by side within a stage of a batch (--lanes, default 2); they share the stage's one loaded model.</summary>
+    public int Lanes { get; init; } = 2;
+    /// <summary>A batch holds up to this many dramas (--batch) or about <see cref="BatchHours"/> of video (--batch-hours), best first.</summary>
+    public int Batch { get; init; } = 6;
+    public double BatchHours { get; init; } = 2;
+    /// <summary>How often a batch renews its hold-blob leases (60 s leases).</summary>
+    public TimeSpan HoldRenew { get; init; } = TimeSpan.FromSeconds(40);
+    /// <summary>Tests replace the unloading of the shared models after a stage.</summary>
+    public Action? UnloadModels { get; init; }
+    public int ThreadsPerLane => ThreadSplit.PerWorker(Threads, Lanes, WorkerThreads);
+    public int ThreadsPerWorker => ThreadSplit.PerWorker(Threads, Workers, WorkerThreads);
     /// <summary>Stop after this long with no job running (a container job that was started for a marker and has no more work); null: never.</summary>
     public TimeSpan? ExitWhenIdle { get; init; }
     public TimeSpan IdleCheck { get; init; } = TimeSpan.FromSeconds(10);
-    /// <summary>How soon a worker that found every heavy slot taken looks again.</summary>
-    public TimeSpan HeavyRetry { get; init; } = TimeSpan.FromSeconds(2);
     public string? StorageHost { get; init; }
     public string StorageRegion { get; init; } = "westus2";
     /// <summary>Tests replace the placement probe (IMDS and the storage connect time).</summary>
@@ -79,7 +90,7 @@ public sealed class EngineOptions
     public Func<DateTimeOffset>? Now { get; init; }
 }
 
-public sealed class NodeEngine
+public sealed partial class NodeEngine
 {
     private sealed record Claim(string BlobName, string LeaseId, JobDescriptor Job, Dictionary<string, string> Tags);
 
@@ -108,13 +119,21 @@ public sealed class NodeEngine
     private readonly EngineOptions o;
     private readonly IReadOnlyDictionary<string, IStageHandler> handlers;
     private readonly ConcurrentDictionary<Running, byte> running = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> ignoreUntil = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> stageBackoff = new();
+    /// <summary>Everything one worker owns: its back-off state and its work folder. Workers share nothing but the store client, the config and the node record.</summary>
+    private sealed class WorkerState(int number)
+    {
+        public int Number { get; } = number;
+        public ConcurrentDictionary<string, DateTimeOffset> IgnoreUntil { get; init; } = new();
+        public ConcurrentDictionary<string, DateTimeOffset> StageBackoff { get; init; } = new();
+        /// <summary>Threads this lane's steps may use; null = the node's per-worker share.</summary>
+        public int? Threads { get; init; }
+        public string WorkRoot => Path.Combine(Path.GetTempPath(), "indexnode", "w" + Number + "-" + Environment.ProcessId);
+    }
+    private readonly List<WorkerState> workerStates = new();
     private readonly SemaphoreSlim registryGate = new(1, 1);
     private readonly DateTimeOffset startedAt = DateTimeOffset.UtcNow;
     private readonly bool[] fallbackListing = new bool[1];
     private int reserved;
-    private SemaphoreSlim? heavySlots;
     private long lastBusyTicks = DateTime.UtcNow.Ticks;
     public bool ExitedIdle { get; private set; }
     private string? lastRegistryKey;
@@ -130,16 +149,13 @@ public sealed class NodeEngine
     private Dictionary<string, string> peers = new();
 
     public ControlWatcher Control { get; }
-    public ThreadBudget Budget { get; }
     public int JobsStarted => Volatile.Read(ref reserved);
 
     public NodeEngine(IStore store, Paths paths, EngineOptions options, IReadOnlyDictionary<string, IStageHandler> handlers)
     {
         this.store = store; this.paths = paths; o = options; this.handlers = handlers;
         Control = new ControlWatcher(store, paths);
-        Budget = new ThreadBudget(options.Threads);
         Control.Changed += OnControlChanged;
-        if (options.MaxHeavy > 0) heavySlots = new SemaphoreSlim(options.MaxHeavy, options.MaxHeavy);
         o.Limits?.Apply(Control.Current);
     }
 
@@ -147,20 +163,20 @@ public sealed class NodeEngine
 
     private string NodeState()
     {
-        var stages = o.Stages.Where(s => o.Jobs.GetValueOrDefault(s, 1) > 0).ToList();
+        var stages = o.Stages.ToList();
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) == Level.Stop)) return "stopped";
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) >= Level.Drain)) return "draining";
         if (!running.IsEmpty) return "working";
         if (o.Limits?.Status() is { } limited) return limited;
-        if (stageBackoff.Any(b => b.Value > DateTimeOffset.UtcNow)) return "backoff";
+        if (workerStates.ToArray().Any(w => w.StageBackoff.Any(b => b.Value > DateTimeOffset.UtcNow))) return "backoff";
         return "idle";
     }
 
     private NodeInfo Snapshot(string? state = null) => new()
     {
         NodeId = o.NodeId, Name = o.Name, Kind = o.Kind, Version = o.Version, Platform = PlatformInfo.Platform(),
-        Stages = o.Stages, Jobs = o.Jobs.Where(j => o.Stages.Contains(j.Key)).ToDictionary(j => j.Key, j => j.Value),
-        Threads = o.Threads, Conditions = o.Conditions, Steps = o.Steps,
+        Stages = o.Stages, Workers = o.Workers,
+        Threads = o.Threads, WorkerThreads = o.ThreadsPerWorker, Conditions = o.Conditions, Steps = o.Steps,
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
         Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker, StartedAt = r.Info.StartedAt }).ToList(),
@@ -336,12 +352,14 @@ public sealed class NodeEngine
             var rt = runCts.Token;
             var workers = new List<Task>();
             int w = 0;
-            foreach (var stage in o.Stages)
-                for (int i = 0; i < o.Jobs.GetValueOrDefault(stage, 1); i++)
-                {
-                    int number = ++w;
-                    workers.Add(Task.Run(() => WorkerLoop(stage, number, rt)));
-                }
+            var sharedIgnore = new ConcurrentDictionary<string, DateTimeOffset>(); var sharedBackoff = new ConcurrentDictionary<string, DateTimeOffset>();
+            // N independent workers: each loops on its own over all the node's stages, with no limit shared between them
+            if (o.Stages.Any(IsPassStage)) workers.Add(Task.Run(() => BatchLoop(rt)));
+            for (int i = 0; i < (o.Stages.Any(s => !IsPassStage(s)) ? Math.Max(1, o.Workers) : 0); i++)
+            {
+                var ws = new WorkerState(++w) { IgnoreUntil = sharedIgnore, StageBackoff = sharedBackoff }; workerStates.Add(ws);   // workers share their back-offs: a job one worker just failed is not retried at once by the other
+                workers.Add(Task.Run(() => WorkerLoop(ws, rt)));
+            }
             await Task.WhenAll(workers);
         }
         finally
@@ -384,92 +402,65 @@ public sealed class NodeEngine
         }
     }
 
-    private async Task WorkerLoop(string stage, int worker, CancellationToken ct)
+    private bool IsPassStage(string stage) => StageOrder.PassOrder.Contains(stage);
+
+    /// <summary>One worker, an engine of its own: take the best waiting work across all the node's stages, run it, repeat. A CPU step stage is taken a whole drama at a time (see <see cref="ClaimDramaAsync"/>).</summary>
+    private async Task WorkerLoop(WorkerState w, CancellationToken ct)
     {
         try
         {
             while (!ct.IsCancellationRequested)
             {
+                if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
                 await Control.RefreshAsync(ct, force: true);
-                var level = Control.Effective(stage);
-                if (level != Level.Run)
+                var open = o.Stages.Where(st => !IsPassStage(st) && Control.Effective(st) == Level.Run && !(w.StageBackoff.TryGetValue(st, out var u) && u > DateTimeOffset.UtcNow)).ToList();
+                if (open.Count == 0)
                 {
                     RegistryChanged();
                     if (o.Once) return;
                     await Task.Delay(o.PollInterval < o.ControlInterval ? o.PollInterval : o.ControlInterval, ct);
                     continue;
                 }
-                if (stageBackoff.TryGetValue(stage, out var until) && until > DateTimeOffset.UtcNow)
-                {
-                    RegistryChanged();
-                    if (o.Once) return;
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Max(0.05, (until - DateTimeOffset.UtcNow).TotalSeconds))), ct);
-                    continue;
-                }
-                if (o.Limits != null && !o.Limits.TryAcquire(stage))
+                Task<bool> Eligible(string st, BlobEntry b, CancellationToken c) => EligibleAsync(w, st, b, c);
+                var heads = await StageOrder.HeadsAsync(open, FindPendingAsync, Eligible, ct);
+                bool worked = false;
+                foreach (var (stage, _) in heads)
+                    if (await ClaimAndRunAsync(w, stage, ct)) { worked = true; break; }
+                if (!worked)
                 {
                     RegistryChanged();
                     if (o.Once) return;
                     await Task.Delay(o.PollInterval, ct);
-                    continue;
                 }
-                // the node-level limit on concurrent heavy steps: a worker takes a slot before it looks for work and gives it back when it finds none
-                bool heavy = heavySlots != null && Protocol.HeavyStages.Contains(stage);
-                if (heavy && !await heavySlots!.WaitAsync(0, ct))
-                {
-                    o.Limits?.Release(stage, false);
-                    if (o.Once) return;
-                    await Task.Delay(o.HeavyRetry, ct);
-                    continue;
-                }
-                if (stage == "download")
-                {
-                    bool allowed;
-                    try { await EnsureFreshNetworkAsync(ct); allowed = await UnderIpCapAsync(ct); }
-                    catch (OperationCanceledException) { o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release(); throw; }
-                    catch (Exception e) { Log.Info($"download: the per-IP cap check failed ({e.Message}); not capping this time"); allowed = true; }
-                    if (!allowed)
-                    {
-                        // waiting, not failing: no attempt counted, no back-off
-                        o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release();
-                        if (o.Once) return;
-                        await Task.Delay(o.PollInterval, ct);
-                        continue;
-                    }
-                }
-                if (!TryReserve()) { o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release(); return; }
-                Claim? claim;
-                Interlocked.Increment(ref busyClaims);
-                try { claim = await TryClaimAsync(stage, ct); }
-                catch (OperationCanceledException) { if (heavy) heavySlots!.Release(); throw; }
-                catch (Exception e)
-                {
-                    Log.Info($"{stage}: looking for work failed ({e.Message})");
-                    Interlocked.Decrement(ref reserved);
-                    o.Limits?.Release(stage, false);
-                    if (heavy) heavySlots!.Release();
-                    if (o.Once) return;
-                    await Task.Delay(o.PollInterval, ct);
-                    continue;
-                }
-                finally { Interlocked.Decrement(ref busyClaims); }
-                if (claim == null)
-                {
-                    Interlocked.Decrement(ref reserved);
-                    o.Limits?.Release(stage, false);
-                    if (heavy) heavySlots!.Release();
-                    if (o.Once) return;
-                    RegistryChanged();
-                    await Task.Delay(o.PollInterval, ct);
-                    continue;
-                }
-                bool finished;
-                try { finished = await RunJobAsync(stage, worker, claim, ct); }
-                finally { if (heavy) heavySlots!.Release(); }
-                o.Limits?.Release(stage, finished);
             }
         }
         catch (OperationCanceledException) { }
+    }
+
+
+    /// <summary>Claims and runs one job of a non-pass stage (download, comments, watch, ...). False when nothing could be claimed.</summary>
+    private async Task<bool> ClaimAndRunAsync(WorkerState w, string stage, CancellationToken ct)
+    {
+        if (o.Limits != null && !o.Limits.TryAcquire(stage)) return false;
+        if (stage == "download")
+        {
+            bool allowed;
+            try { await EnsureFreshNetworkAsync(ct); allowed = await UnderIpCapAsync(ct); }
+            catch (OperationCanceledException) { o.Limits?.Release(stage, false); throw; }
+            catch (Exception e) { Log.Info($"download: the per-IP cap check failed ({e.Message}); not capping this time"); allowed = true; }
+            if (!allowed) { o.Limits?.Release(stage, false); return false; } // waiting, not failing: no attempt counted, no back-off
+        }
+        if (!TryReserve()) { o.Limits?.Release(stage, false); return false; }
+        Claim? claim;
+        Interlocked.Increment(ref busyClaims);
+        try { claim = await TryClaimAsync(w, stage, ct); }
+        catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); o.Limits?.Release(stage, false); throw; }
+        catch (Exception e) { Log.Info($"{stage}: looking for work failed ({e.Message})"); claim = null; }
+        finally { Interlocked.Decrement(ref busyClaims); }
+        if (claim == null) { Interlocked.Decrement(ref reserved); o.Limits?.Release(stage, false); return false; }
+        var finished = await RunJobAsync(w, stage, claim, store, ct);
+        o.Limits?.Release(stage, finished);
+        return true;
     }
 
     // ---------------------------------------------------------------- claim
@@ -494,53 +485,87 @@ public sealed class NodeEngine
             && string.CompareOrdinal(Tags.DueOf(b.Tags), now) <= 0).ToList();
     }
 
-    private async Task<Claim?> TryClaimAsync(string stage, CancellationToken ct)
+    /// <summary>Whether a pending job could be claimed right now (for the workers' stage ranking): not ignored, its needs exist, this node can run it and no GPU hold applies. Reads only.</summary>
+    private async Task<bool> EligibleAsync(WorkerState w, string stage, BlobEntry b, CancellationToken ct)
+    {
+        if (w.IgnoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) return false;
+        if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && GpuRouting.EffectiveHold(o.GpuFallback, Control.Current) is { } hold && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, hold)) return false;
+        var body = await store.GetAsync(b.Name, ct);
+        if (body == null) return false;
+        var job = JobDescriptor.Parse(body.Data);
+        if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct) != null && !(IsPassStage(stage) && NeedsFromPass(job, needs))) return false;
+        if (o.CanRun != null && !o.CanRun(job)) return false;
+        return true;
+    }
+
+    /// <summary>True when every input still missing for a pass-stage job is an output of an earlier step of the pass.</summary>
+    private static bool NeedsFromPass(JobDescriptor job, string[] needs)
+    {
+        var earlier = StageOrder.PassOrder.TakeWhile(x => x != job.Stage).SelectMany(x => ProcessStage.Outputs.Where(y => y.Step == x).Select(y => y.File)).ToHashSet(StringComparer.Ordinal);
+        return needs.Any(n => earlier.Contains(n));
+    }
+
+    private async Task<Claim?> TryClaimAsync(WorkerState w, string stage, CancellationToken ct)
     {
         var found = await FindPendingAsync(stage, ct);
-        var ordered = Tags.ClaimOrder(found);
-        foreach (var b in ordered)
-        {
-            if (ignoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) continue;
-            if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && GpuRouting.EffectiveHold(o.GpuFallback, Control.Current) is { } hold && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, hold))
-            {
-                ignoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(1); // held for the GPU node; look again in a minute
-                continue;
-            }
-            var lease = await store.AcquireLeaseAsync(b.Name, Protocol.LeaseSeconds, ct);
-            if (lease == null) continue; // 409: another node has it
-            try
-            {
-                // the tag index is eventually consistent: confirm under the lease
-                var tags = await store.GetTagsAsync(b.Name, ct);
-                if (tags == null || tags.GetValueOrDefault(Tags.State) != "pending" || string.CompareOrdinal(Tags.DueOf(tags), Protocol.NowUtc()) > 0) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); continue; }
-                var body = await store.GetAsync(b.Name, ct);
-                if (body == null) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); continue; }
-                var job = JobDescriptor.Parse(body.Data);
-                if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct) is { } missing)
-                {
-                    // an earlier step has not finished: leave it pending, due a little later
-                    var later = Protocol.Utc(DateTimeOffset.UtcNow + Protocol.NeedsRetry);
-                    await store.SetTagsAsync(b.Name, Tags.Job(stage, "pending", tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, later, Tags.PriorityOf(tags)), lease, ct);
-                    await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
-                    Log.Info($"[{stage}] {job.JobId} waits for {missing}");
-                    continue;
-                }
-                if (o.CanRun != null && !o.CanRun(job))
-                {
-                    // this node lacks a step the job needs: leave it to another node, and look again later
-                    await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
-                    ignoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(10);
-                    continue;
-                }
-                return new Claim(b.Name, lease, job, new Dictionary<string, string>(tags));
-            }
-            catch
-            {
-                try { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); } catch { }
-                throw;
-            }
-        }
+        foreach (var b in Tags.ClaimOrder(found))
+            if (await TryClaimOneAsync(w, stage, b, ct, null) is { } c) return c;
         return null;
+    }
+
+    /// <summary>True while another node holds the drama (its hold blob is leased and not ours).</summary>
+    private async Task<bool> HeldByOtherAsync(string videoId, CancellationToken ct)
+    {
+        foreach (var e in await store.ListAsync(paths.Hold(videoId), false, true, ct))
+            if (e.Name == paths.Hold(videoId) && e.LeaseState == "leased" && HoldInfo.FromMetadata(e.Metadata)?.Node != o.NodeId) return true;
+        return false;
+    }
+
+    /// <summary>Leases one pending job and confirms it under the lease. <paramref name="produced"/>: outputs earlier steps of the same drama pass will write, so those needs do not block the claim.</summary>
+    private async Task<Claim?> TryClaimOneAsync(WorkerState w, string stage, BlobEntry b, CancellationToken ct, HashSet<string>? produced)
+    {
+        if (w.IgnoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) return null;
+        if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && GpuRouting.EffectiveHold(o.GpuFallback, Control.Current) is { } hold && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, hold))
+        {
+            w.IgnoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(1); // held for the GPU node; look again in a minute
+            return null;
+        }
+        var lease = await store.AcquireLeaseAsync(b.Name, Protocol.LeaseSeconds, ct);
+        if (lease == null) return null; // 409: another worker or node has it
+        try
+        {
+            // the tag index is eventually consistent: confirm under the lease
+            var tags = await store.GetTagsAsync(b.Name, ct);
+            if (tags == null || tags.GetValueOrDefault(Tags.State) != "pending" || string.CompareOrdinal(Tags.DueOf(tags), Protocol.NowUtc()) > 0) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); return null; }
+            // the drama may be held (index/holds/<id>.json under a live lease) by another node's batch, or this step may already be done (the body says so, unlike a lagging tag)
+            if (await HeldByOtherAsync(Path.GetFileNameWithoutExtension(b.Name), ct)) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); return null; }
+            var body = await store.GetAsync(b.Name, ct);
+            if (body == null) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); return null; }
+            var job = JobDescriptor.Parse(body.Data);
+            if (Protocol.IsStep(stage) && job.FinishedAt != null) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); return null; }
+            if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct, produced) is { } missing)
+            {
+                // an earlier step has not finished: leave it pending, due a little later
+                var later = Protocol.Utc(DateTimeOffset.UtcNow + Protocol.NeedsRetry);
+                await store.SetTagsAsync(b.Name, Tags.Job(stage, "pending", tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, later, Tags.PriorityOf(tags)), lease, ct);
+                await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
+                Log.Info($"[{stage}] {job.JobId} waits for {missing}");
+                return null;
+            }
+            if (o.CanRun != null && !o.CanRun(job))
+            {
+                // this node lacks a step the job needs: leave it to another node, and look again later
+                await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
+                w.IgnoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(10);
+                return null;
+            }
+            return new Claim(b.Name, lease, job, new Dictionary<string, string>(tags));
+        }
+        catch
+        {
+            try { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); } catch { }
+            throw;
+        }
     }
 
     /// <summary>When a GPU-stage job became ready: its marker's readyAt, else (no marker: frames made before 0.6.0) the later of idx_added and idx_due.</summary>
@@ -556,9 +581,9 @@ public sealed class NodeEngine
         return A == null ? Dd : Dd == null ? A : (A > Dd ? A : Dd);
     }
 
-    private async Task<string?> MissingNeedAsync(JobDescriptor job, string[] needs, CancellationToken ct)
+    private async Task<string?> MissingNeedAsync(JobDescriptor job, string[] needs, CancellationToken ct, HashSet<string>? produced = null)
     {
-        foreach (var n in needs) if (await store.GetTagsAsync(paths.Video(job.JobId, n), ct) == null) return n;
+        foreach (var n in needs) if (!(produced?.Contains(n) ?? false) && await store.GetTagsAsync(paths.Video(job.JobId, n), ct) == null) return n;
         return null;
     }
 
@@ -566,13 +591,13 @@ public sealed class NodeEngine
 
     private enum Outcome { Done, Permanent, Bot, Transient, Released, LeaseLost, Skipped }
 
-    private async Task<bool> RunJobAsync(string stage, int worker, Claim claim, CancellationToken ct)
+    private async Task<bool> RunJobAsync(WorkerState w, string stage, Claim claim, IStore jobStore, CancellationToken ct)
     {
+        int worker = w.Number;
         var watch = System.Diagnostics.Stopwatch.StartNew();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var run = new Running { Info = new RunningJob { JobId = claim.Job.JobId, Stage = stage, Worker = worker, StartedAt = Protocol.NowUtc() }, Cts = cts };
         running[run] = 0;
-        IDisposable? budget = Protocol.HeavyStages.Contains(stage) ? Budget.Enter() : null;
         RegistryChanged();
         Log.Info($"[{stage}#{worker}] claimed {claim.Job.JobId}");
 
@@ -584,7 +609,7 @@ public sealed class NodeEngine
             var ctx = new JobContext
             {
                 Job = claim.Job, Stage = stage, BlobName = claim.BlobName, LeaseId = claim.LeaseId, Worker = worker,
-                Store = store, Paths = paths, NodeId = o.NodeId, Token = cts.Token, ThreadShare = () => Budget.Share,
+                Store = jobStore, Paths = paths, NodeId = o.NodeId, Token = cts.Token, ThreadShare = () => w.Threads ?? o.ThreadsPerWorker,
                 Report = (step, progress) => { if (step != null && step != run.Info.Step) { run.Info.Step = step; run.Info.StartedAt = Protocol.NowUtc(); run.Timer.Enter(step); } run.Info.Progress = progress; },
             };
             run.Ctx = ctx;
@@ -602,10 +627,9 @@ public sealed class NodeEngine
         try { await renewTask; } catch { }
         if (run.LeaseLost) outcome = Outcome.LeaseLost;
         // a stop that arrives while the handler finishes anyway still counts as done; a cancelled one is released
-        try { await ApplyOutcomeAsync(stage, claim, outcome, error, watch.Elapsed, run); }
+        try { await ApplyOutcomeAsync(w, stage, claim, outcome, error, watch.Elapsed, run); }
         catch (Exception e) { Log.Info($"[{stage}#{worker}] could not record outcome for {claim.Job.JobId}: {e.Message}"); }
 
-        budget?.Dispose();
         running.TryRemove(run, out _);
         if (run.Timer.Line(OrtOptions.Device) is { Length: > 0 } timing) Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: time by step: {timing}");
         RegistryChanged();
@@ -642,7 +666,7 @@ public sealed class NodeEngine
 
     private static string AsciiMeta(string? s) => new string((s ?? "").Where(c => c is >= ' ' and <= '~').Take(200).ToArray());
 
-    private async Task ApplyOutcomeAsync(string stage, Claim claim, Outcome outcome, string? error, TimeSpan elapsed, Running run)
+    private async Task ApplyOutcomeAsync(WorkerState w, string stage, Claim claim, Outcome outcome, string? error, TimeSpan elapsed, Running run)
     {
         var none = CancellationToken.None;
         var job = claim.Job;
@@ -663,7 +687,7 @@ public sealed class NodeEngine
                 else await Rewrite("done");
                 break;
             case Outcome.Skipped:
-                ignoreUntil[claim.BlobName] = DateTimeOffset.UtcNow + TimeSpan.FromHours(1);
+                w.IgnoreUntil[claim.BlobName] = DateTimeOffset.UtcNow + TimeSpan.FromHours(1);
                 try { await store.SetMetadataAsync(claim.BlobName, new Dictionary<string, string>(), claim.LeaseId, none); } catch { }
                 break;
             case Outcome.Permanent:
@@ -673,13 +697,13 @@ public sealed class NodeEngine
             case Outcome.Transient:
                 job.Attempts++; job.LastError = Redact.Sas(error); job.NodeId = o.NodeId;
                 await Rewrite(job.Attempts >= Protocol.MaxAttempts ? "failed" : "pending");
-                ignoreUntil[claim.BlobName] = DateTimeOffset.UtcNow + o.TransientBackoff(job.Attempts);
+                w.IgnoreUntil[claim.BlobName] = DateTimeOffset.UtcNow + o.TransientBackoff(job.Attempts);
                 break;
             case Outcome.Bot:
                 // no attempt counted; the error and the network are written to the job so a block can be matched to home, VPN or mobile data
                 job.LastError = Redact.Sas(error); job.NodeId = o.NodeId;
                 try { await Rewrite("pending"); } catch (Exception e) { Log.Info($"could not record the bot block on {job.JobId}: {e.Message}"); }
-                stageBackoff[stage] = DateTimeOffset.UtcNow + o.BotBackoff;
+                w.StageBackoff[stage] = DateTimeOffset.UtcNow + o.BotBackoff;
                 Log.Info($"[{stage}] bot block / rate limit: backing off {o.BotBackoff.TotalMinutes:F0} min");
                 try { await store.SetMetadataAsync(claim.BlobName, new Dictionary<string, string>(), claim.LeaseId, none); } catch { }
                 break;

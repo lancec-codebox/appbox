@@ -351,6 +351,25 @@ public sealed class RestStore : IStore
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Set Blob Metadata");
     }
 
+    public async Task<bool> SetTagsIfAsync(string name, IReadOnlyDictionary<string, string> tags, IReadOnlyDictionary<string, string> expect, CancellationToken ct)
+    {
+        var xml = new StringBuilder("<?xml version=\"1.0\" encoding=\"utf-8\"?><Tags><TagSet>");
+        foreach (var t in tags)
+            xml.Append("<Tag><Key>").Append(SecurityElement.Escape(t.Key)).Append("</Key><Value>").Append(SecurityElement.Escape(t.Value)).Append("</Value></Tag>");
+        xml.Append("</TagSet></Tags>");
+        var cond = string.Join(" AND ", expect.Select(e => $"\"{e.Key}\"='{e.Value.Replace("'", "''")}'"));
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name, "comp=tags"));
+            q.Headers.TryAddWithoutValidation("x-ms-if-tags", cond);
+            q.Content = new StringContent(xml.ToString(), Encoding.UTF8, "application/xml");
+            return q;
+        }, ct);
+        if (r.StatusCode is HttpStatusCode.PreconditionFailed or HttpStatusCode.NotFound or HttpStatusCode.Conflict) return false;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Set Blob Tags (if tags)");
+        return true;
+    }
+
     public async Task SetTagsAsync(string name, IReadOnlyDictionary<string, string> tags, string? leaseId, CancellationToken ct)
     {
         var xml = new StringBuilder("<?xml version=\"1.0\" encoding=\"utf-8\"?><Tags><TagSet>");
@@ -367,11 +386,14 @@ public sealed class RestStore : IStore
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Set Blob Tags");
     }
 
-    public async Task DeleteAsync(string name, CancellationToken ct)
+    public Task DeleteAsync(string name, CancellationToken ct) => DeleteAsync(name, null, ct);
+
+    public async Task DeleteAsync(string name, string? leaseId, CancellationToken ct)
     {
         using var r = await SendAsync(() =>
         {
             var q = Req(HttpMethod.Delete, BlobUri(name));
+            if (leaseId != null) q.Headers.TryAddWithoutValidation("x-ms-lease-id", leaseId);
             q.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "include");
             return q;
         }, ct);

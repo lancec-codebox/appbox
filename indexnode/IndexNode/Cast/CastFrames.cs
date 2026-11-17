@@ -190,7 +190,7 @@ public static class CastFrames
         int parts = Math.Min(threads, faces.Count), done = 0, S = Clip.Size;
         Parallel.For(0, parts, new ParallelOptions { MaxDegreeOfParallelism = parts, CancellationToken = ct }, p =>
         {
-            using var s = OrtOptions.Session(visionModel, 1, true); var name = s.InputMetadata.Keys.First();
+            var s = OrtOptions.Shared(visionModel, 1, true); var name = s.InputMetadata.Keys.First();
             for (int i = p; i < faces.Count; i += parts)
             {
                 ct.ThrowIfCancellationRequested(); var f = faces[i];

@@ -42,5 +42,16 @@ public interface IStore
     Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct);
     Task SetMetadataAsync(string name, IReadOnlyDictionary<string, string> metadata, string? leaseId, CancellationToken ct);
     Task SetTagsAsync(string name, IReadOnlyDictionary<string, string> tags, string? leaseId, CancellationToken ct);
+
+    /// <summary>Set Blob Tags only while the blob's current tags equal <paramref name="expect"/> (x-ms-if-tags); false when they do not. Tag writes do not change the ETag, so this is how two nodes avoid racing on idx_state / idx_hold. The default is read-compare-write; RestStore sends the real condition.</summary>
+    async Task<bool> SetTagsIfAsync(string name, IReadOnlyDictionary<string, string> tags, IReadOnlyDictionary<string, string> expect, CancellationToken ct)
+    {
+        var cur = await GetTagsAsync(name, ct);
+        if (cur == null || expect.Any(e => cur.GetValueOrDefault(e.Key) != e.Value)) return false;
+        await SetTagsAsync(name, tags, null, ct);
+        return true;
+    }
+    /// <summary>Delete under a blob lease (a hold blob is deleted by the node that holds its lease). The default ignores the lease id; RestStore and FakeStore send/check it.</summary>
+    Task DeleteAsync(string name, string? leaseId, CancellationToken ct) => DeleteAsync(name, ct);
     Task DeleteAsync(string name, CancellationToken ct);
 }

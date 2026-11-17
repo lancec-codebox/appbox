@@ -101,7 +101,7 @@ public static class FrameChunks
     /// <summary>Reads a blob that may be a Nexis ghost: touched and hydrated first (RestStore only), then fetched.</summary>
     public static async Task<byte[]?> ReadAsync(IStore store, string name, CancellationToken ct, bool big = true)
     {
-        var rest = store as RestStore ?? (store as RedirectStore)?.Inner as RestStore; // a test run's redirect store still hydrates production ghosts
+        var rest = LocalCacheStore.Unwrap(store) is var u && (u as RestStore ?? (u as RedirectStore)?.Inner as RestStore) is { } r0 ? r0 : null; // a test run's redirect store still hydrates production ghosts
         if (big && rest != null) await NexisAccess.PrepareAsync(rest, name, ct);
         return (await store.GetAsync(name, ct))?.Data;
     }

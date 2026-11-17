@@ -94,7 +94,7 @@ public sealed class YuNet : IFaceDetector
 {
     private const int Side = 640;
     private readonly InferenceSession s;
-    public YuNet(string path, int threads = 1) { s = OrtOptions.Session(path, threads, true); }
+    public YuNet(string path, int threads = 1) { s = OrtOptions.Shared(path, threads, true); }
 
     public List<FaceDet> Detect(Rgb im)
     {
@@ -122,7 +122,7 @@ public sealed class YuNet : IFaceDetector
         return FaceMath.Nms(res, 0.3f);
     }
 
-    public void Dispose() => s.Dispose();
+    public void Dispose() { } // shared session (OrtOptions.Shared)
 }
 
 /// <summary>InsightFace SCRFD (det_10g, buffalo_l; non-commercial weights): 640x640 RGB (x-127.5)/128, 2 anchors per cell.</summary>
@@ -132,7 +132,7 @@ public sealed class Scrfd : IFaceDetector
     /// <summary>false: the old 640x640 letterbox (kept for comparison runs).</summary>
     public static bool NativeSize = Environment.GetEnvironmentVariable("INDEXNODE_FACE_SQUARE") != "1";
     private readonly InferenceSession s;
-    public Scrfd(string path, int threads = 1) { s = OrtOptions.Session(path, threads, true); }
+    public Scrfd(string path, int threads = 1) { s = OrtOptions.Shared(path, threads, true); }
 
     public List<FaceDet> Detect(Rgb im)
     {
@@ -160,7 +160,7 @@ public sealed class Scrfd : IFaceDetector
         return FaceMath.Nms(res, 0.4f);
     }
 
-    public void Dispose() => s.Dispose();
+    public void Dispose() { } // shared session (OrtOptions.Shared)
 }
 
 /// <summary>OpenCV zoo SFace (Apache-2.0): aligned 112x112 RGB 0..255 in, 128-d out.</summary>
@@ -168,7 +168,7 @@ public sealed class SFace : IFaceEmbedder
 {
     private readonly InferenceSession s;
     public int Dim => 128;
-    public SFace(string path, int threads = 1) { s = OrtOptions.Session(path, threads, true); }
+    public SFace(string path, int threads = 1) { s = OrtOptions.Shared(path, threads, true); }
 
     public float[] Embed(Rgb f)
     {
@@ -178,7 +178,7 @@ public sealed class SFace : IFaceEmbedder
         var v = r.First().AsTensor<float>().ToArray(); FaceMath.L2(v); return v;
     }
 
-    public void Dispose() => s.Dispose();
+    public void Dispose() { } // shared session (OrtOptions.Shared)
 }
 
 /// <summary>InsightFace ArcFace w600k_r50 (buffalo_l; non-commercial weights): aligned 112x112 RGB (x-127.5)/127.5 in, 512-d out.</summary>
@@ -186,7 +186,7 @@ public sealed class ArcFace : IFaceEmbedder
 {
     private readonly InferenceSession s;
     public int Dim => 512;
-    public ArcFace(string path, int threads = 1) { s = OrtOptions.Session(path, threads, true); }
+    public ArcFace(string path, int threads = 1) { s = OrtOptions.Shared(path, threads, true); }
     public const int MaxBatch = 64;
 
     /// <summary>The model's input has a dynamic batch dimension (the output is declared [1,512] but follows it): one run per up to 64 faces.</summary>
@@ -213,5 +213,5 @@ public sealed class ArcFace : IFaceEmbedder
         var v = r.First().AsTensor<float>().ToArray(); FaceMath.L2(v); return v;
     }
 
-    public void Dispose() => s.Dispose();
+    public void Dispose() { } // shared session (OrtOptions.Shared)
 }

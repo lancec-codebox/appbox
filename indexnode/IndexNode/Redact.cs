@@ -52,9 +52,44 @@ public static class Log
 {
     public static TextWriter Out = Console.Out;
     private static readonly object Gate = new();
+    private static RollingFile? file;
+
+    /// <summary>Also writes every log line to a rolling file (2 files of at most 20 MB).</summary>
+    public static void UseFile(RollingFile f) { lock (Gate) file = f; }
 
     public static void Info(string message)
     {
-        lock (Gate) Out.WriteLine($"{DateTime.UtcNow:HH:mm:ss} {Redact.Sas(message)}");
+        var line = $"{DateTime.UtcNow:HH:mm:ss} {Redact.Sas(message)}";
+        lock (Gate) { Out.WriteLine(line); try { file?.WriteLine(line); } catch { /* the log file is a convenience */ } }
     }
+}
+
+/// <summary>A log file that rolls over at <see cref="MaxBytes"/>: name.log and name.1.log, so at most two files.</summary>
+public sealed class RollingFile
+{
+    private readonly string path, older;
+    public long MaxBytes { get; }
+    private long size;
+
+    public RollingFile(string path, long maxBytes = 20L * 1024 * 1024)
+    {
+        this.path = path; MaxBytes = maxBytes;
+        older = Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path) + ".1" + Path.GetExtension(path));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        size = File.Exists(path) ? new FileInfo(path).Length : 0;
+    }
+
+    public void WriteLine(string line)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetByteCount(line) + Environment.NewLine.Length;
+        if (size > 0 && size + bytes > MaxBytes) { File.Move(path, older, true); size = 0; }
+        File.AppendAllText(path, line + Environment.NewLine);
+        size += bytes;
+    }
+
+    public static string DefaultDir() => OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "indexnode", "logs")
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "indexnode", "logs");
+
+    public static string FileFor(string dir, string nodeName) => Path.Combine(dir, "run-" + new string(nodeName.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_').ToArray()) + ".log");
 }

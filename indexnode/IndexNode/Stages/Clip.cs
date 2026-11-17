@@ -49,7 +49,7 @@ public static class Clip
     public static async Task<byte[]> EmbedFramesAsync(Tools tools, string visionModel, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct)
     {
         var ffmpeg = await tools.FfmpegAsync(ct);
-        using var session = OrtOptions.Session(visionModel, threads);
+        var session = OrtOptions.Shared(visionModel, threads);
         var inputName = session.InputMetadata.Keys.First();
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
         foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-start_number", "0", "-framerate", "1", "-i", Path.Combine(framesDir, "%06d.jpg"),

@@ -10,8 +10,12 @@ public sealed class NodeConfig
     public string? NodeName { get; set; }
     public Dictionary<string, int>? Jobs { get; set; }
     public int? Threads { get; set; }
-    /// <summary>Concurrent heavy (model) steps on this node (default 2); 0 = no limit.</summary>
+    /// <summary>Ignored since 0.9.0 (use Workers).</summary>
     public int? MaxHeavy { get; set; }
+    /// <summary>Independent workers on this node (default 2).</summary>
+    public int? Workers { get; set; }
+    /// <summary>Threads per worker; null = Threads divided evenly by Workers.</summary>
+    public int? WorkerThreads { get; set; }
     /// <summary>"cpu" (default) or "cuda".</summary>
     public string? Device { get; set; }
 

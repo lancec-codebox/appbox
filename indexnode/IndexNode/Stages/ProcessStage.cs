@@ -63,6 +63,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
     public async Task RunAsync(JobContext ctx)
     {
         var ct = ctx.Token;
+        var store = ctx.Store; // a drama pass hands in its local-cache store, so a step reads the earlier steps' files from disk
         var wst = new RecordingStore(ctx.Store); // everything this run writes; a redo needs it to tell new outputs from old
         var job = ctx.Job; var id = job.JobId; var paths = ctx.Paths;
         bool stepJob = Protocol.IsStep(job.Stage);
@@ -128,7 +129,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             if (needVideo)
             {
                 ctx.Report("fetch", null);
-                if (store is RestStore rs) await NexisAccess.PrepareAsync(rs, videoBlob, ct);
+                if (LocalCacheStore.Unwrap(store) is RestStore rs && !(store is LocalCacheStore lc && lc.Has(videoBlob))) await NexisAccess.PrepareAsync(rs, videoBlob, ct);
                 using var keep = NexisAccess.KeepTouched(store, videoBlob);
                 await store.DownloadToFileAsync(videoBlob, video, ct);
                 originalBytes = new FileInfo(video).Length;

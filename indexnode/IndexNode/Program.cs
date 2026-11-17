@@ -38,7 +38,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--max-heavy 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--batch 6] [--batch-hours 2] [--lanes 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
@@ -59,6 +59,9 @@ public static class Program
         indexnode dev cast --video <file> --out <dir> [--model buffalo_l|yunet-sface] [--threshold D] [--merge D] [--border D]
         indexnode requeue [--stage S]
         indexnode control run|drain|stop [--stage download|process|comments] [--message M]
+        indexnode control gpu-hold <duration like 30m>|off
+        indexnode control --max-per-ip N|off
+        indexnode --version
         indexnode config set-sas <url>
         indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port> <value>
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
@@ -69,6 +72,7 @@ public static class Program
         try
         {
             var a = Args.Parse(argv);
+            if (a.Has("version") && a.Positional.Count == 0) { Console.WriteLine(Commands.VersionString); return 0; }
             if (a.Positional.Count == 0 || a.Has("help")) { Console.WriteLine(Usage); return a.Has("help") ? 0 : 2; }
             var cmd = a.Positional[0].ToLowerInvariant();
             a.Positional.RemoveAt(0);
@@ -133,6 +137,8 @@ public static class Commands
         return (cfg, new RestStore(http, cfg.Sas), new Paths(a.Get("prefix") ?? "index/"), http);
     }
 
+    public static string VersionString => typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
+
     public static async Task<int> RunAsync(Args a)
     {
         var (cfg, store, paths, http) = Open(a);
@@ -151,14 +157,18 @@ public static class Commands
             if (stages.Length == 0) throw new ArgumentException("--gpu runs only sscd, clip, cast and ocrsubs; --stages names none of them");
         }
         TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? WatchStage.ParseEvery(ew) : null;
-        int maxHeavy = a.Get("max-heavy") is { } mh ? int.Parse(mh) : cfg.MaxHeavy ?? 2;
-        if (gpu && a.Get("max-heavy") == null && cfg.MaxHeavy == null) maxHeavy = 1; // one GPU: one model step at a time, batched
-        var jobs = new Dictionary<string, int> { ["download"] = cfg.JobsFor("download"), ["process"] = cfg.JobsFor("process"), ["comments"] = cfg.JobsFor("comments"), ["watch"] = cfg.JobsFor("watch") };
-        foreach (var st in Protocol.StepStages) jobs[st] = cfg.Jobs != null && cfg.Jobs.TryGetValue(st, out var sn) ? sn : cfg.JobsFor("process");
-        foreach (var kv in NodeConfig.ParseJobs(a.Get("jobs"))) jobs[kv.Key] = kv.Value;
-        if (gpu) foreach (var s in stages) if (a.Get("jobs") == null) jobs[s] = 1;
+        foreach (var old in new[] { "jobs", "max-heavy", "workers" }) if (a.Get(old) != null) Console.Error.WriteLine($"indexnode: --{old} is ignored since 0.9.0 (a node runs stage batches: --batch N, --batch-hours H, --lanes N)");
+        if (cfg.MaxHeavy != null || cfg.Jobs != null || cfg.Workers != null) Console.Error.WriteLine("indexnode: config jobs / max-heavy / workers are ignored since 0.9.0 (use batch, batch-hours, lanes)");
+        int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 2;
+        if (lanes < 1) throw new ArgumentException("--lanes needs at least 1");
+        int batchN = a.Get("batch") is { } bn ? int.Parse(bn) : 6;
+        double batchHours = a.Get("batch-hours") is { } bh ? double.Parse(bh, System.Globalization.CultureInfo.InvariantCulture) : 2;
+        if (batchN < 1 || batchHours <= 0) throw new ArgumentException("--batch needs at least 1 and --batch-hours more than 0");
+        int workers = gpu ? 1 : 2; // workers of the non-batch stages (download, comments, watch, ...)
+        int? workerThreads = a.Get("worker-threads") is { } wt ? int.Parse(wt) : cfg.WorkerThreads;
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         var (nodeId, nodeName) = cfg.ResolveIdentity(a.Get("node-name"), Environment.GetEnvironmentVariable(NodeConfig.NodeNameEnv));
+        try { var lf = RollingFile.FileFor(Environment.GetEnvironmentVariable("INDEXNODE_LOG_DIR") ?? RollingFile.DefaultDir(), nodeName); Log.UseFile(new RollingFile(lf)); Log.Info($"logging to {lf}"); } catch (Exception e) { Console.Error.WriteLine("indexnode: no log file (" + e.Message + ")"); }
 
         var tools = new Tools(http, cfg);
         try { await tools.CheckFfmpegAsync(stages, default); }
@@ -184,7 +194,7 @@ public static class Commands
             NodeId = nodeId, Name = nodeName,
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
             Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
-            Stages = stages, Jobs = jobs, Threads = threads, Once = a.Has("once"), Gpu = gpu, MaxHeavy = maxHeavy, ExitWhenIdle = exitIdle,
+            Stages = stages, Workers = workers, Lanes = lanes, Batch = batchN, BatchHours = batchHours, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
             Kind = gpu ? "gpu" : "desktop",
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
@@ -198,7 +208,7 @@ public static class Commands
 
         var budgetText = limits.Budget is { } bd ? $" budget={limits.Remaining}/{bd}" : "";
         var schedText = (a.Get("schedule") ?? cfg.Schedule) is { } sc ? " schedule=" + sc.Replace(' ', '_') + " window=" + (a.Get("window") ?? cfg.Window ?? "1h") : "";
-        Log.Info($"node {nodeId}: stages={string.Join(',', stages)} jobs={string.Join(',', jobs.Where(j => stages.Contains(j.Key)).Select(j => j.Key + "=" + j.Value))} threads={threads} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
+        Log.Info($"node {nodeId}: stages={string.Join(',', stages)}workers={workers} lanes={lanes} batch={batchN}/{batchHours}h threads={threads} worker-threads={opts.ThreadsPerWorker} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
         Task? statusLoop = null;
         if (a.Get("status-out") is { } statusOut)
         {
@@ -473,7 +483,7 @@ public static class Commands
         var (cfg, store, paths, _) = Open(a);
         var now = DateTimeOffset.UtcNow;
         if (a.Has("json")) { Console.WriteLine(StatusSnapshot.Serialize(await StatusSnapshot.BuildAsync(store, paths, now, default))); return 0; }
-        Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  jobs download={cfg.JobsFor("download")} process={cfg.JobsFor("process")}  threads={cfg.EffectiveThreads}");
+        Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  workers={cfg.Workers ?? 2}  threads={cfg.EffectiveThreads}");
 
         Console.WriteLine("\nNodes");
         var nodeBlobs = await store.ListAsync(paths.NodesDir, false, false, default);
@@ -483,7 +493,7 @@ public static class Commands
         if (nodes.Count == 0) Console.WriteLine("  (none)");
         foreach (var n in nodes.OrderBy(n => n.NodeId))
         {
-            Console.WriteLine($"  {n.NodeId,-24} {n.Kind,-8} stages={string.Join('+', n.Stages)} jobs={string.Join(',', n.Jobs.Select(j => j.Key + "=" + j.Value))} threads={n.Threads} state={n.EffectiveState(now)} control={n.Control} lastSeen={n.LastSeen}");
+            Console.WriteLine($"  {n.NodeId,-24} {n.Kind,-8} stages={string.Join('+', n.Stages)} workers={(n.Workers > 0 ? n.Workers.ToString() : string.Join(',', n.Jobs.Select(j => j.Key + "=" + j.Value)))} threads={n.Threads} state={n.EffectiveState(now)} control={n.Control} lastSeen={n.LastSeen}");
             foreach (var r in n.Running)
                 Console.WriteLine($"      worker {r.Worker}: {r.Stage}/{r.JobId} {r.Step} {r.Progress}");
         }
@@ -671,6 +681,8 @@ public static class Commands
                 case "jobs": file.Jobs = NodeConfig.ParseJobs(val); break;
                 case "threads": file.Threads = int.Parse(val); break;
                 case "max-heavy": file.MaxHeavy = int.Parse(val); break;
+                case "workers": file.Workers = int.Parse(val); break;
+                case "worker-threads": file.WorkerThreads = int.Parse(val); break;
                 case "device": file.Device = OrtOptions.ParseDevice(val); break;
                 case "cast.model": CastLogic.ModelFor(val); file.CastModel = val.ToLowerInvariant(); break;
                 case "frames.crf": file.FrameCrf = int.Parse(val); break;

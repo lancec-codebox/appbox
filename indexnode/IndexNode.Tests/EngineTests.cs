@@ -14,7 +14,7 @@ public class EngineTests
         Func<int, TimeSpan>? backoff = null, TimeSpan? bot = null, FakeTimer? timer = null) => new()
     {
         NodeId = "test-abc123", Name = "test", Stages = stages ?? ["download", "process"],
-        Jobs = new() { ["download"] = download, ["process"] = process }, Threads = threads, Once = once, MaxJobs = maxJobs,
+        Workers = (stages ?? ["download", "process"]).Length == 1 ? Math.Max(download, process) : download + process, Threads = threads, Once = once, MaxJobs = maxJobs,
         PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = Renew,
         RegistryInterval = TimeSpan.FromMilliseconds(100), BotBackoff = bot ?? TimeSpan.FromHours(1),
         TransientBackoff = backoff ?? (_ => TimeSpan.Zero),
@@ -245,8 +245,7 @@ public class EngineTests
             barrier.SignalAndWait(TimeSpan.FromSeconds(5));
             return Task.CompletedTask;
         }));
-        Assert.Equal([4, 4], shares);
-        Assert.Equal(1, Math.Max(1, new ThreadBudget(1).Share));
+        Assert.Equal([4, 4], shares); // 8 threads split evenly across 2 workers
     }
 
     [Fact]
@@ -257,9 +256,8 @@ public class EngineTests
         int share = 0;
         await Run(Engine(s, Opts(["process"], threads: 6), process: ctx => { share = ctx.ThreadShare(); return Task.CompletedTask; }));
         Assert.Equal(6, share);
-        var b = new ThreadBudget(2);
-        using var a1 = b.Enter(); using var a2 = b.Enter(); using var a3 = b.Enter();
-        Assert.Equal(1, b.Share);
+        Assert.Equal(1, ThreadSplit.PerWorker(2, 3, null)); // never below one thread
+        Assert.Equal(3, ThreadSplit.PerWorker(2, 3, 3));   // --worker-threads wins
     }
 
     [Fact]
@@ -475,7 +473,7 @@ public class EngineTests
         Assert.Equal("test-abc123", first.NodeId);
         Assert.Equal("desktop", first.Kind);
         Assert.Equal(["download", "process"], first.Stages);
-        Assert.Equal(1, first.Jobs["download"]); Assert.Equal(2, first.Jobs["process"]);
+        Assert.Equal(3, first.Workers); Assert.Equal(2, first.WorkerThreads); // 3 workers; 8 threads / 3 = 2
         Assert.Equal(8, first.Threads);
         Assert.Equal("node", s[name].Tags[Tags.Kind]);
         Assert.Contains(first.State, new[] { "idle", "working" });

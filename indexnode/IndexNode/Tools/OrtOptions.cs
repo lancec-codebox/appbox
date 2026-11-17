@@ -61,6 +61,29 @@ public static class OrtOptions
         finally { so.Dispose(); }
     }
 
+    private static readonly Dictionary<string, Lazy<InferenceSession>> shared = new();
+    /// <summary>
+    /// One loaded copy per model file, device and thread count for the whole process: every worker (and every step instance) uses it, so two workers hold one model in memory, not two.
+    /// InferenceSession.Run is documented as thread-safe (concurrent calls share the session's thread pool and read-only weights), so no lock is needed. The caller must NOT dispose it.
+    /// </summary>
+    public static InferenceSession Shared(string path, int intraThreads, bool quiet = false)
+    {
+        var key = $"{Path.GetFullPath(path)}|{Device}:{DeviceId}|{intraThreads}";
+        Lazy<InferenceSession> l;
+        lock (shared) { if (!shared.TryGetValue(key, out l!)) shared[key] = l = new Lazy<InferenceSession>(() => Session(path, intraThreads, quiet), LazyThreadSafetyMode.ExecutionAndPublication); }
+        return l.Value;
+    }
+    /// <summary>Disposes every shared session and forgets it: the next Shared() loads again. A batch calls this between stages so only one stage's models are in memory; nothing may be running on them.</summary>
+    public static int UnloadShared()
+    {
+        List<InferenceSession> sessions = new();
+        lock (shared) { foreach (var l in shared.Values) if (l.IsValueCreated) sessions.Add(l.Value); shared.Clear(); }
+        foreach (var s in sessions) try { s.Dispose(); } catch { }
+        return sessions.Count;
+    }
+    /// <summary>Models loaded in this process (tests, and the memory report).</summary>
+    public static int SharedCount { get { lock (shared) return shared.Count(x => x.Value.IsValueCreated); } }
+
     private static readonly HashSet<string> logged = new();
     private static void LogProvider(string model)
     {

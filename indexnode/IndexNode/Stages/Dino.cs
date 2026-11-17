@@ -143,7 +143,7 @@ public static class Dino
     {
         var mf = int8 ? Models.DinoSmallInt8 : Models.DinoSmall; var path = modelPath ?? await Models.EnsureAsync(mf, http, ct);
         var ffmpeg = await tools.FfmpegAsync(ct);
-        using var session = OrtOptions.Session(path, Math.Max(1, threads));
+        var session = OrtOptions.Shared(path, Math.Max(1, threads));
         return await RunStoredAsync(ffmpeg, OnnxEmbed(session), mf.Id, mf.Sha256, store, paths, id, threads, progress, ct, timing, OrtOptions.Batch(32, 64));
     }
 }
