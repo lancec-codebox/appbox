@@ -269,7 +269,8 @@ public class CommentsTests
             (marker.GetProperty("vcodec").GetString(), marker.GetProperty("acodec").GetString(), marker.GetProperty("formatId").GetString(), marker.GetProperty("audioLanguage").GetString(), marker.GetProperty("audioNote").GetString()));
         Assert.Equal(["zh-Hans", "en-US"], marker.GetProperty("audioTracks").EnumerateArray().Select(t => t.GetProperty("language").GetString()!));
         Assert.True(marker.GetProperty("embeddable").GetBoolean());
-        foreach (var step in Protocol.StepStages) { Assert.Equal("pending", s.State(P.Job(step, id))); Assert.Equal([step], s.Job(P.Job(step, id)).Steps); }
+        foreach (var step in new[] { "dino", "clip" }) Assert.False(s.Exists(P.Job(step, id)), step); // opt-in steps get no job on ingest
+        foreach (var step in Protocol.IngestStepStages) { Assert.Equal("pending", s.State(P.Job(step, id))); Assert.Equal([step], s.Job(P.Job(step, id)).Steps); }
         Assert.Equal(Protocol.NeedsOf("describe"), s.Job(P.Job("describe", id)).Needs);
         Assert.False(s.Exists(P.Job("process", id))); // step jobs replace the all-in-one process job
 

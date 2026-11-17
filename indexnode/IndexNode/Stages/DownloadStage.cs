@@ -199,7 +199,7 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
     {
         // one job per step; the dependent ones (sync, describe) carry "needs" and wait for those outputs
         var made = new List<string>();
-        foreach (var step in Protocol.StepStages)
+        foreach (var step in Protocol.IngestStepStages)
         {
             var p = JobDescriptor.NewStep(step, ctx.Job.JobId);
             if (await ctx.Store.PutAsync(ctx.Paths.Job(step, ctx.Job.JobId), p.ToBytes(), Tags.Job(step, "pending", p.AddedAt), null, true, ctx.Token)) made.Add(step);

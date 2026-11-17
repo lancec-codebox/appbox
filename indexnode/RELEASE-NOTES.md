@@ -1,5 +1,12 @@
 # IndexNode release notes
 
+## 0.8.3
+
+- `frames` crops fixed black bars baked into the video (letterbox / pillarbox), after the scale and before anything is stored, so sscd, thumbs and cast see bar-free pictures. Rule: 24 frames between 5% and 95% of the duration; a row/column is a bar when its mean luminance is under 20 in every sampled frame; a side pair is cut when it covers at least 2% of the dimension and at least 20% remains; even size. 640x360 with 44+44 bars is stored as 640x272. Subtitles inside a bar stop the bar run (partial crop). `ocrsubs` reads the source video and is unchanged; cast moves the subtitle band by the crop.
+- `frames/manifest.json` gains `framesVersion` (2; absent = 1), `crop` { top, bottom, left, right } in stored-frame pixels (zeros when none) and `source` { width, height, scaledWidth, scaledHeight }.
+- Redo of an existing upload: `indexnode process --job <id> --steps frames,sscd,thumbs,cast` in one run (add `describe,translate` when they exist, `clip`/`dino` if they were made): every one of them is indexed by frame row, and the new frame count/size differs.
+- DINOv2 is not part of ingest (duplicates use SSCD): the opt-in `dino` step stays, but `processed.json` no longer waits for `dino`/`clip` outputs (a step-by-step upload without them was never marked processed), a download no longer queues `dino` and `clip` step jobs, and `unprocessed` no longer lists dino as missing.
+
 ## 0.8.2
 
 - New opt-in step `dino` (not in the default or full steps; `process --job=<id> --steps dino`, or `stages run --video <id> --stages dino`): one DINOv2-small vector per stored frame, from the stored `frames/NNNN.mjpeg` chunks (Nexis ghosts hydrated as in 0.7.5), after sscd. Output `dino/NNNN.f16` (float16, 384 per row, same chunks and row order as `frames/`, CLS token, L2-normalised) and `dino/manifest.json` (written last: dim, model id and sha256, input size, preprocessing, chunk list).

@@ -58,6 +58,9 @@ public static partial class FrameMath
 
 public static class Frames
 {
+    /// <summary>The frames stage version written to frames/manifest.json (absent = 1, before 0.8.3). 2: fixed black bars are cropped (manifest.crop).</summary>
+    public const int FramesVersion = 2;
+
     /// <summary>
     /// One ffmpeg per segment (the caller passes budget ÷ running jobs), each with its own -ss/-to. Frames are written, in time order, to
     /// <paramref name="framesDir"/> as 000000.jpg, ... and the time list is returned.
@@ -135,7 +138,12 @@ public static class Frames
         var ffmpeg = await tools.FfmpegAsync(ct);
         var probe = await tools.FfprobeAsync(ct);
         var pr = await Proc.RunAsync(probe, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", video], ct);
-        var wh = pr.Stdout.Trim().Split('x'); var (W, H) = StoredSize(int.Parse(wh[0]), int.Parse(wh[1]));
+        var wh = pr.Stdout.Trim().Split('x'); var (SW, SH) = StoredSize(int.Parse(wh[0]), int.Parse(wh[1]));
+        // fixed black bars baked into the video are cut after the scale, before anything is written (see Bars); the stored size is the cropped one
+        var crop = await Bars.DetectAsync(ffmpeg, Path.GetFullPath(video), duration, SW, SH, ct); int W = crop.Width(SW), H = crop.Height(SH);
+        string cropF = crop.IsNone ? "" : "," + crop.Filter(SW, SH);
+        if (!crop.IsNone) progress($"black bars cropped: top {crop.Top}, bottom {crop.Bottom}, left {crop.Left}, right {crop.Right} ({SW}x{SH} -> {W}x{H})");
+        var srcSize = (int.Parse(wh[0]), int.Parse(wh[1]));
         // whole seconds that have a frame to sample: the last second counts only if the video runs at least 0.05 s into it (a 600.001 s video has 600 samples, not 601)
         int S = (int)Math.Floor(duration) + (duration - Math.Floor(duration) >= 0.05 ? 1 : 0);
         int nChunks = Math.Max(1, (int)Math.Ceiling(S / FrameChunks.ChunkSeconds - 1e-9)); int frameBytes = W * H * 3;
@@ -161,8 +169,8 @@ public static class Frames
                     .. (jpeg
                         // one decode, two outputs: raw rgb for the fingerprints and pruning, and the stored frames as JPEG (no separate encode step).
                         // JPEG decoders assume BT.601 full range: convert with that matrix explicitly (the source is tagged BT.709; leaving it shifted colours, -2 dB), 4:4:4 like a plain RGB->JPEG encode
-                        ? new[] { "-filter_complex_threads", "1", "-filter_complex", $"[0:v]fps=1,scale={W}:{H}:flags=bicubic,format=rgb24,split=2[r][j0];[j0]scale=out_color_matrix=bt601:out_range=full,format=yuvj444p[j]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k], "-map", "[j]", "-c:v", "mjpeg", "-q:v", st.JpegQ.ToString(CultureInfo.InvariantCulture), "-f", "mjpeg", files[k] + ".mjpeg" }
-                        : new[] { "-vf", $"fps=1,scale={W}:{H}:flags=bicubic", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k] })], ct);
+                        ? new[] { "-filter_complex_threads", "1", "-filter_complex", $"[0:v]fps=1,scale={SW}:{SH}:flags=bicubic{cropF},format=rgb24,split=2[r][j0];[j0]scale=out_color_matrix=bt601:out_range=full,format=yuvj444p[j]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k], "-map", "[j]", "-c:v", "mjpeg", "-q:v", st.JpegQ.ToString(CultureInfo.InvariantCulture), "-f", "mjpeg", files[k] + ".mjpeg" }
+                        : new[] { "-vf", $"fps=1,scale={SW}:{SH}:flags=bicubic{cropF}", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k] })], ct);
                 if (r.ExitCode != 0) throw new InvalidOperationException($"ffmpeg frames {c}/{k} failed: {r.Stderr.Trim()}");
                 // fingerprint every sampled frame here, in parallel with the other segments (the sequential prune below only compares)
                 var fl = new List<float[]>(); var fbuf = new byte[frameBytes];
@@ -213,7 +221,7 @@ public static class Frames
             progress($"{c + 1}/{nChunks} chunks, {keptN}/{sampled} frames kept");
         }
         foreach (var (name, start, frames, _) in index) await put($"frames/{name}.json", jpeg ? FrameChunks.JpegIndexJson(name, start, W, H, st.JpegQ, frames) : FrameChunks.IndexJson(name, start, W, H, st.Crf, 10, frames, true), "application/json");
-        await put("frames/manifest.json", FrameChunks.ManifestJson("frames", W, H, st.Crf, keptN, index.Select(x => (x.Chunk, x.Start, x.Frames.Count, x.Bytes)).ToList(), new { sampled, fps = 1, gop = 10, preset = 8, pruning = new { grid = st.GridThreshold, lookback = st.LookbackSeconds, kept = keptN, of = sampled } }, jpeg ? "mjpeg" : "mp4", jpeg ? "jpeg" : "av1"), "application/json");
+        await put("frames/manifest.json", FrameChunks.ManifestJson("frames", W, H, st.Crf, keptN, index.Select(x => (x.Chunk, x.Start, x.Frames.Count, x.Bytes)).ToList(), new { sampled, fps = 1, gop = 10, preset = 8, pruning = new { grid = st.GridThreshold, lookback = st.LookbackSeconds, kept = keptN, of = sampled } }, jpeg ? "mjpeg" : "mp4", jpeg ? "jpeg" : "av1", crop: new { top = crop.Top, bottom = crop.Bottom, left = crop.Left, right = crop.Right }, source: new { width = srcSize.Item1, height = srcSize.Item2, scaledWidth = SW, scaledHeight = SH }, framesVersion: FramesVersion), "application/json");
 
         var swShots = System.Diagnostics.Stopwatch.StartNew();
         // shots: the video's keyframe times (packet flags, no decode), each mapped to the kept 1 fps frame that represents the first sampled second at/after it

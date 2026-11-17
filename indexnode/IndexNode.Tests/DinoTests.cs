@@ -127,4 +127,17 @@ public class DinoTests
         Assert.Contains("dino", Protocol.StepStages); Assert.Equal(["dino/"], ProcessStage.Owned["dino"]);
         Assert.Equal(["frames/manifest.json"], Protocol.NeedsOf("dino"));
     }
+
+    [Fact]
+    public void Ingest_never_waits_for_an_opt_in_step_such_as_dino_or_clip()
+    {
+        // step-job mode decides "the last step" (and writes processed.json) from these outputs: an opt-in step in the list would keep a normally processed upload unfinished
+        var steps = ProcessStage.Outputs.Select(o => o.Step).ToArray();
+        Assert.DoesNotContain("dino", steps); Assert.DoesNotContain("clip", steps);
+        Assert.All(steps, s => Assert.True(ProcessStage.FullSteps.Contains(s) || s == "sync", s));
+        Assert.All(ProcessStage.FullSteps, s => Assert.Contains(s, steps));
+        Assert.Equal(["frames", "sscd", "thumbs", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"], Protocol.IngestStepStages);
+        Assert.DoesNotContain("dino", Protocol.DefaultSteps); Assert.DoesNotContain("dino", ProcessStage.FullSteps);
+        Assert.DoesNotContain("dino", JobDescriptor.NewProcess("x").Steps!);
+    }
 }

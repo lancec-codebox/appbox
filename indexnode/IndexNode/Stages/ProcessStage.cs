@@ -24,7 +24,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
     public static readonly string[] KnownSteps = ["frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "translate", "sync"];
 
     /// <summary>The outputs that make a video fully processed, per step: the node that writes the last one also writes processed.json.</summary>
-    static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("dino", "dino/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("clip", "clip/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
+    // owner 2026-11-16: DINOv2 is not part of ingest (duplicates use SSCD), and clip left the default pipeline on 2026-11-14: opt-in steps are NOT listed here, or an upload processed step by step without them would never be marked processed
+    public static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
 
     /// <summary>What each step derives, as paths under the video's folder (a trailing / is a folder). Never a source file: video.mp4, info.json, description.txt, thumb.jpg, subs/ (except our own subs/ai/), comments/, downloaded.json. sync.json is not listed: a redo never reruns sync.</summary>
     public static readonly IReadOnlyDictionary<string, string[]> Owned = new Dictionary<string, string[]>

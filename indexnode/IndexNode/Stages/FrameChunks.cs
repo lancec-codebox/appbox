@@ -86,11 +86,16 @@ public static class FrameChunks
         return r;
     }
 
-    public static byte[] ManifestJson(string kind, int w, int h, int crf, int count, IReadOnlyList<(string Chunk, double Start, int Frames, long Bytes)> chunks, object? extra = null, string container = "mp4", string codec = "av1") => JsonSerializer.SerializeToUtf8Bytes(new
+    public static byte[] ManifestJson(string kind, int w, int h, int crf, int count, IReadOnlyList<(string Chunk, double Start, int Frames, long Bytes)> chunks, object? extra = null, string container = "mp4", string codec = "av1",
+        object? crop = null, object? source = null, int? framesVersion = null)
     {
-        v = 1, kind, container, codec, chunkSeconds = ChunkSeconds, width = w, height = h, crf, count, extra,
-        chunks = chunks.Select(c => new { chunk = c.Chunk, start = c.Start, frames = c.Frames, bytes = c.Bytes }),
-    });
+        var d = new Dictionary<string, object?> { ["v"] = 1, ["kind"] = kind, ["container"] = container, ["codec"] = codec, ["chunkSeconds"] = ChunkSeconds, ["width"] = w, ["height"] = h, ["crf"] = crf, ["count"] = count, ["extra"] = extra };
+        if (framesVersion != null) d["framesVersion"] = framesVersion;
+        if (crop != null) d["crop"] = crop;   // frames only: bars cut from the scaled frame, in stored-frame pixels
+        if (source != null) d["source"] = source; // frames only: the source video size and the scaled size before the crop, to map a crop back to the source
+        d["chunks"] = chunks.Select(c => new { chunk = c.Chunk, start = c.Start, frames = c.Frames, bytes = c.Bytes });
+        return JsonSerializer.SerializeToUtf8Bytes(d);
+    }
 
     /// <summary>Reads a blob that may be a Nexis ghost: touched and hydrated first (RestStore only), then fetched.</summary>
     public static async Task<byte[]?> ReadAsync(IStore store, string name, CancellationToken ct, bool big = true)
@@ -217,6 +222,9 @@ public sealed class ChunkDir
     public int W { get; }
     public int H { get; }
     public string Container { get; }
+    /// <summary>Pixels cut from the left / top of the scaled frame as fixed black bars (manifest crop; 0 when none or before 0.8.3).</summary>
+    public int CropLeft { get; private init; }
+    public int CropTop { get; private init; }
     public int Count => Chunks.Sum(c => c.Frames.Count);
     public string ChunkFile(ChunkInfo c) => Path.Combine(Dir, c.Chunk + (Container == "mjpeg" ? ".mjpeg" : ".mp4"));
     private ChunkDir(string dir, List<ChunkInfo> chunks, int w, int h, string container) { Dir = dir; Chunks = chunks; W = w; H = h; Container = container; }
@@ -232,7 +240,8 @@ public sealed class ChunkDir
         }
         int w = man.TryGetProperty("width", out var we) ? we.GetInt32() : 0, h = man.TryGetProperty("height", out var he) ? he.GetInt32() : 0;
         var container = man.TryGetProperty("container", out var co) ? co.GetString() ?? "mp4" : "mp4";
-        return new ChunkDir(dir, chunks, w, h, container);
+        int Crop(string k) => man.TryGetProperty("crop", out var cr) && cr.ValueKind == JsonValueKind.Object && cr.TryGetProperty(k, out var v) && v.TryGetInt32(out var n) ? n : 0;
+        return new ChunkDir(dir, chunks, w, h, container) { CropLeft = Crop("left"), CropTop = Crop("top") };
     }
 
     public List<double> Times => Chunks.SelectMany(c => c.Frames.Select(f => f.T)).ToList();

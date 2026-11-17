@@ -58,6 +58,8 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         return lines;
     }
     private string? ytdlp, ffmpeg, ffprobe;
+    /// <summary>Tests: use these ffmpeg/ffprobe instead of looking them up (other tests change PATH).</summary>
+    public void UseFfmpeg(string ffmpegPath, string ffprobePath) { ffmpeg = ffmpegPath; ffprobe = ffprobePath; }
     private readonly SemaphoreSlim gate = new(1, 1);
 
     private static string Exe(string n) => OperatingSystem.IsWindows() ? n + ".exe" : n;
