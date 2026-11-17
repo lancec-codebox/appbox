@@ -15,12 +15,15 @@ public readonly record struct BarCrop(int Top, int Bottom, int Left, int Right)
 
 /// <summary>
 /// Fixed black bars baked into a video (letterbox / pillarbox). The rule (owner 2026-11-16, tested on real uploads): on 24 frames sampled evenly between 5% and 95% of the
-/// duration (at the stored frame size), an edge row (column) is "bar" when its mean luminance (0-255) is below 20 in EVERY sampled frame; a side's thickness is the run of
+/// duration (at the stored frame size), an edge row (column) is "bar" when its mean luminance (0-255) is below 20 in at least 80% of the sampled frames; a side's thickness is the run of
 /// bar rows from that edge inward. A side pair (top+bottom, left+right) is cropped only when it covers at least 2% of that dimension, and never when the remaining
 /// picture would be under 20% of the dimension. The cropped size is kept even. Pure arithmetic on plain 8-bit luminance arrays, so screenshot search can use it as is.
 /// </summary>
 public static class Bars
 {
+    /// <summary>Version of this rule, recorded in frames/manifest.json (cropRule). 2: dark in at least 80% of the samples (1 was every sample).</summary>
+    public const int RuleVersion = 2;
+    public const double MinDarkFraction = 0.8;
     public const int Samples = 24;
     public const double From = 0.05, To = 0.95;
     public const double MaxMeanLuma = 20;
@@ -35,16 +38,18 @@ public static class Bars
     public static BarCrop Detect(IReadOnlyList<byte[]> frames, int w, int h)
     {
         if (frames.Count < 2 || w <= 0 || h <= 0) return BarCrop.None;
-        // a row/column is dark only when its mean is below the limit in every frame: track the largest mean over the frames
-        var rowMax = new double[h]; var colMax = new double[w];
+        // a row/column is bar when its mean is below the limit in at least 80% of the frames: count the dark frames
+        var rowDark = new int[h]; var colDark = new int[w];
         foreach (var f in frames)
         {
             if (f.Length < w * h) return BarCrop.None;
             var rows = new double[h]; var cols = new double[w];
             for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { int v = f[y * w + x]; rows[y] += v; cols[x] += v; }
-            for (int y = 0; y < h; y++) rowMax[y] = Math.Max(rowMax[y], rows[y] / w);
-            for (int x = 0; x < w; x++) colMax[x] = Math.Max(colMax[x], cols[x] / h);
+            for (int y = 0; y < h; y++) if (rows[y] / w < MaxMeanLuma) rowDark[y]++;
+            for (int x = 0; x < w; x++) if (cols[x] / h < MaxMeanLuma) colDark[x]++;
         }
+        double need = MinDarkFraction * frames.Count - 1e-9;
+        var rowMax = rowDark.Select(c => c >= need ? 0.0 : 255.0).ToArray(); var colMax = colDark.Select(c => c >= need ? 0.0 : 255.0).ToArray();
         var (top, bottom) = Pair(rowMax, h); var (left, right) = Pair(colMax, w);
         return new BarCrop(top, bottom, left, right);
     }

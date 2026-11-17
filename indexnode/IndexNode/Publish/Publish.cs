@@ -196,7 +196,7 @@ public static class Publish
         async Task<JsonNode?> JN(string f) => await src.ReadAsync(f, ct) is { } b ? StoredJson.Parse(b, $"{id}/{f}") : null;
         var describe = JsonNode.Parse(describeB)!.AsObject(); var processed = JsonNode.Parse(processedB)!.AsObject();
         var info = await J("info.json"); var downloaded = await J("downloaded.json"); var clusters = await J("cast/clusters.json"); var facesDoc = await J("cast/faces.json");
-        var subs = SubtitleBand.Parse(await src.ReadAsync("ocr/lines.json", ct), $"{id}/ocr/lines.json")?.WithCropOf(facesDoc); double frameW = facesDoc?["source"]?["width"]?.GetValue<double>() ?? 360;
+        var subs = SubtitleBand.Parse(await src.ReadAsync("ocr/lines.json", ct), $"{id}/ocr/lines.json"); double frameW = facesDoc?["source"]?["width"]?.GetValue<double>() ?? 360;
 
         // frames.json + sscd.f16 at 1 fps; clip.f16 + clipFrames.json one row per shot
         var times = await FrameChunks.TimesAsync(src, ct);

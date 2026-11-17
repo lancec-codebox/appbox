@@ -73,7 +73,7 @@ public static class CastCandidates
         var facesDoc = StoredJson.Object(await Read("cast/faces.json") ?? throw new InvalidOperationException($"{id}: no cast/faces.json (run cast)"), $"{id}/cast/faces.json");
         var clustersDoc = StoredJson.Object(await Read("cast/clusters.json") ?? throw new InvalidOperationException($"{id}: no cast/clusters.json"), $"{id}/cast/clusters.json");
         int fw = facesDoc["source"]?["width"]?.GetValue<int>() ?? 360, fh = facesDoc["source"]?["height"]?.GetValue<int>() ?? 640;
-        var subs = SubtitleBand.Parse(await Read("ocr/lines.json"), $"{id}/ocr/lines.json")?.WithCropOf(facesDoc);
+        var subs = SubtitleBand.Parse(await Read("ocr/lines.json"), $"{id}/ocr/lines.json");
         var faces = LoadFaces(facesDoc, await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.f16"), ct), subs, fw, $"{id}/cast/faces.f16"); // a ghost blob: hydrated first
         var only = a.Get("clusters")?.Split(',').Select(int.Parse).ToHashSet();
         var main = (clustersDoc["clusters"] as JsonArray)!.OfType<JsonObject>().Where(c => c["main"]?.GetValue<bool>() == true).Select(c => c["id"]!.GetValue<int>()).Where(c => only == null || only.Contains(c)).ToList();

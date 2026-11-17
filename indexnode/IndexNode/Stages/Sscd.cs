@@ -71,21 +71,28 @@ public static class Sscd
     }
 
     /// <summary>Descriptors for frames/000000.jpg ... : short side 288, ImageNet normalisation, L2-normalised, float16.</summary>
-    public static async Task<byte[]> DescribeAsync(Tools tools, string modelPath, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct)
+    /// <summary>The model input size for stored frames of w x h with the bar box cut first: the crop is applied to the stored pixels, then the result is resized to short side 288.</summary>
+    public static (int W, int H) InputSize(int w, int h, BarCrop crop) => TargetSize(crop.Width(w), crop.Height(h));
+
+    /// <summary>The ffmpeg filter that crops the stored frame by the box, then resizes to the model input size.</summary>
+    public static string Filter(int w, int h, BarCrop crop) { var (tw, th) = InputSize(w, h, crop); return (crop.IsNone ? "" : crop.Filter(w, h) + ",") + $"scale={tw}:{th}:flags=bicubic"; }
+
+    /// <summary>Descriptors for frames/000000.jpg ... : the black-bar box <paramref name="crop"/> is cut from each stored frame, then short side 288, ImageNet normalisation, L2-normalised, float16.</summary>
+    public static async Task<byte[]> DescribeAsync(Tools tools, string modelPath, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct, BarCrop crop = default)
     {
         var ffmpeg = await tools.FfmpegAsync(ct);
         var probe = await tools.FfprobeAsync(ct);
         var first = Path.Combine(framesDir, "000000.jpg");
         var pr = await Proc.RunAsync(probe, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", first], ct);
         var wh = pr.Stdout.Trim().Split('x');
-        var (tw, th) = TargetSize(int.Parse(wh[0]), int.Parse(wh[1]));
+        int sw = int.Parse(wh[0]), sh = int.Parse(wh[1]); var (tw, th) = InputSize(sw, sh, crop); Log.Info($"sscd: stored {sw}x{sh}, bar box {crop}, model input {tw}x{th}");
 
         using var session = OrtOptions.Session(modelPath, threads);
         var inputName = session.InputMetadata.Keys.First();
 
         var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
         foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-start_number", "0", "-framerate", "1", "-i", Path.Combine(framesDir, "%06d.jpg"),
-            "-frames:v", count.ToString(), "-vf", $"scale={tw}:{th}:flags=bicubic", "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) psi.ArgumentList.Add(a);
+            "-frames:v", count.ToString(), "-vf", Filter(sw, sh, crop), "-f", "rawvideo", "-pix_fmt", "rgb24", "-" }) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi)!;
         using var reg = ct.Register(() => Proc.Kill(p));
         var err = p.StandardError.ReadToEndAsync();

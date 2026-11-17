@@ -156,7 +156,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 ctx.Report("sscd", null);
                 var model = await Sscd.EnsureModelAsync(config, http, ct);
                 var fs = await FrameSet();
-                var bytes = await Sscd.DescribeAsync(tools, model, await FramesDir(), fs.Count, ctx.ThreadShare(), p => ctx.Report("sscd", p), ct);
+                var fdir = await FramesDir(); var box = await FrameChunks.EnsureBoxAsync(wst, paths, id, fs, fdir, ct);
+                var bytes = await Sscd.DescribeAsync(tools, model, fdir, fs.Count, ctx.ThreadShare(), p => ctx.Report("sscd", p), ct, box);
                 await FrameChunks.PutVectorsAsync(wst, paths, id, "sscd", fs, bytes, Sscd.Dim, new { model = Sscd.ModelId(model), inputSize = Sscd.ShortSide, prune = new { cosine = FrameSettings.From(config).SscdCosine, lookback = FrameSettings.From(config).LookbackSeconds } }, ct);
                 // second pruning pass: SSCD cosine over the same look-back window; the pruned frames stay stored, sscd/keep.json and the spans say which stand for which
                 var fset = FrameSettings.From(config);

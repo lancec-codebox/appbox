@@ -87,10 +87,11 @@ public static class FrameChunks
     }
 
     public static byte[] ManifestJson(string kind, int w, int h, int crf, int count, IReadOnlyList<(string Chunk, double Start, int Frames, long Bytes)> chunks, object? extra = null, string container = "mp4", string codec = "av1",
-        object? crop = null, object? source = null, int? framesVersion = null)
+        object? crop = null, object? source = null, int? framesVersion = null, int? cropRule = null)
     {
         var d = new Dictionary<string, object?> { ["v"] = 1, ["kind"] = kind, ["container"] = container, ["codec"] = codec, ["chunkSeconds"] = ChunkSeconds, ["width"] = w, ["height"] = h, ["crf"] = crf, ["count"] = count, ["extra"] = extra };
         if (framesVersion != null) d["framesVersion"] = framesVersion;
+        if (cropRule != null) d["cropRule"] = cropRule; // the version of the bar rule that made crop
         if (crop != null) d["crop"] = crop;   // frames only: bars cut from the scaled frame, in stored-frame pixels
         if (source != null) d["source"] = source; // frames only: the source video size and the scaled size before the crop, to map a crop back to the source
         d["chunks"] = chunks.Select(c => new { chunk = c.Chunk, start = c.Start, frames = c.Frames, bytes = c.Bytes });
@@ -139,6 +140,41 @@ public static class FrameChunks
         }
         var man = new Dictionary<string, object?> { ["v"] = 1, ["step"] = step, ["dim"] = dim, ["dtype"] = "float16", ["normalised"] = true, ["frames"] = frames.Count, ["info"] = info, ["chunks"] = chunks };
         await store.PutAsync(paths.Video(id, step + "/manifest.json"), JsonSerializer.SerializeToUtf8Bytes(man), null, null, false, ct);
+    }
+
+    /// <summary>
+    /// The bar box for the sscd step. A job whose frames/manifest.json carries the current rule version (cropRule) uses its recorded box. An older job (no cropRule, or an older rule) gets the box computed
+    /// from its stored frames (24 evenly spaced by row, grey) and written back to the manifest (crop, cropRule), so no frames redo is needed. Returns the box to use.
+    /// </summary>
+    public static async Task<BarCrop> EnsureBoxAsync(IStore store, Paths paths, string id, ChunkDir fs, string framesDir, CancellationToken ct)
+    {
+        var mp = Path.Combine(fs.Dir, "manifest.json");
+        var man = JsonDocument.Parse(await File.ReadAllBytesAsync(mp, ct)).RootElement;
+        if (man.TryGetProperty("cropRule", out var cr) && cr.TryGetInt32(out var v) && v >= Bars.RuleVersion) return fs.Crop;
+        var box = BarsFromFrames(framesDir, fs.Count, fs.W, fs.H);
+        var d = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(await File.ReadAllBytesAsync(mp, ct))!;
+        var o = new Dictionary<string, object?>(); foreach (var kv in d) o[kv.Key] = kv.Value;
+        o["crop"] = new { top = box.Top, bottom = box.Bottom, left = box.Left, right = box.Right }; o["cropRule"] = Bars.RuleVersion;
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(o);
+        await File.WriteAllBytesAsync(mp, bytes, ct);
+        await store.PutAsync(paths.Video(id, "frames/manifest.json"), bytes, null, null, false, ct, "application/json");
+        return box;
+    }
+
+    /// <summary>Box from extracted frames (000000.jpg ...): up to 24 evenly spaced by row, from 5% to 95% of the rows.</summary>
+    public static BarCrop BarsFromFrames(string framesDir, int count, int w, int h)
+    {
+        if (count < 2) return BarCrop.None;
+        int n = Math.Min(Bars.Samples, count); var list = new List<byte[]>();
+        for (int i = 0; i < n; i++)
+        {
+            int row = (int)Math.Round((count - 1) * (Bars.From + (Bars.To - Bars.From) * (n == 1 ? 0 : (double)i / (n - 1))));
+            var im = Imaging.DecodeJpeg(File.ReadAllBytes(Path.Combine(framesDir, $"{row:D6}.jpg")));
+            if (im.W != w || im.H != h) return BarCrop.None;
+            var g = new byte[w * h]; for (int k = 0; k < g.Length; k++) g[k] = (byte)((im.Data[k * 3] * 299 + im.Data[k * 3 + 1] * 587 + im.Data[k * 3 + 2] * 114) / 1000);
+            list.Add(g);
+        }
+        return Bars.Detect(list, w, h);
     }
 
     /// <summary>Frame times of a job: from the chunks, or from the old frames.json when a job still has that.</summary>
@@ -222,9 +258,12 @@ public sealed class ChunkDir
     public int W { get; }
     public int H { get; }
     public string Container { get; }
-    /// <summary>Pixels cut from the left / top of the scaled frame as fixed black bars (manifest crop; 0 when none or before 0.8.3).</summary>
+    /// <summary>The black-bar box of the stored frames (manifest crop: pixels per side to leave out before embedding; the frames themselves are whole) (manifest crop; 0 when none or before 0.8.3).</summary>
     public int CropLeft { get; private init; }
     public int CropTop { get; private init; }
+    public int CropRight { get; private init; }
+    public int CropBottom { get; private init; }
+    public BarCrop Crop => new(CropTop, CropBottom, CropLeft, CropRight);
     public int Count => Chunks.Sum(c => c.Frames.Count);
     public string ChunkFile(ChunkInfo c) => Path.Combine(Dir, c.Chunk + (Container == "mjpeg" ? ".mjpeg" : ".mp4"));
     private ChunkDir(string dir, List<ChunkInfo> chunks, int w, int h, string container) { Dir = dir; Chunks = chunks; W = w; H = h; Container = container; }
@@ -241,7 +280,7 @@ public sealed class ChunkDir
         int w = man.TryGetProperty("width", out var we) ? we.GetInt32() : 0, h = man.TryGetProperty("height", out var he) ? he.GetInt32() : 0;
         var container = man.TryGetProperty("container", out var co) ? co.GetString() ?? "mp4" : "mp4";
         int Crop(string k) => man.TryGetProperty("crop", out var cr) && cr.ValueKind == JsonValueKind.Object && cr.TryGetProperty(k, out var v) && v.TryGetInt32(out var n) ? n : 0;
-        return new ChunkDir(dir, chunks, w, h, container) { CropLeft = Crop("left"), CropTop = Crop("top") };
+        return new ChunkDir(dir, chunks, w, h, container) { CropLeft = Crop("left"), CropTop = Crop("top"), CropRight = Crop("right"), CropBottom = Crop("bottom") };
     }
 
     public List<double> Times => Chunks.SelectMany(c => c.Frames.Select(f => f.T)).ToList();

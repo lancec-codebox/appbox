@@ -7,16 +7,7 @@ public sealed class SubtitleBand
 {
     public double Width { get; }
     readonly List<(double S, double E, double X0, double Y0, double X1, double Y1)> cues = [];
-    /// <summary>Stored frames may have fixed black bars cut off (frames/manifest.json crop): the OCR video's pixels, scaled to the frame, are moved by these many frame pixels.</summary>
-    public double Left { get; set; }
-    public double Top { get; set; }
     SubtitleBand(double width) => Width = width;
-
-    /// <summary>Takes the crop of the frames the faces were found on from cast/faces.json (source.cropLeft / cropTop; absent = none).</summary>
-    public SubtitleBand? WithCropOf(JsonObject? facesDoc)
-    {
-        Left = facesDoc?["source"]?["cropLeft"]?.GetValue<double>() ?? 0; Top = facesDoc?["source"]?["cropTop"]?.GetValue<double>() ?? 0; return this;
-    }
 
     public static SubtitleBand? Parse(byte[]? lines, string name = "ocr/lines.json")
     {
@@ -38,6 +29,6 @@ public sealed class SubtitleBand
         foreach (var c in cues)
             if (c.S - 0.5 <= t && t < c.E + 0.5) { any = true; x0 = Math.Min(x0, c.X0); y0 = Math.Min(y0, c.Y0); x1 = Math.Max(x1, c.X1); y1 = Math.Max(y1, c.Y1); }
         if (!any) return null;
-        double k = frameW / Width; return [x0 * k - Left, y0 * k - Top, (x1 - x0) * k, (y1 - y0) * k];
+        double k = frameW / Width; return [x0 * k, y0 * k, (x1 - x0) * k, (y1 - y0) * k];
     }
 }

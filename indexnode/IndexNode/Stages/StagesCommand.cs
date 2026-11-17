@@ -171,11 +171,11 @@ public static class StagesCommand
                         var dir = Path.Combine(work, "frames-jpg"); if (!Directory.Exists(dir)) await fs.ExtractAsync(tools, dir, ct);
                         double extract = sw.Elapsed.TotalSeconds - fetch;
                         P(stage, $"{fs.Count} frames fetched in {fetch:F1}s, images ready in {extract:F1}s; model {Path.GetFileName(model)}, device {OrtOptions.Device}, {threads} threads");
-                        int every = Math.Max(1, fs.Count / 10);
+                        var box = await FrameChunks.EnsureBoxAsync(store, paths, id, fs, dir, ct); int every = Math.Max(1, fs.Count / 10);
                         var bytes = await Sscd.DescribeAsync(tools, model, dir, fs.Count, threads, m =>
                         {   // progress roughly every 10%
                             var n = m.Split('/')[0]; if (int.TryParse(n, out var k) && (k % every < 64 || k == fs.Count)) P(stage, m);
-                        }, ct);
+                        }, ct, box);
                         var fset = FrameSettings.From(cfg);
                         await FrameChunks.PutVectorsAsync(store, paths, id, "sscd", fs, bytes, Sscd.Dim, new { model = Sscd.ModelId(model), inputSize = Sscd.ShortSide, prune = new { cosine = fset.SscdCosine, lookback = fset.LookbackSeconds } }, ct);
                         var (keep, rep) = FrameChunks.SscdPass(fs.Times, bytes, Sscd.Dim, fset.SscdCosine, fset.LookbackSeconds);
