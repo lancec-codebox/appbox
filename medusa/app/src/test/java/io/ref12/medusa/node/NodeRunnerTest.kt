@@ -19,6 +19,7 @@ class FakeBlobs : BlobApi {
             mapOf("idx_stage" to "download", "idx_state" to "pending", "idx_added" to "2026-11-13T19:00:0" + n + "Z"))
     }
     @Synchronized fun setControl(json: String) { blobs[ControlWatcher.CONTROL_PATH] = B(json.toByteArray(), emptyMap(), null, (blobs[ControlWatcher.CONTROL_PATH]?.etag ?: 0) + 1) }
+    @Synchronized fun blobText(path: String) = String(blobs[path]!!.bytes)
     @Synchronized fun job(id: String) = blobs["index/jobs/download/" + id + ".json"]!!
     @Synchronized fun jobJson(id: String) = JSONObject(String(job(id).bytes))
     fun count(prefix: String) = synchronized(log) { log.count { it.startsWith(prefix) } }
@@ -62,6 +63,9 @@ class MemState : NodeState {
     override fun backoffUntil() = backoff
     override fun setBackoffUntil(t: Long) { backoff = t }
     override fun record(entry: JobLogEntry) { entries.add(entry) }
+    val skips = HashMap<String, Long>()
+    override fun skipUntil(jobId: String) = skips[jobId] ?: 0
+    override fun skipJob(jobId: String, until: Long) { skips[jobId] = until }
     override fun saveControl(text: String) { control = text }
     var local = LocalLimits(null, null, null); var bKey: String? = null; var bLeft = 0; var limits = ""
     override fun localLimits() = local
@@ -80,6 +84,7 @@ class FakeFetcher(private val behavior: (DownloadJob, File, FakeFetcher) -> Unit
     @Volatile var cancelled = false
     val jobs = ArrayList<DownloadJob>()
     var subsFailed: List<String> = emptyList()
+    var formatFallback: String? = null
     override fun cancel() { cancelled = true }
     override fun download(job: DownloadJob, dir: File, progress: (String?, String?) -> Unit): DownloadedFiles {
         jobs.add(job); dir.mkdirs(); progress("download 10%", "Title " + job.jobId)
@@ -91,7 +96,7 @@ class FakeFetcher(private val behavior: (DownloadJob, File, FakeFetcher) -> Unit
         val sub = File(dir, "video.zh-Hans.vtt").apply { writeText("WEBVTT") }
         val subs = NodeInfo.order(listOf("zh-Hans", "en", "zh-Hans.auto"))
         return DownloadedFiles(v, listOf(Triple("info.json", info, "application/json"), Triple("description.txt", desc, "text/plain; charset=utf-8"), Triple("subs/zh-Hans.vtt", sub, "text/vtt")),
-            480, 61.5, p.vcodec, p.acodec, p.formatId, subs, p.embeddable, p.audioLanguage, p.audioNote, p.audioTracks, subsFailed)
+            480, 61.5, p.vcodec, p.acodec, p.formatId, subs, p.embeddable, p.audioLanguage, p.audioNote, p.audioTracks, subsFailed, formatFallback)
     }
 }
 

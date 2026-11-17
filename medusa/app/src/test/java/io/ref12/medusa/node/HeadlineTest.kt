@@ -54,6 +54,10 @@ class HeadlineTest {
         assertEquals("downloaded 1, failed 0, released 1, stopped by the owner", NodeStatus.runSummary(1, 0, 1, "control: stop"))
     }
 
+    @Test fun the403RetryShowsInTheHeadline() {
+        assertEquals("Downloading: T \u2014 403 on video, retrying as MP4", h(StatusInput(downloading = true, title = "T", progress = Mp4Fallback.RETRY_TEXT)))
+    }
+
     @Test fun progressWords() {
         assertEquals("video 7%", NodeStatus.friendlyProgress("download 7%")); assertEquals("uploading 40%", NodeStatus.friendlyProgress("upload 40%")); assertEquals("starting", NodeStatus.friendlyProgress("starting"))
     }
