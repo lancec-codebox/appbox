@@ -15,8 +15,12 @@ object CrashRedaction {
         return RuntimeException(t.javaClass.name + ": " + (t.message ?: ""), sc).also { it.stackTrace = t.stackTrace }
     }
 
-    fun install() {
+    /** [dir] and [version]: where to keep the last crash (see [CrashLog]) and what to stamp it with. */
+    fun install(dir: java.io.File? = null, version: String = "") {
         val prev = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { th, e -> if (prev != null) prev.uncaughtException(th, sanitize(e)) }
+        Thread.setDefaultUncaughtExceptionHandler { th, e ->
+            if (dir != null) CrashLog.write(dir, e, version)
+            if (prev != null) prev.uncaughtException(th, sanitize(e))
+        }
     }
 }

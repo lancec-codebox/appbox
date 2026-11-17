@@ -117,12 +117,13 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
         }
 
         /**
-         * "Run now": one expedited run at once, under the same cap, budget and control rules. It drops only the charging condition;
-         * Wi-Fi (unmetered), battery and storage still apply, and so does the daily cap.
+         * "Run now": one expedited run at once, under the same cap, budget and control rules. It keeps only the Wi-Fi (unmetered) condition (expedited work allows no more);
+         * the daily cap, budget and control rules still apply.
          */
         fun runNow(ctx: Context, s: NodeSettings = NodeSettings(ctx)) {
             if (!s.enabled || !s.vault.has()) return
-            val req = OneTimeWorkRequestBuilder<NodeWorker>().setConstraints(constraints(false))
+            // WorkManager refuses (IllegalArgumentException from build()) an expedited request with a battery-not-low, storage-not-low or charging constraint: only the network one is allowed
+            val req = OneTimeWorkRequestBuilder<NodeWorker>().setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build())
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST).build()
             WorkManager.getInstance(ctx).enqueueUniqueWork(UNIQUE_NOW, ExistingWorkPolicy.KEEP, req)
         }
@@ -142,10 +143,11 @@ object StatusNotifier {
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
     private fun build(ctx: Context, text: String, ongoing: Boolean): Notification {
-        val open = PendingIntent.getActivity(ctx, 0, ctx.packageManager.getLaunchIntentForPackage(ctx.packageName), PendingIntent.FLAG_IMMUTABLE)
+        val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+        val open = launch?.let { PendingIntent.getActivity(ctx, 0, it, PendingIntent.FLAG_IMMUTABLE) }
         return NotificationCompat.Builder(ctx, NodeWorker.CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle("Index node").setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text)).setOngoing(ongoing).setOnlyAlertOnce(true).setSilent(true).setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(open).addAction(0, "Run now", runNowIntent(ctx)).build()
+            .also { b -> open?.let { b.setContentIntent(it) } }.addAction(0, "Run now", runNowIntent(ctx)).build()
     }
 
     fun foregroundInfo(ctx: Context, text: String): ForegroundInfo {
@@ -217,6 +219,8 @@ object StatusNotifier {
 
 /** The "Run now" action of the status notification. */
 class RunNowReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) { if (intent.action == ACTION) NodeWorker.runNow(context) }
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ACTION) SafeClick.run("Run now", { android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_LONG).show() }) { NodeWorker.runNow(context); null }
+    }
     companion object { const val ACTION = "io.ref12.medusa.NODE_RUN_NOW" }
 }

@@ -140,9 +140,22 @@ object IndexNodeUi {
         val info = Ui.muted(a, "", 12f).apply { tag = "node-status-info" }
         card.addView(info, Ui.lp(-1, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.button(a, "Run now") {
-            if (!s.enabled || !s.vault.has()) { Toast.makeText(a, "Turn the node on and save a SAS in Index node settings first", Toast.LENGTH_LONG).show(); return@button }
-            NodeWorker.runNow(a, s); Toast.makeText(a, "Started one run (Wi-Fi, battery, cap, budget and control still apply)", Toast.LENGTH_LONG).show()
+            SafeClick.run("Run now", { Toast.makeText(a, it, Toast.LENGTH_LONG).show() }) {
+                if (!s.enabled || !s.vault.has()) "Turn the node on and save a SAS in Index node settings first"
+                else { NodeWorker.runNow(a, s); "Started one run (Wi-Fi, daily cap, budget and control still apply)" }
+            }
         }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
+        val crashLine = Ui.muted(a, "", 12f).apply { tag = "node-last-crash" }
+        val crashRow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; tag = "node-crash-row" }
+        crashRow.addView(Ui.button(a, "Share crash") {
+            SafeClick.run("Share", { Toast.makeText(a, it, Toast.LENGTH_LONG).show() }) {
+                val r = CrashLog.read(a.filesDir) ?: return@run "No crash recorded"
+                a.startActivity(android.content.Intent.createChooser(android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain")
+                    .putExtra(android.content.Intent.EXTRA_SUBJECT, "Medusa crash").putExtra(android.content.Intent.EXTRA_TEXT, r.text()), "Share crash")); null
+            }
+        }, Ui.lp(-2, -2, 0f, 0, 4, 8, 0, a))
+        crashRow.addView(Ui.button(a, "Clear crash", danger = true) { CrashLog.clear(a.filesDir); crashLine.visibility = android.view.View.GONE; crashRow.visibility = android.view.View.GONE }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(crashLine, Ui.lp(-1, -2, 0f, 0, 6, 0, 0, a)); card.addView(crashRow)
         card.addView(Ui.button(a, "Index node settings") { a.go(io.ref12.medusa.Dest.INDEX_SETTINGS) }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.header(a, "Last runs"), Ui.lp(-1, -2, 0f, 0, 12, 0, 0, a))
         val runs = Ui.muted(a, "", 13f).apply { tag = "node-recent" }
@@ -151,6 +164,8 @@ object IndexNodeUi {
         fun refresh() {
             val now = System.currentTimeMillis()
             line.text = StatusNotifier.statusText(a, s)
+            val crash = CrashLog.read(a.filesDir)
+            crashLine.text = crash?.line() ?: ""; crashLine.visibility = if (crash != null) android.view.View.VISIBLE else android.view.View.GONE; crashRow.visibility = crashLine.visibility
             info.text = "Node id: " + s.nodeId + "\nControl: " + (s.lastControl.ifEmpty { "not read yet" }) +
                 (if (s.lastLimits.isNotEmpty()) "\nNow: " + s.lastLimits else "") +
                 "\nDownloads today: " + s.doneToday(NodeRunner.day(now)) + " of " + s.dailyCap +
