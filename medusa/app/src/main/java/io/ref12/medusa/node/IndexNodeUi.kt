@@ -17,6 +17,15 @@ import java.util.Date
 
 /** The "Index node" group of the settings screen. */
 object IndexNodeUi {
+    private fun refreshProfile(s: NodeSettings, info: TextView) {
+        val p = s.profile
+        info.text = when {
+            p == null -> "Download profile: none (the node uses the settings above)"
+            p.found -> "Download profile (yt-dlp " + p.ytdlp + "): " + p.tries.lastOrNull()?.variant + "\nTries: " + p.tries.joinToString("; ") { it.variant + " = " + it.result }
+            else -> "Download profile: no working option found for the last 403 (yt-dlp " + p.ytdlp + ")\nTries: " + p.tries.joinToString("; ") { it.variant + " = " + it.result }
+        }
+    }
+
     /** Index node settings screen: configuration only. */
     fun buildSettings(a: MainActivity, card: LinearLayout) {
         val s = NodeSettings(a)
@@ -64,6 +73,55 @@ object IndexNodeUi {
         val window = field("3h", s.window, "node-window"); card.addView(window)
         card.addView(Ui.muted(a, "Example: \"0 1 * * *\" with \"3h\" claims new jobs only between 01:00 and 04:00; a download in progress finishes. Window is like 90m, 3h, 1d (1h when empty). Empty schedule: any time. Wi-Fi and charging still apply. A budget, schedule or window set for this node in control.json overrides these.", 12f))
         val limitsInfo = Ui.muted(a, "", 12f); card.addView(limitsInfo)
+        card.addView(Ui.header(a, "Downloads"), Ui.lp(-1, -2, 0f, 0, 14, 0, 0, a))
+        card.addView(CheckBox(a).apply {
+            text = "Try WebM first"; tag = "node-webm-first"; isChecked = s.webmFirst; setTextColor(Ui.color(a, R.color.on_surface))
+            setOnCheckedChangeListener { _, on -> s.webmFirst = on }
+        })
+        card.addView(Ui.muted(a, "On (the default): the node first asks for WebM/Opus, then the library's MP4 selector. Off: straight to the MP4 selector Medusa's own downloads use. The info JSON, thumbnail and subtitles are always fetched in separate calls after the video.", 12f))
+        val profileInfo = Ui.muted(a, "", 12f); card.addView(profileInfo)
+        card.addView(Ui.button(a, "Reset profile") { s.profile = null; refreshProfile(s, profileInfo) }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
+        refreshProfile(s, profileInfo)
+        card.addView(Ui.muted(a, "Test download: runs one URL through exactly the node's download path in the foreground, writes nothing to the index, stops after 5 MB. Switches put options back on the video request for the test only."), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
+        val testUrl = field("https://www.youtube.com/watch?v=...", "", "node-test-url"); card.addView(testUrl)
+        val swWebm = CheckBox(a).apply { text = "WebM first"; tag = "test-webm"; isChecked = s.webmFirst; setTextColor(Ui.color(a, R.color.on_surface)) }
+        val swInfo = CheckBox(a).apply { text = "Info JSON with the video"; tag = "test-info"; setTextColor(Ui.color(a, R.color.on_surface)) }
+        val swThumb = CheckBox(a).apply { text = "Thumbnail with the video"; tag = "test-thumb"; setTextColor(Ui.color(a, R.color.on_surface)) }
+        card.addView(swWebm); card.addView(swInfo); card.addView(swThumb)
+        val testResult = Ui.muted(a, "", 12f).apply { tag = "node-test-result"; setTextIsSelectable(true) }
+        card.addView(Ui.button(a, "Test download") {
+            val id = SourceUrl.videoId(SourceUrl.firstUrl(testUrl.text.toString()) ?: testUrl.text.toString())
+            if (id == null) { Toast.makeText(a, "Paste a YouTube video URL", Toast.LENGTH_SHORT).show(); return@button }
+            testResult.text = "Testing\u2026"
+            Thread {
+                val text = try {
+                    val fetcher = YtDlpNodeFetcher(a.app.fetcher, s)
+                    fetcher.ensureTestReady()
+                    val io = YtDlpVideoIo(a.app.fetcher) { false }
+                    val job = DownloadJob(id, "https://www.youtube.com/watch?v=" + id, s.maxHeight, null, false)
+                    val r = TestDownload.run(io, job, java.io.File(a.cacheDir, "index-node-test"), TestDownload.Switches(swWebm.isChecked, swInfo.isChecked, swThumb.isChecked))
+                    s.log("test download " + id + ": " + r.text())
+                    r.text()
+                } catch (e: Exception) { "FAIL - " + Redact.sas(e.message ?: e.javaClass.simpleName) }
+                a.runOnUiThread { testResult.text = text }
+            }.start()
+        }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
+        card.addView(testResult, Ui.lp(-1, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.button(a, "Share node log") {
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain").putExtra(android.content.Intent.EXTRA_SUBJECT, "Medusa index node log").putExtra(android.content.Intent.EXTRA_TEXT, s.logText().ifEmpty { "The node log is empty" })
+            a.startActivity(android.content.Intent.createChooser(send, "Share node log"))
+        }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
+        card.addView(Ui.header(a, "Store my downloads in the index"), Ui.lp(-1, -2, 0f, 0, 14, 0, 0, a))
+        card.addView(CheckBox(a).apply {
+            text = "Also store my downloads in the index"; tag = "node-store-library"; isChecked = s.storeLibrary; setTextColor(Ui.color(a, R.color.on_surface))
+            setOnCheckedChangeListener { _, on -> s.storeLibrary = on; if (on) IndexStoreWorker.enqueue(a, s) }
+        })
+        card.addView(Ui.muted(a, "Write-only: Medusa never reads anything back from the index for this. YouTube videos only. Each download chooses Store only (the default) or Store and process. Uploads run under the node's conditions and resume after an interruption.", 12f))
+        card.addView(TrackUi.radios(a, StoreMode.values().map { it.label }, StoreMode.values().map { "node-store:" + it.name }, s.storeMode.ordinal) { s.storeMode = StoreMode.values()[it] })
+        card.addView(CheckBox(a).apply {
+            text = "Allow mobile data for these uploads"; tag = "node-store-mobile"; isChecked = s.storeMobile; setTextColor(Ui.color(a, R.color.on_surface))
+            setOnCheckedChangeListener { _, on -> s.storeMobile = on }
+        })
         card.addView(Ui.muted(a, "Container SAS URL (paste it, or scan its QR code). It is kept encrypted with an Android Keystore key and never shown or logged."), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
         val sasInfo = Ui.muted(a, "", 12f)
         val sasField = field("https://<account>.blob.core.windows.net/<container>?...", "", "node-sas", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)

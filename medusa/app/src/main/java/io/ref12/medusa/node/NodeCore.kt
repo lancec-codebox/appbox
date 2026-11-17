@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** FORBIDDEN: HTTP 403 on the video data itself (YouTube withholds some formats): retried once as MP4, never counted as an attempt. */
 enum class FailureKind { PERMANENT, TRANSIENT, BOT, FORBIDDEN }
 
-class NodeFetchException(val kind: FailureKind, message: String) : Exception(Redact.sas(message))
+class NodeFetchException(val kind: FailureKind, message: String, val trace: FailureTrace? = null) : Exception(Redact.sas(message))
 
 /** How a yt-dlp error is handled, exactly as the protocol says. */
 object Failures {
@@ -128,6 +128,8 @@ interface NodeState {
     fun skipUntil(jobId: String): Long = 0
     fun skipJob(jobId: String, until: Long) {}
     fun record(entry: JobLogEntry)
+    /** A line for the node log the owner can share (Settings > Index node). */
+    fun log(line: String) {}
     fun saveControl(text: String)
     /** The local settings of the run limits. */
     fun localLimits(): LocalLimits = LocalLimits(null, null, null)
@@ -137,6 +139,8 @@ interface NodeState {
     fun setBudget(key: String?, left: Int) {}
     /** A one-line description of the limits in force, for the settings screen. */
     fun saveLimits(text: String) {}
+    /** The download profile found by the 403 diagnosis (1.8.6), null when none; written to the node record. */
+    fun downloadProfile(): DownloadProfile? = null
 }
 
 class JobLogEntry(val jobId: String, val title: String?, val result: String, val at: Long, val message: String?, val version: String? = null)
@@ -370,10 +374,14 @@ class NodeRunner(
             return Outcome.STOPPED
         }
         val kind = if (e is NodeFetchException) e.kind else FailureKind.TRANSIENT
+        val trace = (e as? NodeFetchException)?.trace
+        // every failed attempt leaves its trace: network (rewrite adds it), yt-dlp version, format ids, client and the last 20 lines of output, next to lastError; the same goes into the node log
+        val withTrace: (JSONObject) -> JSONObject = { o -> trace?.putInto(o); o }
+        trace?.let { state.log("trace " + ref.id + ": " + it.text()) }
         when (kind) {
             FailureKind.FORBIDDEN -> {
                 // 403 on the video, also as MP4: not the job's fault. Back to pending without an attempt; this node leaves it for 6 hours, other nodes may take it.
-                rewrite(ref, leaseId, jobText, "pending") { it.put("lastError", msg) }
+                rewrite(ref, leaseId, jobText, "pending") { withTrace(it.put("lastError", msg)) }
                 state.skipJob(ref.id, env.clock() + SKIP_MS)
                 state.record(JobLogEntry(ref.id, title, "released: " + Mp4Fallback.TWICE_TEXT, env.clock(), msg))
                 s.released++
@@ -382,19 +390,19 @@ class NodeRunner(
             }
             FailureKind.BOT -> {
                 // no attempt counted; the error and the network go into the job so a block can be matched to home, VPN or mobile data
-                rewrite(ref, leaseId, jobText, "pending") { it.put("lastError", msg) }
+                rewrite(ref, leaseId, jobText, "pending") { withTrace(it.put("lastError", msg)) }
                 release(ref.name, leaseId); s.released++
                 state.setBackoffUntil(env.clock() + BACKOFF_MS)
                 state.record(JobLogEntry(ref.id, title, "bot block", env.clock(), msg))
                 return Outcome.BOT
             }
             FailureKind.PERMANENT -> {
-                rewrite(ref, leaseId, jobText, "failed") { it.put("lastError", msg).put("permanent", true) }
+                rewrite(ref, leaseId, jobText, "failed") { withTrace(it.put("lastError", msg).put("permanent", true)) }
                 state.record(JobLogEntry(ref.id, title, "failed (permanent)", env.clock(), msg))
             }
             FailureKind.TRANSIENT -> {
                 var attempts = 0
-                rewrite(ref, leaseId, jobText, null) { attempts = it.optInt("attempts", 0) + 1; it.put("attempts", attempts).put("lastError", msg) }
+                rewrite(ref, leaseId, jobText, null) { attempts = it.optInt("attempts", 0) + 1; withTrace(it.put("attempts", attempts).put("lastError", msg)) }
                 state.record(JobLogEntry(ref.id, title, if (attempts >= MAX_ATTEMPTS) "failed (3 attempts)" else "will retry", env.clock(), msg))
             }
         }
@@ -426,7 +434,7 @@ class NodeRunner(
         if (!force && now - lastRegistry < env.registryMs) return
         lastRegistry = now
         try {
-            val json = registryJson(cfg, regState, control.current.effective(STAGE).name.lowercase(), running, iso(now), startedAt, limitView, network)
+            val json = registryJson(cfg, regState, control.current.effective(STAGE).name.lowercase(), running, iso(now), startedAt, limitView, network, state.downloadProfile())
             api.put("index/nodes/${cfg.nodeId}.json", json.toString().toByteArray(), "application/json", mapOf("idx_kind" to "node"))
         } catch (e: Exception) { /* the registry is best effort */ }
     }
@@ -443,13 +451,14 @@ class NodeRunner(
         fun day(ms: Long): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(ms))
         fun describe(c: Control): String = c.effective(STAGE).name.lowercase() + (c.message?.let { " - $it" } ?: "")
 
-        fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String, limits: LimitView? = null, network: NetInfo? = null): JSONObject = JSONObject()
+        fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String, limits: LimitView? = null, network: NetInfo? = null, profile: DownloadProfile? = null): JSONObject = JSONObject()
             .put("v", 1).put("nodeId", cfg.nodeId).put("name", cfg.name).put("kind", "medusa").put("version", cfg.version).put("platform", cfg.platform)
             .put("stages", JSONArray(listOf("download"))).put("jobs", JSONObject().put("download", 1)).put("threads", cfg.threads)
             .put("conditions", cfg.conditions).put("state", state).put("control", control)
             .put("running", JSONArray().also { a -> running?.let { r -> a.put(JSONObject().put("jobId", r.jobId).put("stage", r.stage).put("step", r.step).put("progress", r.progress ?: JSONObject.NULL)) } })
             .put("lastSeen", lastSeen).put("startedAt", startedAt)
             .also { o -> network?.let { o.put("network", it.toJson()) } }
+            .also { o -> profile?.let { o.put("downloadProfile", it.toJson()) } }
             .also { o -> limits?.let { l ->
                 l.budget?.let { o.put("budget", it) }
                 l.schedule?.let { o.put("schedule", it) }; l.window?.let { o.put("window", it) }

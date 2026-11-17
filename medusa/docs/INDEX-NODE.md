@@ -210,3 +210,7 @@ Each node record in `index/nodes/<nodeId>.json` has an optional `network` object
 A download job's attempt records `network` (`ipv4`, `ipv6Prefix`, `vpn`, `transport`) on success and on failure, and `videos/<jobId>/downloaded.json` carries the same object.
 
 Optional cap: `control.json` `"downloads": { "maxPerIp": N }`. Absent, null or 0 means unlimited. Before claiming a download a node counts running downloads on OTHER nodes (lastSeen under 3 minutes old, not offline) with the same IPv4 or the same IPv6 /64, plus its own; at or over N it waits (no attempt counted, no back-off). Best effort: two nodes can race past the cap, and a storage read failure permits the download. `indexnode control --max-per-ip N|off` sets it; `indexnode status --json` shows each node's network.
+
+## Medusa library downloads in the index (Medusa 1.8.6)
+
+Library downloads are often 720p. The frames stage scales stored frames to a short side of 360 (Frames.cs), so only decode time grows. Such videos carry origin "medusa-library" and their real height in downloaded.json.

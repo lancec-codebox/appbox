@@ -19,12 +19,15 @@ class StatusInput(
 /** What the worker is doing right now, shared with the screen (same process). */
 object NodeLive {
     @Volatile var input: StatusInput? = null
+    /** Progress of storing a library download in the index (1.8.6), shown in the status notification while it runs. */
+    @Volatile var store: String? = null
 }
 
 object NodeStatus {
     /** Precedence: off > downloading > backing off > waiting for the per-IP cap > waiting > stopped by the owner > cap / budget > draining > no work > idle. */
     fun text(s: StatusInput): String = when {
         !s.enabled -> "Index node is off"
+        !s.downloading && NodeLive.store != null -> NodeLive.store!!
         s.downloading -> "Downloading: " + (s.title?.take(50) ?: "starting") + (s.progress?.let { " \u2014 " + friendlyProgress(it) } ?: "")
         s.backoffUntil != null -> "Backing off until " + s.backoffUntil + (s.backoffReason?.let { " \u2014 $it" } ?: "")
         s.ipCapRunning != null -> NetCap.waitText(s.ipCapRunning)

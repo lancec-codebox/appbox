@@ -60,7 +60,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
                 val text = NodeStatus.text(status)
                 if (throttle.allow(text, progressOnly)) goForeground(text)
             }
-            val r = NodeRunner(client, YtDlpNodeFetcher(ctx.app.fetcher), cfg, settings, env = NodeEnv(deviceNet = { StatusNotifier.deviceNet(ctx) }), cap = settings.dailyCap, listener = object : NodeListener {
+            val r = NodeRunner(client, YtDlpNodeFetcher(ctx.app.fetcher, settings), cfg, settings, env = NodeEnv(deviceNet = { StatusNotifier.deviceNet(ctx) }), cap = settings.dailyCap, listener = object : NodeListener {
                 override fun onWork(left: Int) { show(StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap, title = null), false) }
                 override fun onJob(jobId: String, title: String?, left: Int, text: String?) {
                     show(StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap, title = title ?: jobId, progress = text), true)

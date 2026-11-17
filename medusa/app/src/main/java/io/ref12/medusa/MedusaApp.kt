@@ -44,7 +44,8 @@ class MedusaApp : Application() {
         val root = File(filesDir, "data")
         media = MediaStore(root)
         // One job at a time: yt-dlp is heavy and the phone is small.
-        jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() }, onNoSubtitles = { id -> settings.setOcrOffered(id, true) })
+        jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() }, onNoSubtitles = { id -> settings.setOcrOffered(id, true) },
+            onVideoDone = { jobId, mediaId -> val ns = io.ref12.medusa.node.NodeSettings(this); if (ns.storeQueue.finished(jobId, mediaId) != null) io.ref12.medusa.node.IndexStoreWorker.enqueue(this, ns) })
         ocr = OcrManager(this, media)
         io.ref12.medusa.node.CrashRedaction.install(filesDir, BuildConfig.VERSION_NAME)
         try { io.ref12.medusa.node.NodeWorker.schedule(this, io.ref12.medusa.node.NodeSettings(this)) } catch (e: Exception) { /* the node is optional */ }

@@ -31,9 +31,11 @@ class JobManager(
     private val executor: Executor,
     /** The language to also fetch titles in (null = Original only); read at each capture. */
     private val titleLanguage: () -> String? = { null },
-    private val clock: () -> Long = System::currentTimeMillis,
     /** Called with the media id when a finished capture stored a video but found no subtitle track: the app then offers to read them from the picture. */
     private val onNoSubtitles: (String) -> Unit = {},
+    /** Called with (job id, media id) when a capture that wanted video finished with a video: the app then stores it in the index when the owner asked for that. */
+    private val onVideoDone: (String, String) -> Unit = { _, _ -> },
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val jobs = ConcurrentHashMap<String, JobRecord>()
 
@@ -298,6 +300,7 @@ class JobManager(
             ).joinToString(" ").ifEmpty { null }
             media.clearPartial(rec.mediaId); media.clearPartial(target)
             set(rec, JobState.DONE, null, note, 1.0)
+            if (gotVideo) try { onVideoDone(rec.id, target) } catch (e: Throwable) { /* storing in the index is optional */ }
         } catch (e: FetchException) {
             set(rec, JobState.FAILED, e.code, e.message, null)
         } catch (e: Throwable) {

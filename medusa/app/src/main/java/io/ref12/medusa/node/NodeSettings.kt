@@ -50,7 +50,7 @@ enum class NodeConditions(val label: String, val wire: String) {
 }
 
 /** Settings and counters of the index node. The SAS goes only through [vault]. */
-class NodeSettings(ctx: Context) : NodeState, SetupStore {
+class NodeSettings(ctx: Context) : NodeState, SetupStore, DownloadPrefs {
     private val prefs = ctx.getSharedPreferences("index_node", Context.MODE_PRIVATE)
     val vault = SasVault(prefs)
 
@@ -85,6 +85,40 @@ class NodeSettings(ctx: Context) : NodeState, SetupStore {
     })
 
     var maxHeight: Int get() = prefs.getInt("maxHeight", 480); set(v) { prefs.edit().putInt("maxHeight", v.coerceIn(144, 4320)).apply() }
+
+    /** "Also store my downloads in the index" (1.8.6): off by default. YouTube videos only. */
+    var storeLibrary: Boolean get() = prefs.getBoolean("storeLibrary", false); set(v) { prefs.edit().putBoolean("storeLibrary", v).apply() }
+    /** Store only (default) or Store and process, for the next library download. */
+    var storeMode: StoreMode get() = StoreMode.parse(prefs.getString("storeMode", null)); set(v) { prefs.edit().putString("storeMode", v.wire).apply() }
+    /** Upload over mobile data too (default off: Wi-Fi only). */
+    var storeMobile: Boolean get() = prefs.getBoolean("storeMobile", false); set(v) { prefs.edit().putBoolean("storeMobile", v).apply() }
+    /** Priority of the step jobs of "Store and process" (0 unless the owner sets one). */
+    var storePriority: Int get() = prefs.getInt("storePriority", 0); set(v) { prefs.edit().putInt("storePriority", v.coerceIn(Prio.MIN, Prio.MAX)).apply() }
+    val storeQueue = IndexStoreQueue(object : TextStore {
+        override fun load() = prefs.getString("storeQueue", null)
+        override fun save(text: String) { prefs.edit().putString("storeQueue", text).apply() }
+    })
+
+    /** "Try WebM first" (1.8.6): on by default, today's behaviour; off goes straight to the library's MP4 selector. */
+    override var webmFirst: Boolean get() = prefs.getBoolean("webmFirst", true); set(v) { prefs.edit().putBoolean("webmFirst", v).apply() }
+    /** The download profile the 403 diagnosis found (or the record that nothing passed); null: none yet. Reset profile clears it. */
+    override var profile: DownloadProfile?
+        get() = DownloadProfile.parse(prefs.getString("downloadProfile", null))
+        set(v) { prefs.edit().apply { if (v == null) remove("downloadProfile") else putString("downloadProfile", v.toJson().toString()) }.apply() }
+    override fun downloadProfile(): DownloadProfile? = profile?.takeIf { it.found || it.tries.isNotEmpty() }
+
+    /** The node log: the newest lines, kept in the settings (about 60 KB), shared from Settings > Index node. Never holds a SAS or a URL query string. */
+    override fun log(line: String) {
+        val stamp = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        val clean = FailureTrace.clean(Redact.sas(line))
+        synchronized(LOG_LOCK) {
+            var text = (prefs.getString("nodeLog", "") ?: "") + stamp + " " + clean + "\n"
+            if (text.length > LOG_MAX) text = text.substring(text.length - LOG_MAX).substringAfter('\n')
+            prefs.edit().putString("nodeLog", text).apply()
+        }
+    }
+    fun logText(): String = prefs.getString("nodeLog", "") ?: ""
+    fun clearLog() { prefs.edit().remove("nodeLog").apply() }
 
     override fun current() = SetupCurrent(name, conditions.wire, dailyCap, budget, schedule, window, maxHeight, vault.has())
     override fun putSas(sas: String) = vault.save(sas)
@@ -135,4 +169,6 @@ class NodeSettings(ctx: Context) : NodeState, SetupStore {
 
     fun config(ctx: Context, version: String) = NodeConfig(nodeId, name, conditions.wire, version,
         "android-" + (Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"), Runtime.getRuntime().availableProcessors(), java.io.File(ctx.cacheDir, "index-node"))
+
+    private companion object { val LOG_LOCK = Any(); const val LOG_MAX = 60_000 }
 }

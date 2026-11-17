@@ -173,14 +173,8 @@ class YtDlpFetcher(private val ctx: Context, private val settings: Settings) : M
         val h = req.quality.height
         val meter = ProgressMeter(2)
         val resumeOptions = Resume.videoOptions(dir)
-        run(YoutubeDLRequest(req.url).apply {
-            for (o in resumeOptions) addOption(o)
-            addOption("--no-playlist"); addOption("--no-warnings")
-            // MP4 (H.264 + AAC) so every Android player can play it; fall back to the best single MP4 file
-            addOption("-f", "bv*[height<=$h][ext=mp4]+ba[ext=m4a]/b[height<=$h][ext=mp4]/b[height<=$h]")
-            addOption("--merge-output-format", "mp4")
-            addOption("-o", File(dir, "video.%(ext)s").absolutePath)
-        }) { pct, _, _ -> progress(JobState.DOWNLOADING, null, meter.update(pct.toDouble())) }
+        // the request builder the index node uses too (VideoRequest)
+        run(VideoRequest.apply(YoutubeDLRequest(req.url), VideoRequest.options(File(dir, "video.%(ext)s").absolutePath, h, resumeOptions))) { pct, _, _ -> progress(JobState.DOWNLOADING, null, meter.update(pct.toDouble())) }
         val f = dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }?.maxByOrNull { it.length() }
             ?: throw FetchException("yt-dlp did not produce a video file", Codes.YTDLP)
         return f

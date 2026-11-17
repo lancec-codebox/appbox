@@ -21,6 +21,7 @@ class CapturePage(a: MainActivity) : Page(a) {
     private var libraryId: String? = null
     private var langPicked = 0
     private var quality = Quality.P720
+    private var storeProcess: android.widget.CheckBox? = null
     private var langChoices: List<Pair<String, String?>> = emptyList()
 
     override fun build(): View {
@@ -55,6 +56,14 @@ class CapturePage(a: MainActivity) : Page(a) {
 
         col.addView(Ui.header(a, "Video quality").apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 14), 0, Ui.dp(a, 4)) })
         col.addView(TrackUi.radios(a, Quality.values().map { it.wire }, Quality.values().map { "quality:" + it.wire }, 0) { quality = Quality.values()[it] })
+        val ns0 = io.ref12.medusa.node.NodeSettings(a)
+        if (ns0.storeLibrary && ns0.vault.has()) {
+            storeProcess = android.widget.CheckBox(a).apply {
+                text = "Also process it in the index (default: store only)"; tag = "store-process"; isChecked = ns0.storeMode == io.ref12.medusa.node.StoreMode.STORE_AND_PROCESS
+                setTextColor(Ui.color(a, R.color.on_surface))
+            }
+            col.addView(Ui.muted(a, "Stored in the index after the download (YouTube videos only)", 12f)); col.addView(storeProcess)
+        }
         col.addView(Ui.button(a, "Download", primary = true) { fetch() }, Ui.lp(-1, -2, 0f, 0, 14, 0, 0, a))
 
         col.addView(Ui.header(a, "Recent jobs").apply { setPadding(Ui.dp(a, 4), Ui.dp(a, 20), 0, Ui.dp(a, 4)) })
@@ -111,6 +120,11 @@ class CapturePage(a: MainActivity) : Page(a) {
         val want = if (choice == null) Want(subtitles = false, video = true) else Want.DEFAULT
         val langs = if (choice.isNullOrEmpty()) a.app.settings.defaultLanguages.takeIf { choice == "" } ?: emptyList() else listOf(choice)
         val id = a.app.jobs.submit(JobSubmit(null, url, langs, want, quality))
+        // "Also store my downloads in the index" (node settings): YouTube videos only; each download chooses Store only or Store and process
+        val ns = io.ref12.medusa.node.NodeSettings(a)
+        if (want.video && ns.storeLibrary && ns.vault.has() && io.ref12.medusa.node.IndexStoreFiles.youtubeId(url) != null) {
+            ns.storeQueue.intend(id, if (storeProcess?.isChecked == true) io.ref12.medusa.node.StoreMode.STORE_AND_PROCESS else ns.storeMode)
+        }
         a.go(Dest.DOWNLOADS, id)
     }
 
