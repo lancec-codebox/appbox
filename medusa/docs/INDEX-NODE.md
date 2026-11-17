@@ -128,8 +128,8 @@ Rewriting a blob (Put Blob) drops its tags unless they're sent again in `x-ms-ta
   - `description.txt`: the video description, in plain text.
   - `thumb.jpg`.
   - Subtitles:
-    - `subs/<lang>.vtt` for uploaded subtitles in English (`en*`) and Chinese (`zh`, `zh-Hans`, `zh-Hant`, `zh-CN`, `zh-TW`, `zh-HK`).
-    - `subs/<lang>.auto.vtt` for YouTube's automatic captions in the same languages, when present.
+    - `subs/<lang>.vtt` for uploaded subtitles: the Chinese set (`zh`, `zh-Hans`, `zh-Hant`, `zh-CN`, `zh-TW`, `zh-HK`) and every `en` / `en-*` key listed under `subtitles` in the info JSON. Requested by exact key, never by pattern.
+    - `subs/<lang>.auto.vtt` for the original-language automatic captions only (`zh-orig`, `en-orig`), never YouTube's machine translations. `downloaded.json` may carry `subsFailed` (Medusa): tracks that were wanted but could not be fetched; that never fails the job.
     - Missing subtitles are not an error.
 - Then, written last, `downloaded.json`: `{ "v": 1, "bytes", "height", "durationSeconds", "vcodec", "acodec", "formatId", "audioLanguage", "audioNote", "audioTracks": [{ "language", "note" }], "subs": ["en", "zh-Hans.auto", ...], "embeddable": true, "nodeId", "at" }`. The audio is the original-language track when YouTube offers several (dubbed tracks are listed in `audioTracks`, not downloaded). `embeddable` comes from yt-dlp's `playable_in_embed`; the viewer plays embeddable videos through YouTube's IFrame player with our own subtitles, and falls back to the stored copy otherwise.
 - Then the node creates, for the same `jobId` and only where they don't exist yet:

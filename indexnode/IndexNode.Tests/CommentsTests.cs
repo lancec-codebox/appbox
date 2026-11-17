@@ -204,7 +204,7 @@ public class CommentsTests
         File.WriteAllText(Path.Combine(dir, "yt-dlp.sh"), """
             #!/bin/bash
             echo "$@" >> "$(dirname "$0")/calls.log"
-            args=("$@"); out=""; mode=main; ea=""; url="${args[${#args[@]}-1]}"
+            args=("$@"); out=""; mode=main; ea=""; sl=""; url="${args[${#args[@]}-1]}"
             for ((i=0;i<${#args[@]};i++)); do
               case "${args[$i]}" in
                 -o) out="${args[$((i+1))]}";;
@@ -212,16 +212,17 @@ public class CommentsTests
                 --write-auto-subs) mode=auto;;
                 --write-comments) mode=comments;;
                 --extractor-args) ea="${args[$((i+1))]}";;
+                --sub-langs) sl="${args[$((i+1))]}";;
               esac
             done
             base=$(echo "$out" | sed 's/%(ext)s$//')
             case "$mode" in
               main)
                 printf VIDEO > "${base}mp4"; printf JPG > "${base}jpg"
-                echo '{"id":"x","description":"line one\nline two","height":480,"duration":12.5,"playable_in_embed":true,"format_id":"398+251-0","vcodec":"av01.0.04M.08","acodec":"opus","requested_formats":[{"vcodec":"av01.0.04M.08","acodec":"none"},{"vcodec":"none","acodec":"opus","language":"zh-Hans","format_note":"Chinese, original (default), low"}],"formats":[{"vcodec":"none","acodec":"opus","language":"zh-Hans","format_note":"Chinese, original (default), low"},{"vcodec":"none","acodec":"opus","language":"en-US","format_note":"English (US), dubbed-auto, low"}],"comments":[{"id":"zz"}]}' > "${base}info.json";;
+                echo '{"id":"x","description":"line one\nline two","height":480,"duration":12.5,"playable_in_embed":true,"format_id":"398+251-0","vcodec":"av01.0.04M.08","acodec":"opus","requested_formats":[{"vcodec":"av01.0.04M.08","acodec":"none"},{"vcodec":"none","acodec":"opus","language":"zh-Hans","format_note":"Chinese, original (default), low"}],"formats":[{"vcodec":"none","acodec":"opus","language":"zh-Hans","format_note":"Chinese, original (default), low"},{"vcodec":"none","acodec":"opus","language":"en-US","format_note":"English (US), dubbed-auto, low"}],"subtitles":{"en":[{}],"zh-Hans":[{}]},"automatic_captions":{"en":[{}],"en-ar":[{}],"en-ja":[{}],"zh-Hans":[{}],"zh-orig":[{}]},"comments":[{"id":"zz"}]}' > "${base}info.json";;
               subs|auto)
                 if [[ "$url" == *nosubs* ]]; then echo "ERROR: There are no subtitles" >&2; exit 1; fi
-                printf "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n$mode en\n" > "${base}en.vtt"; printf "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n$mode zh\n" > "${base}zh-Hans.vtt";;
+                for l in ${sl//,/ }; do printf "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n$mode $l\n" > "${base}$l.vtt"; done;;
               comments)
                 if [[ "$ea" == *comment_sort=new* ]]; then
                   echo '{"comment_count":42,"comments":[{"id":"c2","parent":"c1","author":"B","author_id":"UCb","text":"reply","like_count":1,"timestamp":1700000100,"is_pinned":false,"author_is_uploader":true},{"id":"c3","parent":"root","author":"C","author_id":"UCc","text":"new","like_count":0,"timestamp":1700000200,"is_pinned":false,"author_is_uploader":false}]}' > "${base}info.json"
@@ -254,15 +255,16 @@ public class CommentsTests
         await new DownloadStage(new Tools(new HttpClient(), cfg), s, NoWait).RunAsync(Ctx(s, job, "download"));
 
         var id = "abcdefghij1";
-        foreach (var f in new[] { "video.mp4", "info.json", "description.txt", "thumb.jpg", "downloaded.json", "subs/en.vtt", "subs/zh-Hans.vtt", "subs/en.auto.vtt", "subs/zh-Hans.auto.vtt" })
+        foreach (var f in new[] { "video.mp4", "info.json", "description.txt", "thumb.jpg", "downloaded.json", "subs/en.vtt", "subs/zh-Hans.vtt", "subs/zh-orig.auto.vtt" })
             Assert.True(s.Exists(P.Video(id, f)), f);
         Assert.Equal("line one\nline two", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "description.txt")].Data));
         Assert.DoesNotContain("comments", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "info.json")].Data)); // comments live in their own snapshots
         Assert.Contains("subs en", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "subs/en.vtt")].Data));
-        Assert.Contains("auto en", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "subs/en.auto.vtt")].Data));
+        Assert.Contains("auto zh-orig", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "subs/zh-orig.auto.vtt")].Data));
+        Assert.False(s.Exists(P.Video(id, "subs/en.auto.vtt"))); // a translation track is never requested
 
         var marker = JsonDocument.Parse(s[P.Video(id, "downloaded.json")].Data).RootElement;
-        Assert.Equal(new[] { "en", "zh-Hans", "en.auto", "zh-Hans.auto" }.OrderBy(x => x), marker.GetProperty("subs").EnumerateArray().Select(x => x.GetString()!).OrderBy(x => x));
+        Assert.Equal(new[] { "en", "zh-Hans", "zh-orig.auto" }.OrderBy(x => x), marker.GetProperty("subs").EnumerateArray().Select(x => x.GetString()!).OrderBy(x => x));
         Assert.Equal(480, marker.GetProperty("height").GetInt32());
         Assert.Equal(12.5, marker.GetProperty("durationSeconds").GetDouble());
         Assert.Equal(("av01.0.04M.08", "opus", "398+251-0", "zh-Hans", "Chinese, original (default)"),
@@ -282,8 +284,9 @@ public class CommentsTests
 
         // two subtitle passes with the language list; no cookies anywhere
         var calls = File.ReadAllLines(Path.Combine(dir, "calls.log"));
-        Assert.Contains(calls, c => c.Contains("--write-subs") && !c.Contains("--write-auto-subs") && c.Contains(DownloadStage.SubLangs));
-        Assert.Contains(calls, c => c.Contains("--write-auto-subs") && !c.Contains("--write-subs"));
+        Assert.Contains(calls, c => c.Contains("--write-subs") && !c.Contains("--write-auto-subs") && c.Contains("--sub-langs zh-Hans,en "));
+        Assert.Contains(calls, c => c.Contains("--write-auto-subs") && !c.Contains("--write-subs") && c.Contains("--sub-langs zh-orig "));
+        Assert.DoesNotContain(calls, c => c.Contains("en.*") || c.Contains("en-ar") || c.Contains("en-ja"));
         Assert.DoesNotContain(calls, c => c.Contains("cookies"));
     }
 

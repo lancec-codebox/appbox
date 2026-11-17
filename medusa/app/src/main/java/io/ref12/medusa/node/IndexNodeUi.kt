@@ -157,7 +157,7 @@ object IndexNodeUi {
                 (if (s.backoffUntil() > now) "\nBacking off until " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(s.backoffUntil())) else "")
             val recent = s.recent()
             runs.text = "Last run: " + (if (s.lastRunAt == 0L) "never" else DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(s.lastRunAt)) + " - " + s.lastRun) +
-                "\nRecent jobs:" + (if (recent.isEmpty()) " none" else recent.take(8).joinToString("") { "\n  " + it.jobId + " " + (it.title?.take(30) ?: "") + " - " + it.result + (it.message?.let { m -> " (" + m.take(60) + ")" } ?: "") })
+                "\nRecent jobs:" + (if (recent.isEmpty()) " none" else recent.take(8).joinToString("") { "\n  " + it.jobId + " " + (it.title?.take(30) ?: "") + " - " + it.result + (it.message?.let { m -> " (" + m.take(220) + ")" } ?: "") })
         }
         refresh()
         return ::refresh

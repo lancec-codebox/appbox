@@ -31,8 +31,6 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
     /// <summary>False (`indexnode download --no-process`): the video is stored but no processing jobs are queued; `indexnode unprocessed` lists it.</summary>
     public bool QueueProcessing { get; init; } = true;
 
-    /// <summary>English (en, en-US, ...) and Chinese uploaded subtitles; zh-orig is the original-language automatic track.</summary>
-    public const string SubLangs = "en.*,zh,zh-Hans,zh-Hant,zh-CN,zh-TW,zh-HK,zh-orig";
     private static readonly string[] LangOrder = ["zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh-HK", "zh", "zh-orig", "en"];
 
     /// <summary>
@@ -106,15 +104,18 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             string? manualDir = null, autoDir = null;
             if (job.Subs != false)
             {
-                // two passes, because yt-dlp names uploaded and automatic subtitles alike (video.<lang>.vtt)
+                // exact tracks from the info JSON (never a regex: it would match every auto-translated track); two passes, because yt-dlp names uploaded and automatic subtitles alike (video.<lang>.vtt)
+                var plan = SubLangs.Plan(File.Exists(Path.Combine(work, "video.info.json")) ? File.ReadAllText(Path.Combine(work, "video.info.json")) : null);
                 foreach (var auto in new[] { false, true })
                 {
+                    var wanted = auto ? plan.AutoArg : plan.ManualArg;
+                    if (wanted.Length == 0) { Log.Info($"download {id}: no {(auto ? "original-language automatic captions" : "uploaded subtitles")} to request"); continue; }
                     ctx.Report(auto ? "auto-subs" : "subs", null);
                     var dir = Path.Combine(work, auto ? "auto" : "manual");
                     Directory.CreateDirectory(dir);
                     var subs = new List<string>(common)
                     {
-                        "--skip-download", auto ? "--write-auto-subs" : "--write-subs", "--sub-langs", SubLangs, "--sub-format", "vtt", "--convert-subs", "vtt",
+                        "--skip-download", auto ? "--write-auto-subs" : "--write-subs", "--sub-langs", wanted, "--sub-format", "vtt", "--convert-subs", "vtt",
                         "-o", Path.Combine(dir, "video.%(ext)s"), job.Url,
                     };
                     var sr = await tools.RunYtDlpAsync(subs, ct);

@@ -23,12 +23,7 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
             job.sortArgs().chunked(2).forEach { addOption(it[0], it[1]) }
             addOption("-f", job.selector()); addOption("--merge-output-format", "mp4")
             addOption("--write-info-json"); addOption("--write-thumbnail"); addOption("--convert-thumbnails", "jpg")
-            if (job.subs) {
-                addOption("--write-subs"); addOption("--write-auto-subs")
-                // Chinese first; only these are fetched
-                addOption("--sub-langs", SUB_LANGS)
-                addOption("--sub-format", "vtt"); addOption("--convert-subs", "vtt")
-            }
+            // the video only: subtitles follow in their own calls, from the exact tracks in the info JSON, so a subtitle failure cannot fail the video
             addOption("-o", File(dir, "video.%(ext)s").absolutePath)
         }
         var title: String? = null
@@ -39,7 +34,7 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
             }
         } catch (e: YoutubeDLException) {
             if (cancelled) throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
-            throw NodeFetchException(Failures.classify(e.message ?: ""), (e.message ?: "yt-dlp failed").lines().lastOrNull { it.isNotBlank() } ?: "yt-dlp failed")
+            throw NodeFetchException(Failures.classify(e.message ?: ""), Failures.errorLine(e.message ?: "yt-dlp failed"))
         } catch (e: InterruptedException) {
             throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
         }
@@ -61,31 +56,28 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
               val f = File(dir, "description.txt"); f.writeText(it, Charsets.UTF_8); extras.add(Triple("description.txt", f, "text/plain; charset=utf-8"))
           }
           File(dir, "video.jpg").takeIf { it.isFile }?.let { extras.add(Triple("thumb.jpg", it, "image/jpeg")) }
-          // subtitles: a language under "subtitles" is uploaded, one only under "automatic_captions" is automatic.
-          // yt-dlp prefers the uploaded file when both exist, so the automatic one of such a language needs a second call.
+          // subtitles: exact tracks from the info JSON, uploaded in one call and original-language automatic ones in another; a failure is recorded, not thrown
           val subFiles = LinkedHashMap<String, File>() // upload name -> file
-          fun langOf(f: File) = f.name.removePrefix("video.").removeSuffix(".vtt")
-          for (f in (dir.listFiles() ?: emptyArray()).filter { it.name.startsWith("video.") && it.name.endsWith(".vtt") }) {
-              val l = langOf(f); subFiles[if (parsed != null) NodeInfo.subName(l, parsed) else l] = f
-          }
-          if (job.subs && parsed != null && !cancelled) {
-              val both = subFiles.keys.filter { !it.endsWith(".auto") && it in parsed.auto }
-              if (both.isNotEmpty()) {
-                  val ad = File(dir, "auto").apply { mkdirs() }
-                  try {
-                      YoutubeDL.getInstance().execute(YoutubeDLRequest(job.url).apply {
-                          addOption("--no-playlist"); addOption("--no-warnings"); addOption("--skip-download"); addOption("--write-auto-subs")
-                          addOption("--sub-langs", both.joinToString(",")); addOption("--sub-format", "vtt"); addOption("--convert-subs", "vtt")
-                          addOption("-o", File(ad, "video.%(ext)s").absolutePath)
-                      }, PID) { _, _, _ -> }
-                  } catch (e: Exception) { /* missing automatic captions are not an error */ }
-                  for (f in (ad.listFiles() ?: emptyArray()).filter { it.name.endsWith(".vtt") }) subFiles[langOf(f) + ".auto"] = f
+          var subsFailed: List<String> = emptyList()
+          if (job.subs && !cancelled) {
+              val plan = SubLangs.plan(if (info.isFile) info.readText() else null)
+              subsFailed = SubLangs.fetch(plan) { auto, langs ->
+                  if (cancelled) throw InterruptedException()
+                  val sd = File(dir, if (auto) "auto" else "manual").apply { mkdirs() }
+                  YoutubeDL.getInstance().execute(YoutubeDLRequest(job.url).apply {
+                      addOption("--no-playlist"); addOption("--no-warnings"); addOption("--skip-download")
+                      addOption(if (auto) "--write-auto-subs" else "--write-subs"); addOption("--sub-langs", langs)
+                      addOption("--sub-format", "vtt"); addOption("--convert-subs", "vtt")
+                      addOption("-o", File(sd, "video.%(ext)s").absolutePath)
+                  }, PID) { _, _, _ -> }
               }
+              for (auto in listOf(false, true)) for (f in (File(dir, if (auto) "auto" else "manual").listFiles() ?: emptyArray()).filter { it.name.startsWith("video.") && it.name.endsWith(".vtt") })
+                  subFiles[f.name.removePrefix("video.").removeSuffix(".vtt") + if (auto) ".auto" else ""] = f
           }
           val names = NodeInfo.order(subFiles.keys)
           for (n in names) extras.add(Triple("subs/$n.vtt", subFiles[n]!!, "text/vtt"))
           return DownloadedFiles(video, extras, height, dur, parsed?.vcodec, parsed?.acodec, parsed?.formatId, names, parsed?.embeddable,
-              parsed?.audioLanguage, parsed?.audioNote, parsed?.audioTracks ?: emptyList())
+              parsed?.audioLanguage, parsed?.audioNote, parsed?.audioTracks ?: emptyList(), subsFailed)
     }
 
     private fun titleFrom(dir: File): String? = try { File(dir, "video.info.json").takeIf { it.isFile }?.let { JSONObject(it.readText()).optString("title").ifEmpty { null } } } catch (e: Exception) { null }
@@ -94,6 +86,5 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher) : NodeFetcher {
 
     companion object {
         const val PID = "medusa-index-node"
-        const val SUB_LANGS = "zh,zh-Hans,zh-Hant,zh-CN,zh-TW,zh-HK,en.*"
     }
 }

@@ -1,5 +1,10 @@
 # IndexNode release notes
 
+## 0.8.7
+
+- **Fix: no more requests for YouTube's machine-translated subtitle tracks.** The download passed `--sub-langs en.*,...` with `--write-auto-subs`; `en.*` matches every auto-translated track (en-ar, en-ja, ...), dozens of timedtext requests per video, and YouTube rate-limited the IP. Now the info JSON written by the main download is read first and yt-dlp gets exact keys only: uploaded = the Chinese keys present (zh, zh-Hans, zh-Hant, zh-CN, zh-TW, zh-HK) plus every `en` / `en-*` key in `subtitles`; automatic = only `*-orig` tracks of `automatic_captions` (zh-orig, en-orig). No wanted track, no call. A subtitle failure still never fails the download (only a bot block in the uploaded pass does).
+- `--ai-session-id` / `x-session-id`: every AI call goes through `AiClient.PostAsync`, which sets the header whenever a session id is configured; tests now pin it for every call type (describe, spoiler check, rewrite, glossary, translate batches, classify; chat, responses, auto and the text fallback).
+
 ## 0.8.6
 
 - GPU routing is opt-in. CPU nodes no longer hold sscd/clip/cast for 30 minutes waiting for a GPU node: they claim them at once, and the finished `frames` step writes no `gpu-ready` markers (the event-triggered GPU job has no other trigger, so it is no longer woken or billed by default).

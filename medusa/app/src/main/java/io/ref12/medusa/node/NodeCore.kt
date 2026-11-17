@@ -20,6 +20,15 @@ class NodeFetchException(val kind: FailureKind, message: String) : Exception(Red
 
 /** How a yt-dlp error is handled, exactly as the protocol says. */
 object Failures {
+    /** yt-dlp's "Unable to download video subtitles for 'en-ar': HTTP Error 429..." and similar. */
+    fun isSubtitleError(lower: String) = lower.contains("video subtitles") || lower.contains("subtitles for '") || lower.contains("unable to download subtitle")
+
+    /** The error line to keep: the last "ERROR:" line, whole (HTTP status and reason included), else the last non-blank line. */
+    fun errorLine(raw: String): String {
+        val lines = raw.lines().filter { it.isNotBlank() }
+        return (lines.lastOrNull { it.trimStart().startsWith("ERROR") } ?: lines.lastOrNull() ?: "yt-dlp failed").trim()
+    }
+
     fun classify(raw: String): FailureKind {
         val t = raw.lowercase()
         // an age gate also says "sign in to confirm", so it is checked before the bot block
@@ -27,6 +36,8 @@ object Failures {
             "join this channel", "has been removed", "been terminated", "available in your country", "blocked it in your country", "blocked in your country",
             "unsupported url", "video is not available", "this video is not available", "does not exist", "copyright", "is a private", "no video formats found")
         if (permanent.any { t.contains(it) }) return FailureKind.PERMANENT
+        // a subtitle-track error (any HTTP status) is never a bot block, whatever it says
+        if (isSubtitleError(t)) return FailureKind.TRANSIENT
         if (t.contains("not a bot") || t.contains("http error 429") || t.contains("too many requests") || t.contains("sign in to confirm")) return FailureKind.BOT
         return FailureKind.TRANSIENT
     }
@@ -227,7 +238,7 @@ class NodeRunner(
                     val marker = JSONObject().put("v", 1).put("bytes", out.video.length()).put("height", out.height ?: JSONObject.NULL)
                         .put("durationSeconds", out.durationSeconds ?: JSONObject.NULL).put("vcodec", out.vcodec ?: JSONObject.NULL)
                         .put("acodec", out.acodec ?: JSONObject.NULL).put("formatId", out.formatId ?: JSONObject.NULL)
-                        .put("subs", JSONArray(out.subs)).put("embeddable", out.embeddable ?: JSONObject.NULL)
+                        .put("subs", JSONArray(out.subs)).put("subsFailed", JSONArray(out.subsFailed)).put("embeddable", out.embeddable ?: JSONObject.NULL)
                         .put("audioLanguage", out.audioLanguage ?: JSONObject.NULL).put("audioNote", out.audioNote ?: JSONObject.NULL)
                         .put("audioTracks", JSONArray().also { a -> out.audioTracks.forEach { a.put(JSONObject().put("language", it.first).put("note", it.second ?: JSONObject.NULL)) } }).put("nodeId", cfg.nodeId).put("at", at)
                     api.put(base + "downloaded.json", marker.toString().toByteArray(), "application/json")
@@ -271,7 +282,7 @@ class NodeRunner(
                 (if (next != null) ", next window " + SimpleDateFormat("EEE d MMM HH:mm", Locale.US).apply { timeZone = TimeZone.getTimeZone(env.zone) }.format(Date(next)) else ", in a window now"))
 
     private fun handleFailure(e: Exception, ref: JobRef, leaseId: String, jobText: String, wasCancelled: Boolean, stopped: Boolean, title: String?, s: Summary): Outcome {
-        val msg = Redact.sas(e.message ?: e.javaClass.simpleName).take(300)
+        val msg = Redact.sas(e.message ?: e.javaClass.simpleName).take(500)
         if (wasCancelled || e is BlobCancelled) { // stop, system stop or a lost lease: let go without counting an attempt
             release(ref.name, leaseId); s.released++
             state.record(JobLogEntry(ref.id, title, "released", env.clock(), if (stopped) "stopped" else "lease lost"))
@@ -376,6 +387,8 @@ class DownloadedFiles(
     val vcodec: String? = null, val acodec: String? = null, val formatId: String? = null,
     val subs: List<String> = emptyList(), val embeddable: Boolean? = null,
     val audioLanguage: String? = null, val audioNote: String? = null, val audioTracks: List<Pair<String, String?>> = emptyList(),
+    /** Subtitle tracks that were wanted but could not be fetched ("lang" or "lang.auto"); they never fail the job. */
+    val subsFailed: List<String> = emptyList(),
 )
 
 /** What the node reads from yt-dlp's info.json. */

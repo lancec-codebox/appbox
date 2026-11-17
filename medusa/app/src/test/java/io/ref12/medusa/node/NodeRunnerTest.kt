@@ -79,6 +79,7 @@ const val SAMPLE_INFO = """{"format_id":"394+251","vcodec":"av01.0.00M.08","acod
 class FakeFetcher(private val behavior: (DownloadJob, File, FakeFetcher) -> Unit = { _, _, _ -> }) : NodeFetcher {
     @Volatile var cancelled = false
     val jobs = ArrayList<DownloadJob>()
+    var subsFailed: List<String> = emptyList()
     override fun cancel() { cancelled = true }
     override fun download(job: DownloadJob, dir: File, progress: (String?, String?) -> Unit): DownloadedFiles {
         jobs.add(job); dir.mkdirs(); progress("download 10%", "Title " + job.jobId)
@@ -90,7 +91,7 @@ class FakeFetcher(private val behavior: (DownloadJob, File, FakeFetcher) -> Unit
         val sub = File(dir, "video.zh-Hans.vtt").apply { writeText("WEBVTT") }
         val subs = NodeInfo.order(listOf("zh-Hans", "en", "zh-Hans.auto"))
         return DownloadedFiles(v, listOf(Triple("info.json", info, "application/json"), Triple("description.txt", desc, "text/plain; charset=utf-8"), Triple("subs/zh-Hans.vtt", sub, "text/vtt")),
-            480, 61.5, p.vcodec, p.acodec, p.formatId, subs, p.embeddable, p.audioLanguage, p.audioNote, p.audioTracks)
+            480, 61.5, p.vcodec, p.acodec, p.formatId, subs, p.embeddable, p.audioLanguage, p.audioNote, p.audioTracks, subsFailed)
     }
 }
 
@@ -276,6 +277,16 @@ class NodeRunnerTest {
         assertEquals(0, f2.jobs.size); assertEquals("backing off", s2.endReason)
         now += 3_600_001L
         runner(f2).run(); assertEquals(2, f2.jobs.size)
+    }
+
+    @Test fun aSubtitleFailureLeavesTheJobDoneWithTheTracksRecordedAsFailed() {
+        api.addJob("aaaaaaaaaaa", 1)
+        val f = FakeFetcher(); f.subsFailed = listOf("en", "zh-orig.auto")
+        val s = runner(f).run()
+        assertEquals(1, s.done); assertEquals(0, s.failed); assertEquals(0L, state.backoff)
+        val marker = JSONObject(String(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"]!!.bytes))
+        assertEquals("[\"en\",\"zh-orig.auto\"]", marker.getJSONArray("subsFailed").toString())
+        assertEquals("done", api.job("aaaaaaaaaaa").tags["idx_state"])
     }
 
     @Test fun theDailyCapStopsClaiming() {
