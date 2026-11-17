@@ -4,7 +4,9 @@ on:
   push:
     branches: ["**"]
     paths: ["indexnode/**", ".github/workflows/indexnode.yml"]
-    tags: ["indexnode-v*"]
+  # Manual rebuild/publish of the version in the source (publishes only when its tag does not exist yet).
+  # There is no tag trigger: the release job creates the tag itself, and a tag made with GITHUB_TOKEN does not start a workflow anyway.
+  workflow_dispatch:
   pull_request:
     paths: ["indexnode/**", ".github/workflows/indexnode.yml"]
 
@@ -32,20 +34,63 @@ jobs:
       - name: Test
         run: dotnet test IndexNode.Tests --no-build
 
+  plan:
+    # Does this push carry a version nobody has released yet? (Cheap; the release job checks again under its lock.)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' indexnode/IndexNode/IndexNode.csproj | head -1)"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "cannot read <Version> from indexnode/IndexNode/IndexNode.csproj (got '$VERSION')"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/indexnode-v$VERSION" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"; echo "indexnode-v$VERSION already exists: build and test only"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"; echo "indexnode-v$VERSION is new: the release job publishes it"
+          fi
+
   release:
-    if: startsWith(github.ref, 'refs/tags/indexnode-v')
-    needs: test
+    # The self-contained, framework-dependent and GPU single files of this commit become the versioned release. Only from main, only for a version without a tag.
+    if: needs.plan.outputs.publish == 'true'
+    needs: [test, plan]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    concurrency:
+      # two pushes to main can never publish at the same time; the second finds the tag and does nothing
+      group: indexnode-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: indexnode-v${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Is the tag still free?
+        id: free
+        working-directory: ${{ github.workspace }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "free=false" >> "$GITHUB_OUTPUT"; echo "$TAG exists already (another run published it): nothing to do"
+          else
+            echo "free=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-dotnet@v4
+        if: steps.free.outputs.free == 'true'
         with:
           dotnet-version: 10.0.x
       - name: Publish single-file builds
+        if: steps.free.outputs.free == 'true'
         run: |
-          VERSION="${GITHUB_REF_NAME#indexnode-v}"
           mkdir -p dist
           for RID in win-x64 linux-x64; do
             if [ "$RID" = win-x64 ]; then EXT=.exe; else EXT=; fi
@@ -68,9 +113,14 @@ jobs:
           (cd dist && for f in indexnode-*; do sha256sum "$f" > "$f.sha256"; done)
           ls -l dist
       - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
+        if: steps.free.outputs.free == 'true'
         run: |
-          VERSION="${GITHUB_REF_NAME#indexnode-v}"
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "IndexNode $VERSION" --generate-notes --latest=false
+          set -euo pipefail
+          # notes: this version's section of RELEASE-NOTES.md ("## 0.8.7"), else generated
+          awk -v h="## $VERSION" '$0 == h {on=1; next} /^## / {on=0} on' RELEASE-NOTES.md > "$RUNNER_TEMP/notes.md"
+          if grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then NOTES=(--notes-file "$RUNNER_TEMP/notes.md"); else NOTES=(--generate-notes); fi
+          # --target makes gh create the tag at this commit
+          if ! gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "IndexNode $VERSION" "${NOTES[@]}" --latest=false; then
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then echo "$TAG was created meanwhile: nothing to do"; exit 0; fi
+            exit 1
+          fi

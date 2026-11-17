@@ -41,7 +41,7 @@ cd medusa
 ./gradlew :app:connectedDebugAndroidTest              # local-server smoke tests, needs an emulator or phone
 ```
 
-JDK 17, Android SDK 36. Releases: push a tag `medusa-vX.Y.Z`; `.github/workflows/medusa.yml` builds `medusa-X.Y.Z.apk`, signs it (secrets and key alias: see `docs/RELEASE.md`) and attaches it to a GitHub Release.
+JDK 17, Android SDK 36. Releases: bump `appVersion` in `app/build.gradle.kts`, add `docs/RELEASE-NOTES-X.Y.Z.md` and land it on main. The main build (`.github/workflows/medusa.yml`) tests, then, when the tag `medusa-vX.Y.Z` does not exist yet, builds `medusa-X.Y.Z.apk` once, signs it (secrets and key alias: see `docs/RELEASE.md`), creates the tag at that commit and publishes the GitHub Release (notes from the notes file) and `medusa-latest`. A push without a version bump only builds. Do not push release tags by hand.
 
 ## How it works
 

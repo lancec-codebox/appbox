@@ -8,4 +8,4 @@ Small open-source apps, in one repository: <https://github.com/lancec-codebox/ap
 | [Reveal current tab](tab-reveal/) | Brave/Chromium extension: one shortcut scrolls the current tab back into view in a long vertical tab strip. |
 | [IndexNode](indexnode/) | Desktop node of the drama index, the counterpart of Medusa: downloads, frames, descriptors and AV1 compression over a shared blob container. Windows and Linux command-line tool. |
 
-Each app lives in its own folder with its own README, build and release workflow. Releases: <https://github.com/lancec-codebox/appbox/releases> (tags `medusa-v*` for Medusa, `indexnode-v*` for IndexNode). Licence: see `LICENSE`.
+Each app lives in its own folder with its own README, build and release workflow. Releases: <https://github.com/lancec-codebox/appbox/releases> (tags `medusa-v*` for Medusa, `indexnode-v*` for IndexNode). To release, bump the version in the source and land it on main: the main build publishes once and creates the tag itself. Licence: see `LICENSE`.

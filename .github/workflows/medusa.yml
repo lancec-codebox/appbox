@@ -4,7 +4,8 @@ on:
   push:
     branches: ["**"]
     paths: ["medusa/**", ".github/workflows/medusa.yml"]
-    tags: ["medusa-v*"]
+  # Manual rebuild/publish of the version in the source (publishes only when its tag does not exist yet).
+  # There is no tag trigger: the release job creates the tag itself, and a tag made with GITHUB_TOKEN does not start a workflow anyway.
   workflow_dispatch:
   pull_request:
     paths: ["medusa/**", ".github/workflows/medusa.yml"]
@@ -59,20 +60,65 @@ jobs:
           working-directory: medusa
           script: ./gradlew --no-daemon :app:connectedDebugAndroidTest
 
+  plan:
+    # Does this push carry a version nobody has released yet? (Cheap; the release job checks again under its lock.)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -nE 's/^val appVersion = .*\?: "([^"]+)".*/\1/p' medusa/app/build.gradle.kts | head -1)"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "cannot read the Medusa version from medusa/app/build.gradle.kts (got '$VERSION')"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/medusa-v$VERSION" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"; echo "medusa-v$VERSION already exists: build only"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"; echo "medusa-v$VERSION is new: the release job publishes it"
+          fi
+
   release:
-    if: startsWith(github.ref, 'refs/tags/medusa-v')
-    needs: build
+    # One signed build of this commit becomes the versioned release (and the stable link). Only from main, only for a version without a tag.
+    if: needs.plan.outputs.publish == 'true'
+    needs: [build, plan]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    concurrency:
+      # two pushes to main can never publish at the same time; the second finds the tag and does nothing
+      group: medusa-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: medusa-v${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Is the tag still free?
+        id: free
+        working-directory: ${{ github.workspace }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "free=false" >> "$GITHUB_OUTPUT"; echo "$TAG exists already (another run published it): nothing to do"
+          else
+            echo "free=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-java@v4
+        if: steps.free.outputs.free == 'true'
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
+        if: steps.free.outputs.free == 'true'
       - name: Build signed release APK
+        if: steps.free.outputs.free == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.MEDIA_HELPER_KEYSTORE_BASE64 }}
           MEDUSA_KEYSTORE_PASSWORD: ${{ secrets.MEDIA_HELPER_KEYSTORE_PASSWORD }}
@@ -82,36 +128,37 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$KEYSTORE_BASE64" || { echo "release key secrets are not set"; exit 1; }
-          VERSION="${GITHUB_REF_NAME#medusa-v}"
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           export MEDUSA_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
-          # versionCode from the tag: 1.2.3 -> 10203
+          # versionCode from the version: 1.2.3 -> 10203
           IFS=. read -r MA MI PA <<< "${VERSION%%-*}"
           CODE=$((MA * 10000 + MI * 100 + PA))
           ./gradlew --no-daemon :app:assembleRelease -PversionName="$VERSION" -PversionCode="$CODE"
           rm -f "$RUNNER_TEMP/release.jks"
           ls -l app/build/outputs/apk/release
       - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
+        if: steps.free.outputs.free == 'true'
         run: |
-          VERSION="${GITHUB_REF_NAME#medusa-v}"
+          set -euo pipefail
           APK="app/build/outputs/apk/release/medusa-$VERSION.apk"
           # the in-app updater verifies its download against this checksum file
           scripts/make-release-assets.sh "$APK"
-          gh release create "$GITHUB_REF_NAME" "$APK" "$APK.sha256" \
-            --title "Medusa $VERSION" --generate-notes
+          NOTES_FILE="docs/RELEASE-NOTES-$VERSION.md"
+          if [ -f "$NOTES_FILE" ]; then NOTES=(--notes-file "$NOTES_FILE"); else NOTES=(--generate-notes); fi
+          # --target makes gh create the tag at this commit
+          if ! gh release create "$TAG" "$APK" "$APK.sha256" --target "$GITHUB_SHA" --title "Medusa $VERSION" "${NOTES[@]}"; then
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then echo "$TAG was created meanwhile: nothing to do"; exit 0; fi
+            exit 1
+          fi
       - name: Update the stable install link (medusa-latest)
-        env:
-          GH_TOKEN: ${{ github.token }}
+        if: steps.free.outputs.free == 'true'
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#medusa-v}"
           APK="app/build/outputs/apk/release/medusa-$VERSION.apk"
           # a fixed release with a fixed asset name: .../releases/download/medusa-latest/medusa.apk
           # never "latest" (make_latest false), so IndexNode releases and this one never fight over the Latest badge
           cp "$APK" "$RUNNER_TEMP/medusa.apk"
-          NOTES="Stable install link for the newest Medusa ($VERSION). Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME"
+          NOTES="Stable install link for the newest Medusa ($VERSION). Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
           if gh release view medusa-latest >/dev/null 2>&1; then
             gh release edit medusa-latest --title "Medusa (latest: $VERSION)" --notes "$NOTES" --prerelease=false --latest=false
           else
@@ -121,7 +168,8 @@ jobs:
 
   pages:
     # The https setup page (medusa/web/setup). Needs Pages enabled on the repo with source "GitHub Actions".
-    if: startsWith(github.ref, 'refs/tags/medusa-v') || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Only from main: the github-pages environment accepts no other ref.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read

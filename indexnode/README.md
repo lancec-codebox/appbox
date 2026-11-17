@@ -55,7 +55,7 @@ dotnet build indexnode/IndexNode.Tests
 dotnet test indexnode/IndexNode.Tests
 ```
 
-Releases: push a tag `indexnode-vX.Y.Z`; the workflow publishes single-file, framework-dependent `indexnode` for `win-x64` and `linux-x64` with a `.sha256` each. The version comes from the tag.
+Releases: bump `<Version>` in `IndexNode/IndexNode.csproj`, add a `## X.Y.Z` section to `RELEASE-NOTES.md` and land it on main. The main build tests, then, when the tag `indexnode-vX.Y.Z` does not exist yet, publishes the single-file (self-contained, framework-dependent, GPU) builds for `win-x64` and `linux-x64` with a `.sha256` each, creating the tag at that commit. A push without a version bump only builds and tests. Do not push release tags by hand.
 
 ## Nexis
 
@@ -97,6 +97,6 @@ Big blobs may be Nexis ghosts. [`IndexNode/Tools/NexisGhost.cs`](IndexNode/Tools
 
 ### Container and Azure Container Apps job
 
-`indexnode/Dockerfile` (nvidia/cuda 12.8 + cuDNN 9 + .NET 10; ORT 1.23.2 GPU matches CUDA 12, CUDA 13 builds of ORT start at 1.27) is built and pushed to `ghcr.io/<owner>/indexnode-gpu` by `.github/workflows/indexnode-gpu.yml` on `indexnode-v*` tags or by hand. `--build-arg BAKE_MODELS=1` bakes the models in.
+`indexnode/Dockerfile` (nvidia/cuda 12.8 + cuDNN 9 + .NET 10; ORT 1.23.2 GPU matches CUDA 12, CUDA 13 builds of ORT start at 1.27) is built and pushed to `ghcr.io/<owner>/indexnode-gpu` by `.github/workflows/indexnode-gpu.yml` on a push to main with a new IndexNode version (no image for it yet), or by hand. `--build-arg BAKE_MODELS=1` bakes the models in.
 
 `indexnode/deploy/gpu-job.bicep` is an event-triggered job (`Microsoft.App/jobs`, A100 workload profile) with the KEDA `azure-blob` scaler on `index/gpu-ready/`. It is **not deployed** by anything here. Parameters you supply: the environment id, the workload profile name, the image, the container SAS (`INDEXNODE_SAS_URL`) and a scaler connection string (`BlobEndpoint=...;SharedAccessSignature=...`, list + read on the container). After deploying, check that one marker starts exactly one execution (`az containerapp job execution list`), and that the execution ends 10 minutes after the last marker is gone.
