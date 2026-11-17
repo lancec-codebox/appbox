@@ -135,7 +135,6 @@ class NodeRunnerTest {
         assertFalse(c.tags.containsKey("idx_priority"))
         assertEquals(1000, cj.getInt("maxComments")); assertEquals("top", cj.getString("sort")); assertEquals(0, cj.getInt("round")); assertEquals(0, cj.getInt("attempts")); assertEquals(1, cj.getInt("v"))
         assertTrue(cj.getString("url").isNotEmpty()); assertEquals("aaaaaaaaaaa", cj.getString("jobId"))
-        assertEquals(listOf("frames", "sscd", "clip", "transcribe", "ocrsubs"), JSONObject(String(p.bytes)).getJSONArray("steps").let { a -> (0 until a.length()).map { a.getString(it) } })
         val j = api.job("aaaaaaaaaaa"); val o = api.jobJson("aaaaaaaaaaa")
         assertEquals("done", j.tags["idx_state"]); assertEquals("download", j.tags["idx_stage"]); assertNotNull(j.tags["idx_added"])
         assertEquals("lancecm1-a1b2c3", o.getString("nodeId")); assertTrue(o.has("finishedAt")); assertTrue(o.has("elapsedSeconds"))

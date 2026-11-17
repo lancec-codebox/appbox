@@ -106,7 +106,7 @@ class SourcesTest {
         assertEquals(25, o.getInt("priority")); assertEquals(25, o.getInt("ownPriority")); assertEquals("25", b.tags["idx_priority"])
         IndexVideo.add(api, "eeeeeeeeeee", 1_800_000_000_000L)
         assertFalse(api.blobs["index/jobs/download/eeeeeeeeeee.json"]!!.tags.containsKey("idx_priority"))
-        try { IndexVideo.add(api, "fffffffffff", 1L, 5000); fail() } catch (e: IllegalArgumentException) { }
+        assertTrue(IndexVideo.add(api, "fffffffffff", 1L, 5000) is AddResult.Failed); assertNull(api.blobs["index/jobs/download/fffffffffff.json"])
     }
 
     @Test fun changingASourcePriorityRetagsItsPendingJobsAndStepsOnly() {

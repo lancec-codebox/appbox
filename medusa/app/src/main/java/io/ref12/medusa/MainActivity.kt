@@ -165,7 +165,7 @@ class MainActivity : Activity() {
 
     private fun refreshDrawer() {
         drawerItems.removeAllViews()
-        val icons = mapOf(Dest.LIBRARY to R.drawable.ic_library, Dest.CAPTURE to R.drawable.ic_capture, Dest.DOWNLOADS to R.drawable.ic_downloads, Dest.SETTINGS to R.drawable.ic_settings, Dest.ABOUT to R.drawable.ic_info)
+        val icons = mapOf(Dest.LIBRARY to R.drawable.ic_library, Dest.CAPTURE to R.drawable.ic_capture, Dest.DOWNLOADS to R.drawable.ic_downloads, Dest.INDEX_NODE to R.drawable.ic_downloads, Dest.INDEX_SETTINGS to R.drawable.ic_settings, Dest.SETTINGS to R.drawable.ic_settings, Dest.ABOUT to R.drawable.ic_info)
         for (d in Dest.values().filter { it.top }) {
             val on = d == nav.highlighted
             val row = LinearLayout(this).apply {
@@ -224,6 +224,8 @@ class MainActivity : Activity() {
             Dest.LIBRARY -> LibraryPage(this)
             Dest.CAPTURE -> CapturePage(this)
             Dest.DOWNLOADS -> DownloadsPage(this, s.arg)
+            Dest.INDEX_NODE -> IndexNodePage(this)
+            Dest.INDEX_SETTINGS -> IndexNodeSettingsPage(this)
             Dest.SETTINGS -> SettingsPage(this)
             Dest.ABOUT -> AboutPage(this)
             Dest.ITEM -> ItemPage(this, s.arg!!)

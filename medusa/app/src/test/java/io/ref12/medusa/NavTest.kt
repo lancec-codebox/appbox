@@ -53,4 +53,13 @@ class NavTest {
         assertEquals(Dest.LIBRARY, NavStack.restore(null).current.dest)
         assertEquals(Dest.LIBRARY, NavStack.restore(arrayOf("junk|x")).current.dest)
     }
+
+    @Test fun theIndexNodeScreensAreTopLevelEntriesOfTheirOwn() {
+        val tops = Dest.values().filter { it.top }
+        assertTrue(Dest.INDEX_NODE in tops && Dest.INDEX_SETTINGS in tops && Dest.SETTINGS in tops)
+        val n = NavStack(); n.goTop(Dest.INDEX_NODE); n.goTop(Dest.INDEX_SETTINGS)
+        assertEquals(Dest.INDEX_SETTINGS, n.highlighted)
+        assertTrue(n.back()); assertEquals(Dest.LIBRARY, n.current.dest) // top-level entries replace each other; neither sits under the other
+        assertEquals(Screen(Dest.INDEX_SETTINGS), Screen.decode(Screen(Dest.INDEX_SETTINGS).encode()))
+    }
 }

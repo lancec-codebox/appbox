@@ -46,11 +46,11 @@ object NodeStatus {
 
     /** Progress text changes at most every [minMs]; anything else (a new state) goes through at once. */
     class Throttle(private val minMs: Long = 4000, private val clock: () -> Long = System::currentTimeMillis) {
-        private var lastText: String? = null; private var lastAt = 0L
+        private var lastText: String? = null; private var lastAt: Long? = null
         fun allow(text: String, progressOnly: Boolean): Boolean {
             val now = clock()
             if (text == lastText) return false
-            if (progressOnly && now - lastAt < minMs) return false
+            if (progressOnly && lastAt != null && now - lastAt!! < minMs) return false
             lastText = text; lastAt = now; return true
         }
     }

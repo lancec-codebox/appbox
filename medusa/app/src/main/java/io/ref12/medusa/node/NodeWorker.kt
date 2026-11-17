@@ -102,6 +102,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
     companion object {
         const val CHANNEL = "index_node"; const val NOTIF_ID = 4217; const val STATUS_ID = 4218; const val UNIQUE = "index-node"; const val UNIQUE_NOW = "index-node-now"
         private val RUNNING = AtomicBoolean(false)
+        val isRunning get() = RUNNING.get()
 
         private fun constraints(needsCharging: Boolean) = Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).setRequiresBatteryNotLow(true).setRequiresStorageNotLow(true)
             .setRequiresCharging(needsCharging).build()
@@ -157,21 +158,29 @@ object StatusNotifier {
 
     fun notificationsAllowed(ctx: Context): Boolean = androidx.core.app.NotificationManagerCompat.from(ctx).areNotificationsEnabled()
 
+    /** The status as the node screen and the notification show it, worked out from the settings and the device. [after] is the state at the end of a run. */
+    fun statusInput(ctx: Context, s: NodeSettings, after: StatusInput? = null): StatusInput {
+        if (!s.enabled) return StatusInput(enabled = false)
+        val day = NodeRunner.day(System.currentTimeMillis())
+        val wait = deviceWait(ctx, s.conditions == NodeConditions.CHARGING_WIFI)
+        val sinceMin = if (s.lastRunAt == 0L) 0 else ((System.currentTimeMillis() - s.lastRunAt) / 60_000).toInt()
+        return when {
+            NodeWorker.isRunning -> StatusInput(downloading = true, doneToday = s.doneToday(day), cap = s.dailyCap)
+            s.lastControl.startsWith("stop") -> StatusInput(stoppedByOwner = true, message = s.lastControl.substringAfter(" - ", "").ifEmpty { null })
+            wait != Wait.NONE -> StatusInput(wait = wait)
+            after != null -> after
+            s.doneToday(day) >= s.dailyCap -> StatusInput(doneToday = s.doneToday(day), cap = s.dailyCap, capReached = true)
+            else -> StatusInput(nextCheckMin = (15 - sinceMin).coerceIn(1, 15))
+        }
+    }
+
+    fun statusText(ctx: Context, s: NodeSettings): String = try { NodeStatus.text(statusInput(ctx, s)) } catch (e: Exception) { "Status unavailable" }
+
     /** Posts the status when it changed (a new state, not a timer). [after] is the state at the end of a run; null: work it out from the device. */
     fun refresh(ctx: Context, s: NodeSettings, after: StatusInput?) {
         try {
             if (!s.enabled || !s.vault.has() || !s.statusNotification) { cancel(ctx); return }
-            val day = NodeRunner.day(System.currentTimeMillis())
-            val wait = deviceWait(ctx, s.conditions == NodeConditions.CHARGING_WIFI)
-            val sinceMin = if (s.lastRunAt == 0L) 0 else ((System.currentTimeMillis() - s.lastRunAt) / 60_000).toInt()
-            val st = when {
-                wait != Wait.NONE -> StatusInput(wait = wait)
-                after != null -> after
-                s.doneToday(day) >= s.dailyCap -> StatusInput(doneToday = s.doneToday(day), cap = s.dailyCap, capReached = true)
-                s.lastControl.startsWith("stop") -> StatusInput(stoppedByOwner = true, message = s.lastControl.substringAfter(" - ", "").ifEmpty { null })
-                else -> StatusInput(nextCheckMin = (15 - sinceMin).coerceIn(1, 15))
-            }
-            val text = NodeStatus.text(st)
+            val text = NodeStatus.text(statusInput(ctx, s, after))
             if (text == s.lastStatus) return
             s.lastStatus = text
             channel(ctx).notify(NodeWorker.STATUS_ID, build(ctx, text, false))

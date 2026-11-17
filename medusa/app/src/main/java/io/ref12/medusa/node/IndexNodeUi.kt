@@ -17,7 +17,8 @@ import java.util.Date
 
 /** The "Index node" group of the settings screen. */
 object IndexNodeUi {
-    fun build(a: MainActivity, card: LinearLayout) {
+    /** Index node settings screen: configuration only. */
+    fun buildSettings(a: MainActivity, card: LinearLayout) {
         val s = NodeSettings(a)
         // shown only when Android blocks this app's notifications; the button opens Medusa's notification settings
         val notifWarnView = LinearLayout(a).apply {
@@ -48,10 +49,6 @@ object IndexNodeUi {
             setOnCheckedChangeListener { _, on -> s.statusNotification = on; s.lastStatus = ""; NodeWorker.schedule(a, s) }
         })
         card.addView(notifWarnView)
-        card.addView(Ui.button(a, "Run now") {
-            if (!s.enabled || !s.vault.has()) { Toast.makeText(a, "Enable the node and save a SAS first", Toast.LENGTH_LONG).show(); return@button }
-            NodeWorker.runNow(a, s); Toast.makeText(a, "Started one run (Wi-Fi, battery, cap, budget and control still apply)", Toast.LENGTH_LONG).show()
-        }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.muted(a, "Node name"), Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
         val name = field("Node name", s.name, "node-name"); card.addView(name)
         card.addView(Ui.muted(a, "Run when"), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
@@ -72,22 +69,16 @@ object IndexNodeUi {
         val sasField = field("https://<account>.blob.core.windows.net/<container>?...", "", "node-sas", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         card.addView(sasField)
         card.addView(sasInfo)
-        val status = Ui.muted(a, "", 13f)
+        val testInfo = Ui.muted(a, "", 13f)
         fun refresh() {
             val u = s.vault.load()
             sasInfo.text = if (u == null) "No SAS saved" else "Saved: " + u.container + " - can " + SasUrl.describe(u.permissions) + (u.expiry?.let { " - expires $it" } ?: "")
-            val recent = s.recent()
             limitsInfo.text = if (s.lastLimits.isNotEmpty()) "Now: " + s.lastLimits else {
                 val e = RunLimits.resolve(s.localLimits(), Control.RUN, s.nodeId)
                 val left = RunLimits.remaining(e, s)
                 "Now: " + (if (left != null) "budget left $left" else "no budget") + "; " + (e.schedule?.let { sc ->
                     sc.nextStart(System.currentTimeMillis(), java.time.ZoneId.systemDefault())?.let { "next window " + DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(it)) } } ?: "any time")
             }
-            status.text = "Node id: " + s.nodeId + "\nControl: " + (s.lastControl.ifEmpty { "not read yet" }) + "\nLast run: " +
-                (if (s.lastRunAt == 0L) "never" else DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(s.lastRunAt)) + " - " + s.lastRun) +
-                "\nDownloads today: " + s.doneToday(NodeRunner.day(System.currentTimeMillis())) + " of " + s.dailyCap +
-                (if (s.backoffUntil() > System.currentTimeMillis()) "\nBacking off until " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(s.backoffUntil())) else "") +
-                "\nRecent jobs:" + (if (recent.isEmpty()) " none" else recent.take(8).joinToString("") { "\n  " + it.jobId + " " + (it.title?.take(30) ?: "") + " - " + it.result + (it.message?.let { m -> " (" + m.take(60) + ")" } ?: "") })
         }
         fun save() {
             s.name = name.text.toString()
@@ -122,7 +113,7 @@ object IndexNodeUi {
         card.addView(Ui.button(a, "Test connection") {
             val u = s.vault.load()
             if (u == null) { Toast.makeText(a, "Save a SAS first", Toast.LENGTH_SHORT).show(); return@button }
-            status.text = "Testing\u2026"
+            testInfo.text = "Testing\u2026"
             Thread {
                 val msg = try {
                     val c = BlobClient(u)
@@ -133,13 +124,43 @@ object IndexNodeUi {
                         (if (!u.can('f')) "\nNo 'f': jobs are found by listing with tags instead." else "") +
                         (if (listOf('r', 'c', 'w', 'l').any { !u.can(it) }) "\nThe node needs r, c, w and l at least." else "") + "\nControl: " + s.lastControl
                 } catch (e: Exception) { "Failed: " + Redact.sas(e.message) }
-                a.runOnUiThread { refresh(); status.text = msg + "\n\n" + status.text }
+                a.runOnUiThread { refresh(); testInfo.text = msg }
             }.start()
         }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
         card.addView(Ui.button(a, "Forget SAS", danger = true) { s.vault.clear(); NodeWorker.schedule(a, s); refresh() }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
-        card.addView(status, Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
-        sourcesSection(a, s, card)
+        card.addView(testInfo, Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
         refresh()
+    }
+
+    /** Index node screen. Returns the function that refreshes its live parts (called by the page's tick). */
+    fun buildMain(a: MainActivity, card: LinearLayout): () -> Unit {
+        val s = NodeSettings(a)
+        val line = Ui.text(a, "", 15f, bold = true).apply { tag = "node-status-line" }
+        card.addView(line)
+        val info = Ui.muted(a, "", 12f).apply { tag = "node-status-info" }
+        card.addView(info, Ui.lp(-1, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.button(a, "Run now") {
+            if (!s.enabled || !s.vault.has()) { Toast.makeText(a, "Turn the node on and save a SAS in Index node settings first", Toast.LENGTH_LONG).show(); return@button }
+            NodeWorker.runNow(a, s); Toast.makeText(a, "Started one run (Wi-Fi, battery, cap, budget and control still apply)", Toast.LENGTH_LONG).show()
+        }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
+        card.addView(Ui.button(a, "Index node settings") { a.go(io.ref12.medusa.Dest.INDEX_SETTINGS) }, Ui.lp(-2, -2, 0f, 0, 4, 0, 0, a))
+        card.addView(Ui.header(a, "Last runs"), Ui.lp(-1, -2, 0f, 0, 12, 0, 0, a))
+        val runs = Ui.muted(a, "", 13f).apply { tag = "node-recent" }
+        card.addView(runs)
+        sourcesSection(a, s, card)
+        fun refresh() {
+            val now = System.currentTimeMillis()
+            line.text = StatusNotifier.statusText(a, s)
+            info.text = "Node id: " + s.nodeId + "\nControl: " + (s.lastControl.ifEmpty { "not read yet" }) +
+                (if (s.lastLimits.isNotEmpty()) "\nNow: " + s.lastLimits else "") +
+                "\nDownloads today: " + s.doneToday(NodeRunner.day(now)) + " of " + s.dailyCap +
+                (if (s.backoffUntil() > now) "\nBacking off until " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(s.backoffUntil())) else "")
+            val recent = s.recent()
+            runs.text = "Last run: " + (if (s.lastRunAt == 0L) "never" else DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(s.lastRunAt)) + " - " + s.lastRun) +
+                "\nRecent jobs:" + (if (recent.isEmpty()) " none" else recent.take(8).joinToString("") { "\n  " + it.jobId + " " + (it.title?.take(30) ?: "") + " - " + it.result + (it.message?.let { m -> " (" + m.take(60) + ")" } ?: "") })
+        }
+        refresh()
+        return ::refresh
     }
 
     const val ADMIN_URL = "https://apps--hexad-project.ref12.dev/local-apps/drama-admin/"

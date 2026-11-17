@@ -9,7 +9,7 @@ import android.widget.ScrollView
 import android.widget.Toast
 import java.io.File
 
-/** Settings in groups: Subtitles, Background, Web apps, Updates, Storage. */
+/** App-wide settings in groups: Subtitles, Background, Web apps, Updates, Storage. The index node has its own two screens. */
 class SettingsPage(a: MainActivity) : Page(a) {
     override val title = "Settings"
     private lateinit var storageText: android.widget.TextView
@@ -49,8 +49,6 @@ class SettingsPage(a: MainActivity) : Page(a) {
         bg.addView(TrackUi.radios(a, KeepAliveMode.values().map { it.label }, KeepAliveMode.values().map { "keepalive:" + it.minutes }, a.app.settings.keepAlive.ordinal) {
             a.app.settings.keepAlive = KeepAliveMode.values()[it]
         })
-
-        io.ref12.medusa.node.IndexNodeUi.build(a, section("Index node"))
 
         val web = section("Web apps")
         web.addView(Ui.muted(a, "Allowed origins, one per line"))
