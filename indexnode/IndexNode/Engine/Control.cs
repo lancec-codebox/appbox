@@ -47,6 +47,18 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         return cur;
     }
 
+    /// <summary>indexnode control --max-per-ip N|off: the per-IP download cap (downloads.maxPerIp); off removes it. Everything else in the file stays.</summary>
+    public static async Task<ControlFile> SetMaxPerIpAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        if (value.Equals("off", StringComparison.OrdinalIgnoreCase) || value == "0") cur.Downloads = null;
+        else if (int.TryParse(value, out var n) && n > 0) cur.Downloads = new DownloadsControl { MaxPerIp = n };
+        else throw new ArgumentException("--max-per-ip must be a positive number or off");
+        cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        return cur;
+    }
+
     /// <summary>indexnode control run|drain|stop [--stage S] [--message M]</summary>
     public static async Task<ControlFile> WriteAsync(IStore store, Paths paths, string level, string? stage, string? message, string changedBy, CancellationToken ct)
     {

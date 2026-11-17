@@ -73,6 +73,10 @@ public sealed class EngineOptions
     public string StorageRegion { get; init; } = "westus2";
     /// <summary>Tests replace the placement probe (IMDS and the storage connect time).</summary>
     public Func<CancellationToken, Task<Placement>>? PlacementProbe { get; init; }
+    /// <summary>Tests replace the trace fetch (Cloudflare's /cdn-cgi/trace); null: a real HTTP GET.</summary>
+    public Func<string, CancellationToken, Task<string?>>? NetworkFetch { get; init; }
+    /// <summary>Tests replace the clock used for the network check's age.</summary>
+    public Func<DateTimeOffset>? Now { get; init; }
 }
 
 public sealed class NodeEngine
@@ -115,6 +119,8 @@ public sealed class NodeEngine
     public bool ExitedIdle { get; private set; }
     private string? lastRegistryKey;
     private Placement? placement;
+    private NetworkInfo? network;
+    private readonly SemaphoreSlim networkGate = new(1, 1);
     private string? firstSeen;
     private Traffic traffic => o.Traffic ?? Traffic.Current;
     private Task Wait(TimeSpan t, CancellationToken ct) => (o.Delay ?? Task.Delay)(t, ct);
@@ -158,7 +164,7 @@ public sealed class NodeEngine
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
         Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker, StartedAt = r.Info.StartedAt }).ToList(),
-        Traffic = traffic.Snapshot(), Placement = placement, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
+        Traffic = traffic.Snapshot(), Placement = placement, Network = network, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
         LastSeen = Protocol.NowUtc(), StartedAt = Protocol.Utc(startedAt),
     };
 
@@ -211,6 +217,7 @@ public sealed class NodeEngine
                 traffic.Load(prev.Traffic);
                 firstSeen = prev.FirstSeen ?? prev.StartedAt;
                 placement ??= prev.Placement;
+                network ??= prev.Network; // keeps "since" when the same address is seen again
                 var others = LivePeers(prev, instance, DateTimeOffset.UtcNow);
                 if (others.Count > 0) Log.Info($"WARNING: another process is already reporting as node '{o.NodeId}' (seen {string.Join(", ", others.Values)}); running anyway, leases keep jobs safe");
             }
@@ -218,6 +225,48 @@ public sealed class NodeEngine
         catch (OperationCanceledException) { throw; }
         catch (Exception e) { Log.Info($"registry: could not read the previous record ({e.Message})"); }
         finally { recordLoaded = true; }
+    }
+
+    private DateTimeOffset NowUtc => o.Now?.Invoke() ?? DateTimeOffset.UtcNow;
+
+    /// <summary>Looks up the public IPv4/IPv6 (5 s per family). Called at start, every 30 minutes, and before a download claim when the last check is older than 10 minutes.</summary>
+    public async Task RefreshNetworkAsync(CancellationToken ct)
+    {
+        await networkGate.WaitAsync(ct);
+        try
+        {
+            var prev = network;
+            var n = await NetworkProbe.DetectAsync(o.NetworkFetch ?? NetworkProbe.HttpFetchAsync, ct, prev);
+            n.CheckedAt = Protocol.Utc(NowUtc);
+            n.Since = prev != null && n.SamePair(prev) && prev.Since.Length > 0 ? prev.Since : n.CheckedAt;
+            if (!n.SamePair(prev)) Log.Info($"network: ipv4={n.Ipv4 ?? "-"} ipv6={n.Ipv6Prefix ?? n.Ipv6 ?? "-"} {n.Country} {n.Colo}");
+            network = n;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { Log.Info($"network: lookup failed ({e.Message})"); }
+        finally { networkGate.Release(); }
+    }
+
+    private async Task EnsureFreshNetworkAsync(CancellationToken ct)
+    {
+        var n = network;
+        if (n != null && DateTimeOffset.TryParse(n.CheckedAt, out var at) && NowUtc - at < NetworkProbe.ClaimStale) return;
+        await RefreshNetworkAsync(ct);
+    }
+
+    /// <summary>The cap check before a download claim: true = may claim. Off (the default) = no storage reads at all.</summary>
+    private async Task<bool> UnderIpCapAsync(CancellationToken ct)
+    {
+        var cap = Control.Current.Downloads?.MaxPerIp;
+        if (cap is not > 0) return true;
+        var nodes = new List<NodeInfo>();
+        foreach (var b in await store.ListAsync(paths.NodesDir, false, false, ct))
+            if (b.Name != paths.Node(o.NodeId) && await store.GetAsync(b.Name, ct) is { } c && NodeInfo.Parse(c.Data) is { } n) nodes.Add(n);
+        int others = NetworkCap.CountOthers(network, o.NodeId, nodes, NowUtc);
+        int own = running.Keys.Count(r => r.Info.Stage == "download");
+        if (NetworkCap.MayClaim(cap, others, own)) return true;
+        Log.Info($"download: {NetworkCap.WaitText(others + own)} (cap {cap})");
+        return false;
     }
 
     private async Task RefreshPlacementAsync(CancellationToken ct)
@@ -241,6 +290,7 @@ public sealed class NodeEngine
             {
                 await Task.Delay(o.RegistryInterval, ct);
                 if (!DateTimeOffset.TryParse(placement?.CheckedAt, out var chk) || DateTimeOffset.UtcNow - chk > Placement.Refresh) await RefreshPlacementAsync(ct);
+                if (!DateTimeOffset.TryParse(network?.CheckedAt, out var nchk) || NowUtc - nchk >= NetworkProbe.Refresh) await RefreshNetworkAsync(ct);
                 await WriteRegistryAsync(ct: ct);
             }
         }
@@ -275,6 +325,7 @@ public sealed class NodeEngine
         await Control.RefreshAsync(ct, force: true);
         await LoadPreviousRecordAsync(ct);
         await RefreshPlacementAsync(ct);
+        await RefreshNetworkAsync(ct);
         await WriteRegistryAsync(ct: ct);
 
         using var loopsCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -370,6 +421,21 @@ public sealed class NodeEngine
                     if (o.Once) return;
                     await Task.Delay(o.HeavyRetry, ct);
                     continue;
+                }
+                if (stage == "download")
+                {
+                    bool allowed;
+                    try { await EnsureFreshNetworkAsync(ct); allowed = await UnderIpCapAsync(ct); }
+                    catch (OperationCanceledException) { o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release(); throw; }
+                    catch (Exception e) { Log.Info($"download: the per-IP cap check failed ({e.Message}); not capping this time"); allowed = true; }
+                    if (!allowed)
+                    {
+                        // waiting, not failing: no attempt counted, no back-off
+                        o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release();
+                        if (o.Once) return;
+                        await Task.Delay(o.PollInterval, ct);
+                        continue;
+                    }
                 }
                 if (!TryReserve()) { o.Limits?.Release(stage, false); if (heavy) heavySlots!.Release(); return; }
                 Claim? claim;
@@ -510,6 +576,7 @@ public sealed class NodeEngine
         RegistryChanged();
         Log.Info($"[{stage}#{worker}] claimed {claim.Job.JobId}");
 
+        if (stage == "download") claim.Job.Network = JobNetwork.From(network); // the network this attempt starts on
         var renewTask = RenewLoopAsync(stage, claim, run, cts.Token);
         Outcome outcome; string? error = null;
         try
@@ -609,6 +676,9 @@ public sealed class NodeEngine
                 ignoreUntil[claim.BlobName] = DateTimeOffset.UtcNow + o.TransientBackoff(job.Attempts);
                 break;
             case Outcome.Bot:
+                // no attempt counted; the error and the network are written to the job so a block can be matched to home, VPN or mobile data
+                job.LastError = Redact.Sas(error); job.NodeId = o.NodeId;
+                try { await Rewrite("pending"); } catch (Exception e) { Log.Info($"could not record the bot block on {job.JobId}: {e.Message}"); }
                 stageBackoff[stage] = DateTimeOffset.UtcNow + o.BotBackoff;
                 Log.Info($"[{stage}] bot block / rate limit: backing off {o.BotBackoff.TotalMinutes:F0} min");
                 try { await store.SetMetadataAsync(claim.BlobName, new Dictionary<string, string>(), claim.LeaseId, none); } catch { }

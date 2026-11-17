@@ -78,13 +78,14 @@ public static class StatusSnapshot
             {
                 ["nodeId"] = n.NodeId, ["name"] = n.Name, ["kind"] = n.Kind, ["version"] = n.Version, ["stages"] = new JsonArray(n.Stages.Select(s => (JsonNode)s).ToArray()), ["state"] = state, ["workers"] = workers,
                 ["traffic"] = TrafficJson(n.Traffic, now), ["firstSeen"] = n.FirstSeen, ["placement"] = n.Placement == null ? null : JsonSerializer.SerializeToNode(n.Placement, Protocol.Json),
+                ["network"] = n.Network == null ? null : JsonSerializer.SerializeToNode(n.Network, Protocol.Json),
                 ["lastSeen"] = n.LastSeen, ["budget"] = lim?.Budget, ["budgetRemaining"] = remaining, ["nextWindow"] = nextWindow, ["etaBudgetHours"] = etaHours, ["finishedPerHour"] = perHour,
             });
         }
         return new JsonObject
         {
             ["v"] = 1, ["at"] = now.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ"), ["prefix"] = paths.Prefix,
-            ["control"] = new JsonObject { ["mode"] = ctl.Mode, ["stages"] = ctl.Stages == null ? null : JsonSerializer.SerializeToNode(ctl.Stages), ["message"] = ctl.Message, ["changedAt"] = ctl.ChangedAt, ["changedBy"] = ctl.ChangedBy },
+            ["control"] = new JsonObject { ["mode"] = ctl.Mode, ["stages"] = ctl.Stages == null ? null : JsonSerializer.SerializeToNode(ctl.Stages), ["message"] = ctl.Message, ["changedAt"] = ctl.ChangedAt, ["changedBy"] = ctl.ChangedBy, ["downloads"] = ctl.Downloads == null ? null : JsonSerializer.SerializeToNode(ctl.Downloads, Protocol.Json) },
             ["nodes"] = nodeRows, ["queue"] = queue, ["leased"] = leased,
             ["finished"] = new JsonArray(finished.Take(50).Select(f => (JsonNode)f.Row).ToArray()), ["failures"] = new JsonArray(failures.Take(50).Select(f => (JsonNode)f.Row).ToArray()),
             ["throughput"] = throughput,

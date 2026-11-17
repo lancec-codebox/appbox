@@ -176,7 +176,8 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
                 audioLanguage = fmt?.AudioLanguage, audioNote = fmt?.AudioNote,
                 audioTracks = (fmt?.AudioTracks ?? []).Select(t => new { language = t.Language, note = t.Note }).ToArray(),
                 subs = subFiles.Select(s => s.Name).ToArray(), embeddable = fmt?.Embeddable ?? false, nodeId = ctx.NodeId, at = Protocol.NowUtc(),
-            });
+                network = ctx.Job.Network == null ? null : new { ipv4 = ctx.Job.Network.Ipv4, ipv6Prefix = ctx.Job.Network.Ipv6Prefix, vpn = ctx.Job.Network.Vpn, transport = ctx.Job.Network.Transport },
+            }, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
             await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);
             await EnsureFollowUpJobs(ctx);
         }

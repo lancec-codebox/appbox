@@ -131,6 +131,8 @@ public sealed class JobDescriptor
     public string AddedAt { get; set; } = "";
     public int Attempts { get; set; }
     public string? LastError { get; set; }
+    /// <summary>The network the last download attempt started on (0.8.8): written next to lastError on a failure or bot block, and on success.</summary>
+    public JobNetwork? Network { get; set; }
     public bool? Permanent { get; set; }
     public int? MaxComments { get; set; }
     public string? Sort { get; set; }
@@ -235,6 +237,8 @@ public sealed class ControlFile
     public Dictionary<string, NodeLimits>? Nodes { get; set; }
     /// <summary>GPU routing (0.8.6): absent or no hold = off, CPU nodes claim sscd/clip/cast at once and no gpu-ready markers are written.</summary>
     public GpuControl? Gpu { get; set; }
+    /// <summary>Download limits (0.8.8): absent, null or maxPerIp 0 = no cap (the default).</summary>
+    public DownloadsControl? Downloads { get; set; }
 
     public static Level ParseLevel(string? s) => s?.ToLowerInvariant() switch
     {
@@ -252,6 +256,12 @@ public sealed class ControlFile
 
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static ControlFile Parse(byte[]? b) => b == null || b.Length == 0 ? new() : JsonSerializer.Deserialize<ControlFile>(b, Protocol.Json) ?? new();
+}
+
+public sealed class DownloadsControl
+{
+    /// <summary>At most this many downloads at once across the nodes that share one public address (same IPv4 or IPv6 /64). Best effort: two nodes may start at the same moment.</summary>
+    public int? MaxPerIp { get; set; }
 }
 
 public sealed class GpuControl
@@ -301,6 +311,8 @@ public sealed class NodeInfo
     public TrafficReport? Traffic { get; set; }
     /// <summary>Where the node runs, detected at start and refreshed daily.</summary>
     public Placement? Placement { get; set; }
+    /// <summary>The node's public network (0.8.8), re-checked every 30 minutes.</summary>
+    public NetworkInfo? Network { get; set; }
     /// <summary>When this node first registered; kept across restarts.</summary>
     public string? FirstSeen { get; set; }
     /// <summary>A per-process GUID of the process that wrote the record last.</summary>

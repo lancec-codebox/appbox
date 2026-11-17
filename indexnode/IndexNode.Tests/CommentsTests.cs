@@ -252,6 +252,7 @@ public class CommentsTests
         var dir = Setup(out var cfg);
         var s = new FakeStore();
         var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=abcdefghij1", 480, null);
+        job.Network = new JobNetwork { Ipv4 = "203.0.113.7", Ipv6Prefix = "2001:db8:1:2::/64" };
         await new DownloadStage(new Tools(new HttpClient(), cfg), s, NoWait).RunAsync(Ctx(s, job, "download"));
 
         var id = "abcdefghij1";
@@ -266,6 +267,9 @@ public class CommentsTests
         var marker = JsonDocument.Parse(s[P.Video(id, "downloaded.json")].Data).RootElement;
         Assert.Equal(new[] { "en", "zh-Hans", "zh-orig.auto" }.OrderBy(x => x), marker.GetProperty("subs").EnumerateArray().Select(x => x.GetString()!).OrderBy(x => x));
         Assert.Equal(480, marker.GetProperty("height").GetInt32());
+        Assert.Equal("203.0.113.7", marker.GetProperty("network").GetProperty("ipv4").GetString());
+        Assert.Equal("2001:db8:1:2::/64", marker.GetProperty("network").GetProperty("ipv6Prefix").GetString());
+        Assert.False(marker.GetProperty("network").TryGetProperty("vpn", out _)); // IndexNode leaves transport and vpn out
         Assert.Equal(12.5, marker.GetProperty("durationSeconds").GetDouble());
         Assert.Equal(("av01.0.04M.08", "opus", "398+251-0", "zh-Hans", "Chinese, original (default)"),
             (marker.GetProperty("vcodec").GetString(), marker.GetProperty("acodec").GetString(), marker.GetProperty("formatId").GetString(), marker.GetProperty("audioLanguage").GetString(), marker.GetProperty("audioNote").GetString()));

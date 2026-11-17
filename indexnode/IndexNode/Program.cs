@@ -447,6 +447,12 @@ public static class Commands
     {
         var (cfg, store, paths, _) = Open(a);
         var level = a.Positional.FirstOrDefault()?.ToLowerInvariant();
+        if (a.Get("max-per-ip") is { } mpi)
+        {
+            var mc = await ControlWatcher.SetMaxPerIpAsync(store, paths, mpi, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: downloads per IP = {(mc.Downloads?.MaxPerIp is > 0 ? mc.Downloads.MaxPerIp.ToString() : "no cap")}");
+            if (level == null) return 0;
+        }
         if (level == "gpu-hold")
         {
             var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control gpu-hold <duration like 30m>|off");
@@ -454,7 +460,7 @@ public static class Commands
             Console.WriteLine($"control: gpu hold = {gc.Gpu?.Hold ?? "off"} (CPU nodes {(gc.Gpu?.Hold == null ? "claim sscd/clip/cast at once and no gpu-ready markers are written" : "wait that long for a GPU node before taking sscd/clip/cast; markers are written")}; a node's --gpu-fallback overrides this)");
             return 0;
         }
-        if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain, stop or gpu-hold");
+        if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain, stop, gpu-hold or --max-per-ip N|off");
         var stage = a.Get("stage");
         if (stage != null && !Protocol.Stages.Contains(stage)) throw new ArgumentException("--stage must be download, process, comments or watch");
         var c = await ControlWatcher.WriteAsync(store, paths, level, stage, a.Get("message"), cfg.NodeName ?? Environment.UserName, default);
