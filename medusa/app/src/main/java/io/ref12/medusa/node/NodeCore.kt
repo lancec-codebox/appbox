@@ -74,7 +74,8 @@ enum class Level { RUN, DRAIN, STOP;
 /** nodes.<nodeId> in control.json: per-node run limits that win over the node's local settings. */
 class NodeOverride(val budget: Int?, val schedule: String?, val window: String?)
 
-class Control(val mode: Level, val stages: Map<String, Level>, val message: String?, val changedAt: String?, val changedBy: String?, val nodes: Map<String, NodeOverride> = emptyMap()) {
+class Control(val mode: Level, val stages: Map<String, Level>, val message: String?, val changedAt: String?, val changedBy: String?, val nodes: Map<String, NodeOverride> = emptyMap(),
+              /** downloads.maxPerIp (1.8.5): null or 0 = no cap, the default. */ val maxPerIp: Int? = null) {
     fun effective(stage: String): Level = maxOf(mode, stages[stage] ?: Level.RUN)
     companion object {
         val RUN = Control(Level.RUN, emptyMap(), null, null, null)
@@ -86,7 +87,8 @@ class Control(val mode: Level, val stages: Map<String, Level>, val message: Stri
                 nodes[id] = NodeOverride(if (x.has("budget") && !x.isNull("budget")) x.optInt("budget", -1).takeIf { it >= 0 } else null,
                     x.optString("schedule").ifEmpty { null }, x.optString("window").ifEmpty { null })
             } } }
-            return Control(Level.of(o.optString("mode", "run")), st, o.optString("message").ifEmpty { null }, o.optString("changedAt").ifEmpty { null }, o.optString("changedBy").ifEmpty { null }, nodes)
+            return Control(Level.of(o.optString("mode", "run")), st, o.optString("message").ifEmpty { null }, o.optString("changedAt").ifEmpty { null }, o.optString("changedBy").ifEmpty { null }, nodes,
+                o.optJSONObject("downloads")?.let { d -> if (d.has("maxPerIp") && !d.isNull("maxPerIp")) d.optInt("maxPerIp", 0).takeIf { it > 0 } else null })
         }
     }
 }
@@ -151,6 +153,10 @@ class NodeEnv(
     val renewMs: Long = 30_000L,
     val registryMs: Long = 60_000L,
     val zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+    /** Fetches a Cloudflare trace URL (null when it fails); tests replace it. */
+    val netFetch: (String) -> String? = NetworkProbe::httpFetch,
+    /** The phone's transport and VPN flag; tests replace it. */
+    val deviceNet: () -> DeviceNet = { DeviceNet(null, null) },
 )
 
 class Summary { var done = 0; var failed = 0; var released = 0; var endReason = ""; var finalState = "idle" }
@@ -167,13 +173,55 @@ class NodeRunner(
     private var limitView: LimitView? = null
     private var lastRegistry = 0L
     private val startedAt = iso(env.clock())
+    /** The public network as last looked up (null before the first lookup). */
+    @Volatile var network: NetInfo? = null
+        private set
+    @Volatile private var netDirty = false
+    /** The network the running attempt started on, written to the job record and downloaded.json. */
+    @Volatile private var attemptNet: JSONObject? = null
+    /** Downloads running on other nodes from this IP when the cap last held this node back. */
+    @Volatile var capHeldAt: Int? = null
+        private set
+
+    /** The phone's network changed (Android callback): look it up again before the next claim. */
+    fun onNetworkChanged() { netDirty = true }
+
+    /** Looks the public IPv4/IPv6 up (5 s per family) and keeps "since" while the address pair stays. */
+    @Synchronized fun refreshNetwork() {
+        netDirty = false
+        try { network = NetworkProbe.detect(env.netFetch, iso(env.clock()), env.deviceNet(), network) } catch (e: Exception) { /* keep the last */ }
+    }
+
+    private fun ensureFreshNetwork() {
+        val n = network
+        val at = n?.checkedAt?.let { try { java.time.Instant.parse(it).toEpochMilli() } catch (e: Exception) { null } }
+        if (n == null || at == null || netDirty || env.clock() - at >= NetworkProbe.CLAIM_STALE_MS) refreshNetwork()
+    }
+
+    /** The cap check before a claim: true = may claim. Off (the default) reads nothing. A failed read of the other nodes' records does not impose a cap. */
+    private fun underIpCap(): Boolean {
+        capHeldAt = null
+        val cap = control.current.maxPerIp
+        if (cap == null || cap <= 0) return true
+        return try {
+            val own = if (running != null) 1 else 0
+            val peers = api.listNames("index/nodes/").filter { it != "index/nodes/${cfg.nodeId}.json" && it.endsWith(".json") }.mapNotNull { n ->
+                val g = api.get(n); if (g.status == 200) PeerNode.parse(g.text) else null }
+            val others = NetCap.countOthers(network, cfg.nodeId, peers, env.clock())
+            if (NetCap.mayClaim(cap, others, own)) true else { capHeldAt = others + own; false }
+        } catch (e: Exception) { true }
+    }
 
     /** The system is stopping the work (time limit, constraints): let go of the lease and end. */
     fun abort() { aborted.set(true); fetcher.cancel() }
 
     fun run(): Summary {
         val s = Summary()
-        regState = "idle"; writeRegistry(true)
+        regState = "idle"
+        // the previous record's network keeps "since" across runs; then look the address up (at every start)
+        try { api.get("index/nodes/${cfg.nodeId}.json").let { if (it.status == 200) network = NetInfo.parse(it.text) } } catch (e: Exception) {}
+        refreshNetwork()
+        writeRegistry(true)
         try {
             while (true) {
                 if (aborted.get()) { s.endReason = "stopped by the system"; break }
@@ -189,6 +237,8 @@ class NodeRunner(
                 if (gate == Gate.BUDGET_SPENT) { s.endReason = "budget spent"; regState = "budget spent"; break }
                 if (gate == Gate.WAITING) { s.endReason = "waiting for window"; regState = "waiting for window"; break }
                 if (state.doneToday(day(env.clock())) >= cap) { s.endReason = "daily cap reached"; break }
+                ensureFreshNetwork()
+                if (!underIpCap()) { s.endReason = IP_CAP_REASON + capHeldAt; break } // waiting, not failing: no attempt counted, no back-off
                 val jobs = Prio.claimOrder(api.findJobs(STAGE)).filter { state.skipUntil(it.id) <= env.clock() }
                 if (jobs.isEmpty()) { s.endReason = "no work"; break }
                 listener.onWork(jobs.size)
@@ -217,6 +267,7 @@ class NodeRunner(
 
     private fun runJob(ref: JobRef, leaseId: String, left: Int, s: Summary): Outcome {
         val t0 = env.clock()
+        attemptNet = network?.forJob() // the network this attempt starts on
         val rj = RunningJob(ref.id, STAGE, "download", null); running = rj; regState = "working"; writeRegistry(true)
         val lost = AtomicBoolean(false); val stopReq = AtomicBoolean(false)
         var title: String? = null
@@ -235,6 +286,8 @@ class NodeRunner(
                         }
                         if (control.refresh().effective(STAGE) == Level.STOP) { stopReq.set(true); fetcher.cancel() }
                         try { api.setMetadata(ref.name, leaseId, mapOf("node" to cfg.nodeId, "progress" to (rj.progress ?: rj.step), "heartbeat" to iso(env.clock()))) } catch (e: Exception) {}
+                        val nAt = network?.checkedAt?.let { try { java.time.Instant.parse(it).toEpochMilli() } catch (e: Exception) { null } }
+                        if (netDirty || nAt == null || env.clock() - nAt >= NetworkProbe.REFRESH_MS) refreshNetwork()
                         writeRegistry(false)
                     }
                 }
@@ -267,10 +320,12 @@ class NodeRunner(
                         .also { m -> out.formatFallback?.let { m.put("formatFallback", it) } }.put("subs", JSONArray(out.subs)).put("subsFailed", JSONArray(out.subsFailed)).put("embeddable", out.embeddable ?: JSONObject.NULL)
                         .put("audioLanguage", out.audioLanguage ?: JSONObject.NULL).put("audioNote", out.audioNote ?: JSONObject.NULL)
                         .put("audioTracks", JSONArray().also { a -> out.audioTracks.forEach { a.put(JSONObject().put("language", it.first).put("note", it.second ?: JSONObject.NULL)) } }).put("nodeId", cfg.nodeId).put("at", at)
+                        .also { m -> attemptNet?.let { m.put("network", it) } }
                     api.put(base + "downloaded.json", marker.toString().toByteArray(), "application/json")
                     // as IndexNode's DownloadStage: comments plus one job per ingest step (with needs), all at the download's priority; no legacy process job
                     FollowUps.create(api, ref.id, job.url, job.priority ?: Prio.of(ref.tags), at)
                     val done = JSONObject(jobText).put("finishedAt", at).put("nodeId", cfg.nodeId).put("elapsedSeconds", (env.clock() - t0) / 1000)
+                        .also { d -> attemptNet?.let { d.put("network", it) } }
                     api.put(ref.name, done.toString().toByteArray(), "application/json", tagsOf(ref, "done"), leaseId)
                     release(ref.name, leaseId)
                     state.addDone(day(env.clock())); s.done++
@@ -326,6 +381,8 @@ class NodeRunner(
                 return Outcome.FAILED
             }
             FailureKind.BOT -> {
+                // no attempt counted; the error and the network go into the job so a block can be matched to home, VPN or mobile data
+                rewrite(ref, leaseId, jobText, "pending") { it.put("lastError", msg) }
                 release(ref.name, leaseId); s.released++
                 state.setBackoffUntil(env.clock() + BACKOFF_MS)
                 state.record(JobLogEntry(ref.id, title, "bot block", env.clock(), msg))
@@ -349,7 +406,7 @@ class NodeRunner(
     /** Rewrites the job blob with the lease id and the full idx_* tag set. [state] null: failed at 3 attempts, else pending. */
     private fun rewrite(ref: JobRef, leaseId: String, jobText: String, state: String?, edit: (JSONObject) -> JSONObject) {
         try {
-            val o = edit(JSONObject(jobText.ifEmpty { "{}" }))
+            val o = edit(JSONObject(jobText.ifEmpty { "{}" })).also { j -> attemptNet?.let { j.put("network", it) } }
             val st = state ?: if (o.optInt("attempts", 0) >= MAX_ATTEMPTS) "failed" else "pending"
             api.put(ref.name, o.toString().toByteArray(), "application/json", tagsOf(ref, st), leaseId)
         } catch (e: Exception) { /* the lease is released next either way */ }
@@ -369,7 +426,7 @@ class NodeRunner(
         if (!force && now - lastRegistry < env.registryMs) return
         lastRegistry = now
         try {
-            val json = registryJson(cfg, regState, control.current.effective(STAGE).name.lowercase(), running, iso(now), startedAt, limitView)
+            val json = registryJson(cfg, regState, control.current.effective(STAGE).name.lowercase(), running, iso(now), startedAt, limitView, network)
             api.put("index/nodes/${cfg.nodeId}.json", json.toString().toByteArray(), "application/json", mapOf("idx_kind" to "node"))
         } catch (e: Exception) { /* the registry is best effort */ }
     }
@@ -379,17 +436,20 @@ class NodeRunner(
         const val MAX_ATTEMPTS = 3
         const val BACKOFF_MS = 3_600_000L
         const val SKIP_MS = 6 * 3_600_000L
+        /** The end reason when the per-IP cap holds the node back; the number of downloads already running from this IP follows. */
+        const val IP_CAP_REASON = "waiting for IP cap: "
 
         fun iso(ms: Long): String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(ms))
         fun day(ms: Long): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(ms))
         fun describe(c: Control): String = c.effective(STAGE).name.lowercase() + (c.message?.let { " - $it" } ?: "")
 
-        fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String, limits: LimitView? = null): JSONObject = JSONObject()
+        fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String, limits: LimitView? = null, network: NetInfo? = null): JSONObject = JSONObject()
             .put("v", 1).put("nodeId", cfg.nodeId).put("name", cfg.name).put("kind", "medusa").put("version", cfg.version).put("platform", cfg.platform)
             .put("stages", JSONArray(listOf("download"))).put("jobs", JSONObject().put("download", 1)).put("threads", cfg.threads)
             .put("conditions", cfg.conditions).put("state", state).put("control", control)
             .put("running", JSONArray().also { a -> running?.let { r -> a.put(JSONObject().put("jobId", r.jobId).put("stage", r.stage).put("step", r.step).put("progress", r.progress ?: JSONObject.NULL)) } })
             .put("lastSeen", lastSeen).put("startedAt", startedAt)
+            .also { o -> network?.let { o.put("network", it.toJson()) } }
             .also { o -> limits?.let { l ->
                 l.budget?.let { o.put("budget", it) }
                 l.schedule?.let { o.put("schedule", it) }; l.window?.let { o.put("window", it) }

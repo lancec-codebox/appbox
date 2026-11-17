@@ -1,5 +1,12 @@
 # IndexNode release notes
 
+## 0.8.8
+
+- Nodes report their public IPv4/IPv6, IPv6 /64, country, colo, checkedAt and since in the registry.
+- Download jobs and downloaded.json record the network of each attempt (success and failure).
+- Optional control.json downloads.maxPerIp (default off) limits running downloads per IPv4 or IPv6 /64 across nodes; `indexnode control --max-per-ip N|off`.
+- `indexnode status --json` includes the network fields.
+
 ## 0.8.7
 
 - **Fix: no more requests for YouTube's machine-translated subtitle tracks.** The download passed `--sub-langs en.*,...` with `--write-auto-subs`; `en.*` matches every auto-translated track (en-ar, en-ja, ...), dozens of timedtext requests per video, and YouTube rate-limited the IP. Now the info JSON written by the main download is read first and yt-dlp gets exact keys only: uploaded = the Chinese keys present (zh, zh-Hans, zh-Hant, zh-CN, zh-TW, zh-HK) plus every `en` / `en-*` key in `subtitles`; automatic = only `*-orig` tracks of `automatic_captions` (zh-orig, en-orig). No wanted track, no call. A subtitle failure still never fails the download (only a bot block in the uploaded pass does).

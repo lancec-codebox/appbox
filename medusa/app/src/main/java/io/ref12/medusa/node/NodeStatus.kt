@@ -12,6 +12,8 @@ class StatusInput(
     /** Back-off: the local time it ends (already formatted) and why; set only while it is in force. */
     val backoffUntil: String? = null, val backoffReason: String? = null,
     val noWork: Boolean = false,
+    /** The per-IP cap holds the node back: how many downloads are already running from this IP (null = not capped). */
+    val ipCapRunning: Int? = null,
 )
 
 /** What the worker is doing right now, shared with the screen (same process). */
@@ -20,11 +22,12 @@ object NodeLive {
 }
 
 object NodeStatus {
-    /** Precedence: off > downloading > backing off > waiting > stopped by the owner > cap / budget > draining > no work > idle. */
+    /** Precedence: off > downloading > backing off > waiting for the per-IP cap > waiting > stopped by the owner > cap / budget > draining > no work > idle. */
     fun text(s: StatusInput): String = when {
         !s.enabled -> "Index node is off"
         s.downloading -> "Downloading: " + (s.title?.take(50) ?: "starting") + (s.progress?.let { " \u2014 " + friendlyProgress(it) } ?: "")
         s.backoffUntil != null -> "Backing off until " + s.backoffUntil + (s.backoffReason?.let { " \u2014 $it" } ?: "")
+        s.ipCapRunning != null -> NetCap.waitText(s.ipCapRunning)
         s.wait != Wait.NONE -> "Waiting: " + when (s.wait) {
             Wait.NOT_CHARGING -> "not charging"; Wait.NOT_UNMETERED -> "not on Wi-Fi"; Wait.BATTERY_LOW -> "battery low"; Wait.STORAGE_LOW -> "storage low"; Wait.WINDOW -> "outside the schedule window"; else -> ""
         }
@@ -50,6 +53,7 @@ object NodeStatus {
         endReason == "control: stop" -> StatusInput(stoppedByOwner = true, message = message)
         endReason == "control: drain" -> StatusInput(drain = true)
         endReason == "waiting for window" -> StatusInput(wait = Wait.WINDOW)
+        endReason.startsWith(NodeRunner.IP_CAP_REASON) -> StatusInput(ipCapRunning = endReason.removePrefix(NodeRunner.IP_CAP_REASON).toIntOrNull() ?: 0)
         endReason == "no work" -> StatusInput(noWork = true, nextCheckMin = nextCheckMin)
         else -> StatusInput(nextCheckMin = nextCheckMin)
     }
@@ -65,6 +69,7 @@ object NodeStatus {
             endReason == "control: stop" -> "stopped by the owner"
             endReason == "control: drain" -> "draining"
             endReason == "waiting for window" -> "outside the schedule window"
+            endReason.startsWith(NodeRunner.IP_CAP_REASON) -> NetCap.waitText(endReason.removePrefix(NodeRunner.IP_CAP_REASON).toIntOrNull() ?: 0).removePrefix("Waiting: ")
             endReason == "all jobs are held by other nodes" -> "all jobs held by other nodes"
             else -> endReason
         }

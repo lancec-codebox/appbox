@@ -60,13 +60,14 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
                 val text = NodeStatus.text(status)
                 if (throttle.allow(text, progressOnly)) goForeground(text)
             }
-            val r = NodeRunner(client, YtDlpNodeFetcher(ctx.app.fetcher), cfg, settings, cap = settings.dailyCap, listener = object : NodeListener {
+            val r = NodeRunner(client, YtDlpNodeFetcher(ctx.app.fetcher), cfg, settings, env = NodeEnv(deviceNet = { StatusNotifier.deviceNet(ctx) }), cap = settings.dailyCap, listener = object : NodeListener {
                 override fun onWork(left: Int) { show(StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap, title = null), false) }
                 override fun onJob(jobId: String, title: String?, left: Int, text: String?) {
                     show(StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap, title = title ?: jobId, progress = text), true)
                 }
             })
             runner = r
+            ACTIVE = r
             StatusNotifier.cancel(ctx) // the foreground notification speaks during the run
             // The system ended the work (the Android 15 dataSync time limit, lost constraints, cancel): WorkManager cancels this coroutine, and the runner lets go of the lease.
             settings.lastRunAt = System.currentTimeMillis(); settings.lastRunVersion = BuildConfig.VERSION_NAME; settings.lastRun = "running"; NodeLive.input = StatusInput(downloading = true, doneToday = today(), cap = settings.dailyCap)
@@ -84,7 +85,7 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
             } catch (e: Throwable) {
                 settings.lastRun = Redact.sas("error: " + (e.message ?: e.javaClass.simpleName))
             } finally {
-                runner = null; NodeLive.input = null
+                runner = null; ACTIVE = null; NodeLive.input = null
                 settings.lastRunAt = System.currentTimeMillis()
                 settings.lastStatus = ""
                 StatusNotifier.refresh(ctx, settings, if (reason.isNotEmpty()) NodeStatus.afterRun(reason, today(), settings.dailyCap, message = settings.lastControl.substringAfter(" - ", "").ifEmpty { null }) else null)
@@ -103,6 +104,8 @@ class NodeWorker(private val ctx: Context, params: WorkerParameters) : Coroutine
     companion object {
         const val CHANNEL = "index_node"; const val NOTIF_ID = 4217; const val STATUS_ID = 4218; const val UNIQUE = "index-node"; const val UNIQUE_NOW = "index-node-now"
         private val RUNNING = AtomicBoolean(false)
+        /** The runner of the run in progress, so a network change can make it look its address up again. */
+        @Volatile var ACTIVE: NodeRunner? = null
         val isRunning get() = RUNNING.get()
 
         private fun constraints(needsCharging: Boolean) = Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).setRequiresBatteryNotLow(true).setRequiresStorageNotLow(true)
@@ -173,7 +176,7 @@ object StatusNotifier {
                 backoffReason = backoffReason(s))
             wait != Wait.NONE -> StatusInput(wait = wait)
             s.lastControl.startsWith("stop") -> StatusInput(stoppedByOwner = true, message = s.lastControl.substringAfter(" - ", "").ifEmpty { null })
-            after != null && after.downloading.not() && (after.capReached || after.budgetSpent || after.drain) -> after
+            after != null && after.downloading.not() && (after.capReached || after.budgetSpent || after.drain || after.ipCapRunning != null) -> after
             s.doneToday(day) >= s.dailyCap -> StatusInput(doneToday = s.doneToday(day), cap = s.dailyCap, capReached = true)
             s.lastEndReason == "no work" -> StatusInput(noWork = true, nextCheckMin = (15 - sinceMin).coerceIn(1, 15))
             else -> StatusInput(nextCheckMin = (15 - sinceMin).coerceIn(1, 15))
@@ -196,6 +199,15 @@ object StatusNotifier {
         } catch (e: SecurityException) { /* notification permission denied: Settings shows a warning */ } catch (e: Exception) { }
     }
 
+    /** The active network's transport (wifi, cellular, ethernet) and whether it is a VPN. */
+    fun deviceNet(ctx: Context): DeviceNet = try {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+        if (caps == null) DeviceNet(null, null) else DeviceNet(
+            NetworkProbe.transportOf(caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI), caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR), caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)),
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+    } catch (e: Exception) { DeviceNet(null, null) }
+
     /** The first condition the phone does not meet (Wi-Fi, charging, battery, storage). */
     fun deviceWait(ctx: Context, needsCharging: Boolean): Wait {
         val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -217,8 +229,8 @@ object StatusNotifier {
         if (Build.VERSION.SDK_INT >= 33) app.registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED) else app.registerReceiver(r, f)
         try {
             (app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-                override fun onCapabilitiesChanged(n: android.net.Network, c: NetworkCapabilities) { Thread { refresh(app, NodeSettings(app), null) }.start() }
-                override fun onLost(n: android.net.Network) { Thread { refresh(app, NodeSettings(app), null) }.start() }
+                override fun onCapabilitiesChanged(n: android.net.Network, c: NetworkCapabilities) { NodeWorker.ACTIVE?.onNetworkChanged(); Thread { refresh(app, NodeSettings(app), null) }.start() }
+                override fun onLost(n: android.net.Network) { NodeWorker.ACTIVE?.onNetworkChanged(); Thread { refresh(app, NodeSettings(app), null) }.start() }
             })
         } catch (e: Exception) { }
     }

@@ -202,3 +202,11 @@ Write it with `indexnode control run|drain|stop [--stage download|process] [--me
 - A node writes `state: "offline"` when it shuts down cleanly. Any node whose `lastSeen` is more than 5 minutes old counts as offline.
 - `indexnode status` lists every node: its kind, the stages it handles, its parallelism, state, running jobs, and last seen. Then come the queue counts and the control state.
 - The tag `idx_kind=node` on these blobs lets them be found by tag.
+
+## Public network (0.8.8 / Medusa 1.8.5)
+
+Each node record in `index/nodes/<nodeId>.json` has an optional `network` object: `ipv4`, `ipv6`, `ipv6Prefix` (the /64, e.g. `2001:db8:1:2::/64`), `country`, `colo`, `checkedAt`, `since` (when this ipv4/ipv6 pair was first seen). Medusa also reports `transport` (`wifi`, `cellular`, `ethernet`) and `vpn`. Addresses come from Cloudflare's `/cdn-cgi/trace`, looked up per family (5 s each, one fallback endpoint). A node checks at start, every 30 minutes, and before claiming a download when the last check is older than 10 minutes.
+
+A download job's attempt records `network` (`ipv4`, `ipv6Prefix`, `vpn`, `transport`) on success and on failure, and `videos/<jobId>/downloaded.json` carries the same object.
+
+Optional cap: `control.json` `"downloads": { "maxPerIp": N }`. Absent, null or 0 means unlimited. Before claiming a download a node counts running downloads on OTHER nodes (lastSeen under 3 minutes old, not offline) with the same IPv4 or the same IPv6 /64, plus its own; at or over N it waits (no attempt counted, no back-off). Best effort: two nodes can race past the cap, and a storage read failure permits the download. `indexnode control --max-per-ip N|off` sets it; `indexnode status --json` shows each node's network.
