@@ -350,8 +350,9 @@ class NodeRunnerTest {
 
     @Test fun drainFinishesTheClaimedJobAndClaimsNoMore() {
         api.addJob("aaaaaaaaaaa", 1); api.addJob("bbbbbbbbbbb", 2)
-        val f = FakeFetcher { _, _, _ -> api.setControl("{\"v\":1,\"mode\":\"drain\"}"); Thread.sleep(80) }
-        val s = runner(f).run()
+        // no lease renewal in this test: with a 20 ms renewal a renewal could land just after the job's lease was released (409) and cancel the fetcher, which made it flaky
+        val f = FakeFetcher { _, _, _ -> api.setControl("{\"v\":1,\"mode\":\"drain\"}") }
+        val s = runner(f, renewMs = 60_000).run()
         assertEquals(1, f.jobs.size); assertEquals(1, s.done); assertEquals("done", api.job("aaaaaaaaaaa").tags["idx_state"])
         assertEquals("pending", api.job("bbbbbbbbbbb").tags["idx_state"]); assertEquals("control: drain", s.endReason)
         assertFalse(f.cancelled)
