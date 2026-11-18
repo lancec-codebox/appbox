@@ -243,4 +243,39 @@ public class ClassifyAllTests
         Assert.False(ClassifyJobs.IsUnavailable(Dl("aaaaaaaaaaa", 60, "[Private video]")));             // a real duration: the title alone proves nothing
         Assert.False(ClassifyJobs.IsUnavailable(Dl("aaaaaaaaaaa", null, "Some title", availability: "public")));
     }
+
+    /// <summary>An AI that answers every upload of a prompt except the ones in <paramref name="never"/> (which it never answers), and leaves out <paramref name="first"/> of the prompt's first call.</summary>
+    private static Chat Omits(string[] never, string[]? firstOnly = null) { int call = 0; return new(p =>
+    {
+        var ids = p.Split('\n').Where(l => Regex.IsMatch(l, @"^v\d{10} \|")).Select(l => l[..11]).Where(x => !never.Contains(x)).ToList();
+        if (call++ == 0 && firstOnly != null) ids = ids.Where(x => !firstOnly.Contains(x)).ToList();
+        return "{\"videos\":[" + string.Join(",", ids.Select(x => $"{{\"id\":\"{x}\",\"candidate\":true,\"kind\":\"full\",\"language\":\"zh\",\"reason\":\"r\"}}")) + "]}";
+    }); }
+
+    [Fact]
+    public async Task An_omission_is_asked_again_and_the_rest_of_the_answer_is_kept()
+    {
+        var s = new FakeStore();
+        for (int i = 1; i <= 40; i++) await Add(s, Dl(Id(i), 90, added: "2026-11-17T10:00:" + (i % 60).ToString("D2") + "Z"));
+        var chat = Omits([], [Id(7)]);
+        await RunAll(s, chat);
+        Assert.Equal(40, Enumerable.Range(1, 40).Count(i => s.State(P.Job("download", Id(i))) == "pending"));
+        Assert.Equal(2, chat.Prompts.Count);   // the whole batch, then only the left-out one
+        Assert.DoesNotContain(Id(1), chat.Prompts[1]); Assert.Contains(Id(7), chat.Prompts[1]);
+    }
+
+    [Fact]
+    public async Task An_upload_the_ai_never_answers_stays_unclassified_then_is_given_up_on_after_three_misses()
+    {
+        var s = new FakeStore();
+        for (int i = 1; i <= 5; i++) await Add(s, Dl(Id(i), 90));
+        var bad = P.Job("download", Id(3));
+        await RunAll(s, Omits([Id(3)]));
+        Assert.Equal("unclassified", s.State(bad)); Assert.Equal(1, s.Job(bad).ClassifyMisses);
+        Assert.Equal(4, Enumerable.Range(1, 5).Count(i => s.State(P.Job("download", Id(i))) == "pending"));
+        await RunAll(s, Omits([Id(3)]));
+        Assert.Equal("unclassified", s.State(bad)); Assert.Equal(2, s.Job(bad).ClassifyMisses);
+        await RunAll(s, Omits([Id(3)]));
+        Assert.Equal("failed", s.State(bad)); Assert.Equal("classify: no AI answer", s.Job(bad).Reason);
+    }
 }

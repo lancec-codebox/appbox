@@ -29,6 +29,13 @@ public static partial class Protocol
         "translate" => ["describe.zip"],
         _ => [],
     };
+    /// <summary>A need as stored in a job written before 0.10.0 (a loose file) becomes the stage zip that holds it now: frames/manifest.json -> frames.zip, asr/... -> transcribe.zip, describe.json -> describe.zip. Zip names pass through; keyframes/ is part of frames.zip.</summary>
+    public static string NormalizeNeed(string need)
+    {
+        if (need.EndsWith(".zip", StringComparison.Ordinal) && !need.Contains('/')) return need;
+        return StageLayout.StageOf(need) is { } st && st != "download" || need is "info.json" or "downloaded.json" or "description.txt" or "thumb.jpg" ? (need is "downloaded.json" or "info.json" or "description.txt" or "thumb.jpg" ? "download.zip" : StageLayout.StageOf(need) + ".zip") : need;
+    }
+    public static string[] NormalizeNeeds(IEnumerable<string> needs) => needs.Select(NormalizeNeed).Distinct(StringComparer.Ordinal).ToArray();
     public static readonly TimeSpan NeedsRetry = TimeSpan.FromMinutes(2);
     /// <summary>What a desktop node runs by default: downloads go to the phone, so download is opt-in (--stages).</summary>
     // owner 2026-11-14: only the yt-dlp nodes (residential downloaders) touch YouTube: download, watch and comments are opt-in there
@@ -214,6 +221,8 @@ public sealed class JobDescriptor
     public string? CountDay { get; set; }
     public int? Classified { get; set; }
     public int? Rejected { get; set; }
+    /// <summary>0.10.1: how many times the AI left this upload out of its classify answer (given up at 3).</summary>
+    public int? ClassifyMisses { get; set; }
 
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static JobDescriptor Parse(byte[] b) => JsonSerializer.Deserialize<JobDescriptor>(b, Protocol.Json) ?? throw new InvalidDataException("empty job");

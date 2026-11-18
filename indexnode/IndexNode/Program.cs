@@ -15,10 +15,12 @@ public sealed class Args
     {
         var a = new Args();
         var q = new Queue<string>(argv);
+        bool rest = false;   // after a bare "--" everything is a positional argument (a video id may start with '-')
         while (q.Count > 0)
         {
             var t = q.Dequeue();
-            if (t.StartsWith("--"))
+            if (!rest && t == "--") { rest = true; continue; }
+            if (!rest && t.StartsWith("--"))
             {
                 var key = t[2..]; string? val = null;
                 var eq = key.IndexOf('=');
@@ -31,14 +33,15 @@ public sealed class Args
         return a;
     }
 
-    public string? Get(string key) => Options.TryGetValue(key, out var v) ? v : null;
+    /// <summary>--video=&lt;id&gt; is accepted wherever a video id is taken (--job, --videos): an id may start with '-', which no other spelling can carry.</summary>
+    public string? Get(string key) => Options.TryGetValue(key, out var v) ? v : key is "job" or "videos" && Options.TryGetValue("video", out var vid) ? vid : null;
     public bool Has(string key) => Options.ContainsKey(key);
 }
 
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--batch 6] [--batch-hours 2] [--lanes 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--batch 6] [--batch-hours 12] [--lanes 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
@@ -52,7 +55,9 @@ public static class Program
         indexnode tools install --ytdlp-zipapp
         indexnode gpu markers [--dry]
         indexnode status [--json]
-        indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel 2]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
+        indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]   (read-only: why each drama's steps are or are not eligible for the next batch)
+        (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
+        indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel <cores>]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
         indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
         indexnode publish [--out <dir>] [--job <id>] [--since <time>] [--local <dir>] [--force]   (site packs per PACK.md; default out: %LOCALAPPDATA%\indexnode\site)
@@ -91,6 +96,7 @@ public static class Program
                 "stages" => await StagesCommand.RunAsync(a),
                 "ensure" => await EnsureCommand.RunAsync(a),
                 "repack" => await Commands.RepackAsync(a),
+                "batch" => await Commands.BatchAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
                 "search" => await Commands.SearchAsync(a),
                 "status" => await Commands.StatusAsync(a),
@@ -168,7 +174,7 @@ public static class Commands
         int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 2;
         if (lanes < 1) throw new ArgumentException("--lanes needs at least 1");
         int batchN = a.Get("batch") is { } bn ? int.Parse(bn) : 6;
-        double batchHours = a.Get("batch-hours") is { } bh ? double.Parse(bh, System.Globalization.CultureInfo.InvariantCulture) : 2;
+        double batchHours = a.Get("batch-hours") is { } bh ? double.Parse(bh, System.Globalization.CultureInfo.InvariantCulture) : 12;
         if (batchN < 1 || batchHours <= 0) throw new ArgumentException("--batch needs at least 1 and --batch-hours more than 0");
         int workers = gpu ? 1 : 2; // workers of the non-batch stages (download, comments, watch, ...)
         int? workerThreads = a.Get("worker-threads") is { } wt ? int.Parse(wt) : cfg.WorkerThreads;
@@ -502,12 +508,29 @@ public static class Commands
         return 0;
     }
 
+    /// <summary>indexnode batch explain [--stages ...] [--batch N] [--top 50]: why the batch selection picks what it picks (read-only).</summary>
+    public static async Task<int> BatchAsync(Args a)
+    {
+        if (a.Positional.Skip(1).FirstOrDefault() != "explain") { Console.Error.WriteLine("usage: indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]"); return 2; }
+        var (cfg, store, paths, _) = Open(a);
+        var requested = (a.Get("stages") ?? string.Join(',', StageOrder.PassOrder)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var stages = Protocol.ExpandStages(requested);
+        TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null;
+        var opts = new EngineOptions
+        {
+            NodeId = cfg.NodeId ?? "explain", Name = "explain", Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
+            Stages = stages, Batch = a.Get("batch") is { } bn ? int.Parse(bn) : 6, Gpu = a.Has("gpu"), GpuFallback = gpuFlag,
+        };
+        var engine = new NodeEngine(store, paths, opts, new Dictionary<string, IStageHandler>());
+        return await engine.ExplainAsync(a.Get("top") is { } tp ? int.Parse(tp) : 50, Console.WriteLine, default);
+    }
+
     public static async Task<int> RepackAsync(Args a)
     {
         var (cfg, store, paths, _) = Open(a);
         var only = a.Get("videos")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Concat(a.Positional.Skip(1)).ToList();
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-        return await Repack.RunAsync(store, paths, cfg.NodeId ?? "repack", only is { Count: > 0 } ? only : null, a.Has("dry"), a.Has("delete-loose"), int.TryParse(a.Get("parallel"), out var par) ? par : 2, Console.WriteLine, cts.Token);
+        return await Repack.RunAsync(store, paths, cfg.NodeId ?? "repack", only is { Count: > 0 } ? only : null, a.Has("dry"), a.Has("delete-loose"), int.TryParse(a.Get("parallel"), out var par) ? par : Environment.ProcessorCount, Console.WriteLine, cts.Token);
     }
 
     public static async Task<int> StatusAsync(Args a)

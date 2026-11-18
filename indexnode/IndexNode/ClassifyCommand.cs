@@ -16,8 +16,12 @@ public static class ClassifyCommand
         {
             case "set":
             {
-                var id = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("classify set <videoId> drama|not [--reason R]");
-                var verdict = a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("classify set <videoId> drama|not [--reason R]");
+                const string use = "classify set <videoId> drama|not [--reason R]   (an id starting with '-': --video=<id> drama, or: classify set drama -- <id>)";
+                var rest = a.Positional.Skip(1).ToList(); string? id, verdict;
+                if (a.Get("video") is { } vid) { id = vid; verdict = rest.FirstOrDefault(); }
+                else if (rest.Count > 0 && rest[0].ToLowerInvariant() is "drama" or "not" && rest.Count > 1) { verdict = rest[0]; id = rest[1]; }   // after "--" the id comes last
+                else { id = rest.ElementAtOrDefault(0); verdict = rest.ElementAtOrDefault(1); }
+                if (id == null || verdict == null) throw new ArgumentException(use);
                 Console.WriteLine(await SetAsync(store, paths, id, verdict, a.Get("reason"), DateTimeOffset.UtcNow, default));
                 return 0;
             }

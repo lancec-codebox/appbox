@@ -20,6 +20,35 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
     /// <summary>The AI for classification (chat + model), or null when this node has none.</summary>
     public Func<(IChat Chat, string Model)?> Ai { get; init; } = () => null;
 
+    public const int MaxMisses = 3, RetryBatch = 10;
+
+    /// <summary>0.10.1: the AI sometimes leaves an upload out of its answer. Takes every decision it did return, asks again for only the missing ones in a smaller batch (<see cref="RetryBatch"/>), then one at a time. What is still missing comes back in <c>missing</c>; nothing here fails the job for an omission (a failed call of the first ask still throws: the AI is down, the job retries).</summary>
+    public static async Task<(Dictionary<string, JsonObject> Got, List<ClassifyEntry> Missing)> AskAsync(IChat chat, string model, string? channel, List<ClassifyEntry> batch, CancellationToken ct)
+    {
+        var got = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        var remaining = batch.ToList(); int last = int.MaxValue; bool first = true;
+        foreach (var size in new[] { batch.Count, RetryBatch, 1 })
+        {
+            if (remaining.Count == 0) break;
+            if (!first && size >= last) continue;
+            for (int i = 0; i < remaining.Count; i += size)
+            {
+                var part = remaining.Skip(i).Take(size).ToList();
+                try
+                {
+                    var res = await chat.JsonAsync(model, JsonValue.Create(Prompt(channel, part))!, "submit_classification", ct);
+                    foreach (var o in ((res["videos"] as JsonArray) ?? []).OfType<JsonObject>().Where(o => o["id"] != null))
+                        if (part.Any(p => p.Id == o["id"]!.ToString())) got.TryAdd(o["id"]!.ToString(), o);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception e) when (!first) { Log.Info($"classify: asking again for {part.Count} left-out upload(s) failed ({e.Message})"); }
+            }
+            remaining = batch.Where(e => !got.ContainsKey(e.Id)).ToList(); last = size; first = false;
+            if (remaining.Count > 0) Log.Info($"classify: the AI left out {remaining.Count} of {batch.Count} upload(s) (e.g. {remaining[0].Id}); asking again{(size > 1 ? " in smaller batches" : "")}");
+        }
+        return (got, remaining);
+    }
+
     public static string Blob(Paths paths, string id) => $"{paths.Prefix}classify/{id}.json";
 
     public static string Prompt(string? channel, IEnumerable<ClassifyEntry> batch) => $$"""
@@ -57,11 +86,9 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         {
             var (chat, model) = Ai()!.Value;
             var batch = ask.Skip(i).Take(AiBatch).ToList();
-            var res = await chat.JsonAsync(model, JsonValue.Create(Prompt(job.Name ?? job.Id ?? "", batch))!, "submit_classification", ct); // a failure retries the job
-            var byId = ((res["videos"] as JsonArray) ?? []).OfType<JsonObject>().Where(o => o["id"] != null).GroupBy(o => o["id"]!.ToString()).ToDictionary(g => g.Key, g => g.First());
-            var missing = batch.Where(e => !byId.ContainsKey(e.Id)).ToList();
-            if (missing.Count > 0) throw new InvalidOperationException($"the AI left out {missing.Count} of {batch.Count} uploads (e.g. {missing[0].Id})");
-            foreach (var e in batch)
+            var (byId, missing) = await AskAsync(chat, model, job.Name ?? job.Id ?? "", batch, ct); // a failed call retries the job; an omission does not
+            if (missing.Count > 0) Log.Info($"classify {job.JobId}: no AI answer for {missing.Count} upload(s) (e.g. {missing[0].Id}); they stay undecided");
+            foreach (var e in batch.Where(e => byId.ContainsKey(e.Id)))
             {
                 var o = byId[e.Id];
                 bool c = o["candidate"] is JsonValue cv && cv.TryGetValue<bool>(out var cb) && cb;
@@ -93,7 +120,7 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         var todo = all.Take(MaxPerRun).ToList();
         ctx.Report("classify", $"{todo.Count} of {all.Count} unclassified");
         if (job.CountDay != at[..10]) { job.CountDay = at[..10]; job.Classified = 0; job.Rejected = 0; }
-        int stored = 0, rule = 0, dead = 0, aiCount = 0, yes = 0, no = 0;
+        int stored = 0, rule = 0, dead = 0, aiCount = 0, yes = 0, no = 0, noAnswer = 0;
         var ask = new List<(BlobEntry Blob, JobDescriptor Job)>();
 
         async Task Decide(BlobEntry b, JobDescriptor d, bool candidate, string kind, string reason, string by, string? model, bool save)
@@ -129,11 +156,16 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
             var (chat, model) = Ai()!.Value;
             var batch = ask.Skip(i).Take(AiBatch).ToList();
             var entries = batch.Select(x => new ClassifyEntry { Id = Path.GetFileNameWithoutExtension(x.Blob.Name), Title = x.Job.Title, Duration = x.Job.Duration, ChannelName = x.Job.ChannelName }).ToList();
-            var res = await chat.JsonAsync(model, JsonValue.Create(Prompt(null, entries))!, "submit_classification", ct);
-            var byId = ((res["videos"] as JsonArray) ?? []).OfType<JsonObject>().Where(o => o["id"] != null).GroupBy(o => o["id"]!.ToString()).ToDictionary(g => g.Key, g => g.First());
-            var missing = entries.Where(e => !byId.ContainsKey(e.Id)).ToList();
-            if (missing.Count > 0) throw new InvalidOperationException($"the AI left out {missing.Count} of {entries.Count} uploads (e.g. {missing[0].Id})");
-            foreach (var (x, e) in batch.Zip(entries))
+            var (byId, missing) = await AskAsync(chat, model, null, entries, ct);
+            foreach (var (x, e) in batch.Zip(entries).Where(p => !byId.ContainsKey(p.Second.Id)))
+            {
+                // no answer even one at a time: it stays unclassified with a counter; the third miss gives up on it
+                x.Job.ClassifyMisses = (x.Job.ClassifyMisses ?? 0) + 1; noAnswer++;
+                if (x.Job.ClassifyMisses >= MaxMisses) await Decide(x.Blob, x.Job, false, "no AI answer", "", "ai", model, false);
+                else { try { await store.PutAsync(x.Blob.Name, x.Job.ToBytes(), x.Blob.Tags, null, false, ct); } catch (StorageException ex) { Log.Info($"classify: could not record the miss for {e.Id} ({ex.Message})"); } }
+                Log.Info($"classify: no AI answer for {e.Id} (miss {x.Job.ClassifyMisses} of {MaxMisses}){(x.Job.ClassifyMisses >= MaxMisses ? ": given up (failed, classify: no AI answer)" : "")}");
+            }
+            foreach (var (x, e) in batch.Zip(entries).Where(p => byId.ContainsKey(p.Second.Id)))
             {
                 var o = byId[e.Id];
                 bool c = o["candidate"] is JsonValue cv && cv.TryGetValue<bool>(out var cb) && cb;
@@ -141,9 +173,9 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
             }
         }
         job.Attempts = 0; job.LastError = null; job.LastPolled = at;
-        bool more = all.Count > todo.Count;
+        bool more = all.Count > todo.Count;   // (a drama left unclassified after a miss is picked up again in the next round)
         ctx.NextDue = Protocol.Utc(more ? now() : now() + IdleEvery);
-        Log.Info($"classify all: {todo.Count} of {all.Count} unclassified: {stored} already decided, {rule} too short, {dead} unavailable, {aiCount} by AI; {yes} candidate(s), {no} rejected{(more ? "; more remain" : "")}");
+        Log.Info($"classify all: {todo.Count} of {all.Count} unclassified: {stored} already decided, {rule} too short, {dead} unavailable, {aiCount} by AI{(noAnswer > 0 ? $", {noAnswer} without an AI answer" : "")}; {yes} candidate(s), {no} rejected{(more ? "; more remain" : "")}");
     }
 }
 

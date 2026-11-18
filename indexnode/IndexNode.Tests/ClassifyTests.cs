@@ -51,13 +51,14 @@ public class ClassifyTests
     }
 
     [Fact]
-    public async Task A_node_without_ai_passes_the_job_on_and_an_incomplete_answer_fails_it_for_a_retry()
+    public async Task A_node_without_ai_passes_the_job_on_and_an_incomplete_answer_leaves_the_upload_undecided()
     {
         var s = new FakeStore();
         await Assert.ThrowsAsync<JobSkipped>(() => Run(s, Job(E("aaaaaaaaaaa", 90, "Drama")), null));
         Assert.False(s.Exists(ClassifyStage.Blob(P, "aaaaaaaaaaa")));
         var partial = new Chat(_ => """{"videos":[]}""");
-        await Assert.ThrowsAsync<InvalidOperationException>(() => Run(s, Job(E("aaaaaaaaaaa", 90, "Drama")), partial));
+        await Run(s, Job(E("aaaaaaaaaaa", 90, "Drama")), partial);   // 0.10.1: an omission never fails the job
+        Assert.False(s.Exists(ClassifyStage.Blob(P, "aaaaaaaaaaa")));   // asked again, still no answer: undecided
         // only short uploads: no AI needed at all
         await Run(s, Job(E("ddddddddddd", 1, "Short")), null);
         Assert.True(s.Exists(ClassifyStage.Blob(P, "ddddddddddd")));

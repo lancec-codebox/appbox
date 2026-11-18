@@ -61,6 +61,8 @@ public sealed partial class NodeEngine
     {
         try
         {
+            // 0.10.0: the duration is in download.zip's idx_summary (what downloaded.json held)
+            if ((await store.HeadAsync(paths.Video(id, "download.zip"), ct))?.Metadata.GetValueOrDefault("idx_summary") is { Length: > 2 } sum && System.Text.Json.JsonDocument.Parse(sum).RootElement.TryGetProperty("durationSeconds", out var ds) && ds.ValueKind == System.Text.Json.JsonValueKind.Number && ds.GetDouble() > 0) return ds.GetDouble();
             if (await store.GetAsync(paths.Video(id, "downloaded.json"), ct) is { } c && StoredJson.Doc(c.Data, id).RootElement.TryGetProperty("durationSeconds", out var d) && d.GetDouble() > 0) return d.GetDouble();
         }
         catch (OperationCanceledException) { throw; }
@@ -72,9 +74,17 @@ public sealed partial class NodeEngine
     private async Task<List<BatchDrama>> SelectBatchAsync(WorkerState state, List<string> open, CancellationToken ct)
     {
         var foreign = await ForeignHoldsAsync(ct);
-        var picks = await StageOrder.DramasAsync(open, FindPendingAsync, (st, b, c) => EligibleAsync(state, st, b, c), ct, Math.Max(1, o.Batch));
+        var why = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(); int examined = 0;
+        var picks = await StageOrder.DramasAsync(open, FindPendingAsync, async (st, b, c) =>
+        {
+            Interlocked.Increment(ref examined);
+            var r = await WhyNotAsync(state, st, b, c);
+            if (r != null) why.AddOrUpdate(r.Split(':', ' ')[0] is "need" ? "a need missing" : r.StartsWith("loose") ? "loose layout" : r.StartsWith("ignored") ? "ignored" : r.StartsWith("gpu") ? "gpu hold" : r.StartsWith("CanRun") ? "CanRun false" : "job body gone", 1, (_, v) => v + 1);
+            return r == null;
+        }, ct, Math.Max(1, o.Batch));
         var root = Path.Combine(Path.GetTempPath(), "indexnode", "batch-" + Environment.ProcessId + "-" + instanceTag + "-" + (batchNumber + 1));
-        var batch = new List<BatchDrama>(); double total = 0, cap = o.BatchHours * 3600;
+        var batch = new List<BatchDrama>(); double total = 0, cap = o.BatchHours * 3600; int foreignSkipped = 0;
+        if (picks.Count == 0 && examined > 0) Log.Info($"batch: nothing eligible: {examined} pending step job(s) looked at: {string.Join(", ", why.OrderByDescending(k => k.Value).Select(k => k.Value + " " + k.Key))}; `indexnode batch explain` shows each");
         foreach (var pick in picks)
         {
             if (batch.Count >= Math.Max(1, o.Batch)) break;
@@ -82,12 +92,52 @@ public sealed partial class NodeEngine
             var d = new BatchDrama(pick.Id, seconds, new LocalCacheStore(store, Path.Combine(root, pick.Id)));
             foreach (var stage in StageOrder.PassOrder)
                 if (open.Contains(stage) && pick.Members.TryGetValue(stage, out var b)) lock (d.Steps) d.Steps[stage] = b;
+            if (foreign.Contains(pick.Id)) foreignSkipped++;
             if (d.Steps.Count == 0 || foreign.Contains(pick.Id) || !await TryHoldAsync(d, ct)) { d.Local.Dispose(); continue; }
             batch.Add(d); total += seconds;
             if (total >= cap) break;
         }
+        if (batch.Count == 0 && picks.Count > 0) Log.Info($"batch: {picks.Count} drama(s) eligible but none could be held ({foreignSkipped} held by another node)");
         if (batch.Count > 0) { batchNumber++; Log.Info($"[batch#{batchNumber}] {batch.Count} drama(s), {total / 3600:F1} h of video: {string.Join(", ", batch.Select(d => d.Id + "(" + string.Join('+', d.Steps.Keys) + ")"))}"); }
         return batch;
+    }
+
+    /// <summary>`indexnode batch explain`: read-only. For the best <paramref name="top"/> dramas the batch selection would examine, each pending step and why it is or is not eligible, then the picks. Takes no hold, writes nothing.</summary>
+    public async Task<int> ExplainAsync(int top, Action<string> say, CancellationToken ct)
+    {
+        await Control.RefreshAsync(ct, force: true);
+        var state = new WorkerState(0);
+        var open = o.Stages.Where(IsPassStage).ToList();
+        say($"stages this node runs in batches: {string.Join(",", open)}; control: {string.Join(", ", open.Select(s => s + "=" + Control.Effective(s)))}");
+        var running = open.Where(st => Control.Effective(st) == Level.Run).ToList();
+        var foreign = await ForeignHoldsAsync(ct);
+        say($"holds by other nodes: {foreign.Count}{(foreign.Count > 0 ? " (" + string.Join(" ", foreign.Take(10)) + ")" : "")}");
+        var byDrama = new Dictionary<string, Dictionary<string, BlobEntry>>(StringComparer.Ordinal); var perStage = new Dictionary<string, int>();
+        foreach (var st in running)
+        {
+            var list = await FindPendingAsync(st, ct); perStage[st] = list.Count;
+            foreach (var b in list) { var id = Path.GetFileNameWithoutExtension(b.Name); (byDrama.TryGetValue(id, out var g) ? g : byDrama[id] = new())[st] = b; }
+        }
+        say($"pending step jobs (due, tagged pending): {string.Join(", ", perStage.Select(k => k.Key + "=" + k.Value))}; {byDrama.Count} drama(s)");
+        var order = Tags.ClaimOrder(byDrama.Select(g => new BlobEntry(g.Key, Tags.Job("pass", "pending", g.Value.Values.Select(b => b.Tags.GetValueOrDefault(Tags.Added) ?? "").OrderBy(x => x, StringComparer.Ordinal).First(), null, g.Value.Values.Max(b => Tags.PriorityOf(b.Tags))), new Dictionary<string, string>(), "available", 0))).ToList();
+        var reasons = new Dictionary<string, int>(); var picks = new List<string>(); int shown = 0;
+        foreach (var key in order)
+        {
+            var steps = byDrama[key.Name]; bool eligible = false; var lines = new List<string>();
+            foreach (var st in StageOrder.PassOrder.Where(steps.ContainsKey))
+            {
+                var why = await WhyNotAsync(state, st, steps[st], ct);
+                lines.Add($"    {st}: {(why == null ? "eligible" : "NOT eligible - " + why)}");
+                if (why == null) eligible = true; else { var k = why.StartsWith("need") ? "a need missing" : why.Split(':')[0]; reasons[k] = reasons.GetValueOrDefault(k) + 1; }
+            }
+            if (eligible && foreign.Contains(key.Name)) { lines.Add("    held by another node: skipped"); eligible = false; reasons["foreign hold"] = reasons.GetValueOrDefault("foreign hold") + 1; }
+            if (eligible && picks.Count < Math.Max(1, o.Batch)) picks.Add(key.Name);
+            if (shown++ < top) { say($"  {key.Name}  priority {Tags.PriorityOf(key.Tags)}  oldest pending {key.Tags.GetValueOrDefault(Tags.Added)}  {(eligible ? "-> ELIGIBLE" : "-> no")}"); foreach (var l in lines) say(l); }
+            if (picks.Count >= Math.Max(1, o.Batch) && shown >= top) break;
+        }
+        say($"reasons (steps examined): {(reasons.Count == 0 ? "none" : string.Join(", ", reasons.OrderByDescending(k => k.Value).Select(k => k.Value + " " + k.Key)))}");
+        say($"batch picks (--batch {o.Batch}): {(picks.Count == 0 ? "none" : string.Join(", ", picks))}");
+        return picks.Count > 0 ? 0 : 1;
     }
 
     /// <summary>Video ids whose hold blob is leased by another node right now (a consistent listing with metadata, not the tag query).</summary>

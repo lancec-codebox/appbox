@@ -70,7 +70,7 @@ public sealed class EngineOptions
     public int Lanes { get; init; } = 2;
     /// <summary>A batch holds up to this many dramas (--batch) or about <see cref="BatchHours"/> of video (--batch-hours), best first.</summary>
     public int Batch { get; init; } = 6;
-    public double BatchHours { get; init; } = 2;
+    public double BatchHours { get; init; } = 12;
     /// <summary>How often a batch renews its hold-blob leases (60 s leases).</summary>
     public TimeSpan HoldRenew { get; init; } = TimeSpan.FromSeconds(40);
     /// <summary>Tests replace the unloading of the shared models after a stage.</summary>
@@ -120,7 +120,7 @@ public sealed partial class NodeEngine
     private readonly IReadOnlyDictionary<string, IStageHandler> handlers;
     private readonly ConcurrentDictionary<Running, byte> running = new();
     /// <summary>Everything one worker owns: its back-off state and its work folder. Workers share nothing but the store client, the config and the node record.</summary>
-    private sealed class WorkerState(int number)
+    internal sealed class WorkerState(int number)
     {
         public int Number { get; } = number;
         public ConcurrentDictionary<string, DateTimeOffset> IgnoreUntil { get; init; } = new();
@@ -486,24 +486,27 @@ public sealed partial class NodeEngine
     }
 
     /// <summary>Whether a pending job could be claimed right now (for the workers' stage ranking): not ignored, its needs exist, this node can run it and no GPU hold applies. Reads only.</summary>
-    private async Task<bool> EligibleAsync(WorkerState w, string stage, BlobEntry b, CancellationToken ct)
+    private async Task<bool> EligibleAsync(WorkerState w, string stage, BlobEntry b, CancellationToken ct) => await WhyNotAsync(w, stage, b, ct) == null;
+
+    /// <summary>Why a pending job cannot be claimed right now (the reason with the detail of how it was checked), or null when it can. Reads only.</summary>
+    internal async Task<string?> WhyNotAsync(WorkerState w, string stage, BlobEntry b, CancellationToken ct)
     {
-        if (w.IgnoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) return false;
-        if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && GpuRouting.EffectiveHold(o.GpuFallback, Control.Current) is { } hold && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, hold)) return false;
+        if (w.IgnoreUntil.TryGetValue(b.Name, out var until) && until > DateTimeOffset.UtcNow) return $"ignored: a failed or held claim, looked at again after {Protocol.Utc(until)}";
+        if (!o.Gpu && GpuRouting.IsMarkerStage(stage) && GpuRouting.EffectiveHold(o.GpuFallback, Control.Current) is { } hold && !GpuRouting.MayClaim(false, stage, await ReadySinceAsync(stage, b, ct), DateTimeOffset.UtcNow, hold)) return $"gpu hold: left for the GPU node for {hold.TotalMinutes:F0} min after it was ready";
         var body = await store.GetAsync(b.Name, ct);
-        if (body == null) return false;
+        if (body == null) return "job body is gone (GET " + b.Name + " -> 404)";
         var job = JobDescriptor.Parse(body.Data);
-        if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct) != null && !(IsPassStage(stage) && NeedsFromPass(job, needs))) return false;
-        if (NeedsLayout(stage) && await LooseAsync(job.JobId, ct)) return false;
-        if (o.CanRun != null && !o.CanRun(job)) return false;
-        return true;
+        if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct) is { } missing && !(IsPassStage(stage) && NeedsFromPass(job, needs))) return $"need {missing} missing (checked: HEAD {paths.Video(job.JobId, Protocol.NormalizeNeed(missing))}; job needs [{string.Join(", ", needs)}])";
+        if (NeedsLayout(stage) && await LooseAsync(job.JobId, ct)) return "loose 0.9 layout: loose files still in " + paths.VideoDir(job.JobId) + " (run indexnode repack)";
+        if (o.CanRun != null && !o.CanRun(job)) return "CanRun is false: this node does not run this step (" + string.Join(",", job.Steps ?? [stage]) + ")";
+        return null;
     }
 
     /// <summary>True when every input still missing for a pass-stage job is an output of an earlier step of the pass.</summary>
     private static bool NeedsFromPass(JobDescriptor job, string[] needs)
     {
         var earlier = StageOrder.PassOrder.TakeWhile(x => x != job.Stage).Select(x => x + ".zip").ToHashSet(StringComparer.Ordinal);
-        return needs.Any(n => earlier.Contains(n));
+        return Protocol.NormalizeNeeds(needs).Any(n => earlier.Contains(n));
     }
 
     private async Task<Claim?> TryClaimAsync(WorkerState w, string stage, CancellationToken ct)
@@ -604,7 +607,13 @@ public sealed partial class NodeEngine
 
     private async Task<string?> MissingNeedAsync(JobDescriptor job, string[] needs, CancellationToken ct, HashSet<string>? produced = null)
     {
-        foreach (var n in needs) if (!(produced?.Contains(n) ?? false) && await store.GetTagsAsync(paths.Video(job.JobId, n), ct) == null) return n;
+        foreach (var raw in needs)
+        {
+            var n = Protocol.NormalizeNeed(raw);   // jobs written before 0.10.0 name loose files: they wait on the stage zip now
+            if ((produced?.Contains(n) ?? false) || (produced?.Contains(raw) ?? false)) continue;
+            bool there = n.EndsWith(".zip", StringComparison.Ordinal) && !n.Contains('/') ? await store.HeadAsync(paths.Video(job.JobId, n), ct) != null : await store.GetTagsAsync(paths.Video(job.JobId, n), ct) != null;
+            if (!there) return raw;
+        }
         return null;
     }
 

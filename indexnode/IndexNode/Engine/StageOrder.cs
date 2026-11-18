@@ -12,7 +12,7 @@ public sealed record DramaPick(string Id, BlobEntry Key, Dictionary<string, Blob
 /// <summary>What a worker looks at first. Stages outside the drama pass: the stage whose best claimable job comes first in one queue order (idx_priority descending, idx_added, name). CPU step stages: whole dramas, ordered by their highest priority and oldest pending step.</summary>
 public static class StageOrder
 {
-    public const int MaxExamined = 20;
+    // 0.10.1: no cap on dramas examined; selection goes on until the batch is full or the list ends (0.10.0 stopped after 20 and starved when they were all ineligible)
 
     /// <summary>The CPU steps a worker runs on one drama in one pass, in this order (only those the node runs and that are pending).</summary>
     public static readonly string[] PassOrder = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs", "cast", "sync"];
@@ -25,11 +25,11 @@ public static class StageOrder
         {
             try
             {
-                foreach (var b in Tags.ClaimOrder(await pending(stage, ct)).Take(MaxExamined))
+                foreach (var b in Tags.ClaimOrder(await pending(stage, ct)))
                     if (await eligible(stage, b, ct)) { heads[b.Name] = stage; entries.Add(b); break; }
             }
             catch (OperationCanceledException) { throw; }
-            catch { /* a stage whose queue cannot be read now does not hold the others back */ }
+            catch (Exception e) { Log.Info($"[{stage}] the pending list could not be read ({e.GetType().Name}: {e.Message}); the other stages go on"); }   // a stage whose queue cannot be read now does not hold the others back
         }
         return Tags.ClaimOrder(entries).Select(b => (heads[b.Name], b)).ToList();
     }
@@ -55,13 +55,13 @@ public static class StageOrder
                 }
             }
             catch (OperationCanceledException) { throw; }
-            catch { }
+            catch (Exception e) { Log.Info($"[{stage}] the pending list could not be read ({e.GetType().Name}: {e.Message}); the other stages go on"); }
         }
         var picks = groups.Select(g => new DramaPick(g.Key, new BlobEntry(g.Key,
             Tags.Job("pass", "pending", g.Value.Values.Select(b => b.Tags.GetValueOrDefault(Tags.Added) ?? "").OrderBy(x => x, StringComparer.Ordinal).First(), null, g.Value.Values.Max(b => Tags.PriorityOf(b.Tags))),
             new Dictionary<string, string>(), "available", 0), g.Value)).ToList();
         var result = new List<DramaPick>();
-        foreach (var key in Tags.ClaimOrder(picks.Select(p => p.Key)).Take(MaxExamined))
+        foreach (var key in Tags.ClaimOrder(picks.Select(p => p.Key)))
         {
             var pick = picks.First(p => ReferenceEquals(p.Key, key));
             foreach (var (stage, b) in pick.Members) if (await eligible(stage, b, ct)) { result.Add(pick); break; }

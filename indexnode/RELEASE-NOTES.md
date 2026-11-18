@@ -1,5 +1,19 @@
 # IndexNode release notes
 
+## 0.10.1
+
+Fixes batch nodes that never started a batch after the 0.10.0 repack.
+
+- **`indexnode batch explain [--stages ...] [--batch N] [--top 50]`:** read-only (no hold, no claim, no write). For the best dramas it prints each pending step and the exact reason it is or is not eligible (ignored, GPU hold, which need is missing and how it was checked, loose layout, CanRun, held by another node), the totals per reason and the batch it would pick. Exit code 0 when something is eligible, 1 when not.
+- **Legacy needs:** a job that still names a loose file (`frames/manifest.json`, `keyframes/manifest.json`, `asr/sensevoice.zh.json`, `ocr/lines.json`, `cast/clusters.json`, `describe.json`, `info.json`) now waits for the stage zip that holds it (HEAD of `frames.zip` ...), so old jobs run without data edits.
+- **Selection no longer stops at 20 dramas:** it goes down the priority/age list until the batch is full or the list ends.
+- **Errors are logged:** a pending list that cannot be read is logged per stage instead of swallowed. When a round finds nothing eligible, one line gives the counts per reason.
+- **Duration** comes from `download.zip`'s `idx_summary` (`durationSeconds`); `downloaded.json` is only a fallback.
+- **`indexnode repack` is faster:** the files of a drama are fetched/restored and deleted 8 at a time; verification uses the computed sizes and CRCs plus the uploaded blob's length and hash instead of downloading the zip back; `--parallel` defaults to the number of cores.
+- **Classify tolerates omissions:** when the AI leaves uploads out of its answer, the decisions it did return are kept; only the missing ones are asked again, in batches of 10 and then one at a time. An upload that still gets no answer stays unclassified with a counter (`classifyMisses` on its job) and is given up on (failed, reason `classify: no AI answer`) after 3 misses. An omission never fails the classify job; a failed AI call still retries it.
+- **Video ids that start with '-':** `--video=<id>` is accepted wherever a video id is taken (`--job`, `--videos`), and everything after a bare `--` is positional: `indexnode classify set --video=--QfpuGhs0U drama` or `indexnode classify set drama -- --QfpuGhs0U`.
+- **`--batch-hours` defaults to 12** (2 h made nearly every batch one drama, so `--lanes 2` ran one lane).
+
 ## 0.10.0
 
 - **One zip per stage per drama.** `index/videos/<id>/` now holds video.mp4 (and compact.mp4) plus `download`, `frames`, `sscd`, `thumbs`, `transcribe`, `ocrsubs`, `cast`, `sync`, `describe`, `translate` and `comments` zips: about 12 files per drama instead of about 430. Standard zips (real CRC-32, stored members, zip64), written whole by their own stage, never patched. Member names are the old relative paths.
