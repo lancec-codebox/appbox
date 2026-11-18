@@ -76,11 +76,16 @@ public class ClassifyAllTests
         Assert.Empty(picks);
         // the classify job holds nothing: a hold blob is per drama and the singleton's id is not a video
         Assert.DoesNotContain(s.Names(P.HoldsDir), n => n.Contains("all"));
-        // the Medusa claim queries (BlobClient.kt, IndexStore.kt, NodeCore.kt) match idx_state == pending only
+        // the Medusa claim queries (BlobClient.kt, IndexStore.kt, NodeCore.kt) match idx_state == pending only.
+        // Only query lines are checked: Medusa's refresh (1.9.2) rightly creates new downloads as unclassified.
         var root = AppContext.BaseDirectory; while (root != null && !Directory.Exists(Path.Combine(root, "medusa"))) root = Path.GetDirectoryName(root);
         if (root != null)
-            foreach (var f in Directory.EnumerateFiles(Path.Combine(root, "medusa", "app", "src", "main"), "*.kt", SearchOption.AllDirectories))
-                Assert.DoesNotContain("unclassified", File.ReadAllText(f));
+        {
+            var queries = Directory.EnumerateFiles(Path.Combine(root, "medusa", "app", "src", "main"), "*.kt", SearchOption.AllDirectories)
+                .SelectMany(File.ReadLines).Where(l => l.Contains("\\\"idx_state\\\"")).ToList();
+            Assert.NotEmpty(queries);
+            foreach (var line in queries) Assert.DoesNotContain("unclassified", line);
+        }
     }
 
     [Fact]
