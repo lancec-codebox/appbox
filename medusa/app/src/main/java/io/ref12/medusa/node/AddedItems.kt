@@ -54,7 +54,7 @@ object AddedState {
                 else -> "no job found"
             }
         } else {
-            val w = api.get(WatchJobs.path(item.jobId))
+            val w = api.get(RefreshJobs.path(item.jobId)).let { if (it.status == 200) it else api.get(RefreshJobs.legacyPath(item.jobId)) }
             if (w.status != 200) "source not found (removed?)" else {
                 val c = sourceCounts(api, item.jobId)
                 "pending " + (c["pending"] ?: 0) + " \u00b7 done " + (c["done"] ?: 0) + " \u00b7 failed " + (c["failed"] ?: 0)
@@ -62,12 +62,12 @@ object AddedState {
         }
     } catch (e: Exception) { "state unknown: " + Redact.sas(e.message) }
 
-    /** Removes the entry's job from the index: a source's watch job, or a still-pending video job. Downloaded videos stay. */
+    /** Removes the entry's job from the index: a source's refresh job, or a still-pending video job. Downloaded videos stay. */
     fun removeFromIndex(api: BlobApi, item: AddedItem): String =
         if (item.kind == "video") {
             val p = IndexVideo.jobPath(item.jobId.removePrefix("v-"))
             if (api.getTags(p)["idx_state"] == "pending") { api.delete(p); "Removed the pending download" } else "Entry removed (the download is not pending, so it was left)"
-        } else { WatchJobs.remove(api, item.jobId); "Source removed (its downloads stay)" }
+        } else { RefreshJobs.remove(api, item.jobId); "Source removed (its downloads stay)" }
 
     /** Changes the priority of an entry in the index, with the re-tagging rules of "sources priority". */
     fun changePriority(api: BlobApi, item: AddedItem, priority: Int, listed: Collection<String>?): SourceResult =

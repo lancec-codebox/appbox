@@ -91,7 +91,8 @@ object Priorities {
                 val job = JSONObject(body.text).put("priority", priority)
                 if (explicit) job.put("explicit", true) else job.remove("explicit")
                 val next = LinkedHashMap(tags) // every tag stays
-                if (priority == 0) next.remove(Prio.TAG) else next[Prio.TAG] = priority.toString()
+                if (stage == RefreshJobs.STAGE && Prio.of(tags) == RefreshJobs.NOW_PRIORITY) { /* a lookup that is due now keeps its boost; the body's priority is what its videos inherit */ }
+                else if (priority == 0) next.remove(Prio.TAG) else next[Prio.TAG] = priority.toString()
                 api.put(name, job.toString().toByteArray(), "application/json", next, lease, false)
                 changed++
             } finally { try { api.releaseLease(name, lease) } catch (e: Exception) { /* it expires */ } }
@@ -115,18 +116,19 @@ object Priorities {
 
     /**
      * Sets a source's priority and re-tags the still-pending jobs (download, comments, steps) of every video from it, as "sources priority".
-     * [sourceId] is a watch job id (ch-/pl-) or v-<videoId> for a direct video. [listedIds]: video ids from a yt-dlp listing of the source,
+     * [sourceId] is a refresh job id (ch-/pl-) or v-<videoId> for a direct video. [listedIds]: video ids from a yt-dlp listing of the source,
      * to match videos queued before their source was recorded.
      */
     fun setSource(api: BlobApi, sourceId: String, priority: Int, listedIds: Collection<String>?): SourceResult {
         Prio.check(priority)
         val direct = sourceId.startsWith("v-")
         val prios = HashMap<String, Int>()
-        for (r in api.findAll("watch")) { val g = api.get(r.name); if (g.status == 200) { val w = JSONObject(g.text); prios[w.optString("jobId", r.id)] = w.optInt("priority", 0) } }
+        try { RefreshJobs.migrateLegacy(api) } catch (e: Exception) { /* read the old ones below */ }
+        for (r in api.findAll("refresh")) { val g = api.get(r.name); if (g.status == 200) { val w = JSONObject(g.text); prios[w.optString("jobId", r.id)] = w.optInt("priority", 0) } }
         val skipped = LinkedHashMap<String, Int>(); var changed = 0; var matched = 0
         if (!direct) {
             if (!prios.containsKey(sourceId)) throw IllegalArgumentException("no source $sourceId")
-            val r = set(api, priority, listOf("watch" to sourceId), explicit = false)
+            val r = set(api, priority, listOf("refresh" to sourceId), explicit = false)
             if (r.changed == 0) throw IllegalStateException("source $sourceId could not be updated (" + r.skipped.keys.joinToString(", ") + "); try again")
             prios[sourceId] = priority
         }

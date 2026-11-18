@@ -106,14 +106,14 @@ Rewriting a blob (Put Blob) drops its tags unless they're sent again in `x-ms-ta
 - Refresh: after a round finishes, the job is rewritten with `round + 1`, `idx_state=pending` and `idx_due` set to the next refresh. Refreshes fall at 1 day, 3 days, 7 days and 30 days after the download, then every 30 days while the video is under a year old. After that the job ends as `done`.
 - Comments mention cast names, other parts and sequels, and sentiment; later steps mine them for that.
 
-`watch` (a followed source, polled on a schedule; the job never ends):
+`refresh` (a followed source; before 1.9.2 `watch`, still read and moved to `jobs/refresh/` on first touch). One job per source, `index/jobs/refresh/<sourceId>.json`; its `run` field says what the next claim does:
 ```json
-{ "v": 1, "stage": "watch", "jobId": "pl-PLxxxx", "kind": "playlist"|"channel", "id": "<playlist id or channel id UC...>", "name": "...",
-  "every": "1h", "tabs": ["videos", "shorts"], "followChannels": false, "maxHeight": 480, "addedAt": "...", "lastPolled": null, "attempts": 0 }
+{ "v": 1, "stage": "refresh", "jobId": "pl-PLxxxx", "kind": "playlist"|"channel", "id": "<playlist id or channel id UC...>", "name": "...",
+  "schedule": "once"|"off"|"6h"|"1d"|"daily@03:00", "every": "1d", "backfill": 0, "followChannels": true, "maxHeight": 480, "priority": 0,
+  "run": "lookup"|"refresh", "lastRun": "lookup", "lastLookup": "…Z", "lastRefresh": "…Z", "nextRefresh": "…Z", "members": 120, "seen": ["…"], "found": 3, "addedAt": "…Z" }
 ```
-- Followed sources are the owner's chosen channels and playlists. **Watch Later is never a source**: it was a one-off seed (`index/seeds/`), used only to suggest channels.
-- A node claims a due `watch` job like any other (`idx_due` ≤ now), polls, then rewrites it with `idx_state=pending`, `idx_due` = now + `every` (default 1 h) and `lastPolled`.
-- **Polling uses yt-dlp's flat listing**, newest first, no cookies: `--flat-playlist --playlist-end 30 --print id` on the playlist URL, or on the channel's `/videos` and `/shorts` tabs (per `tabs`), with a JS runtime. Tested 2026-11-13 from the hexad host: listings work without cookies even while video pages ask it to sign in. **Everything YouTube goes through yt-dlp** (owner rule): never YouTube's official Data API, RSS feeds or other official endpoints, which don't cover what we need and are too restrictive. `backfill` uses the same listing with a larger `--playlist-end`.
+- Adding a source writes the job due now at `idx_priority` 500 (`run`: lookup); any node that runs `refresh` claims it. **Lookup** = full listing (every member to `index/sources/<id>/members.json`, every unknown video queued, subject to `backfill`). **Refresh** = incremental (a channel's newest 30 until known ones; a playlist in full; only new videos queued). A manual "Refresh now" / "Look up again" sets `run` and makes the job due now at 500.
+- After a run the node rewrites the job: pending with `idx_due` at the next scheduled time, or `done` for `once`/`off`, and back at the source's own priority.
 - **New videos:** a video id with no `index/jobs/download/<id>.json` and no `index/videos/<id>/` gets a download job (the source's `maxHeight`, `"source": "<watch jobId>"`). Known ids are skipped, so a video in several sources is downloaded once.
 - `followChannels: true` (the owner's public "drop" playlist): the channel of every video found is added as a followed `channel` source, if not already followed, with `backfill: 0` (new uploads only). The owner drops videos into that playlist to say "follow this channel".
 - `backfill`: on the first poll of a newly added source, enqueue at most this many of its existing videos, newest first (default 0: only videos published after it was added).

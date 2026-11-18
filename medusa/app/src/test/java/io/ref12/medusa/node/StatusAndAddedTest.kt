@@ -72,7 +72,7 @@ class StatusAndAddedTest {
         IndexAdd.add(api, l, "https://youtu.be/cccccccccc1", FollowOptions(), 0, 2L, { null }, { null })
         assertEquals("download pending", AddedState.describe(l.find("v-cccccccccc1")!!, api))
         AddedState.removeFromIndex(api, l.find("v-cccccccccc1")!!); assertNull(api.blobs["index/jobs/download/cccccccccc1.json"])
-        AddedState.removeFromIndex(api, l.find("pl-PLabcdefghijk123")!!); assertNull(api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"])
+        AddedState.removeFromIndex(api, l.find("pl-PLabcdefghijk123")!!); assertNull(api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"])
         assertNotNull(api.blobs["index/jobs/download/aaaaaaaaaaa.json"])
     }
 }

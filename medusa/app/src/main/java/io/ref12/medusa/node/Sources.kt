@@ -6,7 +6,7 @@ import java.net.URI
 /** A followed source: a YouTube playlist or channel. [id] is the playlist id or the channel id (UC...). */
 class SourceRef(val kind: String, val id: String) {
     val jobId: String get() = (if (kind == "playlist") "pl-" else "ch-") + id
-    val path: String get() = WatchJobs.path(jobId)
+    val path: String get() = RefreshJobs.path(jobId)
 }
 
 object SourceUrl {
@@ -86,31 +86,81 @@ object SourceUrl {
     }
 }
 
-class FollowOptions(val every: String = "1h", val backfill: Int = 0, val followChannels: Boolean = false, val name: String? = null, val maxHeight: Int = 480, val priority: Int = 0)
+/** [every] is the schedule: once (the default: a lookup on add, then nothing), off, 1h, 6h, 1d or daily@03:00. [backfill] null: no limit on a playlist's lookup (a channel's takes its newest 100). */
+class FollowOptions(val every: String = "once", val backfill: Int? = null, val followChannels: Boolean = false, val name: String? = null, val maxHeight: Int = 480, val priority: Int = 0)
 
-object WatchJobs {
-    const val STAGE = "watch"
-    val EVERY = listOf("1h", "6h", "1d")
-    fun path(jobId: String) = "index/jobs/watch/$jobId.json"
+/** The refresh stage's source jobs (index/jobs/refresh/<sourceId>.json; before 1.9.2 jobs/watch/, still read and migrated). */
+object RefreshJobs {
+    const val STAGE = "refresh"
+    const val LEGACY_STAGE = "watch"
+    /** A lookup or manual run is claimed at this priority; the job body keeps the source's own, which its videos inherit. */
+    const val NOW_PRIORITY = 500
+    val EVERY = listOf("once", "1d", "6h", "1h")
+    fun path(jobId: String) = "index/jobs/refresh/$jobId.json"
+    fun legacyPath(jobId: String) = "index/jobs/watch/$jobId.json"
 
-    fun descriptor(ref: SourceRef, o: FollowOptions, addedAt: String): JSONObject = JSONObject()
-        .put("v", 1).put("stage", STAGE).put("jobId", ref.jobId).put("kind", ref.kind).put("id", ref.id).put("name", o.name ?: ref.id)
-        .put("every", o.every).put("backfill", o.backfill).also { if (ref.kind == "channel") it.put("tabs", org.json.JSONArray(listOf("videos", "shorts"))) }
-        .put("followChannels", o.followChannels && ref.kind == "playlist").put("maxHeight", o.maxHeight)
-        .also { if (o.priority != 0) it.put("priority", Prio.check(o.priority)) }
-        .put("addedAt", addedAt).put("lastPolled", JSONObject.NULL).put("attempts", 0)
-
-    fun tags(now: String, priority: Int = 0) = Prio.jobTags(STAGE, "pending", now, priority)
-
-    /** Writes the watch job unless it exists (If-None-Match: *). True when it was created, false when it was already there; an existing job is never touched. */
-    fun follow(api: BlobApi, ref: SourceRef, o: FollowOptions, nowMs: Long): Boolean {
-        val now = NodeRunner.iso(nowMs)
-        return api.put(ref.path, descriptor(ref, o, now).toString().toByteArray(), "application/json", tags(now, o.priority), null, true)
+    fun descriptor(ref: SourceRef, o: FollowOptions, addedAt: String): JSONObject {
+        val sched = RefreshSchedule.parse(o.every)
+        return JSONObject()
+            .put("v", 1).put("stage", STAGE).put("jobId", ref.jobId).put("kind", ref.kind).put("id", ref.id).put("name", o.name ?: ref.id)
+            .put("schedule", sched.text).also { if (sched.kind == "every") it.put("every", sched.text) }
+            .also { if (o.backfill != null) it.put("backfill", o.backfill) }
+            .also { if (ref.kind == "channel") it.put("tabs", org.json.JSONArray(listOf("videos", "shorts"))) }
+            .put("followChannels", o.followChannels && ref.kind == "playlist").put("maxHeight", o.maxHeight)
+            .also { if (o.priority != 0) it.put("priority", Prio.check(o.priority)) }
+            .put("run", "lookup").put("addedAt", addedAt).put("lastPolled", JSONObject.NULL).put("attempts", 0)
     }
 
-    /** Deletes the watch job; its downloaded videos stay. */
-    fun remove(api: BlobApi, jobId: String) = api.delete(path(jobId))
+    /** The tags of a job that is due now at the high priority (a lookup on add, or a manual run). */
+    fun nowTags(now: String) = Prio.jobTags(STAGE, "pending", now, NOW_PRIORITY)
+
+    /** True when the source exists as a refresh job or as a pre-1.9.2 watch job. */
+    fun exists(api: BlobApi, jobId: String) = api.getTags(path(jobId)).isNotEmpty() || api.getTags(legacyPath(jobId)).isNotEmpty()
+
+    /** Writes the source's job, due NOW at priority 500 (so the next free downloader lists it, whatever the schedule), unless it exists (If-None-Match: *). An existing job is never touched. */
+    fun follow(api: BlobApi, ref: SourceRef, o: FollowOptions, nowMs: Long): Boolean {
+        if (api.getTags(legacyPath(ref.jobId)).isNotEmpty()) return false
+        val now = NodeRunner.iso(nowMs)
+        return api.put(ref.path, descriptor(ref, o, now).toString().toByteArray(), "application/json", nowTags(now), null, true)
+    }
+
+    /** Moves jobs/watch/<id>.json to jobs/refresh/<id>.json with state, due time, priority and schedule kept. Returns how many moved; a job another node holds is left. */
+    fun migrateLegacy(api: BlobApi): Int {
+        var moved = 0
+        for (n in api.listNames("index/jobs/watch/").filter { it.endsWith(".json") }) {
+            val id = n.substringAfterLast('/').removeSuffix(".json")
+            val lease = api.acquireLease(n, 60) ?: continue
+            try {
+                val g = api.get(n); if (g.status != 200) continue
+                val tags = LinkedHashMap(api.getTags(n)); tags["idx_stage"] = STAGE
+                val o = JSONObject(g.text).put("stage", STAGE)
+                if (!o.has("run")) o.put("run", if (o.isNull("seen") || !o.has("seen")) "lookup" else "refresh")
+                if (api.put(path(id), o.toString().toByteArray(), "application/json", tags, null, true)) moved++
+                api.delete(n)
+            } finally { try { api.releaseLease(n, lease) } catch (e: Exception) { /* gone with the delete */ } }
+        }
+        return moved
+    }
+
+    /** "Refresh now" / "Look up again": makes the source's job due now at priority 500. [kind] is "refresh" (incremental) or "lookup" (full listing). False when a node is running it. */
+    fun trigger(api: BlobApi, jobId: String, kind: String, nowMs: Long): Boolean {
+        require(kind == "lookup" || kind == "refresh") { "kind is lookup or refresh" }
+        try { migrateLegacy(api) } catch (e: Exception) { /* the next claim retries */ }
+        val name = path(jobId)
+        if (api.getTags(name).isEmpty()) throw IllegalArgumentException("no source $jobId")
+        val lease = api.acquireLease(name, 60) ?: return false
+        try {
+            val g = api.get(name); if (g.status != 200) throw IllegalArgumentException("no source $jobId")
+            val o = JSONObject(g.text).put("run", kind).put("attempts", 0).also { it.remove("lastError"); it.remove("permanent") }
+            api.put(name, o.toString().toByteArray(), "application/json", nowTags(NodeRunner.iso(nowMs)), lease, false)
+            return true
+        } finally { try { api.releaseLease(name, lease) } catch (e: Exception) { /* it expires */ } }
+    }
+
+    /** Deletes the source's job (either name); its downloaded videos stay. */
+    fun remove(api: BlobApi, jobId: String) { api.delete(path(jobId)); api.delete(legacyPath(jobId)) }
 }
+
 
 /** The outcome of "Follow in index". */
 sealed class FollowResult {
@@ -121,14 +171,17 @@ sealed class FollowResult {
 }
 
 object SourceFollow {
-    /** Parses [raw] (resolving a handle through [resolve]) and creates its watch job unless it exists. Blocking: call it off the main thread. */
+    /** The refresh job of a known source (no URL parsing): used when a lookup finds channels to follow. */
+    fun followRef(api: BlobApi, ref: SourceRef, opts: FollowOptions, nowMs: Long): Boolean = RefreshJobs.follow(api, ref, opts, nowMs)
+
+    /** Parses [raw] (resolving a handle through [resolve]) and creates its refresh job (a lookup, due now) unless it exists. Blocking: call it off the main thread. */
     fun run(api: BlobApi, raw: String, opts: FollowOptions, nowMs: Long, resolve: (String) -> String?): FollowResult {
         val url = SourceUrl.firstUrl(raw) ?: raw.trim()
         val ref = try { SourceUrl.parse(url, resolve) } catch (e: Exception) { null }
         if (ref == null) return if (SourceUrl.isSource(url)) FollowResult.Failed("Could not find the channel id of this URL") else FollowResult.NotASource
         return try {
             val named = FollowOptions(opts.every, opts.backfill, opts.followChannels, opts.name ?: SourceUrl.nameHint(url, ref), opts.maxHeight, opts.priority)
-            if (WatchJobs.follow(api, ref, named, nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref)
+            if (RefreshJobs.follow(api, ref, named, nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref)
         } catch (e: Exception) { FollowResult.Failed(Redact.sas(e.message ?: e.javaClass.simpleName)) }
     }
 }
@@ -168,7 +221,7 @@ object IndexVideo {
         val ch = try { channelOf("https://www.youtube.com/watch?v=$id")?.lineSequence()?.map { it.trim() }?.firstOrNull { Regex("UC[A-Za-z0-9_-]{22}").matches(it) } } catch (e: Exception) { null }
             ?: return added to FollowResult.Failed("Could not find the channel of this video")
         val ref = SourceRef("channel", ch)
-        return added to try { if (WatchJobs.follow(api, ref, FollowOptions(priority = priority), nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref) }
+        return added to try { if (RefreshJobs.follow(api, ref, FollowOptions(priority = priority), nowMs)) FollowResult.Created(ref) else FollowResult.Exists(ref) }
             catch (e: Exception) { FollowResult.Failed(Redact.sas(e.message ?: e.javaClass.simpleName)) }
     }
 }

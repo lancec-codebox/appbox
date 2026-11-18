@@ -154,5 +154,24 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher, private val prefs: Download
 
     override fun cleanup(dir: File) { dir.deleteRecursively() }
 
+    /** A source listing for the refresh stage: the flat playlist, no cookies, newest first. A 429 or "sign in" is a bot block, as for a download. */
+    override fun list(url: String, end: Int): List<String> {
+        cancelled = false
+        try { yt.ensureInit() } catch (e: Exception) { throw NodeFetchException(FailureKind.TRANSIENT, e.message ?: "yt-dlp did not start") }
+        val lines = java.util.Collections.synchronizedList(ArrayList<String>())
+        try {
+            val r = YoutubeDL.getInstance().execute(YoutubeDLRequest(url).apply {
+                addOption("--flat-playlist"); addOption("--no-warnings")
+                if (end > 0) addOption("--playlist-end", end.toString())
+                addOption("--print", RefreshWork.LIST_PRINT)
+            }, PID) { _, _, line -> if (line.isNotBlank()) lines.add(line) }
+            return r.out.lines().filter { it.isNotBlank() }
+        } catch (e: YoutubeDLException) {
+            if (cancelled) throw NodeFetchException(FailureKind.TRANSIENT, "cancelled")
+            val raw = (e.message ?: "") + "\n" + lines.joinToString("\n")
+            throw NodeFetchException(Failures.classify(e.message ?: raw), Failures.errorLine(e.message ?: raw))
+        } catch (e: InterruptedException) { throw NodeFetchException(FailureKind.TRANSIENT, "cancelled") }
+    }
+
     companion object { const val PID = YtDlpVideoIo.PID }
 }

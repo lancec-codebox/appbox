@@ -76,7 +76,8 @@ class NodeOverride(val budget: Int?, val schedule: String?, val window: String?)
 
 class Control(val mode: Level, val stages: Map<String, Level>, val message: String?, val changedAt: String?, val changedBy: String?, val nodes: Map<String, NodeOverride> = emptyMap(),
               /** downloads.maxPerIp (1.8.5): null or 0 = no cap, the default. */ val maxPerIp: Int? = null) {
-    fun effective(stage: String): Level = maxOf(mode, stages[stage] ?: Level.RUN)
+    /** The stricter of the mode and the stage's own setting; the pre-1.9.2 "watch" key is the refresh stage (the new key wins). */
+    fun effective(stage: String): Level = maxOf(mode, stages[stage] ?: (if (stage == "refresh") stages["watch"] else null) ?: Level.RUN)
     companion object {
         val RUN = Control(Level.RUN, emptyMap(), null, null, null)
         fun parse(text: String): Control {
@@ -230,9 +231,10 @@ class NodeRunner(
             while (true) {
                 if (aborted.get()) { s.endReason = "stopped by the system"; break }
                 val c = control.refresh(); state.saveControl(describe(c))
-                val lvl = c.effective(STAGE)
+                val lvl = minOf(c.effective(STAGE), c.effective(REFRESH)) // the node stops or drains only when both of its stages do
                 if (lvl == Level.STOP) { s.endReason = "control: stop"; s.finalState = "stopped"; break }
                 if (lvl == Level.DRAIN) { s.endReason = "control: drain"; regState = "draining"; break }
+                val dlOpen = c.effective(STAGE) == Level.RUN; val rfOpen = c.effective(REFRESH) == Level.RUN
                 if (state.backoffUntil() > env.clock()) { s.endReason = "backing off"; regState = "backoff"; break }
                 val eff = RunLimits.resolve(state.localLimits(), c, cfg.nodeId)
                 val left = RunLimits.remaining(eff, state)
@@ -240,20 +242,27 @@ class NodeRunner(
                 limitView = limitView(eff, left)
                 if (gate == Gate.BUDGET_SPENT) { s.endReason = "budget spent"; regState = "budget spent"; break }
                 if (gate == Gate.WAITING) { s.endReason = "waiting for window"; regState = "waiting for window"; break }
-                if (state.doneToday(day(env.clock())) >= cap) { s.endReason = "daily cap reached"; break }
+                // the daily cap and the per-IP cap are about downloads: when one holds, sources can still be listed (a listing is one small request)
+                var blocked: String? = null
+                if (state.doneToday(day(env.clock())) >= cap) blocked = "daily cap reached"
                 ensureFreshNetwork()
-                if (!underIpCap()) { s.endReason = IP_CAP_REASON + capHeldAt; break } // waiting, not failing: no attempt counted, no back-off
-                val jobs = Prio.claimOrder(api.findJobs(STAGE)).filter { state.skipUntil(it.id) <= env.clock() }
-                if (jobs.isEmpty()) { s.endReason = "no work"; break }
+                if (blocked == null && dlOpen && !underIpCap()) blocked = IP_CAP_REASON + capHeldAt // waiting, not failing: no attempt counted, no back-off
+                val downloads = if (dlOpen && blocked == null) api.findJobs(STAGE) else emptyList()
+                val nowIso = iso(env.clock())
+                val refreshes = if (rfOpen) { try { RefreshJobs.migrateLegacy(api) } catch (e: Exception) { /* the next claim retries */ }
+                    api.findJobs(REFRESH).filter { (it.tags["idx_due"] ?: "") <= nowIso } } else emptyList()
+                // one claim order for both stages: priority, then idx_added, then name (a lookup or manual run is at 500)
+                val jobs = Prio.claimOrder(downloads + refreshes).filter { state.skipUntil(it.id) <= env.clock() }
+                if (jobs.isEmpty()) { s.endReason = blocked ?: "no work"; break }
                 listener.onWork(jobs.size)
                 var outcome: Outcome? = null
                 for (j in jobs) {
-                    if (control.refresh().effective(STAGE) != Level.RUN) break
+                    if (control.refresh().effective(stageOf(j)) != Level.RUN) continue // that stage was stopped or drained meanwhile: the next job may be of the other stage
                     val lease = api.acquireLease(j.name, 60) ?: continue
                     outcome = runJob(j, lease, jobs.size, s)
                     break
                 }
-                if (outcome == null) { s.endReason = if (control.current.effective(STAGE) != Level.RUN) "control changed" else "all jobs are held by other nodes"; if (control.current.effective(STAGE) == Level.RUN) break else continue }
+                if (outcome == null) { val open = control.current.effective(STAGE) == Level.RUN || control.current.effective(REFRESH) == Level.RUN; s.endReason = if (!open) "control changed" else "all jobs are held by other nodes"; if (open) break else continue }
                 if (outcome == Outcome.BOT) { s.endReason = "bot block: backing off for an hour"; regState = "backoff"; break }
                 if (outcome == Outcome.STOPPED) { s.endReason = if (aborted.get()) "stopped by the system" else "control: stop"; if (!aborted.get()) s.finalState = "stopped"; break }
                 if (jobs.size > 1) env.sleep(env.gapMs())
@@ -269,10 +278,13 @@ class NodeRunner(
 
     private enum class Outcome { DONE, FAILED, BOT, STOPPED, SKIPPED }
 
+    private fun stageOf(ref: JobRef) = if (ref.name.startsWith("index/jobs/$REFRESH/")) REFRESH else STAGE
+
     private fun runJob(ref: JobRef, leaseId: String, left: Int, s: Summary): Outcome {
         val t0 = env.clock()
+        val stage = stageOf(ref)
         attemptNet = network?.forJob() // the network this attempt starts on
-        val rj = RunningJob(ref.id, STAGE, "download", null); running = rj; regState = "working"; writeRegistry(true)
+        val rj = RunningJob(ref.id, stage, if (stage == REFRESH) "refresh" else "download", null); running = rj; regState = "working"; writeRegistry(true)
         val lost = AtomicBoolean(false); val stopReq = AtomicBoolean(false)
         var title: String? = null
         val workDir = File(cfg.workRoot, ref.id)
@@ -288,7 +300,7 @@ class NodeRunner(
                         try { api.renewLease(ref.name, leaseId) } catch (e: BlobException) {
                             if (e.status == 409 || e.status == 404 || e.status == 412) { lost.set(true); fetcher.cancel(); return@launch }
                         }
-                        if (control.refresh().effective(STAGE) == Level.STOP) { stopReq.set(true); fetcher.cancel() }
+                        if (control.refresh().effective(stage) == Level.STOP) { stopReq.set(true); fetcher.cancel() }
                         try { api.setMetadata(ref.name, leaseId, mapOf("node" to cfg.nodeId, "progress" to (rj.progress ?: rj.step), "heartbeat" to iso(env.clock()))) } catch (e: Exception) {}
                         val nAt = network?.checkedAt?.let { try { java.time.Instant.parse(it).toEpochMilli() } catch (e: Exception) { null } }
                         if (netDirty || nAt == null || env.clock() - nAt >= NetworkProbe.REFRESH_MS) refreshNetwork()
@@ -301,6 +313,22 @@ class NodeRunner(
                     jobText = g.text
                     // someone may have finished it between the search and our claim
                     if (api.getTags(ref.name)["idx_state"] != "pending") { release(ref.name, leaseId); outcome = Outcome.SKIPPED; return@runBlocking }
+                    if (stage == REFRESH) {
+                        // a source: a lookup (full listing) or a refresh (incremental); no video, no upload, and nothing off the budget or the daily cap
+                        val kind = RefreshWork.kindOf(JSONObject(jobText)); rj.step = kind
+                        title = JSONObject(jobText).optString("name").ifEmpty { null }
+                        listener.onJob(ref.id, title, left, kind)
+                        val r = RefreshWork.run(api, fetcher, JSONObject(jobText), env.clock())
+                        if (cancelled()) throw BlobCancelled()
+                        val body = r.job.put("finishedAt", iso(env.clock())).put("nodeId", cfg.nodeId)
+                        // pending again at the next scheduled time (once and off: done until triggered by hand); back at the source's own priority
+                        val tg = Prio.jobTags(REFRESH, if (r.nextDueMs == null) "done" else "pending", ref.tags["idx_added"] ?: iso(env.clock()), body.optInt("priority", 0), iso(r.nextDueMs ?: env.clock()))
+                        api.put(ref.name, body.toString().toByteArray(), "application/json", tg, leaseId)
+                        release(ref.name, leaseId)
+                        state.record(JobLogEntry(ref.id, title, r.kind + " done", env.clock(), r.listed.toString() + " listed, " + r.made + " queued"))
+                        outcome = Outcome.DONE
+                        return@runBlocking
+                    }
                     val job = DownloadJob.parse(jobText)
                     rj.step = "download"
                     val out = fetcher.download(job, workDir) { text, t ->
@@ -422,7 +450,7 @@ class NodeRunner(
 
     private fun tagsOf(ref: JobRef, st: String): Map<String, String> {
         val t = LinkedHashMap(ref.tags.filterKeys { it.startsWith("idx_") })
-        t["idx_stage"] = STAGE; t["idx_state"] = st; if (!t.containsKey("idx_added")) t["idx_added"] = iso(env.clock())
+        t["idx_stage"] = stageOf(ref); t["idx_state"] = st; if (!t.containsKey("idx_added")) t["idx_added"] = iso(env.clock())
         return t
     }
 
@@ -441,6 +469,8 @@ class NodeRunner(
 
     companion object {
         const val STAGE = "download"
+        /** 1.9.2: the source stage (formerly "watch"); claimed with the downloads, by the same single worker. */
+        const val REFRESH = "refresh"
         const val MAX_ATTEMPTS = 3
         const val BACKOFF_MS = 3_600_000L
         const val SKIP_MS = 6 * 3_600_000L
@@ -453,7 +483,7 @@ class NodeRunner(
 
         fun registryJson(cfg: NodeConfig, state: String, control: String, running: RunningJob?, lastSeen: String, startedAt: String, limits: LimitView? = null, network: NetInfo? = null, profile: DownloadProfile? = null): JSONObject = JSONObject()
             .put("v", 1).put("nodeId", cfg.nodeId).put("name", cfg.name).put("kind", "medusa").put("version", cfg.version).put("platform", cfg.platform)
-            .put("stages", JSONArray(listOf("download"))).put("jobs", JSONObject().put("download", 1)).put("threads", cfg.threads)
+            .put("stages", JSONArray(listOf("download", "refresh"))).put("jobs", JSONObject().put("download", 1).put("refresh", 1)).put("threads", cfg.threads)
             .put("conditions", cfg.conditions).put("state", state).put("control", control)
             .put("running", JSONArray().also { a -> running?.let { r -> a.put(JSONObject().put("jobId", r.jobId).put("stage", r.stage).put("step", r.step).put("progress", r.progress ?: JSONObject.NULL)) } })
             .put("lastSeen", lastSeen).put("startedAt", startedAt)
@@ -529,6 +559,8 @@ object NodeInfo {
 interface NodeFetcher {
     /** Downloads the job into [dir]; [progress] gets (text, title). Throws NodeFetchException. */
     fun download(job: DownloadJob, dir: File, progress: (String?, String?) -> Unit): DownloadedFiles
+    /** Lists a playlist or channel tab with yt-dlp --flat-playlist (newest first); [end] 0 = the whole listing. Returns the raw lines ([RefreshWork.LIST_PRINT]). Throws NodeFetchException. */
+    fun list(url: String, end: Int): List<String> = throw NodeFetchException(FailureKind.PERMANENT, "this fetcher cannot list sources")
     /** Kills the running download. */
     fun cancel()
     fun cleanup(dir: File) {}

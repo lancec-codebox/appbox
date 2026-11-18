@@ -11,7 +11,7 @@ class SourcesTest {
     @Test fun aPlaylistUrlIsAPlaylist() {
         val r = SourceUrl.parse("https://www.youtube.com/playlist?list=PLabcdefghijk123")!!
         assertEquals("playlist", r.kind); assertEquals("pl-PLabcdefghijk123", r.jobId)
-        assertEquals("index/jobs/watch/pl-PLabcdefghijk123.json", r.path)
+        assertEquals("index/jobs/refresh/pl-PLabcdefghijk123.json", r.path)
         // a video inside a playlist, and a shared text around the link
         assertEquals("pl-PLabcdefghijk123", SourceUrl.parse("https://youtu.be/dQw4w9WgXcQ?list=PLabcdefghijk123")!!.jobId)
         assertEquals("https://www.youtube.com/playlist?list=PLabcdefghijk123", SourceUrl.firstUrl("Look: https://www.youtube.com/playlist?list=PLabcdefghijk123 nice"))
@@ -51,33 +51,34 @@ class SourcesTest {
         assertTrue(SourceUrl.isSource("https://www.youtube.com/@x")); assertTrue(SourceUrl.isSource("https://www.youtube.com/c/x"))
     }
 
-    @Test fun theWatchJobHasTheDescriptorAndTags() {
+    @Test fun theRefreshJobHasTheDescriptorAndTags() {
         val now = 1_800_000_000_000L
         val res = SourceFollow.run(api, "https://www.youtube.com/playlist?list=PLabcdefghijk123", FollowOptions(followChannels = true), now) { null }
         assertTrue(res is FollowResult.Created)
-        val b = api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!
+        val b = api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"]!!
         val o = JSONObject(String(b.bytes))
-        assertEquals("watch", o.getString("stage")); assertEquals("pl-PLabcdefghijk123", o.getString("jobId")); assertEquals("playlist", o.getString("kind"))
-        assertEquals("PLabcdefghijk123", o.getString("id")); assertEquals("1h", o.getString("every")); assertEquals(0, o.getInt("backfill"))
+        assertEquals("refresh", o.getString("stage")); assertEquals("pl-PLabcdefghijk123", o.getString("jobId")); assertEquals("playlist", o.getString("kind"))
+        assertEquals("PLabcdefghijk123", o.getString("id")); assertEquals("once", o.getString("schedule")); assertFalse(o.has("every")); assertFalse(o.has("backfill")); assertEquals("lookup", o.getString("run"))
         assertTrue(o.getBoolean("followChannels")); assertTrue(o.isNull("lastPolled")); assertEquals(0, o.getInt("attempts")); assertEquals(1, o.getInt("v"))
         val at = NodeRunner.iso(now)
-        assertEquals(mapOf("idx_stage" to "watch", "idx_state" to "pending", "idx_added" to at, "idx_due" to at), b.tags)
+        // due now, at the high priority: the next free downloader lists it
+        assertEquals(mapOf("idx_stage" to "refresh", "idx_state" to "pending", "idx_added" to at, "idx_due" to at, "idx_priority" to "500"), b.tags)
     }
 
     @Test fun aChannelJobListsItsTabs() {
         SourceFollow.run(api, "https://www.youtube.com/@Show", FollowOptions(every = "6h", backfill = 5), 1_800_000_000_000L) { UC }
-        val o = JSONObject(String(api.blobs["index/jobs/watch/ch-$UC.json"]!!.bytes))
-        assertEquals("channel", o.getString("kind")); assertEquals("6h", o.getString("every")); assertEquals(5, o.getInt("backfill")); assertEquals("@Show", o.getString("name"))
+        val o = JSONObject(String(api.blobs["index/jobs/refresh/ch-$UC.json"]!!.bytes))
+        assertEquals("channel", o.getString("kind")); assertEquals("6h", o.getString("every")); assertEquals("6h", o.getString("schedule")); assertEquals(5, o.getInt("backfill")); assertEquals("@Show", o.getString("name"))
         assertEquals(2, o.getJSONArray("tabs").length()); assertFalse(o.getBoolean("followChannels"))
     }
 
     @Test fun anExistingWatchJobIsNeverOverwritten() {
         val url = "https://www.youtube.com/playlist?list=PLabcdefghijk123"
         assertTrue(SourceFollow.run(api, url, FollowOptions(), 1_800_000_000_000L) { null } is FollowResult.Created)
-        val before = String(api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!.bytes)
+        val before = String(api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"]!!.bytes)
         val again = SourceFollow.run(api, url, FollowOptions(every = "1d", backfill = 9), 1_900_000_000_000L) { null }
         assertTrue(again is FollowResult.Exists)
-        assertEquals(before, String(api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!.bytes))
+        assertEquals(before, String(api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"]!!.bytes))
     }
 
     @Test fun aVideoUrlFollowsNothing() {
@@ -86,18 +87,18 @@ class SourcesTest {
         assertTrue(SourceFollow.run(api, "https://www.youtube.com/@x", FollowOptions(), 1L) { null } is FollowResult.Failed)
     }
 
-    @Test fun removeDeletesOnlyTheWatchJob() {
+    @Test fun removeDeletesOnlyTheSourceJob() {
         SourceFollow.run(api, "https://www.youtube.com/playlist?list=PLabcdefghijk123", FollowOptions(every = "6h", name = "Drops"), 1_800_000_000_000L) { null }
         api.addJob("aaaaaaaaaaa", 1)
-        WatchJobs.remove(api, "pl-PLabcdefghijk123")
-        assertNull(api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]); assertEquals(1, api.count("delete:"))
+        RefreshJobs.remove(api, "pl-PLabcdefghijk123")
+        assertNull(api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"])
         assertNotNull(api.blobs["index/jobs/download/aaaaaaaaaaa.json"])
     }
 
-    @Test fun aPriorityGoesIntoTheWatchRecordAndTag() {
+    @Test fun aPriorityGoesIntoTheRecordAndTheLookupKeepsItsBoost() {
         SourceFollow.run(api, "https://www.youtube.com/playlist?list=PLabcdefghijk123", FollowOptions(priority = 40), 1_800_000_000_000L) { null }
-        val b = api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!
-        assertEquals(40, JSONObject(String(b.bytes)).getInt("priority")); assertEquals("40", b.tags["idx_priority"])
+        val b = api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"]!!
+        assertEquals(40, JSONObject(String(b.bytes)).getInt("priority")); assertEquals("500", b.tags["idx_priority"]) // due now at 500; its videos get 40
     }
 
     @Test fun aDirectVideoRecordsOwnPriorityAndTag() {
@@ -119,7 +120,7 @@ class SourcesTest {
         api.blobs["index/jobs/sync/aaaaaaaaaaa.json"]!!.tags = api.blobs["index/jobs/sync/aaaaaaaaaaa.json"]!!.tags + ("idx_state" to "done")
         val r = Priorities.setSource(api, "pl-PLabcdefghijk123", 12, listOf("bbbbbbbbbbb"))
         assertEquals(2, r.videos); assertEquals(1, r.matched)
-        assertEquals("12", api.blobs["index/jobs/watch/pl-PLabcdefghijk123.json"]!!.tags["idx_priority"])
+        assertEquals("500", api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"]!!.tags["idx_priority"]); assertEquals(12, JSONObject(String(api.blobs["index/jobs/refresh/pl-PLabcdefghijk123.json"]!!.bytes)).getInt("priority"))
         assertEquals("12", api.job("aaaaaaaaaaa").tags["idx_priority"]); assertEquals("12", api.job("bbbbbbbbbbb").tags["idx_priority"])
         assertNull(api.job("ccccccccccc").tags["idx_priority"])
         assertEquals("12", api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]!!.tags["idx_priority"])
@@ -166,7 +167,7 @@ class SourcesTest {
         val asked = ArrayList<String>()
         val (r, f) = IndexVideo.share(api, V, true, 1_800_000_000_000L) { asked.add(it); UC + "\n" }
         assertTrue(r === AddResult.Added); assertTrue(f is FollowResult.Created); assertEquals(listOf(V), asked)
-        assertEquals("channel", JSONObject(String(api.blobs["index/jobs/watch/ch-$UC.json"]!!.bytes)).getString("kind"))
+        assertEquals("channel", JSONObject(String(api.blobs["index/jobs/refresh/ch-$UC.json"]!!.bytes)).getString("kind"))
         // an already indexed video still follows the channel, once
         val (r2, f2) = IndexVideo.share(api, V, true, 2_000_000_000_000L) { UC }
         assertTrue(r2 === AddResult.Already); assertTrue(f2 is FollowResult.Exists)

@@ -245,7 +245,7 @@ object IndexNodeUi {
     /** Add by URL (with a priority) and "Added from this phone": what this phone added, its state in the index, remove and change priority. No list of the whole index: that is the Drama admin web app. */
     private fun sourcesSection(a: MainActivity, s: NodeSettings, card: LinearLayout) {
         card.addView(Ui.header(a, "Add to the index"), Ui.lp(-1, -2, 0f, 0, 16, 0, 0, a))
-        card.addView(Ui.muted(a, "Paste or share a YouTube video, playlist or channel URL. Whichever node runs the watch stage polls sources. Needs a SAS with r, c, w, l, f (and d to remove)."))
+        card.addView(Ui.muted(a, "Paste or share a YouTube video, playlist or channel URL. Adding a playlist or channel looks it up at once (the next free downloader lists it); after that it is refreshed only on its schedule, or when you tap Refresh now. Needs a SAS with r, c, w, l, f (and d to remove)."))
         fun edit(hint: String, tg: String, type: Int, value: String = "") = EditText(a).apply {
             this.hint = hint; setText(value); tag = tg; contentDescription = hint; textSize = 14f; inputType = type; setSingleLine()
             setTextColor(Ui.color(a, R.color.on_surface)); setHintTextColor(Ui.color(a, R.color.muted))
@@ -255,11 +255,11 @@ object IndexNodeUi {
         card.addView(follow)
         card.addView(Ui.muted(a, "Priority, -1000 to 1000 (higher downloads first, default 0)"))
         val prio = edit("0", "source-priority", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED, "0"); card.addView(prio)
-        card.addView(Ui.muted(a, "Check every (playlists and channels)"))
+        card.addView(Ui.muted(a, "Refresh schedule (playlists and channels; once: look up on add, then only when you tap Refresh now)"))
         var everyPick = 0
-        card.addView(TrackUi.radios(a, WatchJobs.EVERY, WatchJobs.EVERY.map { "source-every:" + it }, 0) { everyPick = it })
-        card.addView(Ui.muted(a, "Backfill: how many existing videos to download first (0: only new ones)"))
-        val backfill = edit("0", "source-backfill", InputType.TYPE_CLASS_NUMBER, "0"); card.addView(backfill)
+        card.addView(TrackUi.radios(a, RefreshJobs.EVERY, RefreshJobs.EVERY.map { "source-every:" + it }, 0) { everyPick = it })
+        card.addView(Ui.muted(a, "Backfill: the most existing videos to queue on the first look (empty: all of a playlist, a channel's newest 100)"))
+        val backfill = edit("all", "source-backfill", InputType.TYPE_CLASS_NUMBER, ""); card.addView(backfill)
         val msg = Ui.muted(a, "", 13f)
         val list = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; tag = "added-list" }
         fun client() = s.vault.load()?.let { BlobClient(it) }
@@ -301,6 +301,20 @@ object IndexNodeUi {
                     }.start()
                 })
                 row.addView(btns)
+                if (it.kind != "video") {
+                    val acts = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
+                    fun trigger(kind: String, label: String) = Ui.button(a, label) { _ ->
+                        val cl = client() ?: run { msg.text = "Save a SAS first"; return@button }
+                        msg.text = "Queueing\u2026"
+                        Thread {
+                            val m = try { if (RefreshJobs.trigger(cl, it.jobId, kind, System.currentTimeMillis())) label + ": queued, the next free downloader runs it" else "A node is running it right now" }
+                                catch (e: Exception) { "Could not queue: " + Redact.sas(e.message) }
+                            a.runOnUiThread { msg.text = m; reload() }
+                        }.start()
+                    }
+                    acts.addView(trigger("refresh", "Refresh now")); acts.addView(trigger("lookup", "Look up again"))
+                    row.addView(acts)
+                }
                 list.addView(row, Ui.lp(-1, -2, 0f, 0, 8, 0, 0, a))
                 if (c != null) Thread { val t = AddedState.describe(it, c); a.runOnUiThread { state.text = t } }.start()
             }
@@ -311,7 +325,7 @@ object IndexNodeUi {
             if (raw.isEmpty()) { msg.text = "Paste a video, playlist or channel URL"; return@button }
             val p = prio.text.toString().trim().ifEmpty { "0" }.toIntOrNull()?.takeIf { v -> v in Prio.MIN..Prio.MAX }
             if (p == null) { msg.text = "Priority must be a whole number from -1000 to 1000"; return@button }
-            val opts = FollowOptions(WatchJobs.EVERY[everyPick], backfill.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 0, follow.isChecked, priority = p)
+            val opts = FollowOptions(RefreshJobs.EVERY[everyPick], backfill.text.toString().trim().toIntOrNull()?.coerceAtLeast(0), follow.isChecked, priority = p)
             msg.text = "Adding\u2026"
             Thread {
                 val m = IndexAdd.add(c, s.added, raw, opts, p, System.currentTimeMillis(), { a.app.sources.channelId(it) }, { a.app.sources.videoChannelId(it) })
