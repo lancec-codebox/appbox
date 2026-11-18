@@ -1,0 +1,52 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "Spike.Loader/1.0.0": {
+        "dependencies": {
+          "Spike.Contract": "1.0.0",
+          "Spike.Contract.Reference": "1.0.0.0"
+        },
+        "runtime": {
+          "Spike.Loader.dll": {}
+        }
+      },
+      "Spike.Contract/1.0.0": {
+        "runtime": {
+          "Spike.Contract.dll": {
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Spike.Contract.Reference/1.0.0.0": {
+        "runtime": {
+          "Spike.Contract.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Spike.Loader/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Spike.Contract/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Spike.Contract.Reference/1.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

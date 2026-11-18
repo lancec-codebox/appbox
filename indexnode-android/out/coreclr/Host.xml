@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Host</name>
+    </assembly>
+    <members>
+        <member name="T:Host.SpikeHost">
+            <summary>The only logic in the app: capabilities for plugins (IHost) and the plugin lifecycle behind the JS bridge.</summary>
+        </member>
+        <member name="T:Host.Resource">
+            <summary>
+            Android Resource Designer class.
+            Exposes the Android Resource designer assembly into the project Namespace.
+            </summary>
+        </member>
+    </members>
+</doc>
