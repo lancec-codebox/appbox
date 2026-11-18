@@ -88,12 +88,22 @@ class BlobClient(val sas: SasUrl, private val retryDelayMs: Long = 1000, private
         val where = "\"idx_stage\"='$stage'" + (if (pendingOnly) " AND \"idx_state\"='pending'" else "")
         var found: List<JobRef>? = null
         if (sas.can('f')) {
-            try { found = paged("restype=container&comp=blobs&where=" + urlEnc(where)) }
+            // Find Blobs by Tags returns ONLY the tags the where expression names, so a plain query hides idx_priority and idx_added and every job would sort as priority 0 with no date.
+            // Three queries, merged by blob name: (a) + idx_added >= '' (every job has it), (b) + idx_priority > '0', (c) + idx_priority < '0' (priority 0 has no tag). The order itself is numeric (Prio.claimOrder).
+            try {
+                val merged = LinkedHashMap<String, JobRef>()
+                for (extra in listOf(" AND \"idx_added\" >= ''", " AND \"idx_priority\" > '0'", " AND \"idx_priority\" < '0'"))
+                    for (j in paged("restype=container&comp=blobs&where=" + urlEnc(where + extra))) {
+                        val have = merged[j.name]
+                        merged[j.name] = if (have == null) j else JobRef(j.name, have.tags + j.tags)
+                    }
+                found = merged.values.toList()
+            }
             catch (e: BlobException) { if (e.status != 400 && e.status != 403) throw e }
         }
         if (found == null) found = paged("restype=container&comp=list&include=tags&prefix=" + urlEnc(prefix))
         return found.filter { it.name.startsWith(prefix) && it.name.endsWith(".json") && it.tags["idx_stage"] == stage && (!pendingOnly || it.tags["idx_state"] == "pending") }
-            .sortedBy { it.added }
+            .sortedWith(compareByDescending<JobRef> { Prio.of(it.tags) }.thenBy { it.added }.thenBy { it.name })
     }
 
     private fun paged(query: String): List<JobRef> {

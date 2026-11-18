@@ -22,8 +22,40 @@ class BlobClientTest {
         <Blob><Name>index/jobs/download/aaa.json</Name><Tags><TagSet><Tag><Key>idx_stage</Key><Value>download</Value></Tag><Tag><Key>idx_state</Key><Value>pending</Value></Tag><Tag><Key>idx_added</Key><Value>2026-11-13T19:00:01Z</Value></Tag></TagSet></Tags></Blob>
         </Blobs><NextMarker/></EnumerationResults>"""
 
+    /** Azure's Find Blobs by Tags returns only the tags the where expression names: this server does the same. */
+    private fun azureFind(blobs: Map<String, Map<String, String>>) = object : okhttp3.mockwebserver.Dispatcher() {
+        val wheres = java.util.Collections.synchronizedList(ArrayList<String>())
+        override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+            val where = request.requestUrl!!.queryParameter("where") ?: return MockResponse().setResponseCode(400)
+            wheres.add(where)
+            val conds = Regex("\"([^\"]+)\"\\s*(=|>=|>|<)\\s*'([^']*)'").findAll(where).map { Triple(it.groupValues[1], it.groupValues[2], it.groupValues[3]) }.toList()
+            val xml = StringBuilder("<?xml version=\"1.0\"?><EnumerationResults><Blobs>")
+            for ((name, tags) in blobs) {
+                if (!conds.all { (k, op, v) -> val t = tags[k]; t != null && when (op) { "=" -> t == v; ">=" -> t >= v; ">" -> t > v; else -> t < v } }) continue
+                xml.append("<Blob><Name>$name</Name><Tags><TagSet>")
+                for ((k, v) in tags) if (conds.any { it.first == k }) xml.append("<Tag><Key>$k</Key><Value>$v</Value></Tag>")
+                xml.append("</TagSet></Tags></Blob>")
+            }
+            return MockResponse().setBody(xml.append("</Blobs><NextMarker/></EnumerationResults>").toString())
+        }
+    }
+
+    private fun job(added: String, priority: Int = 0) = mapOf("idx_stage" to "download", "idx_state" to "pending", "idx_added" to added, "idx_due" to added) + (if (priority != 0) mapOf("idx_priority" to priority.toString()) else emptyMap())
+
+    @Test fun findSeesPriorityAndDateEvenThoughAzureReturnsOnlyTheQueriedTags() {
+        val d = azureFind(linkedMapOf(
+            "index/jobs/download/aaa.json" to job("2026-11-14T00:00:01Z"), "index/jobs/download/bbb.json" to job("2026-11-14T00:00:00Z"),
+            "index/jobs/download/ccc.json" to job("2026-11-14T00:00:05Z", -10), "index/jobs/download/zzz.json" to job("2026-11-18T00:00:00Z", 100)))
+        server.dispatcher = d
+        val jobs = Prio.claimOrder(client.findJobs("download"))
+        // priority 100 first (added last, named last), then the oldest at priority 0, then the negative one
+        assertEquals(listOf("zzz", "bbb", "aaa", "ccc"), jobs.map { it.id })
+        assertEquals(100, Prio.of(jobs[0].tags)); assertEquals(-10, Prio.of(jobs[3].tags)); assertEquals("2026-11-14T00:00:00Z", jobs[1].added)
+        assertEquals(3, d.wheres.size)
+    }
+
     @Test fun findByTagsEncodesWhereAndSortsOldestFirst() {
-        server.enqueue(MockResponse().setBody(findXml))
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() { override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest) = MockResponse().setBody(findXml) }
         val jobs = client.findJobs("download")
         assertEquals(listOf("aaa", "bbb"), jobs.map { it.id })
         val r = server.takeRequest()
@@ -32,8 +64,8 @@ class BlobClientTest {
         assertEquals("/media", r.requestUrl!!.encodedPath)
         assertEquals("container", r.requestUrl!!.queryParameter("restype"))
         assertEquals("blobs", r.requestUrl!!.queryParameter("comp"))
-        assertEquals("\"idx_stage\"='download' AND \"idx_state\"='pending'", r.requestUrl!!.queryParameter("where"))
-        assertTrue(r.path!!.contains("where=%22idx_stage%22%3D%27download%27%20AND%20%22idx_state%22%3D%27pending%27"))
+        assertEquals("\"idx_stage\"='download' AND \"idx_state\"='pending' AND \"idx_added\" >= ''", r.requestUrl!!.queryParameter("where"))
+        assertTrue(r.path!!.contains("where=%22idx_stage%22%3D%27download%27%20AND%20%22idx_state%22%3D%27pending%27%20AND%20%22idx_added%22"))
         assertEquals("racwdlf", r.requestUrl!!.queryParameter("sp"))
     }
 
@@ -48,8 +80,8 @@ class BlobClientTest {
     }
 
     @Test fun aRefusedFindFallsBackToListing() {
-        server.enqueue(MockResponse().setResponseCode(403).setBody("<Error><Code>AuthorizationPermissionMismatch</Code></Error>"))
-        server.enqueue(MockResponse().setBody(findXml))
+        server.dispatcher = (object : okhttp3.mockwebserver.Dispatcher() { override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest) =
+            if (request.requestUrl!!.queryParameter("comp") == "blobs") MockResponse().setResponseCode(403).setBody("<Error><Code>AuthorizationPermissionMismatch</Code></Error>") else MockResponse().setBody(findXml) })
         assertEquals(2, client.findJobs("download").size)
         assertEquals("blobs", server.takeRequest().requestUrl!!.queryParameter("comp"))
         assertEquals("list", server.takeRequest().requestUrl!!.queryParameter("comp"))
