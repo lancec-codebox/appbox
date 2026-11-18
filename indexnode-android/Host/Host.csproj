@@ -47,14 +47,14 @@
 
   <!-- Keep the contract whole and the BCL surface plugins are likely to use (the host itself only uses a slice). -->
   <ItemGroup>
-    <TrimmerRootAssembly Include="Spike.Contract" />
-    <TrimmerRootAssembly Include="Spike.Loader" />
-    <TrimmerRootAssembly Include="Host" />
-    <TrimmerRootAssembly Include="System.Linq" />
-    <TrimmerRootAssembly Include="System.Collections" />
-    <TrimmerRootAssembly Include="System.Text.Json" />
-    <TrimmerRootAssembly Include="System.Text.RegularExpressions" />
-    <TrimmerRootAssembly Include="System.Net.Http" />
-    <TrimmerRootAssembly Include="System.Runtime" />
+    <TrimmerRootAssembly Include="Spike.Contract" RootMode="All" />
+    <TrimmerRootAssembly Include="Spike.Loader" RootMode="All" />
+    <TrimmerRootAssembly Include="Host" RootMode="All" />
+    <TrimmerRootAssembly Include="System.Linq" RootMode="All" />
+    <TrimmerRootAssembly Include="System.Collections" RootMode="All" />
+    <TrimmerRootAssembly Include="System.Text.Json" RootMode="All" />
+    <TrimmerRootAssembly Include="System.Text.RegularExpressions" RootMode="All" />
+    <TrimmerRootAssembly Include="System.Net.Http" RootMode="All" />
+    <TrimmerRootAssembly Include="System.Runtime" RootMode="All" />
   </ItemGroup>
 </Project>
