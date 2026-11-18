@@ -155,7 +155,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
         var f = await inner.HeadAsync(ZipBlob(prefix, id, "frames"), ct); var t = await inner.HeadAsync(ZipBlob(prefix, id, "transcribe"), ct);
         if (f == null || t == null) return null;
         var shas = new List<string?>(); foreach (var st in StageLayout.Stages) shas.Add((st == "frames" ? f : st == "transcribe" ? t : await inner.HeadAsync(ZipBlob(prefix, id, st), ct))?.Metadata.GetValueOrDefault("idx_sha256"));
-        return JsonSerializer.SerializeToUtf8Bytes(new { v = 2, asrModel = Transcribe.ModelName, inputs = StageLayout.Inputs(shas) });
+        return JsonSerializer.SerializeToUtf8Bytes(new { v = 2, asrModel = Protocol.AsrModelName, inputs = StageLayout.Inputs(shas) });
     }
 
     private bool Resolve(string name, out string prefix, out string id, out string member, out string zipBlob)

@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>IndexNode.Core</AssemblyName>
+    <RootNamespace>IndexNode</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <Version>0.10.2</Version>
+    <Description>Shared node logic of the drama index: protocol, store clients, job claiming, the download and watch logic. No process starts, no Windows-only APIs.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.24.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../indexnode-android/Contract/Contract.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="IndexNode" />
+    <InternalsVisibleTo Include="IndexNode.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources/zh-words.txt.gz" LogicalName="zh-words.txt.gz" />
+  </ItemGroup>
+
+</Project>

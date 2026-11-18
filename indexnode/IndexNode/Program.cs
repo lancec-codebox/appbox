@@ -208,6 +208,7 @@ public static class Commands
         ProcessStage.Ai = ai;
         var opts = new EngineOptions
         {
+            UnloadModels = DesktopModels.Unload, Device = () => OrtOptions.Device,
             NodeId = nodeId, Name = nodeName,
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
             Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
@@ -554,6 +555,7 @@ public static class Commands
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null;
         var opts = new EngineOptions
         {
+            UnloadModels = DesktopModels.Unload, Device = () => OrtOptions.Device,
             NodeId = cfg.NodeId ?? "explain", Name = "explain", Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
             Stages = stages, Batch = a.Get("batch") is { } bn ? int.Parse(bn) : 6, Gpu = a.Has("gpu"), GpuFallback = gpuFlag,
         };

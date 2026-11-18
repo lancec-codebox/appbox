@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace IndexNode;
 
 /// <summary>Finds yt-dlp, ffmpeg and ffprobe on PATH, or downloads pinned releases into the tools folder beside the config.</summary>
-public sealed class Tools(HttpClient http, NodeConfig? config = null)
+public sealed class Tools(HttpClient http, NodeConfig? config = null) : ITools
 {
     public const string YtDlpVersion = "2026.10.26";
 
@@ -82,18 +82,49 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null)
         config?.Ytdlp?.Command is { Length: > 0 } c ? c : [await YtDlpAsync(ct)];
 
     /// <summary>Runs yt-dlp through the launcher; a start failure that looks like a policy block says so and names the fix.</summary>
-    public async Task<ProcResult> RunYtDlpAsync(IEnumerable<string> args, CancellationToken ct, Action<string>? onStdout = null)
+    public Task<ProcResult> RunYtDlpAsync(IEnumerable<string> args, CancellationToken ct, Action<string>? onStdout = null) => RunYtDlpAsync(args, ct, onStdout, null);
+
+    private async Task<ProcResult> RunYtDlpAsync(IEnumerable<string> args, CancellationToken ct, Action<string>? onStdout, string? workDir)
     {
         var withJs = JsRuntime is { } js ? ["--js-runtimes", js, ..args] : args.ToArray();
         if (YtDlpOverride != null) return await YtDlpOverride(withJs, ct, onStdout);
         var (file, full) = YtDlpLauncher.Compose(await YtDlpCommandAsync(ct), withJs);
         ProcResult r;
-        try { r = await Proc.RunAsync(file, full, ct, onStdout); }
+        try { r = await Proc.RunAsync(file, full, ct, onStdout, null, workDir); }
         catch (System.ComponentModel.Win32Exception e) when (YtDlpLauncher.LooksBlocked(e.Message, e.NativeErrorCode)) { throw new InvalidOperationException(BlockedHint + " [" + e.Message + "]"); }
         catch (System.ComponentModel.Win32Exception e) when (config?.Ytdlp?.Command is null) { throw new InvalidOperationException($"yt-dlp could not start ({e.Message}). If App Control blocks it, run: indexnode tools install --ytdlp-zipapp"); }
         catch (System.ComponentModel.Win32Exception e) { throw new InvalidOperationException($"the configured ytdlp.command could not start ({e.Message}); check it, or run: indexnode tools install --ytdlp-zipapp"); }
         if (r.ExitCode != 0 && YtDlpLauncher.LooksBlocked(r.Stderr, r.ExitCode)) throw new InvalidOperationException(BlockedHint);
         return r;
+    }
+
+    // ---- ITools: local processes, workspaces are folders under the temp directory ----
+
+    public Task<IToolWorkspace> CreateWorkspaceAsync(string name, CancellationToken ct) => Task.FromResult<IToolWorkspace>(new LocalWorkspace(name));
+
+    public async Task<ProcResult> RunAsync(IToolWorkspace ws, string tool, IReadOnlyList<string> args, CancellationToken ct, Action<string>? onStdout = null)
+    {
+        var dir = ((LocalWorkspace)ws).Dir;
+        switch (tool)
+        {
+            case "yt-dlp":
+                var full = new List<string>();
+                // yt-dlp makes the folder of its -o template itself; a stand-in launcher may not
+                var oi = args.ToList().IndexOf("-o");
+                if (oi >= 0 && oi + 1 < args.Count && Path.GetDirectoryName(Path.Combine(dir, args[oi + 1])) is { Length: > 0 } od) Directory.CreateDirectory(od);
+                // the comments snapshot runs without cookies and without ffmpeg; every other run gets both
+                if (!args.Contains("--write-comments"))
+                {
+                    full.Add("--ffmpeg-location"); full.Add(Path.GetDirectoryName(await FfmpegAsync(ct))!);
+                    var cookies = Environment.GetEnvironmentVariable("INDEXNODE_COOKIES");
+                    if (!string.IsNullOrEmpty(cookies)) { full.Add("--cookies"); full.Add(cookies); }
+                }
+                full.AddRange(args);
+                return await RunYtDlpAsync(full, ct, onStdout, dir);
+            case "ffmpeg": return await Proc.RunAsync(await FfmpegAsync(ct), args, ct, onStdout, null, dir);
+            case "ffprobe": return await Proc.RunAsync(await FfprobeAsync(ct), args, ct, onStdout, null, dir);
+            default: throw new ArgumentException("unknown tool " + tool);
+        }
     }
 
     /// <summary>Downloads the official yt-dlp zipapp (release asset "yt-dlp", no extension) and returns the command to store.</summary>

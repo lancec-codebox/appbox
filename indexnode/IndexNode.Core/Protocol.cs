@@ -9,6 +9,8 @@ namespace IndexNode;
 public static partial class Protocol
 {
     public const string ApiVersion = "2021-12-02";
+    /// <summary>Name of the speech model whose output the ASR step stores under asr/ (the cache key of the process zips).</summary>
+    public const string AsrModelName = "sensevoice";
     /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
     public static readonly string[] StepStages = ["frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"];
     /// <summary>The step jobs an upload gets by default (download, enqueue, sources): every step stage except the opt-in ones (dino: owner 2026-11-16, not part of ingest; clip: dropped 2026-11-14), which run only when asked for (process --job --steps).</summary>

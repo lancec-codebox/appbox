@@ -26,7 +26,7 @@ public static partial class Sources
         return c.Success ? ("channel", c.Groups[1].Value) : null;
     }
 
-    public static async Task<JobDescriptor> ResolveAsync(Tools tools, string url, string every, string[] tabs, bool follow, int backfill, int maxHeight, CancellationToken ct)
+    public static async Task<JobDescriptor> ResolveAsync(ITools tools, string url, string every, string[] tabs, bool follow, int backfill, int maxHeight, CancellationToken ct)
     {
         Schedule.Parse(every);
         var known = Classify(url);

@@ -8,7 +8,7 @@ namespace IndexNode;
 /// A followed source (playlist or channel). Its job runs a <b>lookup</b> (full listing: on add, or by hand) or a <b>refresh</b> (incremental: scheduled, or by hand); after a run
 /// the engine rewrites the job as pending, due at the next scheduled time, or as done when there is none (schedule once/off). Listings are yt-dlp's flat listing, newest first, without cookies.
 /// </summary>
-public sealed partial class RefreshStage(Tools tools, IStore store, Func<DateTimeOffset>? clock = null) : IStageHandler
+public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTimeOffset>? clock = null) : IStageHandler
 {
     public const int ListSize = 30;
     public const int SeenCap = 500;

@@ -75,6 +75,8 @@ public sealed class EngineOptions
     public TimeSpan HoldRenew { get; init; } = TimeSpan.FromSeconds(40);
     /// <summary>Tests replace the unloading of the shared models after a stage.</summary>
     public Action? UnloadModels { get; init; }
+    /// <summary>The compute device named in the timing line of a job ("cpu", "cuda"); the desktop sets it from its ONNX settings.</summary>
+    public Func<string>? Device { get; init; }
     public int ThreadsPerLane => ThreadSplit.PerWorker(Threads, Lanes, WorkerThreads);
     public int ThreadsPerWorker => ThreadSplit.PerWorker(Threads, Workers, WorkerThreads);
     /// <summary>Stop after this long with no job running (a container job that was started for a marker and has no more work); null: never.</summary>
@@ -88,6 +90,8 @@ public sealed class EngineOptions
     public Func<string, CancellationToken, Task<string?>>? NetworkFetch { get; init; }
     /// <summary>Tests replace the clock used for the network check's age.</summary>
     public Func<DateTimeOffset>? Now { get; init; }
+    /// <summary>Called on every fresh network lookup before it is recorded: a phone node adds the transport and VPN flag here (registry field "network").</summary>
+    public Action<NetworkInfo>? NetworkExtra { get; init; }
 }
 
 public sealed partial class NodeEngine
@@ -253,6 +257,7 @@ public sealed partial class NodeEngine
         {
             var prev = network;
             var n = await NetworkProbe.DetectAsync(o.NetworkFetch ?? NetworkProbe.HttpFetchAsync, ct, prev);
+            o.NetworkExtra?.Invoke(n);
             n.CheckedAt = Protocol.Utc(NowUtc);
             n.Since = prev != null && n.SamePair(prev) && prev.Since.Length > 0 ? prev.Since : n.CheckedAt;
             if (!n.SamePair(prev)) Log.Info($"network: ipv4={n.Ipv4 ?? "-"} ipv6={n.Ipv6Prefix ?? n.Ipv6 ?? "-"} {n.Country} {n.Colo}");
@@ -685,7 +690,7 @@ public sealed partial class NodeEngine
         catch (Exception e) { Log.Info($"[{stage}#{worker}] could not record outcome for {claim.Job.JobId}: {e.Message}"); }
 
         running.TryRemove(run, out _);
-        if (run.Timer.Line(OrtOptions.Device) is { Length: > 0 } timing) Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: time by step: {timing}");
+        if (run.Timer.Line(o.Device?.Invoke() ?? "cpu") is { Length: > 0 } timing) Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: time by step: {timing}");
         RegistryChanged();
         Log.Info($"[{stage}#{worker}] {claim.Job.JobId}: {outcome}{(error != null ? " (" + Redact.Sas(error) + ")" : "")} in {watch.Elapsed.TotalSeconds:F1}s");
         return outcome == Outcome.Done;

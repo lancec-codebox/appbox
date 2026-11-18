@@ -3,8 +3,6 @@ using System.Text;
 
 namespace IndexNode;
 
-public sealed record ProcResult(int ExitCode, string Stdout, string Stderr);
-
 public static class Proc
 {
     public static string RunQuick(string file, IEnumerable<string> args)

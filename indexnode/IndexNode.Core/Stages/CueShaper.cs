@@ -21,6 +21,12 @@ public sealed record ShapeStats(int Cues, int Over6s, int OverChars, int Overlap
 /// </summary>
 public static class CueShaper
 {
+    private static string Timestamp(double s)
+    {
+        var ms = (long)Math.Round(s * 1000);
+        return $"{ms / 3600000:D2}:{ms / 60000 % 60:D2}:{ms / 1000 % 60:D2}.{ms % 1000:D3}";
+    }
+
     public const double MaxSeconds = 6, MinSeconds = 0.8, SoftSeconds = 4, HoldSeconds = 0.5, SilenceSeconds = 1.5, TailSeconds = 0.6;
     /// <summary>Reading time (owner, 2026-11-14): a cue stays up until it can be read, into the gap before the next cue (ending GapSeconds before it), at most MaxSeconds.</summary>
     public const double ZhCharsPerSecond = 9, LatinCharsPerSecond = 17, GapSeconds = 0.1;
@@ -272,7 +278,7 @@ public static class CueShaper
     public static string ToVtt(IEnumerable<ShapeCue> cues)
     {
         var sb = new StringBuilder("WEBVTT\n\n");
-        foreach (var c in cues) sb.Append(OcrCues.Timestamp(c.Start)).Append(" --> ").Append(OcrCues.Timestamp(c.End)).Append('\n').Append(c.Text).Append("\n\n");
+        foreach (var c in cues) sb.Append(Timestamp(c.Start)).Append(" --> ").Append(Timestamp(c.End)).Append('\n').Append(c.Text).Append("\n\n");
         return sb.ToString();
     }
 

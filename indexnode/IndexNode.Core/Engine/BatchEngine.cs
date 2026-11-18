@@ -216,8 +216,8 @@ public sealed partial class NodeEngine
     private void UnloadStageModels()
     {
         if (o.UnloadModels != null) { o.UnloadModels(); return; }
-        int n = OrtOptions.UnloadShared() + Transcribe.UnloadRecognizers();
-        if (n > 0) { GC.Collect(); Log.Info($"unloaded {n} model(s)"); }
+        // the models belong to the desktop node: it passes UnloadModels; a node without models (Android) has nothing to unload
+        return;
     }
 
     /// <summary>Runs the batch stage by stage. Returns the number of step jobs that were started.</summary>

@@ -77,7 +77,7 @@ public static class CommentsSnapshot
 }
 
 /// <summary>Takes a dated comments snapshot (no cookies) and schedules the next refresh.</summary>
-public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) : IStageHandler
+public sealed class CommentsStage(ITools tools, IStore store, DownloadGate gate) : IStageHandler
 {
     public async Task RunAsync(JobContext ctx)
     {
@@ -90,21 +90,18 @@ public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) 
         int max = job.MaxComments ?? 1000;
 
         await gate.WaitTurnAsync(ct);
-        var work = Path.Combine(Path.GetTempPath(), "indexnode", "c-" + id);
-        if (Directory.Exists(work)) Directory.Delete(work, true);
-        Directory.CreateDirectory(work);
-        try
+        await using var work = await tools.CreateWorkspaceAsync("c-" + id, ct);
         {
             var infos = new List<JsonObject?>();
             foreach (var sort in new[] { job.Sort ?? "top", "new" }.Distinct())
             {
                 ctx.Report("comments", sort);
-                var r = await tools.RunYtDlpAsync(CommentsSnapshot.Args(job.Url, Path.Combine(work, sort + ".%(ext)s"), max, sort), ct);
+                var r = await tools.RunAsync(work, "yt-dlp", CommentsSnapshot.Args(job.Url, sort + ".%(ext)s", max, sort), ct);
                 if (r.ExitCode != 0) YtDlp.Throw(r.Stderr);
-                var f = Path.Combine(work, sort + ".info.json");
-                infos.Add(File.Exists(f) ? JsonNode.Parse(File.ReadAllText(f))!.AsObject() : null);
+                var f = sort + ".info.json";
+                infos.Add(await work.ExistsAsync(f, ct) ? JsonNode.Parse(await work.ReadTextAsync(f, ct))!.AsObject() : null);
             }
-            Traffic.Current.Add(Traffic.YoutubeIn, Directory.EnumerateFiles(work).Sum(x => new FileInfo(x).Length));
+            Traffic.Current.Add(Traffic.YoutubeIn, await work.TotalBytesAsync(ct));
             var snap = CommentsSnapshot.Build(infos.ToArray());
             var name = paths.Video(id, $"comments/{CommentsSnapshot.BlobTimestamp(DateTimeOffset.UtcNow)}.json");
             await ctx.Store.PutAsync(name, JsonSerializer.SerializeToUtf8Bytes(snap), null, null, false, ct);
@@ -113,6 +110,5 @@ public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) 
 
             // one round, then done: a follow-up is requested only by the AI step (CommentsFollowUp.RequestAsync)
         }
-        finally { try { Directory.Delete(work, true); } catch { } }
     }
 }

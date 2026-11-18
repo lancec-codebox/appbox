@@ -26,7 +26,7 @@ public sealed class DownloadGate(Func<TimeSpan, CancellationToken, Task>? delay 
     }
 }
 
-public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) : IStageHandler
+public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate) : IStageHandler
 {
     /// <summary>False (`indexnode download --no-process`): the video is stored but no processing jobs are queued; `indexnode unprocessed` lists it.</summary>
     public bool QueueProcessing { get; init; } = true;
@@ -47,6 +47,25 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
                 list.Add((f, Path.GetFileNameWithoutExtension(f)["video.".Length..] + suffix));
         }
         Add(manualDir, ""); Add(autoDir, ".auto");
+        return Order(list);
+    }
+
+    /// <summary>The same for a tool workspace: the files "video.LANG.vtt" in the two sub folders ("manual" and "auto"; null = not requested).</summary>
+    public static async Task<List<(string Local, string Name)>> CollectSubsAsync(IToolWorkspace ws, string? manualDir, string? autoDir, CancellationToken ct)
+    {
+        var list = new List<(string Local, string Name)>();
+        async Task Add(string? dir, string suffix)
+        {
+            if (dir == null) return;
+            foreach (var f in await ws.ListAsync(dir, "video.*.vtt", ct))
+                list.Add((f, Path.GetFileNameWithoutExtension(f)["video.".Length..] + suffix));
+        }
+        await Add(manualDir, ""); await Add(autoDir, ".auto");
+        return Order(list);
+    }
+
+    private static List<(string Local, string Name)> Order(List<(string Local, string Name)> list)
+    {
         static int Rank(string name)
         {
             var b = name.Replace(".auto", "");
@@ -76,25 +95,19 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
         if (string.IsNullOrEmpty(job.Url)) throw new PermanentFailure("job has no url");
         await gate.WaitTurnAsync(ct);
 
-        var work = Path.Combine(Path.GetTempPath(), "indexnode", id);
-        if (Directory.Exists(work)) Directory.Delete(work, true);
-        Directory.CreateDirectory(work);
-        try
+        await using var work = await tools.CreateWorkspaceAsync(id, ct);
         {
-            var ffmpeg = await tools.FfmpegAsync(ct);
-            var ffdir = Path.GetDirectoryName(ffmpeg)!;
-            var common = new List<string> { "--no-playlist", "--ffmpeg-location", ffdir, "--retries", "3", "--no-warnings", "--newline" };
-            var cookies = Environment.GetEnvironmentVariable("INDEXNODE_COOKIES");
-            if (!string.IsNullOrEmpty(cookies)) { common.Add("--cookies"); common.Add(cookies); }
+            // the tool implementation adds what it knows (ffmpeg location, cookies, JS runtime)
+            var common = new List<string> { "--no-playlist", "--retries", "3", "--no-warnings", "--newline" };
 
             ctx.Report("download", "starting");
             var main = new List<string>(common);
             main.AddRange(YtDlp.FormatArgs(job.MaxHeight ?? 480, job.Format));
             main.AddRange(new[] {
                 "--merge-output-format", "mp4", "--write-info-json", "--write-thumbnail", "--convert-thumbnails", "jpg",
-                "-o", Path.Combine(work, "video.%(ext)s"), job.Url,
+                "-o", "video.%(ext)s", job.Url,
             });
-            var r = await tools.RunYtDlpAsync(main, ct, onStdout: line =>
+            var r = await tools.RunAsync(work, "yt-dlp", main, ct, onStdout: line =>
             {
                 var m = Regex.Match(line, @"\[download\]\s+(\d+(\.\d+)?)%");
                 if (m.Success) ctx.Report("download", m.Groups[1].Value + "%");
@@ -105,20 +118,19 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             if (job.Subs != false)
             {
                 // exact tracks from the info JSON (never a regex: it would match every auto-translated track); two passes, because yt-dlp names uploaded and automatic subtitles alike (video.<lang>.vtt)
-                var plan = SubLangs.Plan(File.Exists(Path.Combine(work, "video.info.json")) ? File.ReadAllText(Path.Combine(work, "video.info.json")) : null);
+                var plan = SubLangs.Plan(await work.ExistsAsync("video.info.json", ct) ? await work.ReadTextAsync("video.info.json", ct) : null);
                 foreach (var auto in new[] { false, true })
                 {
                     var wanted = auto ? plan.AutoArg : plan.ManualArg;
                     if (wanted.Length == 0) { Log.Info($"download {id}: no {(auto ? "original-language automatic captions" : "uploaded subtitles")} to request"); continue; }
                     ctx.Report(auto ? "auto-subs" : "subs", null);
-                    var dir = Path.Combine(work, auto ? "auto" : "manual");
-                    Directory.CreateDirectory(dir);
+                    var dir = auto ? "auto" : "manual";
                     var subs = new List<string>(common)
                     {
                         "--skip-download", auto ? "--write-auto-subs" : "--write-subs", "--sub-langs", wanted, "--sub-format", "vtt", "--convert-subs", "vtt",
-                        "-o", Path.Combine(dir, "video.%(ext)s"), job.Url,
+                        "-o", dir + "/video.%(ext)s", job.Url,
                     };
-                    var sr = await tools.RunYtDlpAsync(subs, ct);
+                    var sr = await tools.RunAsync(work, "yt-dlp", subs, ct);
                     if (sr.ExitCode != 0)
                     {
                         // a missing or rate-limited subtitle track must not lose a downloaded video
@@ -129,42 +141,40 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
                 }
             }
 
-            var videoFile = Path.Combine(work, "video.mp4");
-            if (!File.Exists(videoFile)) throw new InvalidOperationException("yt-dlp finished but video.mp4 was not produced");
-            var infoFile = Path.Combine(work, "video.info.json");
+            const string videoName = "video.mp4", infoName = "video.info.json", descriptionName = "description.txt";
+            if (!await work.ExistsAsync(videoName, ct)) throw new InvalidOperationException("yt-dlp finished but video.mp4 was not produced");
             int height = 0; double duration = 0;
             DownloadedFormats? fmt = null;
-            var descriptionFile = Path.Combine(work, "description.txt");
-            if (File.Exists(infoFile))
+            if (await work.ExistsAsync(infoName, ct))
             {
-                var node = JsonNode.Parse(File.ReadAllText(infoFile))!.AsObject();
-                File.WriteAllText(descriptionFile, (string?)node["description"] ?? "");
+                var node = JsonNode.Parse(await work.ReadTextAsync(infoName, ct))!.AsObject();
+                await work.WriteTextAsync(descriptionName, (string?)node["description"] ?? "", ct);
                 node.Remove("comments");
                 fmt = DownloadedFormats.FromInfo(node); // before the size trim below drops "formats"
-                File.WriteAllText(infoFile, node.ToJsonString());
+                var json = node.ToJsonString();
                 height = (int?)node["height"] ?? 0; duration = (double?)node["duration"] ?? 0;
-                if (new FileInfo(infoFile).Length > 1_500_000)
+                if (System.Text.Encoding.UTF8.GetByteCount(json) > 1_500_000)
                 {
                     foreach (var k in new[] { "formats", "automatic_captions", "thumbnails", "heatmap" }) node.Remove(k);
-                    File.WriteAllText(infoFile, node.ToJsonString());
+                    json = node.ToJsonString();
                 }
+                await work.WriteTextAsync(infoName, json, ct);
             }
-            if (duration <= 0) duration = await Frames.DurationAsync(tools, videoFile, ct);
-            if (height <= 0) height = await Frames.HeightAsync(tools, videoFile, ct);
+            if (duration <= 0) duration = await ToolsProbe.DurationAsync(tools, work, videoName, ct);
+            if (height <= 0) height = await ToolsProbe.HeightAsync(tools, work, videoName, ct);
 
-            var bytes = new FileInfo(videoFile).Length;
-            Traffic.Current.Add(Traffic.YoutubeIn, Directory.EnumerateFiles(work, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length)); // video, subtitles, info, thumbnail
+            var bytes = await work.SizeAsync(videoName, ct);
+            Traffic.Current.Add(Traffic.YoutubeIn, await work.TotalBytesAsync(ct)); // video, subtitles, info, thumbnail
             var progress = new Progress<long>(n => ctx.Report("upload", $"{n * 100 / Math.Max(1, bytes)}%"));
             ctx.Report("upload", "0%");
-            await store.PutFileAsync(paths.Video(id, "video.mp4"), videoFile, "video/mp4", progress, ct);
-            if (File.Exists(infoFile)) await store.PutFileAsync(paths.Video(id, "info.json"), infoFile, "application/json", null, ct);
-            var thumb = Path.Combine(work, "video.jpg");
-            if (File.Exists(thumb)) await store.PutFileAsync(paths.Video(id, "thumb.jpg"), thumb, "image/jpeg", null, ct);
-            if (File.Exists(descriptionFile)) await store.PutFileAsync(paths.Video(id, "description.txt"), descriptionFile, "text/plain; charset=utf-8", null, ct);
-            var subFiles = CollectSubs(manualDir, autoDir);
+            await store.PutFileAsync(paths.Video(id, "video.mp4"), await work.LocalPathAsync(videoName, ct), "video/mp4", progress, ct);
+            if (await work.ExistsAsync(infoName, ct)) await store.PutFileAsync(paths.Video(id, "info.json"), await work.LocalPathAsync(infoName, ct), "application/json", null, ct);
+            if (await work.ExistsAsync("video.jpg", ct)) await store.PutFileAsync(paths.Video(id, "thumb.jpg"), await work.LocalPathAsync("video.jpg", ct), "image/jpeg", null, ct);
+            if (await work.ExistsAsync(descriptionName, ct)) await store.PutFileAsync(paths.Video(id, "description.txt"), await work.LocalPathAsync(descriptionName, ct), "text/plain; charset=utf-8", null, ct);
+            var subFiles = await CollectSubsAsync(work, manualDir, autoDir, ct);
             foreach (var (local, name) in subFiles)
             {
-                var (vtt, stats) = ShapeSubs(await File.ReadAllTextAsync(local, ct), name.EndsWith(".auto", StringComparison.Ordinal));
+                var (vtt, stats) = ShapeSubs(await work.ReadTextAsync(local, ct), name.EndsWith(".auto", StringComparison.Ordinal));
                 await store.PutAsync(paths.Video(id, $"subs/{name}.vtt"), System.Text.Encoding.UTF8.GetBytes(vtt), null, null, false, ct, "text/vtt");
                 await store.PutAsync(paths.Video(id, $"subs/{name}.json"), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, shape = stats.ToJson() }), null, null, false, ct);
             }
@@ -181,10 +191,6 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
             await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);   // download.zip's summary
             await StageCommit.CommitAsync(ctx.Store, id, "download", ctx.NodeId, false, ct);   // video.mp4 is already up: the zip, last, marks the download complete
             await EnsureFollowUpJobs(ctx);
-        }
-        finally
-        {
-            try { Directory.Delete(work, true); } catch { }
         }
     }
 

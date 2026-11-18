@@ -34,7 +34,7 @@ public static class Transcribe
         catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException) { return ""; }
     }
 
-    public const string ModelName = "sensevoice";
+    public const string ModelName = Protocol.AsrModelName;
     public const int SampleRate = 16000;
     /// <summary>A video is dubbed when more than this share of its speech time is in a language other than Chinese.</summary>
     public const double DubbedShare = 0.5;

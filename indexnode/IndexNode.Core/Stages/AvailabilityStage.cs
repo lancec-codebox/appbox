@@ -10,7 +10,7 @@ namespace IndexNode;
 /// listing is checked on its own. Unavailable videos get videos/&lt;id&gt;/availability.json with yt-dlp's reason; a video that is back is restored.
 /// The summary (availability.json) feeds the admin pages and the player's fallback. The job never ends: it is due again after <c>every</c> (1d).
 /// </summary>
-public sealed class AvailabilityStage(Tools tools, IStore store, Func<DateTimeOffset>? clock = null) : IStageHandler
+public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeOffset>? clock = null) : IStageHandler
 {
     private readonly Func<DateTimeOffset> now = clock ?? (() => DateTimeOffset.UtcNow);
     public const string SweepId = "sweep";
