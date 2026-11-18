@@ -87,7 +87,7 @@ class NodeNetworkTest {
     @Test fun aSuccessfulDownloadRecordsTheNetworkInTheJobAndDownloadedJson() {
         api.addJob("aaaaaaaaaaa", 1)
         runner(FakeFetcher()).run()
-        val m = JSONObject(api.blobText("index/videos/aaaaaaaaaaa/downloaded.json")).getJSONObject("network")
+        val m = api.summary("index/videos/aaaaaaaaaaa/download.zip").getJSONObject("network")
         assertEquals("203.0.113.7", m.getString("ipv4")); assertEquals("2001:db8:1:2::/64", m.getString("ipv6Prefix")); assertTrue(m.getBoolean("vpn")); assertEquals("wifi", m.getString("transport"))
         val j = api.jobJson("aaaaaaaaaaa").getJSONObject("network")
         assertEquals("203.0.113.7", j.getString("ipv4")); assertEquals("wifi", j.getString("transport"))

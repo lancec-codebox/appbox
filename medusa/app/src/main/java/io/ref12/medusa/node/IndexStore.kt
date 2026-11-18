@@ -19,14 +19,15 @@ class StoreFiles(
 enum class StoreResult { STORED, ALREADY }
 
 /**
- * Library downloads into the index, write-only as storage: nothing of the index is read back into the library. The marker (downloaded.json) goes first, create-only (If-None-Match: *):
- * when it exists the video is already in the index and nothing else is uploaded, read or replaced. Then the files, the video last of them (8 MiB blocks), then the download job as done and,
- * for "store and process", the same step jobs a node download creates (comments plus one job per ingest step, with needs).
+ * Library downloads into the index (1.9.0 layout), write-only as storage. video.mp4 goes first (8 MiB blocks), then download.zip LAST and create-only (If-None-Match: *): the zip is the
+ * completion signal (it replaces downloaded.json), so a drama with a video and no zip is half-written and never taken for complete, and a rerun just continues. If download.zip already exists
+ * (checked before anything is uploaded, and again by the create-only write: 409/412) the video is already in the index and nothing is replaced. Then the download job as done and, for
+ * "store and process", the same step jobs a node download creates (comments plus one job per ingest step, with needs).
  * [done] lists what an interrupted run already uploaded (the caller keeps it), so a resumed run continues instead of starting over.
  */
 object IndexStore {
     const val ORIGIN = "medusa-library"
-    private const val MARKER = "downloaded.json"
+    private const val MARKER = StageZip.NAME
 
     fun marker(f: StoreFiles, nodeId: String, at: String): JSONObject = JSONObject().put("v", 1).put("bytes", f.video.length()).put("height", f.height ?: JSONObject.NULL)
         .put("durationSeconds", f.durationSeconds ?: JSONObject.NULL).put("vcodec", f.info?.vcodec ?: JSONObject.NULL).put("acodec", f.info?.acodec ?: JSONObject.NULL)
@@ -38,18 +39,15 @@ object IndexStore {
     fun store(api: BlobApi, f: StoreFiles, mode: StoreMode, nodeId: String, priority: Int, nowIso: String, done: MutableSet<String>,
               cancelled: () -> Boolean = { false }, onProgress: (Long, Long) -> Unit = { _, _ -> }, persist: () -> Unit = {}): StoreResult {
         val base = "index/videos/${f.videoId}/"
-        if (MARKER !in done) {
-            // first, create-only: an existing marker means the video is in the index (a node's or an earlier store): stop, no reads, nothing replaced
-            if (!api.put(base + MARKER, marker(f, nodeId, nowIso).toString().toByteArray(), "application/json", emptyMap(), null, true)) return StoreResult.ALREADY
-            done.add(MARKER); persist()
-        }
-        for ((rel, file, ct) in f.extras) {
-            if (rel in done) continue
-            if (cancelled()) throw BlobCancelled()
-            api.put(base + rel, file.readBytes(), ct); done.add(rel); persist()
-        }
         if ("video.mp4" !in done) {
+            if (api.exists(base + MARKER)) return StoreResult.ALREADY   // the video is in the index (a node's or an earlier store): nothing is uploaded or replaced
             api.putBlocks(base + "video.mp4", f.video, "video/mp4", emptyMap(), cancelled, onProgress); done.add("video.mp4"); persist()
+        }
+        if (cancelled()) throw BlobCancelled()
+        if (MARKER !in done) {
+            // last, create-only: the zip appearing is the moment the drama counts as downloaded
+            if (!StageZip.upload(api, base, f.extras, marker(f, nodeId, nowIso), nodeId, nowIso, File(f.video.parentFile ?: File("."), ".zipwork"), true, cancelled)) return StoreResult.ALREADY
+            done.add(MARKER); persist()
         }
         if (cancelled()) throw BlobCancelled()
         finishJobs(api, f, mode, nodeId, priority, nowIso)

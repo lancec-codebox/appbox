@@ -310,7 +310,6 @@ class NodeRunner(
                     if (cancelled()) throw BlobCancelled()
                     rj.step = "upload"; rj.progress = null
                     val base = "index/videos/${ref.id}/"
-                    for ((rel, f, ct) in out.extras) api.put(base + rel, f.readBytes(), ct)
                     var lastPct = -1
                     api.putBlocks(base + "video.mp4", out.video, "video/mp4", emptyMap(), ::cancelled) { sent, total ->
                         val pct = (sent * 100 / total).toInt()
@@ -325,7 +324,8 @@ class NodeRunner(
                         .put("audioLanguage", out.audioLanguage ?: JSONObject.NULL).put("audioNote", out.audioNote ?: JSONObject.NULL)
                         .put("audioTracks", JSONArray().also { a -> out.audioTracks.forEach { a.put(JSONObject().put("language", it.first).put("note", it.second ?: JSONObject.NULL)) } }).put("nodeId", cfg.nodeId).put("at", at)
                         .also { m -> attemptNet?.let { m.put("network", it) } }
-                    api.put(base + "downloaded.json", marker.toString().toByteArray(), "application/json")
+                    // 1.9.0: download.zip (info.json, description.txt, thumb.jpg, subs/ + the former downloaded.json as its idx_summary) goes up last, after video.mp4: its existence is the completion signal
+                    StageZip.upload(api, base, out.extras, marker, cfg.nodeId, at, File(out.video.parentFile ?: workDir, ".zipwork"), false, ::cancelled)
                     // as IndexNode's DownloadStage: comments plus one job per ingest step (with needs), all at the download's priority; no legacy process job
                     FollowUps.create(api, ref.id, job.url, job.priority ?: Prio.of(ref.tags), at)
                     val done = JSONObject(jobText).put("finishedAt", at).put("nodeId", cfg.nodeId).put("elapsedSeconds", (env.clock() - t0) / 1000)

@@ -43,6 +43,19 @@ class FakeBlobs : BlobApi {
         if (cancelled()) throw BlobCancelled()
         blobs[path] = B(file.readBytes(), tags); log.add("put:" + path); onProgress(file.length(), file.length())
     }
+    val meta = LinkedHashMap<String, Map<String, String>>()
+    @Synchronized override fun putZip(path: String, file: File, metadata: Map<String, String>, tags: Map<String, String>, ifAbsent: Boolean, cancelled: () -> Boolean): Boolean {
+        if (cancelled()) throw BlobCancelled()
+        if (ifAbsent && blobs[path] != null) return false
+        blobs[path] = B(file.readBytes(), tags); meta[path] = metadata; log.add("put:" + path); return true
+    }
+    @Synchronized override fun exists(path: String) = blobs.containsKey(path)
+    /** The idx_summary of a stage zip (what downloaded.json used to hold). */
+    @Synchronized fun summary(path: String) = JSONObject(meta[path]!!["idx_summary"]!!)
+    /** The members of a stored zip: name -> bytes. */
+    @Synchronized fun members(path: String): Map<String, ByteArray> {
+        val out = LinkedHashMap<String, ByteArray>(); java.util.zip.ZipInputStream(blobs[path]!!.bytes.inputStream()).use { z -> while (true) { val e = z.nextEntry ?: break; out[e.name] = z.readBytes() } }; return out
+    }
     @Synchronized override fun acquireLease(path: String, seconds: Int): String? { val b = blobs[path] ?: return null; if (b.lease != null) return null; b.lease = "L" + (++leaseSeq); log.add("acquire:" + path); return b.lease }
     @Synchronized override fun renewLease(path: String, leaseId: String) {
         log.add("renew:" + path)
@@ -120,11 +133,12 @@ class NodeRunnerTest {
         val puts = api.log.filter { it.startsWith("put:") }
         // outputs first, the marker last of them, then the comments and step jobs, then the job itself
         val vid = "put:index/videos/aaaaaaaaaaa/"
-        assertTrue(puts.indexOf(vid + "downloaded.json") > puts.indexOf(vid + "video.mp4"))
-        assertTrue(puts.indexOf(vid + "downloaded.json") > puts.indexOf(vid + "subs/zh-Hans.vtt"))
-        assertTrue(puts.indexOf("put:index/jobs/frames/aaaaaaaaaaa.json") > puts.indexOf(vid + "downloaded.json"))
+        assertTrue(puts.indexOf(vid + "download.zip") > puts.indexOf(vid + "video.mp4"))   // download.zip is the completion signal: last of the drama's files
+        assertEquals(listOf("description.txt", "info.json", "subs/en.vtt", "subs/zh-Hans.vtt").filter { it in api.members("index/videos/aaaaaaaaaaa/download.zip").keys }, api.members("index/videos/aaaaaaaaaaa/download.zip").keys.toList())
+        assertTrue(api.members("index/videos/aaaaaaaaaaa/download.zip").containsKey("subs/zh-Hans.vtt")); assertFalse(api.blobs.containsKey("index/videos/aaaaaaaaaaa/downloaded.json"))
+        assertTrue(puts.indexOf("put:index/jobs/frames/aaaaaaaaaaa.json") > puts.indexOf(vid + "download.zip"))
         assertTrue(puts.indexOf("put:index/jobs/download/aaaaaaaaaaa.json") > puts.indexOf("put:index/jobs/translate/aaaaaaaaaaa.json"))
-        val marker = JSONObject(String(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"]!!.bytes))
+        val marker = api.summary("index/videos/aaaaaaaaaaa/download.zip")
         assertEquals(100, marker.getInt("bytes")); assertEquals(480, marker.getInt("height")); assertEquals(61.5, marker.getDouble("durationSeconds"), 0.0); assertEquals("lancecm1-a1b2c3", marker.getString("nodeId"))
         assertEquals(1, marker.getInt("v")); assertEquals("av01.0.00M.08", marker.getString("vcodec")); assertEquals("opus", marker.getString("acodec"))
         assertEquals("zh", marker.getString("audioLanguage")); assertEquals("original (default)", marker.getString("audioNote"))
@@ -133,7 +147,7 @@ class NodeRunnerTest {
           assertEquals("en", at.getJSONObject(1).getString("language")); assertEquals("English (dubbed)", at.getJSONObject(1).getString("note"))
           assertEquals("394+251", marker.getString("formatId")); assertEquals(true, marker.getBoolean("embeddable")); assertTrue(marker.has("at"))
         assertEquals("[\"zh-Hans\",\"en\",\"zh-Hans.auto\"]", marker.getJSONArray("subs").toString())
-        assertEquals("第一集 hello", String(api.blobs["index/videos/aaaaaaaaaaa/description.txt"]!!.bytes, Charsets.UTF_8))
+        assertEquals("第一集 hello", String(api.members("index/videos/aaaaaaaaaaa/download.zip")["description.txt"]!!, Charsets.UTF_8))
         assertNull(api.blobs["index/jobs/process/aaaaaaaaaaa.json"])
         val pj = JSONObject(String(api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]!!.bytes))
         val c = api.blobs["index/jobs/comments/aaaaaaaaaaa.json"]!!; val cj = JSONObject(String(c.bytes))
@@ -238,7 +252,7 @@ class NodeRunnerTest {
         val s = runner(FakeFetcher { _, _, _ -> throw NodeFetchException(FailureKind.PERMANENT, "Video unavailable") }).run()
         val o = api.jobJson("aaaaaaaaaaa")
         assertEquals("failed", api.job("aaaaaaaaaaa").tags["idx_state"]); assertTrue(o.getBoolean("permanent")); assertEquals("Video unavailable", o.getString("lastError"))
-        assertNull(api.job("aaaaaaaaaaa").lease); assertEquals(1, s.failed); assertNull(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"])
+        assertNull(api.job("aaaaaaaaaaa").lease); assertEquals(1, s.failed); assertNull(api.blobs["index/videos/aaaaaaaaaaa/download.zip"])
         assertNull(api.blobs["index/jobs/frames/aaaaaaaaaaa.json"]); assertEquals(0, state.doneToday(NodeRunner.day(now)))
     }
 
@@ -268,7 +282,7 @@ class NodeRunnerTest {
         }
         val r = NodeRunner(broken, FakeFetcher(), NodeConfig("n-1", "n", "wifi", "1.7.0", "android", 4, work), state, NodeEnv(clock = { now }, sleep = {}, gapMs = { 1 }, renewMs = 20), cap = 20)
         r.run()
-        assertEquals(3, api.jobJson("aaaaaaaaaaa").getInt("attempts")); assertNull(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"])
+        assertEquals(3, api.jobJson("aaaaaaaaaaa").getInt("attempts")); assertNull(api.blobs["index/videos/aaaaaaaaaaa/download.zip"])
     }
 
     @Test fun aBotBlockReleasesWithoutAnAttemptAndBacksOffAnHour() {
@@ -289,7 +303,7 @@ class NodeRunnerTest {
         val f = FakeFetcher(); f.subsFailed = listOf("en", "zh-orig.auto")
         val s = runner(f).run()
         assertEquals(1, s.done); assertEquals(0, s.failed); assertEquals(0L, state.backoff)
-        val marker = JSONObject(String(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"]!!.bytes))
+        val marker = api.summary("index/videos/aaaaaaaaaaa/download.zip")
         assertEquals("[\"en\",\"zh-orig.auto\"]", marker.getJSONArray("subsFailed").toString())
         assertEquals("done", api.job("aaaaaaaaaaa").tags["idx_state"])
     }
@@ -312,7 +326,7 @@ class NodeRunnerTest {
         api.addJob("aaaaaaaaaaa", 1); api.renewFails = true
         val f = FakeFetcher { _, _, fe -> val t = System.currentTimeMillis(); while (!fe.cancelled && System.currentTimeMillis() - t < 3000) Thread.sleep(5); if (fe.cancelled) throw NodeFetchException(FailureKind.TRANSIENT, "cancelled") }
         runner(f).run()
-        assertEquals(0, api.jobJson("aaaaaaaaaaa").getInt("attempts")); assertNull(api.blobs["index/videos/aaaaaaaaaaa/downloaded.json"])
+        assertEquals(0, api.jobJson("aaaaaaaaaaa").getInt("attempts")); assertNull(api.blobs["index/videos/aaaaaaaaaaa/download.zip"])
     }
 
     // ---- control ----

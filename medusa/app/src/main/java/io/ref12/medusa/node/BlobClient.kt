@@ -35,6 +35,10 @@ interface BlobApi {
     /** Put Blob; [ifAbsent] sends If-None-Match: * and returns false when the blob exists. */
     fun put(path: String, body: ByteArray, contentType: String, tags: Map<String, String> = emptyMap(), leaseId: String? = null, ifAbsent: Boolean = false): Boolean
     fun putBlocks(path: String, file: File, contentType: String, tags: Map<String, String> = emptyMap(), cancelled: () -> Boolean = { false }, onProgress: (Long, Long) -> Unit = { _, _ -> })
+    /** Uploads a stage zip whole with its blob metadata (x-ms-meta-*) and tags in one Put Block List; [ifAbsent] sends If-None-Match: * and returns false when the blob exists (409/412). */
+    fun putZip(path: String, file: File, metadata: Map<String, String>, tags: Map<String, String> = emptyMap(), ifAbsent: Boolean = false, cancelled: () -> Boolean = { false }): Boolean
+    /** Whether the blob exists (Get Blob Properties). */
+    fun exists(path: String): Boolean
     /** Acquire / renew / release. Acquire returns the lease id, or null when another node holds the blob (409). Renew throws BlobException when the lease is lost. */
     fun acquireLease(path: String, seconds: Int = 60): String?
     fun renewLease(path: String, leaseId: String)
@@ -151,8 +155,20 @@ class BlobClient(val sas: SasUrl, private val retryDelayMs: Long = 1000, private
     }
 
     override fun putBlocks(path: String, file: File, contentType: String, tags: Map<String, String>, cancelled: () -> Boolean, onProgress: (Long, Long) -> Unit) {
+        blocks(path, file, contentType, tags, emptyMap(), false, cancelled, onProgress)
+    }
+
+    override fun putZip(path: String, file: File, metadata: Map<String, String>, tags: Map<String, String>, ifAbsent: Boolean, cancelled: () -> Boolean): Boolean =
+        blocks(path, file, "application/zip", tags, metadata, ifAbsent, cancelled) { _, _ -> }
+
+    override fun exists(path: String): Boolean {
+        val r = send("HEAD", sas.blobUrl(path))
+        return when (r.code) { 200 -> true; 404 -> false; else -> fail(r, "Head $path") }
+    }
+
+    private fun blocks(path: String, file: File, contentType: String, tags: Map<String, String>, meta: Map<String, String>, ifAbsent: Boolean, cancelled: () -> Boolean, onProgress: (Long, Long) -> Unit): Boolean {
         val total = file.length()
-        if (total == 0L) { put(path, ByteArray(0), contentType, tags); return }
+        if (total == 0L) { return put(path, ByteArray(0), contentType, tags, null, ifAbsent) }
         val ids = ArrayList<String>(); val buf = ByteArray(minOf(blockSize.toLong(), total).toInt()); var sent = 0L
         FileInputStream(file).use { ins ->
             while (true) {
@@ -168,8 +184,12 @@ class BlobClient(val sas: SasUrl, private val retryDelayMs: Long = 1000, private
         val xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>" + ids.joinToString("") { "<Latest>$it</Latest>" } + "</BlockList>"
         val h = LinkedHashMap<String, String>()
         h["x-ms-blob-content-type"] = contentType; h["Content-Type"] = "application/xml"; h.putAll(tagHeader(tags))
+        meta.forEach { (k, v) -> h["x-ms-meta-$k"] = v.filter { it.code in 32..126 } }
+        if (ifAbsent) h["If-None-Match"] = "*"
         val r = send("PUT", sas.blobUrl(path, "comp=blocklist"), h, xml.toByteArray(Charsets.UTF_8))
-        if (r.code != 201) fail(r, "Put Block List $path")
+        if (r.code == 201) return true
+        if (ifAbsent && (r.code == 409 || r.code == 412)) return false
+        fail(r, "Put Block List $path")
     }
 
     private fun putBlock(path: String, id: String, buf: ByteArray, n: Int, cancelled: () -> Boolean) {

@@ -88,9 +88,9 @@ class Forbidden403Test {
         api.addJob("aaaaaaaaaaa", 1)
         val f = FakeFetcher().also { it.formatFallback = "mp4" }
         runner(f).run()
-        assertEquals("mp4", JSONObject_(api.blobText("index/videos/aaaaaaaaaaa/downloaded.json")).getString("formatFallback"))
+        assertEquals("mp4", api.summary("index/videos/aaaaaaaaaaa/download.zip").getString("formatFallback"))
         api.addJob("bbbbbbbbbbb", 2); runner(FakeFetcher()).run()
-        assertFalse(JSONObject_(api.blobText("index/videos/bbbbbbbbbbb/downloaded.json")).has("formatFallback"))
+        assertFalse(api.summary("index/videos/bbbbbbbbbbb/download.zip").has("formatFallback"))
     }
     private fun JSONObject_(s: String) = org.json.JSONObject(s)
 }

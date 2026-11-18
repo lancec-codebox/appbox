@@ -214,3 +214,11 @@ Optional cap: `control.json` `"downloads": { "maxPerIp": N }`. Absent, null or 0
 ## Medusa library downloads in the index (Medusa 1.8.6)
 
 Library downloads are often 720p. The frames stage scales stored frames to a short side of 360 (Frames.cs), so only decode time grows. Such videos carry origin "medusa-library" and their real height in downloaded.json.
+
+## One zip per stage (Medusa 1.9.0 / IndexNode 0.10.0)
+
+Medusa no longer writes loose files into `index/videos/<id>/`. A node download and a library store-to-index both write the same two blobs: `video.mp4` and `download.zip`, a standard zip with stored (uncompressed) members and real CRC-32 holding `info.json`, `description.txt`, `thumb.jpg` and `subs/<lang>.vtt` (the member names are the old file names). What `downloaded.json` used to hold is now the zip's blob metadata `idx_summary` (ASCII-escaped JSON); the zip carries `idx_v`, `idx_sha256`, `idx_inputs` (the hash of no inputs), `idx_node`, `idx_at` and `idx_summary`, under 8 KB, sent in the same Put Block List as the zip.
+
+**Order.** `video.mp4` is uploaded first (8 MiB blocks), `download.zip` last: its existence is the completion signal (it replaces downloaded.json), so a drama with a video and no zip is half-written and never taken for complete. The follow-up jobs and the done download job come after the zip. A node download writes the zip last with a plain Put (a rerun replaces it whole). The library store-to-index creates it with `If-None-Match: *`: it first checks that no download.zip exists (then nothing is uploaded or replaced and the store reports "already in the index"), and the create-only write answers 409/412 when another writer finished first, with the same result. An interrupted store resumes: the video is not uploaded again, the zip is written once.
+
+The loose 0.9 layout is converted by `indexnode repack` (see PROTOCOL.md, "One zip per stage") with all nodes stopped; the phone app only writes the new layout.

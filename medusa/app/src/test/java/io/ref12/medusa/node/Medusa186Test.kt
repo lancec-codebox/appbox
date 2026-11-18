@@ -201,28 +201,59 @@ class Medusa186Test {
     }
     private val V = "index/videos/aaaaaaaaaaa/"
 
-    @Test fun theMarkerIsWrittenFirstCreateOnlyWithOriginAndHeight() {
+    private val Z = V + "download.zip"
+
+    @Test fun videoGoesFirstAndTheCreateOnlyDownloadZipLastWithTheSummary() {
         val res = IndexStore.store(api, files(), StoreMode.STORE_ONLY, "phone-a1b2c3", 0, "2026-11-17T12:00:00Z", LinkedHashSet())
         assertEquals(StoreResult.STORED, res)
         val puts = api.log.filter { it.startsWith("put:") }
-        assertEquals("put:" + V + "downloaded.json", puts.first()); assertTrue(puts.indexOf("put:" + V + "video.mp4") > puts.indexOf("put:" + V + "info.json"))
-        val m = JSONObject(api.blobText(V + "downloaded.json"))
+        assertEquals("put:" + V + "video.mp4", puts.first()); assertEquals("put:" + Z, puts[1])   // the zip is the completion signal: nothing of the drama comes after the video but it
+        assertFalse(api.blobs.containsKey(V + "downloaded.json")); assertFalse(api.blobs.containsKey(V + "info.json"))
+        val m = api.summary(Z)
         assertEquals("medusa-library", m.getString("origin")); assertEquals(720, m.getInt("height")); assertEquals(100, m.getInt("bytes"))
-        assertEquals(100, api.blobs[V + "video.mp4"]!!.bytes.size); assertTrue(api.blobs.containsKey(V + "subs/en.vtt"))
+        assertEquals(100, api.blobs[V + "video.mp4"]!!.bytes.size)
+        assertEquals(listOf("info.json", "subs/en.vtt"), api.members(Z).keys.toList())
+        val md = api.meta[Z]!!
+        assertEquals(setOf("idx_v", "idx_sha256", "idx_inputs", "idx_node", "idx_at", "idx_summary"), md.keys)
+        assertEquals("1", md["idx_v"]); assertEquals("phone-a1b2c3", md["idx_node"]); assertTrue(md.all { e -> e.value.all { it.code < 128 } }); assertTrue(md.entries.sumOf { it.key.length + it.value.length } < 8000)
     }
 
-    @Test fun anExistingMarkerMeansSkipAndNothingIsUploadedReadOrReplaced() {
-        api.blobs[V + "downloaded.json"] = FakeBlobs.B("old".toByteArray(), emptyMap())
+    @Test fun theZipIsAStandardStoredZipWithRealCrcs() {
+        IndexStore.store(api, files(), StoreMode.STORE_ONLY, "n", 0, "t", LinkedHashSet())
+        java.util.zip.ZipInputStream(api.blobs[Z]!!.bytes.inputStream()).use { z -> while (true) { val e = z.nextEntry ?: break; z.readBytes() } }   // CRC-32 is checked on read
+        val zf = File.createTempFile("dlzip", ".zip"); zf.writeBytes(api.blobs[Z]!!.bytes)
+        java.util.zip.ZipFile(zf).use { z -> for (e in z.entries()) { assertEquals(java.util.zip.ZipEntry.STORED, e.method); assertTrue(e.crc != 0L || e.size == 0L) } }
+        assertEquals(api.meta[Z]!!["idx_sha256"], StageZip.sha256(zf))
+    }
+
+    @Test fun anExistingDownloadZipMeansSkipAndNothingIsUploadedOrReplaced() {
+        api.blobs[Z] = FakeBlobs.B("old".toByteArray(), emptyMap())
         val res = IndexStore.store(api, files(), StoreMode.STORE_AND_PROCESS, "phone-a1b2c3", 0, "t", LinkedHashSet())
         assertEquals(StoreResult.ALREADY, res)
-        assertTrue(api.log.isEmpty()); assertEquals("old", api.blobText(V + "downloaded.json")); assertEquals(1, api.blobs.size)
+        assertTrue(api.log.isEmpty()); assertEquals("old", api.blobText(Z)); assertEquals(1, api.blobs.size)
+    }
+
+    @Test fun aZipThatAppearsDuringTheUploadWinsAndIsNotReplaced() {
+        val racing = object : BlobApi by api {
+            override fun putBlocks(path: String, file: File, contentType: String, tags: Map<String, String>, cancelled: () -> Boolean, onProgress: (Long, Long) -> Unit) {
+                api.putBlocks(path, file, contentType, tags, cancelled, onProgress); api.blobs[Z] = FakeBlobs.B("theirs".toByteArray(), emptyMap())   // another writer finished first
+            }
+        }
+        assertEquals(StoreResult.ALREADY, IndexStore.store(racing, files(), StoreMode.STORE_AND_PROCESS, "n", 0, "t", LinkedHashSet()))
+        assertEquals("theirs", api.blobText(Z)); assertFalse(api.blobs.keys.any { it.startsWith("index/jobs/") })
+    }
+
+    @Test fun aHalfWrittenDramaWithAVideoButNoZipIsNotComplete() {
+        val failing = object : BlobApi by api { override fun putZip(path: String, file: File, metadata: Map<String, String>, tags: Map<String, String>, ifAbsent: Boolean, cancelled: () -> Boolean): Boolean = throw BlobException(500, "x", "boom") }
+        assertThrows(BlobException::class.java) { IndexStore.store(failing, files(), StoreMode.STORE_ONLY, "n", 0, "t", LinkedHashSet()) }
+        assertTrue(api.blobs.containsKey(V + "video.mp4")); assertFalse(api.blobs.containsKey(Z)); assertFalse(api.blobs.keys.any { it.startsWith("index/jobs/") })
     }
 
     @Test fun aResumedStoreContinuesFromWhatIsDone() {
-        val done = LinkedHashSet(listOf("downloaded.json", "info.json"))
+        val done = LinkedHashSet(listOf("video.mp4"))
         IndexStore.store(api, files(), StoreMode.STORE_ONLY, "n", 0, "t", done)
         val puts = api.log.filter { it.startsWith("put:") }
-        assertFalse(puts.contains("put:" + V + "downloaded.json")); assertFalse(puts.contains("put:" + V + "info.json")); assertTrue(puts.contains("put:" + V + "video.mp4"))
+        assertFalse(puts.contains("put:" + V + "video.mp4")); assertTrue(puts.contains("put:" + Z))
     }
 
     @Test fun storeOnlyCreatesTheDownloadJobAsDoneAndNoStepJobs() {
