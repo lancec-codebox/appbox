@@ -1,0 +1,132 @@
+name: indexnode-android
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["indexnode-android/**", "indexnode/IndexNode.Core/**", ".github/workflows/indexnode-android.yml"]
+  workflow_dispatch:
+  pull_request:
+    paths: ["indexnode-android/**", "indexnode/IndexNode.Core/**", ".github/workflows/indexnode-android.yml"]
+
+# No store access anywhere in this workflow: no SAS, no storage secrets. Tests use fakes. Releases need only the repository token.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+            11.0.x
+          dotnet-quality: preview
+      - name: Android tests (loader, bridge, Medusa adapter against a fake server, plugin on a fake store)
+        run: dotnet test indexnode-android/Tests -c Release
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      host: ${{ steps.v.outputs.host }}
+      plugin: ${{ steps.v.outputs.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+            11.0.x
+          dotnet-quality: preview
+      - name: Android workload
+        run: dotnet workload install android
+      - id: v
+        run: |
+          set -euo pipefail
+          H="$(sed -nE 's/.*<ApplicationDisplayVersion>([^<]+)<.*/\1/p' indexnode-android/Host/Host.csproj | head -1)"
+          P="$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' indexnode-android/Plugin/Plugin.csproj | head -1)"
+          echo "host=$H" >> "$GITHUB_OUTPUT"; echo "plugin=$P" >> "$GITHUB_OUTPUT"
+      - name: Plugin
+        run: |
+          dotnet build indexnode-android/Plugin -c Release
+          mkdir -p out
+          cp indexnode-android/Plugin/bin/Release/net11.0/IndexNode.Plugin.dll out/IndexNode.Plugin.dll
+          SHA="$(sha256sum out/IndexNode.Plugin.dll | cut -d' ' -f1)"
+          printf '{"version":"%s","sha256":"%s","dll":"IndexNode.Plugin.dll","minHost":"0.1.0"}\n' "${{ steps.v.outputs.plugin }}" "$SHA" > out/manifest.json
+          cat out/manifest.json
+      - name: Signing key (the Medusa release keystore)
+        id: key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MEDIA_HELPER_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.MEDIA_HELPER_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.MEDIA_HELPER_KEY_PASSWORD }}
+          # Not a secret. Same alias as medusa.yml; set the repo variable MEDUSA_KEY_ALIAS to override.
+          KEY_ALIAS: ${{ vars.MEDUSA_KEY_ALIAS || 'media-helper' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            # the store password and the key password are separate secrets; the build reads them from the environment (env:NAME)
+            echo "args=-p:AndroidKeyStore=true -p:AndroidSigningKeyStore=$RUNNER_TEMP/release.jks -p:AndroidSigningStorePass=env:STORE_PASSWORD -p:AndroidSigningKeyAlias=$KEY_ALIAS -p:AndroidSigningKeyPass=env:KEY_PASSWORD" >> "$GITHUB_OUTPUT"
+            echo "signing=release" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            # a release must never be debug-signed: later APKs have to install over this one
+            echo "::error::MEDIA_HELPER_KEYSTORE_BASE64 is not set: refusing to build an APK for main without the release key"
+            exit 1
+          else
+            # branches and forks without the secrets: debug-sign so the build and tests still run (this APK cannot be updated by a release APK)
+            keytool -genkeypair -keystore "$RUNNER_TEMP/debug.keystore" -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug" >/dev/null
+            echo "args=-p:AndroidKeyStore=true -p:AndroidSigningKeyStore=$RUNNER_TEMP/debug.keystore -p:AndroidSigningStorePass=android -p:AndroidSigningKeyAlias=androiddebugkey -p:AndroidSigningKeyPass=android" >> "$GITHUB_OUTPUT"
+            echo "signing=debug" >> "$GITHUB_OUTPUT"
+            echo "::warning::release key secrets are not available here: the APK is debug-signed"
+          fi
+      - name: APK (CoreCLR, untrimmed, arm64)
+        env:
+          STORE_PASSWORD: ${{ secrets.MEDIA_HELPER_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.MEDIA_HELPER_KEY_PASSWORD }}
+        run: |
+          dotnet build indexnode-android/Host -c Release ${{ steps.key.outputs.args }}
+          cp indexnode-android/Host/bin/Release/net11.0-android/*-Signed.apk out/indexnode-android.apk
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: indexnode-android
+          path: out/*
+
+  release:
+    # main only. A new host version publishes the APK as release indexnode-android-v<version>; a new plugin version replaces the assets of the rolling release indexnode-android-plugin.
+    needs: build
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: indexnode-android-release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: indexnode-android
+          path: out
+      - name: Host release (new version only)
+        run: |
+          set -euo pipefail
+          TAG="indexnode-android-v${{ needs.build.outputs.host }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then echo "$TAG exists: no host release"; else
+            gh release create "$TAG" out/indexnode-android.apk --title "$TAG" --notes "IndexNode for Android host ${{ needs.build.outputs.host }} (bundled plugin ${{ needs.build.outputs.plugin }})"
+          fi
+      - name: Plugin on the rolling release (new version only)
+        run: |
+          set -euo pipefail
+          TAG="indexnode-android-plugin"
+          NEW="${{ needs.build.outputs.plugin }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            CUR="$(gh release download "$TAG" --pattern manifest.json -O - 2>/dev/null | sed -nE 's/.*"version":"([^"]+)".*/\1/p')" || CUR=""
+            if [ "$CUR" = "$NEW" ]; then echo "plugin $NEW is already on $TAG"; exit 0; fi
+            gh release upload "$TAG" out/IndexNode.Plugin.dll out/manifest.json --clobber
+          else
+            gh release create "$TAG" out/IndexNode.Plugin.dll out/manifest.json --title "IndexNode Android plugin (rolling)" --notes "The newest plugin DLL and its manifest. The app checks manifest.json before each run."
+          fi

@@ -1,0 +1,81 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IndexNode</title>
+<style>
+ body{font:13px/1.35 system-ui,sans-serif;margin:0;background:#fafafa;color:#222}
+ h1{font-size:15px;margin:0;padding:8px 10px;background:#222;color:#fff}
+ section{background:#fff;border:1px solid #ddd;margin:8px;padding:8px}
+ h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin:0 0 6px;color:#555}
+ table{border-collapse:collapse;width:100%} td{padding:2px 4px;border-bottom:1px solid #eee;vertical-align:top} td:first-child{color:#666;width:38%}
+ button{font:inherit;padding:6px 10px;margin:2px 2px 2px 0;border:1px solid #888;background:#eee} button.p{background:#222;color:#fff}
+ input[type=text],input[type=number],textarea{font:inherit;width:100%;box-sizing:border-box;padding:4px;border:1px solid #bbb}
+ label{display:block;margin:4px 0} .bad{color:#b00} .ok{color:#080}
+ pre{max-height:240px;overflow:auto;background:#111;color:#ddd;padding:6px;font-size:11px;white-space:pre-wrap;margin:0}
+ progress{width:100%}
+</style></head><body>
+<h1>IndexNode <span id="ver"></span></h1>
+<section><h2>Status</h2>
+ <table id="st"></table><progress id="pg" max="1" value="0" style="display:none"></progress>
+ <div id="why" class="bad"></div>
+ <button class="p" id="run">Run now</button><button id="stop">Stop</button>
+</section>
+<section><h2>Setup</h2>
+ <div>Paste the node-setup link or the contents of the .medusa-node.json file, or open the QR with the phone camera.</div>
+ <textarea id="setup" rows="3" placeholder="medusa://node-setup?d=..."></textarea>
+ <button id="imp">Import setup</button> <span id="impmsg"></span>
+</section>
+<section><h2>Medusa</h2>
+ <table id="md"></table>
+ <button id="pair">Pair with Medusa</button> <span id="pairmsg"></span>
+</section>
+<section><h2>Settings</h2>
+ <label><input type="checkbox" id="wifiOnly"> Wi-Fi only</label>
+ <label><input type="checkbox" id="chargingOnly"> Charging only</label>
+ <label>Daily cap (downloads, 0 = none) <input type="number" id="dailyCap" min="0"></label>
+ <label>Budget (total downloads, blank = none) <input type="number" id="budget" min="0"></label>
+ <label>Downloads per run <input type="number" id="runMax" min="1"></label>
+ <label>Max video height <input type="number" id="maxHeight" min="144"></label>
+ <label><input type="checkbox" id="periodic"> Run by itself (about every <input type="number" id="periodMinutes" min="15" style="width:5em"> min)</label>
+ <label><input type="checkbox" id="v1Fallback"> Use Medusa /v1 (plain videos only) when not paired</label>
+ <label><input type="checkbox" id="noRefresh"> No refresh (do not list followed sources, download only)</label>
+ <label>UI URL (https; blank = bundled page) <input type="text" id="uiUrl"></label>
+ <button class="p" id="save">Save</button> <span id="savemsg"></span>
+</section>
+<section><h2>Plugin</h2>
+ <table id="pl"></table>
+ <label>Manifest URL <input type="text" id="pluginUrl"></label>
+ <button id="upd">Check for update</button> <span id="updmsg"></span>
+</section>
+<section><h2>Log</h2><pre id="log"></pre>
+ <button id="share">Share</button><button id="clear">Clear</button><button id="reload">Refresh</button>
+</section>
+<script>
+const $=id=>document.getElementById(id); let n=0; const pend={};
+const hasBridge = typeof hostBridge!=='undefined';
+if(hasBridge) hostBridge.onmessage=e=>{const r=JSON.parse(e.data);const p=pend[r.id];if(p){delete pend[r.id];r.ok?p.res(r.result):p.rej(new Error(r.error));}};
+const call=(m,a)=>new Promise((res,rej)=>{if(!hasBridge)return rej(new Error('no bridge'));const id=++n;pend[id]={res,rej};hostBridge.postMessage(JSON.stringify({id,m,a:a==null?'':(typeof a==='string'?a:JSON.stringify(a))}));});
+const row=(k,v)=>'<tr><td>'+k+'</td><td>'+(v==null||v===''?'-':String(v).replace(/[<&]/g,c=>c=='<'?'&lt;':'&amp;'))+'</td></tr>';
+let loaded=false;
+async function refresh(){
+ try{
+  const s=await call('getState'); $('ver').textContent='host '+s.hostVersion;
+  $('st').innerHTML=row('State',s.state)+row('Job',s.job)+row('Today',s.doneToday+' / '+(s.settings.dailyCap||'no cap'))+row('Node',s.nodeId+(s.nodeName&&s.nodeName!==s.nodeId?' ('+s.nodeName+')':''))+row('Store',s.configured?s.storeUrl:'not set up')
+   +row('Network',s.device.transport+(s.device.vpn?' + VPN':'')+(s.device.metered?' (metered)':''))+row('Charging / battery',(s.device.charging?'yes':'no')+' / '+s.device.battery+'%')+row('Free space',s.device.freeMb+' MB')+row('Last error',s.lastError);
+  $('pg').style.display=s.progress!=null?'':'none'; $('pg').value=s.progress||0;
+  $('why').textContent=s.whyNot?'Not running: '+s.whyNot:'';
+  const m=s.medusa||{}; $('md').innerHTML=row('Mode',s.medusaMode)+row('Paired',m.paired?'yes':'no')+row('Pairing request',m.pending?'waiting for approval in Medusa':'')+row('Medusa running',m.running===false?'no: '+(m.error||''):m.running);
+  $('pl').innerHTML=row('Plugin',(s.pluginVersion||'(not loaded)')+(s.pluginSource?' ['+s.pluginSource+']':''))+row('Plugin error',s.pluginError)+row('Rolling manifest',s.settings.pluginUrl);
+  if(!loaded){loaded=true;const c=s.settings;for(const k of ['wifiOnly','chargingOnly','periodic','v1Fallback','noRefresh'])$(k).checked=!!c[k];for(const k of ['dailyCap','budget','runMax','maxHeight','periodMinutes'])$(k).value=c[k]==null?'':c[k];$('uiUrl').value=c.uiUrl||'';$('pluginUrl').value=c.pluginUrl;}
+  $('log').textContent=(await call('getLog')).slice(-200).join('\n');
+ }catch(e){$('st').innerHTML=row('Error',e.message);}
+}
+const act=(id,f,msg)=>$(id).onclick=async()=>{try{const r=await f();if(msg)$(msg).textContent=r||'';}catch(e){if(msg)$(msg).textContent=e.message;}refresh();};
+act('run',()=>call('runNow'));act('stop',()=>call('stopRun'));
+act('imp',async()=>{await call('importSetup',$('setup').value);$('setup').value='';loaded=false;return 'imported';},'impmsg');
+act('pair',async()=>{const r=await call('pairMedusa');return r.state==='approved'?'paired':r.state==='denied'?'denied':'approve in Medusa, then tap again';},'pairmsg');
+act('save',async()=>{const o={};for(const k of ['wifiOnly','chargingOnly','periodic','v1Fallback','noRefresh'])o[k]=$(k).checked;for(const k of ['dailyCap','runMax','maxHeight','periodMinutes'])if($(k).value!=='')o[k]=+$(k).value;o.budget=$('budget').value;o.pluginUrl=$('pluginUrl').value;
+ await call('saveSettings',o);await call('setUiUrl',$('uiUrl').value);return 'saved';},'savemsg');
+act('upd',async()=>{const r=await call('checkPluginUpdate');return r.outcome+(r.version?' '+r.version:'')+(r.detail?': '+r.detail:'');},'updmsg');
+act('share',()=>call('shareLog'));act('clear',()=>call('clearLog'));act('reload',async()=>{});
+refresh(); setInterval(refresh,3000);
+</script></body></html>
