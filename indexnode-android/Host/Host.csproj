@@ -14,6 +14,8 @@
     <RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>
     <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Keep all of CoreLib: plugins call BCL APIs the host never uses (costs ~3 MB, see README). -->
+    <RootCoreLib Condition="'$(RootCoreLib)' == ''">true</RootCoreLib>
   </PropertyGroup>
 
   <!-- Release: the normal settings (trim + AOT), plus what hot-loading needs -->
