@@ -45,6 +45,11 @@
     <PackageReference Include="Xamarin.AndroidX.WebKit" Version="1.14.0.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <TrimmerRootDescriptor Include="ILLink.Descriptors.xml" />
+    <TrimmerRootAssembly Include="System.Private.CoreLib" RootMode="All" Condition="'$(RootCoreLib)' == 'true'" />
+  </ItemGroup>
+
   <!-- Keep the contract whole and the BCL surface plugins are likely to use (the host itself only uses a slice). -->
   <ItemGroup>
     <TrimmerRootAssembly Include="Spike.Contract" RootMode="All" />

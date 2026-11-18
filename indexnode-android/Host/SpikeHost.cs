@@ -15,6 +15,7 @@ public sealed class SpikeHost : IHost
     readonly List<string> _log = new();
     readonly object _lock = new();
     LoadedPlugin? _plugin;
+    readonly List<(string ver, WeakReference wr)> _zombies = new();
     public Action<string>? StatusChanged;
     public string Status { get; private set; } = "idle";
     public string CacheDir { get; }
@@ -104,6 +105,7 @@ public sealed class SpikeHost : IHost
         var ver = _plugin.Version;
         var before = Mem();
         var wr = DropAndUnload();
+        lock (_zombies) _zombies.Add((ver, wr));
         var sw = Stopwatch.StartNew();
         int i = 0;
         for (; i < 10 && wr.IsAlive; i++) { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); Thread.Sleep(50); }
@@ -121,8 +123,16 @@ public sealed class SpikeHost : IHost
         return new JsonObject { ["pssKb"] = mi.TotalPss, ["managedKb"] = GC.GetTotalMemory(false) / 1024, ["assembliesLoaded"] = AppDomain.CurrentDomain.GetAssemblies().Length };
     }
 
-    JsonNode? Info() => new JsonObject
+    JsonNode? Info()
     {
+        for (int i = 0; i < 3; i++) { GC.Collect(); GC.WaitForPendingFinalizers(); }
+        string unloaded; lock (_zombies) unloaded = string.Join(",", _zombies.Select(z => "v" + z.ver + (z.wr.IsAlive ? ":alive" : ":collected")));
+        return InfoCore(unloaded);
+    }
+
+    JsonNode? InfoCore(string unloaded) => new JsonObject
+    {
+        ["unloadedContexts"] = unloaded,
         ["firstScreenMs"] = FirstScreenMs,
         ["runtime"] = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription,
         ["arch"] = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString(),

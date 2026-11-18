@@ -1,0 +1,8 @@
+<linker>
+  <!-- Found on device: Plugin.V2 calls RuntimeInformation.OSArchitecture, which the host never uses, so the trimmer
+       removed it (MissingMethodException at run time). Every BCL API a plugin may call must be kept this way
+       (or the whole of System.Private.CoreLib rooted: -p:RootCoreLib=true). -->
+  <assembly fullname="System.Private.CoreLib">
+    <type fullname="System.Runtime.InteropServices.RuntimeInformation" preserve="all" />
+  </assembly>
+</linker>
