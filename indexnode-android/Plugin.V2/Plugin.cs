@@ -18,7 +18,9 @@ public sealed class Plugin : IPlugin
         // IndexNode core type compiled in: proves its protocol code runs inside the loaded DLL.
         Step($"v2 running on {System.Runtime.InteropServices.RuntimeInformation.OSArchitecture}/{System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}");
 
-        var st = await host.GetAsync(Base + "/v1/status");
+        HostResponse st;
+        try { st = await host.GetAsync(Base + "/v1/status"); }
+        catch (Exception e) { Step("GET /v1/status failed: " + e.GetType().Name + ": " + e.Message); return Result(false, steps, "Medusa not reachable on 127.0.0.1:38917 (installed? helper service running?)"); }
         Step($"GET /v1/status -> {st.Status} {Trunc(st.Text)}");
         if (st.Status != 200) return Result(false, steps, "Medusa not reachable (is it installed and the helper service running?)");
 
