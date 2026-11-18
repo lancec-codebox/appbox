@@ -108,6 +108,26 @@ public static class Tags
     public static IEnumerable<BlobEntry> ClaimOrder(IEnumerable<BlobEntry> blobs) =>
         blobs.OrderByDescending(b => PriorityOf(b.Tags)).ThenBy(b => b.Tags.GetValueOrDefault(Added) ?? "", StringComparer.Ordinal).ThenBy(b => b.Name, StringComparer.Ordinal);
 
+    /// <summary>Find Blobs by Tags returns ONLY the tags the where expression names, so a result sorted by priority and date saw neither (every job looked like priority 0 with no date: claims came in blob-name order). This runs the query and its three variants and merges them by blob name: (a) + idx_added/idx_due >= '' (every job has both), (b) + idx_priority > '0', (c) + idx_priority < '0' (a priority of 0 has no tag; tag comparison is a string comparison, which is all (b) and (c) need: "100" > "0", "-10" < "0"). Order the result with <see cref="ClaimOrder"/>, which compares numbers.</summary>
+    public static async Task<IReadOnlyList<BlobEntry>> FindFullAsync(IStore store, string where, CancellationToken ct)
+    {
+        var all = new[]
+        {
+            where + $" AND \"{Added}\" >= '' AND \"{Due}\" >= ''",
+            where + $" AND \"{Priority}\" > '0'",
+            where + $" AND \"{Priority}\" < '0'",
+        };
+        var merged = new Dictionary<string, BlobEntry>(StringComparer.Ordinal);
+        foreach (var q in all)
+            foreach (var b in await store.FindByTagsAsync(q, ct))
+            {
+                if (!merged.TryGetValue(b.Name, out var have)) { merged[b.Name] = b; continue; }
+                var t = new Dictionary<string, string>(have.Tags); foreach (var (k, v) in b.Tags) t[k] = v;
+                merged[b.Name] = have with { Tags = t };
+            }
+        return merged.Values.ToList();
+    }
+
     /// <summary>The full idx_* set of a job blob; idx_due defaults to idx_added.</summary>
     public static Dictionary<string, string> Job(string stage, string state, string added, string? due = null, int priority = 0)
     {

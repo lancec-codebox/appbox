@@ -473,7 +473,7 @@ public sealed partial class NodeEngine
             {
                 // Find Blobs by Tags searches the whole container: keep only this prefix's jobs
                 var dir = paths.JobsDir(stage);
-                var found = (await store.FindByTagsAsync(Tags.PendingWhere(stage, Protocol.NowUtc()), ct)).Where(b => b.Name.StartsWith(dir, StringComparison.Ordinal)).ToList();
+                var found = (await Tags.FindFullAsync(store, Tags.PendingWhere(stage, Protocol.NowUtc()), ct)).Where(b => b.Name.StartsWith(dir, StringComparison.Ordinal)).ToList();
                 if (found.Count > 0) return found;
                 // the tag index lags behind writes by a few seconds, so an empty answer is double-checked with a (consistent) listing
             }
@@ -540,7 +540,17 @@ public sealed partial class NodeEngine
         {
             // the tag index is eventually consistent: confirm under the lease
             var tags = await store.GetTagsAsync(b.Name, ct);
-            if (tags == null || tags.GetValueOrDefault(Tags.State) != "pending" || string.CompareOrdinal(Tags.DueOf(tags), Protocol.NowUtc()) > 0) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); return null; }
+            if (tags == null || tags.GetValueOrDefault(Tags.State) != "pending" || string.CompareOrdinal(Tags.DueOf(tags), Protocol.NowUtc()) > 0)
+            {
+                await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
+                // 0.10.2: this skip was silent. The listing (tag index) said pending and due, the blob's own tags say otherwise (or none, e.g. a ghost): say so, once a minute per job
+                if (!w.IgnoreUntil.TryGetValue(b.Name, out var seen) || seen <= DateTimeOffset.UtcNow)
+                {
+                    Log.Info($"[{stage}] {Path.GetFileNameWithoutExtension(b.Name)}: listed as pending (priority {Tags.PriorityOf(b.Tags)}, due {Tags.DueOf(b.Tags)}) but its own tags say {(tags == null ? "no blob" : tags.Count == 0 ? "nothing (an empty tag set)" : "state=" + tags.GetValueOrDefault(Tags.State) + " due=" + Tags.DueOf(tags))}; skipped, looked at again in a minute");
+                    w.IgnoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(1);
+                }
+                return null;
+            }
             // the drama may be held (index/holds/<id>.json under a live lease) by another node's batch, or this step may already be done (the body says so, unlike a lagging tag)
             if (await HeldByOtherAsync(Path.GetFileNameWithoutExtension(b.Name), ct)) { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); return null; }
             var body = await store.GetAsync(b.Name, ct);

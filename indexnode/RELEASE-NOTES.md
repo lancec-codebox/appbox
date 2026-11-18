@@ -1,3 +1,9 @@
+## 0.10.2
+
+- **Claim order fixed (root cause):** Azure's Find Blobs by Tags returns only the tags the query names, so every claim that sorted its result saw no `idx_priority` and no `idx_added`: every job looked like priority 0 with no date and claims came in blob-name order (downloads, every non-batch stage, the batch selection, classify). `Tags.FindFullAsync` runs the query plus `idx_added/idx_due >= ''`, `idx_priority > '0'` and `idx_priority < '0'` and merges by blob name, so the order sees priority (numeric) and date. The test store now returns only the queried tags, as Azure does.
+- **Download claim order checked, and a silent skip now logged:** a test (4 priority-100 explicit downloads among 60 older priority-0 ones) shows IndexNode claims the priority jobs first. A job the tag index lists as pending but whose own tags read otherwise (state, due, or an empty tag set) was skipped without a word; it is now logged with what the blob's tags say.
+- **`indexnode batch explain` runs:** 0.10.1 always printed its usage line (it looked for the subcommand one argument too late). `--top N`, `--top=N` and `--stages ...` work; a test runs the command against a fake store.
+
 # IndexNode release notes
 
 ## 0.10.1

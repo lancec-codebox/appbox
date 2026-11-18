@@ -462,7 +462,7 @@ public static class Commands
         foreach (var stage in stages)
         {
             IReadOnlyList<BlobEntry> failed;
-            try { failed = (await store.FindByTagsAsync(Tags.StateWhere(stage, "failed"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList(); }
+            try { failed = (await Tags.FindFullAsync(store, Tags.StateWhere(stage, "failed"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList(); }
             catch (ForbiddenException)
             {
                 failed = (await store.ListAsync(paths.JobsDir(stage), true, false, default)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "failed").ToList();
@@ -511,8 +511,15 @@ public static class Commands
     /// <summary>indexnode batch explain [--stages ...] [--batch N] [--top 50]: why the batch selection picks what it picks (read-only).</summary>
     public static async Task<int> BatchAsync(Args a)
     {
-        if (a.Positional.Skip(1).FirstOrDefault() != "explain") { Console.Error.WriteLine("usage: indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]"); return 2; }
-        var (cfg, store, paths, _) = Open(a);
+        // Main has already taken "batch" off the positionals: the subcommand is the first one left
+        if (a.Positional.FirstOrDefault() != "explain") { Console.Error.WriteLine("usage: indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]"); return 2; }
+        var (cfg, store, paths, http) = Open(a); using var _h = http;
+        return await ExplainAsync(a, cfg, store, paths, Console.WriteLine);
+    }
+
+    /// <summary>The body of `batch explain`, with the store and the output given (tests run it on a fake store).</summary>
+    internal static async Task<int> ExplainAsync(Args a, NodeConfig cfg, IStore store, Paths paths, Action<string> say)
+    {
         var requested = (a.Get("stages") ?? string.Join(',', StageOrder.PassOrder)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var stages = Protocol.ExpandStages(requested);
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null;
@@ -522,7 +529,7 @@ public static class Commands
             Stages = stages, Batch = a.Get("batch") is { } bn ? int.Parse(bn) : 6, Gpu = a.Has("gpu"), GpuFallback = gpuFlag,
         };
         var engine = new NodeEngine(store, paths, opts, new Dictionary<string, IStageHandler>());
-        return await engine.ExplainAsync(a.Get("top") is { } tp ? int.Parse(tp) : 50, Console.WriteLine, default);
+        return await engine.ExplainAsync(a.Get("top") is { } tp ? int.Parse(tp) : 50, say, default);
     }
 
     public static async Task<int> RepackAsync(Args a)
@@ -665,7 +672,7 @@ public static class Commands
         int made = 0, have = 0, waiting = 0;
         foreach (var stage in GpuRouting.MarkerStages)
         {
-            var pending = (await store.FindByTagsAsync(Tags.StateWhere(stage, "pending"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList();
+            var pending = (await Tags.FindFullAsync(store, Tags.StateWhere(stage, "pending"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList();
             foreach (var b in pending)
             {
                 var id = Path.GetFileNameWithoutExtension(b.Name);

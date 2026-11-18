@@ -91,7 +91,7 @@ public static class ClassifyCommand
     {
         var from = Protocol.Utc(since);
         IEnumerable<BlobEntry> found;
-        try { found = await store.FindByTagsAsync(Tags.StateWhere("download", "failed") + $" AND \"{Tags.Classified}\" >= '{from}'", ct); }
+        try { found = await Tags.FindFullAsync(store, Tags.StateWhere("download", "failed") + $" AND \"{Tags.Classified}\" >= '{from}'", ct); }
         catch (ForbiddenException) { found = (await store.ListAsync(paths.JobsDir("download"), true, false, ct)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "failed"); }
         var rows = new List<(string At, string Line)>();
         foreach (var b in found.Where(b => b.Name.StartsWith(paths.JobsDir("download"), StringComparison.Ordinal)))
@@ -109,7 +109,7 @@ public static class ClassifyCommand
     public static async Task<int> RequeueSourceAsync(IStore store, Paths paths, string source, CancellationToken ct)
     {
         IEnumerable<BlobEntry> found;
-        try { found = await store.FindByTagsAsync(Tags.StateWhere("download", "pending"), ct); }
+        try { found = await Tags.FindFullAsync(store, Tags.StateWhere("download", "pending"), ct); }
         catch (ForbiddenException) { found = (await store.ListAsync(paths.JobsDir("download"), true, false, ct)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "pending"); }
         int n = 0;
         foreach (var b in found.Where(b => b.Name.StartsWith(paths.JobsDir("download"), StringComparison.Ordinal) && b.LeaseState != "leased"))

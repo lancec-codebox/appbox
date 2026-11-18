@@ -213,7 +213,7 @@ public static class ClassifyJobs
     public static async Task<List<BlobEntry>> ListUnclassifiedAsync(IStore store, Paths paths, CancellationToken ct)
     {
         IEnumerable<BlobEntry> found;
-        try { found = await store.FindByTagsAsync(Tags.UnclassifiedWhere, ct); }
+        try { found = await Tags.FindFullAsync(store, Tags.UnclassifiedWhere, ct); }
         catch (ForbiddenException) { found = (await store.ListAsync(paths.JobsDir("download"), true, false, ct)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == Tags.Unclassified); }
         return found.Where(b => b.Name.StartsWith(paths.JobsDir("download"), StringComparison.Ordinal) && b.Tags.GetValueOrDefault(Tags.State) == Tags.Unclassified)
             .OrderBy(b => b.Tags.GetValueOrDefault(Tags.Added) ?? "", StringComparer.Ordinal).ThenBy(b => b.Name, StringComparer.Ordinal).ToList();

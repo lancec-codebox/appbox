@@ -44,6 +44,13 @@ public sealed class FakeStore : IStore
         await PutAsync(p.Job(stage, id), job.ToBytes(), Tags.Job(stage, "pending", added, due), null, true, default);
     }
 
+    /// <summary>Azure's Find Blobs by Tags returns only the tags the where expression names (verified on the real store): the fake does the same, so no code can lean on tags it did not ask for.</summary>
+    private static BlobEntry OnlyQueried(BlobEntry e, string where)
+    {
+        var named = Regex.Matches(where, "\"(?<k>[^\"]+)\"").Select(m => m.Groups["k"].Value).ToHashSet();
+        return e with { Tags = e.Tags.Where(t => named.Contains(t.Key)).ToDictionary(t => t.Key, t => t.Value) };
+    }
+
     private static BlobEntry Entry(string name, Blob b) =>
         new(name, new Dictionary<string, string>(b.Tags), new Dictionary<string, string>(b.Meta), b.Lease != null ? "leased" : "available", b.Data.Length);
 
@@ -62,7 +69,7 @@ public sealed class FakeStore : IStore
             IReadOnlyList<BlobEntry> r = Blobs.Where(b => conds.All(c => b.Value.Tags.GetValueOrDefault(c.Item1) == c.Item2)
                 && ge.All(c => b.Value.Tags.TryGetValue(c.Item1, out var tv) && string.CompareOrdinal(tv, c.Item2) >= 0)
                 && lt.All(c => b.Value.Tags.TryGetValue(c.Item1, out var tv) && string.CompareOrdinal(tv, c.Item2) < 0)
-                && le.All(c => b.Value.Tags.TryGetValue(c.Item1, out var tv) && string.CompareOrdinal(tv, c.Item2) <= 0)).Select(b => Entry(b.Key, b.Value)).ToList();
+                && le.All(c => b.Value.Tags.TryGetValue(c.Item1, out var tv) && string.CompareOrdinal(tv, c.Item2) <= 0)).Select(b => Entry(b.Key, b.Value)).Select(e => OnlyQueried(e, where)).ToList();
             return Task.FromResult(r);
         }
     }
