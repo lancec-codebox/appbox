@@ -53,7 +53,7 @@ public class WatchTests
         Assert.Equal(P.Job("download", Id('d')), dl);
         var d = s.Job(dl);
         Assert.Equal("pl-PLa", d.Source); Assert.Equal(360, d.MaxHeight);
-        Assert.Equal("pending", s.State(dl));
+        Assert.Equal("unclassified", s.State(dl));
         Assert.Equal(1, job.Found);
         Assert.Equal(Id('d'), job.Seen![0]);
     }
@@ -167,10 +167,11 @@ public class WatchTests
         var job = JobDescriptor.NewWatch("channel", c, "x", "1h", ["videos", "shorts"], false, 5, 480);
         await Poll(s, f, job);
         Assert.Equal(2, f.Calls.Count);
-        // a channel's uploads are not downloaded directly: they go to one classify job (decided on a node with AI)
-        Assert.Empty(s.Blobs.Keys.Where(k => k.Contains("/jobs/download/")));
-        var cj = s.Job(Assert.Single(s.Blobs.Keys, k => k.Contains("/jobs/classify/")));
-        Assert.Equal(2, cj.Entries!.Count); Assert.Equal("ch-" + c, cj.Source);
+        // a channel's uploads become unclassified download jobs and no per-channel classify job: the singleton classify/all decides them
+        Assert.Equal(2, s.Blobs.Keys.Count(k => k.Contains("/jobs/download/")));
+        Assert.All(s.Blobs.Keys.Where(k => k.Contains("/jobs/download/")), k => Assert.Equal("unclassified", s.State(k)));
+        Assert.Equal([P.Job("classify", "all")], s.Blobs.Keys.Where(k => k.Contains("/jobs/classify/")).ToList());
+        Assert.Equal("ch-" + c, s.Job(P.Job("download", Id('a'))).Source);
     }
 
     [Fact]

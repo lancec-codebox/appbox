@@ -58,6 +58,9 @@ public static class Program
         indexnode medusa-setup [--qr] [--file <path>.medusa-node.json] [--name N] [--conditions wifi+charging|wifi] [--daily-cap N] [--budget N] [--schedule C] [--window W] [--no-sas]
         indexnode dev cast --video <file> --out <dir> [--model buffalo_l|yunet-sface] [--threshold D] [--merge D] [--border D]
         indexnode requeue [--stage S]
+        indexnode classify set <videoId> drama|not [--reason R]   (owner override: writes the decision and sets the download job)
+        indexnode classify list --rejected [--since 1d]
+        indexnode classify requeue --source <id>   (sets the source's pending downloads back to unclassified)
         indexnode control run|drain|stop [--stage download|process|comments] [--message M]
         indexnode control gpu-hold <duration like 30m>|off
         indexnode control --max-per-ip N|off
@@ -90,6 +93,7 @@ public static class Program
                 "search" => await Commands.SearchAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await Commands.RequeueAsync(a),
+                "classify" => await ClassifyCommand.RunAsync(a),
                 "availability" => await Commands.AvailabilityAsync(a),
                 "control" => await Commands.ControlAsync(a),
                 "config" => Commands.Config(a),
@@ -129,7 +133,7 @@ public static class Commands
         return h;
     }
 
-    private static (NodeConfig Cfg, RestStore Store, Paths Paths, HttpClient Http) Open(Args a)
+    internal static (NodeConfig Cfg, RestStore Store, Paths Paths, HttpClient Http) Open(Args a)
     {
         var cfg = NodeConfig.Load();
         if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
@@ -391,6 +395,7 @@ public static class Commands
         var format = a.Get("format"); int priority = PriorityTool.ParseOption(a.Get("priority"));
         var tools = new Tools(http, cfg);
         int added = 0, existed = 0;
+        var meta = new Dictionary<string, WatchStage.Entry>();
         foreach (var input in a.Positional)
         {
             var urls = new List<string>();
@@ -398,14 +403,30 @@ public static class Commands
             else
             {
                 Log.Info($"expanding {Redact.Sas(input)}");
-                var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(webpage_url,url)s", input], default);
+                var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(webpage_url,url)s\t" + WatchStage.ListPrint, input], default);
                 if (r.ExitCode != 0) throw new InvalidOperationException(YtDlp.LastErrorLine(r.Stderr));
-                urls.AddRange(r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Where(u => u.StartsWith("http")));
+                foreach (var line in r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    var cut = line.IndexOf('\t'); var u = cut < 0 ? line : line[..cut];
+                    if (!u.StartsWith("http")) continue;
+                    urls.Add(u);
+                    if (cut >= 0 && WatchStage.ParseLine(line[(cut + 1)..]) is { } le) meta[u] = le;
+                }
             }
             foreach (var url in urls.Distinct())
             {
                 var job = JobDescriptor.NewDownload(url, maxHeight, format); job.Priority = priority; if (priority != 0) job.OwnPriority = priority;
-                var created = await store.PutAsync(paths.Job("download", job.JobId), job.ToBytes(), Tags.Job("download", "pending", job.AddedAt, null, priority), null, true, default);
+                if (!meta.TryGetValue(url, out var m) && YtDlp.IsSingleVideoUrl(url))
+                {   // a single video: one metadata call for the classifier (best effort: without it the AI is told the length is unknown)
+                    try
+                    {
+                        var mr = await tools.RunYtDlpAsync(["--no-warnings", "--skip-download", "--print", WatchStage.ListPrint, url], default);
+                        if (mr.ExitCode == 0 && mr.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() is { } ml) m = WatchStage.ParseLine(ml);
+                    }
+                    catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"enqueue: no metadata for {url}: {e.Message}"); }
+                }
+                if (m != null) { job.Title = m.Title; job.Duration = m.Duration; job.ChannelId = m.ChannelId; job.ChannelName = m.ChannelName; job.Availability = m.Availability; }
+                var created = await ClassifyJobs.CreateUnclassifiedAsync(store, paths, job, default);
                 if (created) added++; else existed++;
                 Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId} {url}");
             }
@@ -443,6 +464,7 @@ public static class Commands
                 var body = await store.GetAsync(b.Name, default);
                 if (body == null) continue;
                 var job = JobDescriptor.Parse(body.Data);
+                if (job.Reason?.StartsWith("classify:", StringComparison.Ordinal) == true) continue; // a rejection: overrule it with "classify set", not requeue
                 job.Attempts = 0; job.LastError = null; job.Permanent = null;
                 await store.PutAsync(b.Name, job.ToBytes(), Tags.Job(stage, "pending", b.Tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, b.Tags.GetValueOrDefault(Tags.Due)), null, false, default);
                 Console.WriteLine($"requeued {stage}/{job.JobId}");
@@ -503,10 +525,12 @@ public static class Commands
         foreach (var stage in Protocol.Stages)
         {
             var inStage = all.Where(b => b.Tags.GetValueOrDefault(Tags.Stage) == stage).ToList();
-            var counts = new[] { "pending", "done", "failed" }.Select(s => $"{s}={inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s)}");
+            var counts = (stage == "download" ? new[] { Tags.Unclassified, "pending", "done", "failed" } : new[] { "pending", "done", "failed" }).Select(s => $"{s}={inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s)}");
             int prio = inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == "pending" && Tags.PriorityOf(b.Tags) != 0);
             Console.WriteLine($"  {stage,-9} {string.Join("  ", counts)}  leased={inStage.Count(b => b.LeaseState == "leased")}{(prio > 0 ? $"  pending with priority={prio}" : "")}");
         }
+        var (cDay, cDone, cRejected) = await ClassifyCommand.TodayAsync(store, paths, now, default);
+        Console.WriteLine($"  classify  unclassified={all.Count(b => b.Tags.GetValueOrDefault(Tags.Stage) == "download" && b.Tags.GetValueOrDefault(Tags.State) == Tags.Unclassified)}  classified today={cDone}  rejected today={cRejected}  (UTC {cDay}; review: indexnode classify list --rejected)");
         var leased = all.Where(b => b.LeaseState == "leased").ToList();
         if (leased.Count > 0)
         {

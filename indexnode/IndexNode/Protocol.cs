@@ -85,6 +85,8 @@ public sealed class Paths(string prefix)
 public static class Tags
 {
     public const string Stage = "idx_stage", State = "idx_state", Added = "idx_added", Due = "idx_due", Kind = "idx_kind", Priority = "idx_priority";
+    /// <summary>When the classify job decided a download job (UTC, set on pending candidates and on rejections): "classify list --rejected --since" finds rejections by it.</summary>
+    public const string Classified = "idx_classified";
 
     public const int MinPriority = -1000, MaxPriority = 1000;
 
@@ -114,6 +116,9 @@ public static class Tags
     /// <summary>idx_due of a listed blob (idx_added when a legacy blob has none).</summary>
     public static string DueOf(IReadOnlyDictionary<string, string> tags) =>
         tags.GetValueOrDefault(Due) ?? tags.GetValueOrDefault(Added) ?? "";
+    /// <summary>Download jobs waiting for the classify job; no node claims them (claims match idx_state='pending' only).</summary>
+    public const string Unclassified = "unclassified";
+    public static string UnclassifiedWhere => StateWhere("download", Unclassified);
     public static string StateWhere(string stage, string state) => $"\"{Stage}\"='{stage}' AND \"{State}\"='{state}'";
 }
 
@@ -198,6 +203,18 @@ public sealed class JobDescriptor
     /// <summary>True when the priority was set by "priority set" on this job: it stays until a source priority of this video is changed again.</summary>
     public bool? Explicit { get; set; }
 
+    // ---- unclassified download jobs: what classification needs, from the listing that found the video (0.9.1)
+    public string? Title { get; set; }
+    public double? Duration { get; set; }
+    public string? ChannelId { get; set; }
+    public string? ChannelName { get; set; }
+    /// <summary>yt-dlp's availability of the video in the listing (private, needs_auth, ...), when it had one.</summary>
+    public string? Availability { get; set; }
+    /// <summary>The singleton classify job (index/jobs/classify/all.json): what it decided today (UTC day in <see cref="CountDay"/>).</summary>
+    public string? CountDay { get; set; }
+    public int? Classified { get; set; }
+    public int? Rejected { get; set; }
+
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static JobDescriptor Parse(byte[] b) => JsonSerializer.Deserialize<JobDescriptor>(b, Protocol.Json) ?? throw new InvalidDataException("empty job");
 
@@ -239,6 +256,7 @@ public sealed class ClassifyEntry
     public string Id { get; set; } = "";
     public string? Title { get; set; }
     public double? Duration { get; set; }
+    public string? ChannelName { get; set; }
 }
 
 public sealed class CompressSettings

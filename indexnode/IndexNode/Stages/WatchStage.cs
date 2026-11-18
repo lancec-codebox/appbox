@@ -14,7 +14,10 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
     public const int SeenCap = 500;
     private readonly Func<DateTimeOffset> now = clock ?? (() => DateTimeOffset.UtcNow);
 
-    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null);
+    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null, string? Availability = null);
+
+    /// <summary>The yt-dlp --print template of a listing line (see <see cref="ParseLine"/>).</summary>
+    public const string ListPrint = "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(availability)s\t%(title)s";
     /// <summary>A channel's first poll looks this far back: its back catalogue goes to classification too.</summary>
     public const int ChannelFirstList = 100;
 
@@ -36,7 +39,7 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         return tabs.Select(tab => $"https://www.youtube.com/channel/{j.Id}/{tab}").ToArray();
     }
 
-    /// <summary>One yt-dlp line "id TAB channel_id TAB channel"; "NA" and empty fields mean missing.</summary>
+    /// <summary>One yt-dlp line "id TAB channel_id TAB channel TAB duration TAB availability TAB title"; "NA" and empty fields mean missing.</summary>
     public static Entry? ParseLine(string line)
     {
         var p = line.TrimEnd('\r').Split('\t');
@@ -44,7 +47,7 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         if (!Regex.IsMatch(id, @"^[A-Za-z0-9_-]{11}$")) return null;
         string? Field(int i) => p.Length > i && p[i].Trim() is { Length: > 0 } v && v != "NA" ? v : null;
         double? dur = Field(3) is { } d && double.TryParse(d, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var dv) ? dv : null;
-        return new Entry(id, Field(1), Field(2), dur, p.Length > 4 && Field(4) != null ? string.Join(' ', p[4..]).Trim() : null);
+        return new Entry(id, Field(1), Field(2), dur, p.Length > 5 && string.Join(' ', p[5..]).Trim() is { Length: > 0 } title && title != "NA" ? title : null, Field(4));
     }
 
     public async Task<List<Entry>> ListAsync(JobDescriptor j, int end, CancellationToken ct)
@@ -54,7 +57,7 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         var urls = ListingUrls(j);
         foreach (var url in urls)
         {
-            var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--playlist-end", end.ToString(), "--print", "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(title)s", url], ct);
+            var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--playlist-end", end.ToString(), "--print", ListPrint, url], ct);
             if (r.ExitCode != 0) { failed++; lastError = r.Stderr; continue; }
             foreach (var line in r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 if (ParseLine(line) is { } e && all.All(x => x.Id != e.Id)) all.Add(e);
@@ -110,21 +113,16 @@ public sealed partial class WatchStage(Tools tools, IStore store, Func<DateTimeO
         var addedAt = Protocol.Utc(now());
 
         // which of the fresh videos get a download job: on the first poll only the newest `backfill`, afterwards all of them
-        // a playlist is the owner's curation: its videos are downloaded; a channel's uploads are classified first (classify stage, on a node with AI)
-        var toDownload = job.Kind == "channel" ? [] : first ? fresh.Take(backfill).ToList() : fresh;
-        if (job.Kind == "channel" && fresh.Count > 0)
-        {
-            var cj = JobDescriptor.NewClassify(job, fresh.Select(e => new ClassifyEntry { Id = e.Id, Title = e.Title, Duration = e.Duration }).ToList(), addedAt);
-            cj.Priority = job.Priority;
-            await store.PutAsync(paths.Job("classify", cj.JobId), cj.ToBytes(), Tags.Job("classify", "pending", addedAt, null, cj.Priority), null, true, ct);
-            Log.Info($"watch {job.JobId}: {fresh.Count} new uploads handed to classify/{cj.JobId}");
-        }
+        // every new video becomes an unclassified download job (0.9.1); the singleton classify job decides it. A playlist's first poll takes only the newest `backfill`
+        var toDownload = job.Kind == "channel" || !first ? fresh : fresh.Take(backfill).ToList();
         foreach (var e in toDownload)
         {
             if (await KnownAsync(paths, e.Id, ct)) { skipped++; continue; }
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={e.Id}", job.MaxHeight ?? 480, null);
             d.Source = job.JobId; d.Sources = [job.JobId]; d.AddedAt = addedAt; d.Priority = job.Priority;
-            if (await store.PutAsync(paths.Job("download", e.Id), d.ToBytes(), Tags.Job("download", "pending", addedAt, null, d.Priority), null, true, ct)) made++; else skipped++;
+            d.Title = e.Title; d.Duration = e.Duration; d.Availability = e.Availability;
+            d.ChannelId = e.ChannelId ?? (job.Kind == "channel" ? job.Id : null); d.ChannelName = e.ChannelName ?? (job.Kind == "channel" ? job.Name : null);
+            if (await ClassifyJobs.CreateUnclassifiedAsync(store, paths, d, ct)) made++; else skipped++;
         }
 
         if (job.FollowChannels == true)

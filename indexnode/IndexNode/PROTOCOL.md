@@ -24,7 +24,7 @@ The owner wants that for the index videos. So:
 One blob per job: `index/jobs/<stage>/<jobId>.json`. The stages are `download`, `process` and `comments`. The job's state is in its index tags:
 
 - `idx_stage`: `download` or `process`
-- `idx_state`: `pending`, `done` or `failed`
+- `idx_state`: `pending`, `done` or `failed`; download jobs also `unclassified` (0.9.1: waiting for the classify job; no node claims it, claims and stage batches match `pending` only)
 - `idx_added`: the time it was added, in sortable UTC
 - `idx_due`: the earliest time it may run, in sortable UTC; for most jobs, the same as `idx_added`
 - `idx_priority` (0.8.5, optional): an integer as a plain string, -1000..1000, higher runs first, negative is low priority. A missing, unparsable or out-of-range tag counts as 0, so existing jobs are unchanged; writers leave the tag off for 0 and every rewrite of a job (done, failed, retry, comments refresh, "waits for an earlier step") keeps it. The job body carries the same number as `priority`.
@@ -123,7 +123,29 @@ Rewriting a blob (Put Blob) drops its tags unless they're sent again in `x-ms-ta
 - **New videos:** a video id with no `index/jobs/download/<id>.json` and no `index/videos/<id>/` gets a download job (the source's `maxHeight`, `"source": "<watch jobId>"`). Known ids are skipped, so a video in several sources is downloaded once.
 - `followChannels: true` (the owner's public "drop" playlist): the channel of every video found is added as a followed `channel` source, if not already followed, with `backfill: 0` (new uploads only). The owner drops videos into that playlist to say "follow this channel".
 - `backfill`: on the first poll of a newly added source, enqueue at most this many of its existing videos, newest first (default 0: only videos published after it was added).
+- **0.9.1: new videos start `unclassified`.** The rule above creates the download job with `idx_state=unclassified`, not `pending`, and the body records what classification needs from the listing: `title`, `duration`, `channelId`, `channelName`, `availability` (yt-dlp's, when present) and `source`. `indexnode enqueue` does the same (metadata from its listing, or one yt-dlp call for a single video). A channel's first poll hands over its look-back (100 uploads) the same way; there are no per-channel classify jobs any more (old ones still run once).
 - Sources are added and removed with `indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels]`, `sources list`, `sources remove <id>`; a removed source's job is deleted, its downloaded videos stay.
+
+## Classify (0.9.1)
+
+Every new download job is `unclassified` until the singleton `index/jobs/classify/all.json` decides it. Whoever creates an unclassified job also creates the singleton (create-only; a copy that ended `failed` or `done` is made `pending` again). Any node with an AI endpoint claims it under the normal lease (a node without one skips it when the AI would be needed). It is an ordinary job of the `classify` stage, not a step: stage batches (0.9.0) take dramas with pending CPU step jobs only, so they never pick an unclassified download or the classify job, and the classify job takes no hold blob.
+
+**A run** takes the unclassified download jobs (`"idx_stage"='download' AND "idx_state"='unclassified'`), oldest `idx_added` first, at most 400, and decides each by, in this order:
+1. a stored decision `index/classify/<id>.json` (never asked twice; it always wins, also over the rules below);
+2. the length rule: shorter than 20 min is never a drama (`kind: "short"`, `by: "rule"`);
+3. unavailable: the listing says `availability` private/deleted/unavailable, or there is no duration and the title is `[Private video]` / `[Deleted video]` (`kind: "unavailable"`, `by: "rule"`), before any AI call;
+4. the AI, 40 per call, the prompt now naming each upload's channel (`by: "ai"`).
+
+Each decision is written to `classify/<id>.json` (`candidate`, `kind`, `reason`, `by`: rule/ai/owner). A candidate's job becomes `pending` (other tags kept, `idx_classified` set); any other becomes `failed`, `permanent: true`, `reason` and `lastError` = `"classify: <kind> <reason>"`, `idx_classified` set. The singleton keeps the UTC day's `classified` / `rejected` counters. It is due again at once when more than 400 remain, else 10 minutes after the run. `requeue` skips rejections (`reason` starting `classify:`).
+
+**Per-channel classify jobs** (`classify/<watchJobId>-<time>`, with `entries`) are the 0.8.x form: they still run once (candidates become `pending` downloads) and are not created any more.
+
+**Commands**
+- `indexnode classify set <videoId> drama|not [--reason R]`: writes the decision (`by: "owner"`) and sets the job: `drama` -> `pending` (also overrules a rejection; creates the job if missing), `not` -> `failed` + permanent. A job that is leased, done or failed for another reason is left alone and reported.
+- `indexnode classify list --rejected [--since 1d]`: the rejections (by `idx_classified`) with channel, title and reason.
+- `indexnode classify requeue --source <id>`: that source's `pending` (not leased) downloads go back to `unclassified`; their stored decisions still apply. Existing pending downloads are otherwise never reclassified.
+- `indexnode status` shows `unclassified` in the download queue line and a classify line with classified-today and rejected-today.
+- Medusa's "Add to index" for one shared video still writes a `pending` download: a deliberate owner action.
 
 ## Outputs: `index/videos/<jobId>/`
 

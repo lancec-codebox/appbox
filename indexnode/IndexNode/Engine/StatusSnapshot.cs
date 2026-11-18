@@ -22,7 +22,7 @@ public static class StatusSnapshot
         {
             var inStage = all.Where(b => b.Tags.GetValueOrDefault(Tags.Stage) == stage).ToList();
             var q = new JsonObject();
-            foreach (var s in new[] { "pending", "done", "failed" }) q[s] = inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s);
+            foreach (var s in stage == "download" ? new[] { Tags.Unclassified, "pending", "done", "failed" } : new[] { "pending", "done", "failed" }) q[s] = inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s);
             q["leased"] = inStage.Count(b => b.LeaseState == "leased"); queue[stage] = q;
             foreach (var b in inStage.Where(b => b.LeaseState == "leased"))
             {
