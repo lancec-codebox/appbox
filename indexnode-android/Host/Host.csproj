@@ -19,7 +19,6 @@
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <PublishTrimmed>true</PublishTrimmed>
     <TrimMode>partial</TrimMode>
-    <RunAOTCompilation>true</RunAOTCompilation>
     <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
     <!-- Plugins call BCL APIs the host never uses; JIT is the fallback for the (non-AOT) plugin DLL.
          UseInterpreter is NOT needed on Android (JIT is allowed); set true to force interpretation of non-AOT code. -->
@@ -28,6 +27,15 @@
     <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
     <DebugSymbols>false</DebugSymbols>
     <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!-- .NET 11 for Android defaults to CoreCLR (JIT + ReadyToRun; Mono-style AOT is rejected: XA1044).
+       Variant: -p:UseMonoRuntime=true gives the Mono runtime with full AOT (JIT fallback stays for plugin DLLs). -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release' and '$(UseMonoRuntime)' == 'true'">
+    <RunAOTCompilation>true</RunAOTCompilation>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release' and '$(UseMonoRuntime)' != 'true'">
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>
