@@ -60,7 +60,7 @@ async function refresh(){
  try{
   const s=await call('getState'); $('ver').textContent='host '+s.hostVersion;
   $('st').innerHTML=row('State',s.state)+row('Job',s.job)+row('Today',s.doneToday+' / '+(s.settings.dailyCap||'no cap'))+row('Node',s.nodeId+(s.nodeName&&s.nodeName!==s.nodeId?' ('+s.nodeName+')':''))+row('Store',s.configured?s.storeUrl:'not set up')
-   +row('Network',s.device.transport+(s.device.vpn?' + VPN':'')+(s.device.metered?' (metered)':''))+row('Charging / battery',(s.device.charging?'yes':'no')+' / '+s.device.battery+'%')+row('Free space',s.device.freeMb+' MB')+row('Last error',s.lastError);
+   +row('Network',(s.device.transport==='wifi'?'Wi-Fi':s.device.transport)+(s.device.via==='vpn'?' (via VPN)':s.device.vpn?' + VPN':'')+(s.device.metered?' (metered)':''))+row('Network facts','active='+s.device.activeTransport+', transport='+s.device.transport+', vpn='+s.device.vpn+', metered='+s.device.metered+', validated='+s.device.validated)+row('Rule (Wi-Fi only '+(s.settings.wifiOnly?'on':'off')+')',s.whyNot||'a run may start')+row('Charging / battery',(s.device.charging?'yes':'no')+' / '+s.device.battery+'%')+row('Free space',s.device.freeMb+' MB')+row('Last error',s.lastError);
   $('pg').style.display=s.progress!=null?'':'none'; $('pg').value=s.progress||0;
   $('why').textContent=s.whyNot?'Not running: '+s.whyNot:'';
   const m=s.medusa||{}; $('md').innerHTML=row('Mode',s.medusaMode)+row('Paired',m.paired?'yes':'no')+row('Pairing request',m.pending?'waiting for approval in Medusa':'')+row('Medusa running',m.running===false?'no: '+(m.error||''):m.running);

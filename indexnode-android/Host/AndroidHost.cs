@@ -73,13 +73,16 @@ public sealed class AndroidHost(Context ctx, Prefs prefs, Func<ITools> tools, Ac
         try
         {
             var cm = (ConnectivityManager)ctx.GetSystemService(Context.ConnectivityService)!;
-            var net = cm.ActiveNetwork; var caps = net == null ? null : cm.GetNetworkCapabilities(net);
-            if (caps != null)
+            // a thin mapping of every network into NetworkClassifier (the active one may be a metered VPN that does not report Wi-Fi)
+            var active = cm.ActiveNetwork; var snaps = new List<NetSnapshot>();
+            foreach (var n in cm.GetAllNetworks() ?? [])
             {
-                d.Vpn = caps.HasTransport(TransportType.Vpn);
-                d.Transport = caps.HasTransport(TransportType.Wifi) ? "wifi" : caps.HasTransport(TransportType.Ethernet) ? "ethernet" : caps.HasTransport(TransportType.Cellular) ? "cellular" : d.Vpn ? "vpn" : "none";
-                d.Metered = !caps.HasCapability(NetCapability.NotMetered);
+                var c = cm.GetNetworkCapabilities(n); if (c == null) continue;
+                snaps.Add(new NetSnapshot(c.HasTransport(TransportType.Wifi), c.HasTransport(TransportType.Ethernet), c.HasTransport(TransportType.Cellular), c.HasTransport(TransportType.Vpn),
+                    c.HasCapability(NetCapability.Internet), c.HasCapability(NetCapability.Validated), c.HasCapability(NetCapability.NotMetered), active != null && n.Equals(active)));
             }
+            var cls = NetworkClassifier.Classify(snaps);
+            d.Transport = cls.Transport; d.Vpn = cls.Vpn; d.Metered = cls.Metered; d.Via = cls.Via; d.ActiveTransport = cls.ActiveTransport; d.Validated = cls.Validated;
             var bm = (BatteryManager)ctx.GetSystemService(Context.BatteryService)!;
             d.BatteryPercent = bm.GetIntProperty((int)BatteryProperty.Capacity);
             var intent = ctx.RegisterReceiver(null, new IntentFilter(Intent.ActionBatteryChanged));

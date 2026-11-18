@@ -21,7 +21,13 @@ public sealed class DeviceInfo
     /// <summary>"wifi", "cellular", "ethernet" or "none".</summary>
     public string Transport { get; set; } = "none";
     public bool Vpn { get; set; }
+    /// <summary>"vpn" when the transport is the one under an active VPN (Wi-Fi via VPN), else null.</summary>
+    public string? Via { get; set; }
+    /// <summary>Informational only: the rule "Wi-Fi only" ignores it (Medusa does too).</summary>
     public bool Metered { get; set; }
+    /// <summary>Raw facts for the status screen: the active network's own transport ("wifi", "vpn", ...) and whether the network used for the decision is validated.</summary>
+    public string ActiveTransport { get; set; } = "none";
+    public bool Validated { get; set; }
     public bool Charging { get; set; }
     public int BatteryPercent { get; set; } = -1;
     public long FreeBytes { get; set; }

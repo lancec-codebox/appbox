@@ -6,7 +6,7 @@ using Java.Util.Concurrent;
 
 namespace IndexNode.Host;
 
-/// <summary>WorkManager: a periodic job (constraints: connected, plus unmetered and charging as the settings say) and an expedited "Run now". A foreground notification shows during a run.</summary>
+/// <summary>WorkManager: a periodic job (constraints: connected, plus charging as the setting says; Wi-Fi only is decided by HostPolicy in the worker) and an expedited "Run now". A foreground notification shows during a run.</summary>
 public sealed class RunWorker(Context context, WorkerParameters p) : Worker(context, p)
 {
     public const string PeriodicName = "indexnode-periodic", NowName = "indexnode-now", Channel = "indexnode-run";
@@ -36,7 +36,7 @@ public sealed class RunWorker(Context context, WorkerParameters p) : Worker(cont
     }
 
     public static Constraints ConstraintsFor(Prefs prefs) => new Constraints.Builder()
-        .SetRequiredNetworkType(prefs.Bool("wifiOnly", true) ? NetworkType.Unmetered : NetworkType.Connected)!
+        .SetRequiredNetworkType(NetworkType.Connected)!   // Wi-Fi only is decided by HostPolicy in the worker: a VPN hides Wi-Fi and is metered, so NetworkType.Unmetered never ran
         .SetRequiresCharging(prefs.Bool("chargingOnly", true))!.Build()!;
 
     public static void Schedule(Context ctx)

@@ -146,7 +146,7 @@ public sealed class NodeRuntime
             ["hostVersion"] = HostVersion, ["pluginVersion"] = Plugins.Current?.Version, ["pluginSource"] = Plugins.Current?.Source, ["pluginError"] = Plugins.LastError,
             ["nodeId"] = Host.NodeId, ["nodeName"] = Host.NodeName, ["storeUrl"] = Host.StoreUrl, ["configured"] = Prefs.Sas != null,
             ["doneToday"] = Prefs.DoneToday, ["lastResult"] = LastResult, ["lastError"] = LastError,
-            ["device"] = new JsonObject { ["transport"] = d.Transport, ["vpn"] = d.Vpn, ["metered"] = d.Metered, ["charging"] = d.Charging, ["battery"] = d.BatteryPercent, ["freeMb"] = d.FreeBytes / (1 << 20), ["model"] = d.Model },
+            ["device"] = new JsonObject { ["transport"] = d.Transport, ["vpn"] = d.Vpn, ["via"] = d.Via, ["activeTransport"] = d.ActiveTransport, ["validated"] = d.Validated, ["metered"] = d.Metered, ["charging"] = d.Charging, ["battery"] = d.BatteryPercent, ["freeMb"] = d.FreeBytes / (1 << 20), ["model"] = d.Model },
             ["whyNot"] = c.WhyNot(d, Prefs.DoneToday),
             ["settings"] = new JsonObject
             {

@@ -9,9 +9,12 @@ public sealed record RunConditions(bool WifiOnly = true, bool ChargingOnly = tru
     /// <summary>Why a run may not start now, or null when it may.</summary>
     public string? WhyNot(DeviceInfo d, int doneToday)
     {
-        if (WifiOnly && (d.Transport != "wifi" && d.Transport != "ethernet" || d.Metered)) return "waiting for an unmetered Wi-Fi network";
-        if (!WifiOnly && d.Transport == "none") return "no network";
-        if (ChargingOnly && !d.Charging) return "waiting for the charger";
+        // precise verdicts: what the owner needs to see on the status screen
+        if (d.Transport == "none") return "no network";
+        if ((d.Transport == "wifi" || d.Transport == "ethernet") && !d.Validated) return "Wi-Fi connected, no internet";
+        if (WifiOnly && d.Transport != "wifi" && d.Transport != "ethernet") return d.Transport == "cellular" ? "on mobile data" : "no Wi-Fi network";
+        if (WifiOnly && d.Metered) return "Wi-Fi is metered";
+        if (ChargingOnly && !d.Charging) return "not charging";
         if (DailyCap > 0 && doneToday >= DailyCap) return $"daily cap of {DailyCap} reached";
         return null;
     }

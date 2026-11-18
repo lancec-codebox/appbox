@@ -5,19 +5,75 @@ namespace IndexNode.Android.Tests;
 
 public class PolicyTests
 {
-    static DeviceInfo Dev(string t = "wifi", bool charging = true, bool metered = false) => new() { Transport = t, Charging = charging, Metered = metered };
+    static DeviceInfo Dev(string t = "wifi", bool charging = true, bool metered = false, bool validated = true) => new() { Transport = t, Charging = charging, Metered = metered, Validated = validated };
 
     [Fact]
     public void Wifi_and_charging_are_both_required_by_default()
     {
         var c = new RunConditions();
         Assert.Null(c.WhyNot(Dev(), 0));
-        Assert.Contains("Wi-Fi", c.WhyNot(Dev("cellular"), 0));
-        Assert.Contains("Wi-Fi", c.WhyNot(Dev("wifi", metered: true), 0));
-        Assert.Contains("charger", c.WhyNot(Dev(charging: false), 0));
+        Assert.Equal("on mobile data", c.WhyNot(Dev("cellular"), 0));
+        Assert.Equal("Wi-Fi is metered", c.WhyNot(Dev("wifi", metered: true), 0));
+        Assert.Equal("not charging", c.WhyNot(Dev(charging: false), 0));
         Assert.Null(new RunConditions(true, false).WhyNot(Dev(charging: false), 0));
         Assert.Null(new RunConditions(false, false).WhyNot(Dev("cellular", false), 0));
         Assert.Equal("no network", new RunConditions(false, false).WhyNot(Dev("none"), 0));
+        Assert.Equal("no network", c.WhyNot(Dev("none"), 0));
+        Assert.Equal("Wi-Fi connected, no internet", c.WhyNot(Dev("wifi", validated: false), 0));   // the owner's internet was down
+        Assert.Null(new RunConditions(false, true).WhyNot(Dev("wifi", metered: true), 0));         // metered only matters for Wi-Fi only
+    }
+
+    // a network as ConnectivityManager reports it: (transports, capabilities, isActive)
+    static NetSnapshot Wifi(bool active = false, bool metered = false, bool validated = true) => new(true, false, false, false, true, validated, !metered, active);
+    static NetSnapshot Cell(bool active = false) => new(false, false, true, false, true, true, false, active);
+    static NetSnapshot Vpn(bool active = true, bool metered = true) => new(false, false, false, true, true, true, !metered, active);   // Android 10+ VPNs are metered by default
+
+    static DeviceInfo Nets(params NetSnapshot[] nets) { var r = NetworkClassifier.Classify(nets); return new() { Transport = r.Transport, Vpn = r.Vpn, Metered = r.Metered, Via = r.Via, Validated = r.Validated, Charging = true }; }
+
+    [Fact]
+    public void A_vpn_with_wifi_underneath_gives_a_run()
+    {
+        var d = Nets(Vpn(), Wifi());   // the VPN is the active network, metered, without TRANSPORT_WIFI
+        Assert.Equal("wifi", d.Transport); Assert.True(d.Vpn); Assert.False(d.Metered); Assert.Equal("vpn", d.Via);
+        Assert.Null(new RunConditions().WhyNot(d, 0));
+    }
+
+    [Fact]
+    public void A_vpn_with_cellular_underneath_waits()
+    {
+        var d = Nets(Vpn(), Cell());
+        Assert.Equal("cellular", d.Transport); Assert.True(d.Vpn);
+        Assert.Equal("on mobile data", new RunConditions().WhyNot(d, 0));
+        // Wi-Fi that is up under the VPN but has no internet: its own verdict
+        Assert.Equal("Wi-Fi connected, no internet", new RunConditions().WhyNot(Nets(Vpn(), Cell(), Wifi(validated: false)), 0));
+    }
+
+    [Fact]
+    public void Metered_wifi_waits_unmetered_runs_and_a_wifi_without_internet_says_so()
+    {
+        var d = Nets(Wifi(active: true, metered: true));
+        Assert.Equal("wifi", d.Transport); Assert.True(d.Metered); Assert.True(d.Validated); Assert.Null(d.Via);
+        Assert.Equal("Wi-Fi is metered", new RunConditions().WhyNot(d, 0));
+        Assert.Null(new RunConditions().WhyNot(Nets(Wifi(active: true)), 0));
+        Assert.Equal("on mobile data", new RunConditions().WhyNot(Nets(Cell(active: true)), 0));
+        Assert.Equal("Wi-Fi connected, no internet", new RunConditions().WhyNot(Nets(Wifi(active: true, validated: false)), 0));
+        Assert.Equal("no network", new RunConditions().WhyNot(Nets(), 0));
+        var r = NetworkClassifier.Classify([Wifi(active: true, metered: true)]);
+        Assert.Equal(("wifi", true), (r.ActiveTransport, r.Validated));   // the raw facts the status screen shows
+        Assert.Equal("vpn", NetworkClassifier.Classify([Vpn(), Wifi()]).ActiveTransport);
+    }
+
+    [Fact]
+    public void The_wifi_under_a_vpn_decides_metered_not_the_vpn_and_ethernet_counts()
+    {
+        Assert.True(Nets(Vpn(metered: false), Wifi(metered: true)).Metered);            // metered Wi-Fi under an unmetered VPN: still metered
+        Assert.Equal("Wi-Fi is metered", new RunConditions().WhyNot(Nets(Vpn(), Wifi(metered: true)), 0));
+        var eth = Nets(Vpn(), new NetSnapshot(false, true, false, false, true, true, true, false));
+        Assert.Equal("ethernet", eth.Transport); Assert.Null(new RunConditions().WhyNot(eth, 0));
+        Assert.Equal("none", Nets().Transport);
+        Assert.Equal("cellular", Nets(Cell(active: true)).Transport);
+        // wifi + cellular both up and the active one is Wi-Fi: Wi-Fi
+        Assert.Equal("wifi", Nets(Cell(), Wifi(active: true)).Transport);
     }
 
     [Fact]
