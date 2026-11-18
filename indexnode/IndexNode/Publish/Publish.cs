@@ -155,7 +155,7 @@ public static class Publish
             var st = new JsonArray(); foreach (var s in stills.GetValueOrDefault(id) ?? []) { var so = new JsonObject { ["file"] = s.File, ["t"] = s.T, ["spoiler"] = s.Spoiler }; if (sources?.GetValueOrDefault(s.File) is { } src0) so["source"] = src0.DeepClone(); st.Add(so); }
             cast.Add(new JsonObject
             {
-                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = SafeRoleAtStart(c.AsObject(), out _), ["description"] = c["description"]!.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
+                ["id"] = Id(id), ["character"] = c["character"]?.DeepClone(), ["role"] = c["role"]!.DeepClone(), ["roleAtStart"] = SafeRoleAtStart(c.AsObject(), out _), ["description"] = c["description"]!.DeepClone(), ["label"] = c["label"]?.DeepClone(), ["actor"] = c["actor"]?.DeepClone(),
                 ["screenSeconds"] = Math.Round(fs.Sum(x => x["screenSeconds"]?.GetValue<double>() ?? 0), 1), ["firstSeen"] = fs.Count == 0 ? 0 : fs.Min(x => x["first"]!.GetValue<double>()), ["masked"] = Describe.ClusterMasked(describe, id) is { } dm ? dm : f?["masked"]?.DeepClone() ?? false, ["faceCluster"] = id, ["faceClusters"] = new JsonArray(grp.Select(x => (JsonNode)x).ToArray()), ["stills"] = st, ["label"] = c["label"]!.DeepClone(),
                 ["portrait"] = sources?.GetValueOrDefault($"cast/{Id(id)}.jpg") is { } ps0 ? new JsonObject { ["file"] = $"cast/{Id(id)}.jpg", ["source"] = ps0.DeepClone() } : null,
             });
@@ -166,7 +166,7 @@ public static class Publish
         return new JsonObject
         {
             ["v"] = 0, ["packId"] = jobId, ["youtubeId"] = info?["id"]?.GetValue<string>() ?? jobId, ["embeddable"] = downloaded?["embeddable"]?.GetValue<bool>() ?? false,
-            ["channel"] = info?["channel"]?.GetValue<string>() ?? info?["uploader"]?.GetValue<string>() ?? "", ["durationSeconds"] = dur,
+            ["channel"] = info?["channel"]?.GetValue<string>() ?? info?["uploader"]?.GetValue<string>() ?? "", ["channelId"] = info?["channel_id"]?.GetValue<string>() ?? info?["uploader_id"]?.GetValue<string>(), ["durationSeconds"] = dur,
             ["originalTitle"] = info?["title"]?.GetValue<string>() ?? "",
             ["title"] = describe["title"]!.DeepClone(), ["fullTitle"] = describe["fullTitle"]!.DeepClone(), ["teaser"] = describe["teaser"]!.DeepClone(), ["synopsis"] = describe["synopsis"]!.DeepClone(),
             ["era"] = describe["era"]?.DeepClone(), ["fantasy"] = describe["fantasy"]?.DeepClone() ?? false, ["aiGenerated"] = describe["aiGenerated"]?["level"]?.DeepClone(), ["ending"] = describe["ending"]?.DeepClone(), ["aiFlag"] = describe["aiGenerated"]?["level"]?.ToString() is "partly" or "yes", ["tags"] = describe["tags"]!.DeepClone(),
@@ -187,14 +187,13 @@ public static class Publish
     {
         var id = src.JobId;
         var processedB = await src.ReadAsync("processed.json", ct); var describeB = await src.ReadAsync("describe.json", ct);
-        if (processedB == null) return new(id, false, "no processed.json");
         if (describeB == null) return new(id, false, "no describe.json");
         var dir = Path.Combine(outDir, id); var stampFile = Path.Combine(dir, ".stamp"); var ourEn = await src.ReadAsync(Translate.OutVtt, ct); var stamp = Stamp(processedB, describeB, ourEn);
         if (!force && File.Exists(stampFile) && File.ReadAllText(stampFile) == stamp) return new(id, false, "up to date");
         var tmp = dir + ".tmp"; if (Directory.Exists(tmp)) Directory.Delete(tmp, true); Directory.CreateDirectory(Path.Combine(tmp, "cast"));
         async Task<JsonObject?> J(string f) => await src.ReadAsync(f, ct) is { } b && StoredJson.Parse(b, $"{id}/{f}") is JsonObject o ? o : null;
         async Task<JsonNode?> JN(string f) => await src.ReadAsync(f, ct) is { } b ? StoredJson.Parse(b, $"{id}/{f}") : null;
-        var describe = JsonNode.Parse(describeB)!.AsObject(); var processed = JsonNode.Parse(processedB)!.AsObject();
+        var describe = JsonNode.Parse(describeB)!.AsObject(); var processed = processedB == null ? null : JsonNode.Parse(processedB)!.AsObject(); // processed.json is optional: 0.10.0 packs have no such file (the stamp hashes describe.json and the translation)
         var info = await J("info.json"); var downloaded = await J("downloaded.json"); var clusters = await J("cast/clusters.json"); var facesDoc = await J("cast/faces.json");
         var subs = SubtitleBand.Parse(await src.ReadAsync("ocr/lines.json", ct), $"{id}/ocr/lines.json"); double frameW = facesDoc?["source"]?["width"]?.GetValue<double>() ?? 360;
 
@@ -533,16 +532,44 @@ public static class Publish
         File.WriteAllBytes(Path.Combine(tmp, "poster.jpg"), Imaging.EncodeJpeg(o));
     }
 
-    /// <summary>packs.json at the top: one entry per pack folder present.</summary>
+    static readonly JsonSerializerOptions Compact = new() { WriteIndented = false, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
+    /// <summary>packs.json and search.json at the top, both rebuilt whole from every pack folder's drama.json (never patched), ordered by packId. search.json (0.10.5) is what the site and local tools search: titles, teaser, synopsis, tags, cast names, ending, channel; no storage URLs or keys.</summary>
     public static void WriteIndex(string outDir)
     {
-        var packs = new JsonArray();
-        foreach (var d in Directory.GetDirectories(outDir).OrderBy(x => x))
+        var packs = new JsonArray(); var dramas = new JsonArray();
+        foreach (var d in Directory.GetDirectories(outDir).OrderBy(x => Path.GetFileName(x), StringComparer.Ordinal))
         {
             var f = Path.Combine(d, "drama.json"); if (!File.Exists(f)) continue;
             var j = JsonNode.Parse(File.ReadAllText(f))!.AsObject();
+            dramas.Add(SearchEntry(Path.GetFileName(d), j));
             packs.Add(new JsonObject { ["packId"] = Path.GetFileName(d), ["title"] = j["title"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["aiGenerated"] = j["aiGenerated"]?.DeepClone(), ["ending"] = j["ending"]?.DeepClone(), ["aiFlag"] = j["aiFlag"]?.DeepClone(), ["durationSeconds"] = j["durationSeconds"]?.DeepClone(), ["madeAt"] = j["made"]?["at"]?.DeepClone() });
         }
         File.WriteAllText(Path.Combine(outDir, "packs.json"), new JsonObject { ["v"] = 0, ["packs"] = packs }.ToJsonString(Opt));
+        File.WriteAllText(Path.Combine(outDir, "search.json"), new JsonObject { ["v"] = 1, ["builtAt"] = Protocol.NowUtc(), ["dramas"] = dramas }.ToJsonString(Compact));
+    }
+
+    /// <summary>One search.json entry from a pack's drama.json. Missing optional fields are null.</summary>
+    public static JsonObject SearchEntry(string packId, JsonObject j)
+    {
+        var cast = new JsonArray();
+        foreach (var c in (j["cast"] as JsonArray)?.OfType<JsonObject>() ?? [])
+        {
+            var ch = c["character"] as JsonObject;
+            cast.Add(new JsonObject { ["en"] = ch?["en"]?.DeepClone(), ["zh"] = ch?["zh"]?.DeepClone(), ["pinyin"] = ch?["pinyin"]?.DeepClone(), ["role"] = c["role"]?.DeepClone(), ["label"] = (c["label"] as JsonObject)?["en"]?.DeepClone() ?? (c["label"] is JsonValue ? c["label"]!.DeepClone() : null) });
+        }
+        var e = j["ending"] as JsonObject;
+        var cname = j["channel"]?.GetValue<string>(); var cid = j["channelId"]?.GetValue<string>();
+        return new JsonObject
+        {
+            ["packId"] = packId, ["videos"] = new JsonArray((JsonNode)(j["youtubeId"]?.GetValue<string>() ?? packId)),
+            ["title"] = new JsonObject { ["en"] = j["title"]?["en"]?.DeepClone(), ["zh"] = j["title"]?["zh"]?.DeepClone() },
+            ["fullTitle"] = new JsonObject { ["en"] = j["fullTitle"]?["en"]?.DeepClone() },
+            ["teaser"] = new JsonObject { ["en"] = j["teaser"]?["en"]?.DeepClone() }, ["synopsis"] = new JsonObject { ["en"] = j["synopsis"]?["en"]?.DeepClone() },
+            ["tags"] = j["tags"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["ai"] = j["aiGenerated"]?.DeepClone(),
+            ["ending"] = e == null ? null : new JsonObject { ["kind"] = e["kind"]?.DeepClone(), ["nextPart"] = e["nextPart"]?.DeepClone(), ["nextPartHint"] = e["nextPartHint"]?.DeepClone() },
+            ["cast"] = cast, ["durationSeconds"] = j["durationSeconds"]?.DeepClone(),
+            ["channel"] = cname == null && cid == null ? null : new JsonObject { ["id"] = cid, ["name"] = cname },
+        };
     }
 }

@@ -19,18 +19,23 @@ public static class SiteCommands
         else
         {
             if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>', or publish a local job folder with --local <dir>");
-            var store = new RestStore(http, cfg.Sas); var paths = new Paths(a.Get("prefix") ?? "index/");
+            // 0.10.0 layout: a drama is its stage zips; the wrapper serves each old per-file name from the right zip (describe.json from describe.zip, info.json and downloaded.json from download.zip's contents and summary)
+            var store = StageZipStore.Wrap(new RestStore(http, cfg.Sas)); var paths = new Paths(a.Get("prefix") ?? "index/");
             var since = a.Get("since") is { } s ? DateTimeOffset.Parse(s, System.Globalization.CultureInfo.InvariantCulture).ToUniversalTime() : (DateTimeOffset?)null;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            // dramas are found by describe.zip (an older loose describe.json still counts)
             foreach (var b in await store.ListAsync(paths.Prefix + "videos/", false, false, ct))
             {
-                if (!b.Name.EndsWith("/describe.json")) continue;
+                if (!b.Name.EndsWith("/describe.zip") && !b.Name.EndsWith("/describe.json")) continue;
                 var id = b.Name[(paths.Prefix + "videos/").Length..].Split('/')[0];
                 if (a.Get("job") is { } only && only != id) continue;
+                if (!seen.Add(id)) continue;
                 var sj = new StoreJob(store, paths, id);
                 if (since != null)
                 {
-                    // BlobEntry has no modified time: describe.json carries its own "at"
-                    var at = await sj.ReadAsync("describe.json", ct) is { } db ? System.Text.Json.Nodes.JsonNode.Parse(db)?["at"]?.GetValue<string>() : null;
+                    // --since: describe.zip's idx_at; a loose describe.json carries its own "at"
+                    string? at = (await store.HeadAsync(paths.Video(id, "describe.zip"), ct))?.Metadata.GetValueOrDefault("idx_at");
+                    at ??= await sj.ReadAsync("describe.json", ct) is { } db ? System.Text.Json.Nodes.JsonNode.Parse(db)?["at"]?.GetValue<string>() : null;
                     if (at == null || DateTimeOffset.Parse(at, System.Globalization.CultureInfo.InvariantCulture) < since) continue;
                 }
                 jobs.Add(sj);
