@@ -92,8 +92,30 @@ public static class SiteCommands
         return 0;
     }
 
+    /// <summary>describe ending --backfill [--dry-run N] [--limit N]: adds the 0.10.4 "ending" to existing describe.zip blobs (title, description, last 3 minutes of text and the synopsis only; several dramas per call).</summary>
+    static async Task<int> DescribeEndingAsync(Args a)
+    {
+        const string use = "describe ending --backfill [--dry-run N] [--limit N] [--ai-...]   (--dry-run N: look at N dramas, print the first prompt, no AI call, nothing written)";
+        if (!a.Has("backfill")) throw new ArgumentException(use);
+        int? dryN = a.Has("dry-run") ? (int.TryParse(a.Get("dry-run"), out var dn) && dn > 0 ? dn : throw new ArgumentException(use)) : null;
+        int? limit = dryN ?? (a.Get("limit") is { } ls ? (int.TryParse(ls, out var ln) && ln > 0 ? ln : throw new ArgumentException(use)) : null);
+        var (cfg, store, paths, http) = Commands.Open(a); using var _h = http;
+        var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
+        if (dryN == null && !ai.Configured) throw new InvalidOperationException("describe ending --backfill needs an AI endpoint (ai.* in the config), or --dry-run N");
+        var work = Path.Combine(Path.GetTempPath(), "indexnode", "ending-" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            var (rep, prompt) = await EndingBackfill.RunAsync(store, paths, dryN == null ? new AiClient(http, ai) : null, ai.TextModel ?? ai.VisionModel, cfg.NodeName ?? Environment.MachineName, work, limit, dryN != null, default);
+            if (dryN != null && prompt != null) Console.WriteLine(prompt);
+            Console.WriteLine($"describe ending{(dryN != null ? " (dry)" : "")}: {rep.Found} describe.zip, {rep.Skipped} skipped (has an ending or unreadable), {rep.Asked} to do, {rep.Written} written, {rep.Raced} changed meanwhile, {rep.Unanswered} {(dryN != null ? "not asked" : "without an answer")}, {rep.Calls} AI call(s)");
+            return 0;
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
     public static async Task<int> DescribeAsync(Args a)
     {
+        if (a.Positional.FirstOrDefault() == "ending") return await DescribeEndingAsync(a);
         var local = a.Get("local") ?? (a.Get("job") != null ? null : throw new ArgumentException("describe --local <job folder> | --job <id> [--dry] [--out <file>] [--raw-dir <dir>] [--ai-... ]  (--job reads the store, writes only --out)"));
         if (local == null && a.Get("out") == null) throw new ArgumentException("describe --job <id> needs --out <file>: it never writes the store");
         var cfg = NodeConfig.Load(); var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable); var ct = CancellationToken.None;

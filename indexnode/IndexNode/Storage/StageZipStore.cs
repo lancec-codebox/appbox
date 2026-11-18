@@ -246,6 +246,12 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public Task<bool> SetTagsIfAsync(string name, IReadOnlyDictionary<string, string> tags, IReadOnlyDictionary<string, string> expect, CancellationToken ct) => inner.SetTagsIfAsync(name, tags, expect, ct);
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(name, ct);
     public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => inner.GetRangeAsync(name, off, len, ifMatch, ct);
+    public async Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct)
+    {
+        var ok = await inner.PutZipIfMatchAsync(name, path, metadata, tags, etag, ct);
+        views.TryRemove(name, out _);
+        return ok;
+    }
     public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) => inner.PutZipAsync(name, path, metadata, tags, onlyIfNew, ct);
 
     // ------------------------------------------------------------------ commit

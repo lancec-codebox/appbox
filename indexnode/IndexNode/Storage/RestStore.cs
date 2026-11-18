@@ -273,10 +273,14 @@ public sealed class RestStore : IStore
     public async Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) =>
         await PutFileCoreAsync(name, path, "application/zip", null, metadata, tags, onlyIfNew, ct);
 
+    /// <summary>One Put Block List with If-Match: 412 (changed) or 404 (gone) leave the blob alone and return false.</summary>
+    public async Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct) =>
+        await PutFileCoreAsync(name, path, "application/zip", null, metadata, tags, false, ct, etag);
+
     public Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct) =>
         PutFileCoreAsync(name, path, contentType, progress, null, null, false, ct);
 
-    private async Task<bool> PutFileCoreAsync(string name, string path, string contentType, IProgress<long>? progress, IReadOnlyDictionary<string, string>? metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct)
+    private async Task<bool> PutFileCoreAsync(string name, string path, string contentType, IProgress<long>? progress, IReadOnlyDictionary<string, string>? metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct, string? ifMatch = null)
     {
         var length = new FileInfo(path).Length;
         if (length == 0) { return await PutAsync(name, [], tags, null, onlyIfNew, ct, contentType); }
@@ -325,10 +329,13 @@ public sealed class RestStore : IStore
             if (metadata != null) foreach (var kv in metadata) q.Headers.TryAddWithoutValidation("x-ms-meta-" + kv.Key, kv.Value);
             if (tags is { Count: > 0 }) q.Headers.TryAddWithoutValidation("x-ms-tags", EncodeTags(tags));
             if (onlyIfNew) q.Headers.TryAddWithoutValidation("If-None-Match", "*");
+            if (ifMatch != null) q.Headers.TryAddWithoutValidation("If-Match", ifMatch);
             q.Content = new StringContent(BlockListXml(ids), Encoding.UTF8, "application/xml");
             return q;
         }, ct);
         if (onlyIfNew && (rl.StatusCode == HttpStatusCode.Conflict || rl.StatusCode == HttpStatusCode.PreconditionFailed)) return false;
+        if (ifMatch != null && (rl.StatusCode == HttpStatusCode.PreconditionFailed || rl.StatusCode == HttpStatusCode.NotFound)) return false;
+        if (ifMatch != null && (rl.StatusCode == HttpStatusCode.PreconditionFailed || rl.StatusCode == HttpStatusCode.NotFound)) return false;
         if (!rl.IsSuccessStatusCode) throw await Fail(rl, "Put Block List");
         return true;
     }

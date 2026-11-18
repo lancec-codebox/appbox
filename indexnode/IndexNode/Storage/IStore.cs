@@ -82,5 +82,13 @@ public interface IStore
         if (tags is { Count: > 0 }) await SetTagsAsync(name, tags, null, ct);
         return true;
     }
+    /// <summary>Replaces an existing zip only while its ETag still equals <paramref name="etag"/> (If-Match); false when it changed or is gone (412/404), nothing written then. The default checks the ETag with a Head first (racy); RestStore and FakeStore make it one conditional write.</summary>
+    async Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct)
+    {
+        var h = await HeadAsync(name, ct);
+        if (h == null || h.ETag != etag) return false;
+        return await PutZipAsync(name, path, metadata, tags, false, ct);
+    }
     Task DeleteAsync(string name, CancellationToken ct);
 }
+

@@ -47,7 +47,7 @@ public static partial class DescribeJob
         };
     }
 
-    static List<ShapeCue> TextCues(byte[]? b) => b == null ? [] : CueShaper.ParseVtt(System.Text.Encoding.UTF8.GetString(b));
+    internal static List<ShapeCue> TextCues(byte[]? b) => b == null ? [] : CueShaper.ParseVtt(System.Text.Encoding.UTF8.GetString(b));
 
     /// <summary>The step: describe.json bytes. Without an AI endpoint the step is skipped (null), it does not fail.</summary>
     public static async Task<byte[]?> RunAsync(IChat? chat, AiConfig? ai, DescribeInput d, CancellationToken ct)

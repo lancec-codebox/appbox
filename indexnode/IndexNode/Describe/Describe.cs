@@ -68,7 +68,8 @@ public sealed class DescribeInput
 /// <summary>The describe step: titles, tags, era, teaser, synopsis, cast and relations in one batched vision call, then a spoiler check with rewrite.</summary>
 public static class Describe
 {
-    public const string PromptVersion = "describe-6"; // describe-6 (2026-11-16): the rewrite answer example has no concrete cluster id (a "0" in it overwrote the female lead with the male lead's text)
+    public const string PromptVersion = "describe-7"; // describe-7 (2026-11-17): ending {kind, signs, nextPart}: is the story finished in this upload
+    // describe-6 (2026-11-16): the rewrite answer example has no concrete cluster id (a "0" in it overwrote the female lead with the male lead's text)
     // describe-5 (2026-11-15): roleAtStart is always a short spoiler-free line about who the character is, never "not introduced" // describe-4 (2026-11-14): aiGenerated // describe-3 (2026-11-14): marks covered faces per head shot ("masked"); cast no longer scores masks
     public static readonly string[] Eras = ["ancient", "republic", "1950s-60s", "1970s", "1980s-90s", "modern", "futuristic"];
     public const double CutoffFraction = 0.12;
@@ -127,12 +128,13 @@ public static class Describe
 - teaser.en: premise-style, 2-4 sentences, NO spoilers beyond the cutoff. synopsis.en: the full story with the ending.
 - tags: lowercase English words.
 - aiGenerated: is the drama itself AI-generated (generated video or images, synthetic faces or voices), as opposed to filmed with actors? level: ""no"" (filmed), ""partly"" (filmed with some generated scenes, faces or voiceover) or ""yes"" (wholly generated); signs: the evidence you saw in a few words (e.g. faces that change between shots, warped hands or text, a synthetic voice in the transcript's rhythm, an 'AI' label in the title or description), [] when none. Judge from the head shots, the thumbnail and the text; do not guess from the genre.
+- ending: is the story finished in THIS upload? Judge from the last minutes of the text track, the description and your synopsis. kind: ""complete"" (the main conflict is resolved and the story is told to its end), ""cliffhanger"" (it stops on an unresolved turn, a 'to be continued' or a next-episode teaser) or ""truncated"" (it stops mid-scene or mid-sentence, as if the upload were cut off); signs: the evidence in a few words (e.g. 'closing line ends mid-sentence', '下集预告', 'epilogue after the wedding'), [] when none; nextPart: true when the text or description points to a further part, episode or season, false when it says this is the last, null when nothing says; nextPartHint: what names the next part when the title, description or last lines show it (e.g. '第二部', 'Part 2', a sequel title, 'EP 5'), copied as written and at most 80 characters, else null.
 - era: one of ancient (dynastic costume drama), republic (1912-1949), 1950s-60s, 1970s, 1980s-90s, modern (present day), futuristic. A time-travel or rebirth story takes the era where most of it happens. fantasy: true for xianxia, xuanhuan or supernatural stories.
 - cast: one entry per cluster you can identify; exactly one 'female lead' and one 'male lead' when the story has them, others 'main' or 'supporting'. NEVER use the words villain or antagonist anywhere. Name a person only when subtitles, dialogue or credits support it; otherwise label them relative to a named character (""Gu Heng's grandmother""). actor only from the credits lines, else null. role is the final role. roleAtStart is ALWAYS a short spoiler-free line (a few words to one sentence) saying who the character is: position, standing, and how they relate to the plot as known at the start, for example 'A powerful chief minister.' or 'The princess's loyal maid.'. It must never say that the character is not introduced, not yet seen, unknown or similar, even for a character who first appears late: then say who they are without any later reveal. Descriptions and labels describe the start, never later reveals.
 - relations: every cast member linked to at least one other. since/until in seconds; spoiler is true when since is after the cutoff or the relation is itself a reveal; implied true when not stated outright.
 - masked: for each cluster, the indexes of the head shots on its sheet where the face is covered (mask, veil, helmet, face covering, the face hidden by a hand or object); [] when none. Most clusters have none.
 - picks: for each cluster, the best portrait (most flattering, in-character, well lit, expressive, no other face dominating, never a covered face) and 1-3 stills as candidate indexes of its sheet; poster: the index of the single most poster-worthy 'together' frame (charged, iconic, cinematic; NOT a twist, death, blood, identity reveal or late-story costume), or null.
-JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""aiGenerated"":{""level"":""no"",""signs"":[]},""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""expression"":{""0"":[0],""poster"":[0]},""masked"":{""0"":[]},""samePerson"":[[0,1]]}
+JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""aiGenerated"":{""level"":""no"",""signs"":[]},""ending"":{""kind"":""complete"",""signs"":[],""nextPart"":null,""nextPartHint"":null},""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""expression"":{""0"":[0],""poster"":[0]},""masked"":{""0"":[]},""samePerson"":[[0,1]]}
 - expression: score EVERY numbered head shot of EVERY cluster sheet, and every frame of the poster candidate sheet, for how flattering the face is, an integer 0-10. 8-10: eyes open and roughly toward the camera, mouth closed or a slight smile, relaxed or composed. 5-7: acceptable but flat or slightly off. 0-2: mid-speech (open mouth), shocked or startled, crying, grimacing, blinking, eyes closed, looking far away. For a poster frame score the weaker of the two faces. Arrays are in sheet order; ""poster"" is the poster sheet.
 from/to and picks keys are cluster ids.
 - samePerson: lists of cluster ids that show the SAME person (the face matcher sometimes splits one character across clusters, e.g. in another costume or mask). Compare the contact sheets carefully; only merge when you are sure; [] when none. Do not list such a cluster separately in cast: give the group once, the first id is kept.");
@@ -234,6 +236,26 @@ from/to and picks keys are cluster ids.
         return map;
     }
 
+    public const int MaxHint = 80;
+    public static readonly string[] EndingKinds = ["complete", "cliffhanger", "truncated"];
+
+    /// <summary>The model's ending as { kind, signs, nextPart }: kind one of <see cref="EndingKinds"/> else null (the model did not say), at most 6 short English signs, nextPart a real boolean else null, nextPartHint a non-empty string of at most <see cref="MaxHint"/> characters else null. Not an object: null.</summary>
+    public static JsonObject? CleanEnding(JsonNode? n)
+    {
+        if (n is not JsonObject e) return null;
+        var kind = (Txt(e["kind"]) ?? "").Trim().ToLowerInvariant();
+        var signs = new JsonArray();
+        foreach (var s in (e["signs"] as JsonArray) ?? [])
+            if (signs.Count < 6 && Bad.Replace(Txt(s)?.Trim() ?? "", "").Trim() is { Length: > 0 } c) signs.Add(c.Length > 120 ? c[..120] : c);
+        return new JsonObject
+        {
+            ["kind"] = EndingKinds.Contains(kind) ? kind : null,
+            ["signs"] = signs,
+            ["nextPart"] = e["nextPart"] is JsonValue v && v.TryGetValue<bool>(out var b) ? b : null,
+            ["nextPartHint"] = e["nextPartHint"] is JsonValue hv && hv.TryGetValue<string>(out var h) && h.Trim() is { Length: > 0 and <= MaxHint } ht ? ht : null,   // a string of at most 80 characters, else null (never cut)
+        };
+    }
+
     /// <summary>Validates and cleans a model reply into the describe result: English-only text, valid era, no villain wording, roles from the allowed set, one lead each.</summary>
     public static JsonObject Normalize(JsonObject r, DescribeInput d)
     {
@@ -257,6 +279,7 @@ from/to and picks keys are cluster ids.
             ["level"] = aiLevel is "no" or "partly" or "yes" ? aiLevel : null,   // null: the model did not say
             ["signs"] = new JsonArray(((r["aiGenerated"]?["signs"] as JsonArray) ?? []).Select(x => x?.ToString()).Where(x => !string.IsNullOrWhiteSpace(x)).Take(6).Select(x => (JsonNode)Clean(x!)).ToArray()),
         };
+        o["ending"] = CleanEnding(r["ending"]);
         var ids = d.Clusters.Select(c => c.Id).ToHashSet(); var cast = new JsonArray(); bool f = false, m = false;
         var canon = SamePerson(r["samePerson"], ids, d); int Cn(int id) => canon.GetValueOrDefault(id, id);
         o["samePerson"] = new JsonArray(canon.GroupBy(kv => kv.Value).Select(g => (JsonNode)new JsonArray(new[] { g.Key }.Concat(g.Select(kv => kv.Key).OrderBy(x => x)).Select(x => (JsonNode)x).ToArray())).ToArray());

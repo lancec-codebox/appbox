@@ -62,6 +62,7 @@ public static class Program
         (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
         indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel <cores>]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
+        indexnode describe ending --backfill [--dry-run N] [--limit N]   (0.10.4: adds the story ending to existing describe.zip; several dramas per AI call; --dry-run N prints the first prompt of N dramas, no AI call, nothing written)
         indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
         indexnode publish [--out <dir>] [--job <id>] [--since <time>] [--local <dir>] [--force]   (site packs per PACK.md; default out: %LOCALAPPDATA%\indexnode\site)
         indexnode medusa-setup [--qr] [--file <path>.medusa-node.json] [--name N] [--conditions wifi+charging|wifi] [--daily-cap N] [--budget N] [--schedule C] [--window W] [--no-sas]

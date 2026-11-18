@@ -15,6 +15,7 @@ public sealed class LocalCacheStore(IStore inner, string dir) : IStore, IDisposa
     public int Hits { get; private set; }
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(name, ct);
     public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => inner.GetRangeAsync(name, off, len, ifMatch, ct);
+    public Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct) => inner.PutZipIfMatchAsync(name, path, metadata, tags, etag, ct);
     public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) => inner.PutZipAsync(name, path, metadata, tags, onlyIfNew, ct);
     public bool Has(string name) { lock (gate) return files.ContainsKey(name); }
 

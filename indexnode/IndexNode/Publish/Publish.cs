@@ -169,7 +169,7 @@ public static class Publish
             ["channel"] = info?["channel"]?.GetValue<string>() ?? info?["uploader"]?.GetValue<string>() ?? "", ["durationSeconds"] = dur,
             ["originalTitle"] = info?["title"]?.GetValue<string>() ?? "",
             ["title"] = describe["title"]!.DeepClone(), ["fullTitle"] = describe["fullTitle"]!.DeepClone(), ["teaser"] = describe["teaser"]!.DeepClone(), ["synopsis"] = describe["synopsis"]!.DeepClone(),
-            ["era"] = describe["era"]?.DeepClone(), ["fantasy"] = describe["fantasy"]?.DeepClone() ?? false, ["aiGenerated"] = describe["aiGenerated"]?["level"]?.DeepClone(), ["aiFlag"] = describe["aiGenerated"]?["level"]?.ToString() is "partly" or "yes", ["tags"] = describe["tags"]!.DeepClone(),
+            ["era"] = describe["era"]?.DeepClone(), ["fantasy"] = describe["fantasy"]?.DeepClone() ?? false, ["aiGenerated"] = describe["aiGenerated"]?["level"]?.DeepClone(), ["ending"] = describe["ending"]?.DeepClone(), ["aiFlag"] = describe["aiGenerated"]?["level"]?.ToString() is "partly" or "yes", ["tags"] = describe["tags"]!.DeepClone(),
             ["cast"] = cast, ["relations"] = rel, ["cutoffSeconds"] = cut,
             ["sources"] = new JsonObject { ["text"] = textSource, ["asrModel"] = processed?["asrModel"]?.DeepClone(), ["ocr"] = hasOcr },
             ["made"] = new JsonObject { ["at"] = Protocol.NowUtc(), ["by"] = by, ["notes"] = $"describe {describe["promptVersion"]}, models {describe["models"]?.ToJsonString()}" },
@@ -541,7 +541,7 @@ public static class Publish
         {
             var f = Path.Combine(d, "drama.json"); if (!File.Exists(f)) continue;
             var j = JsonNode.Parse(File.ReadAllText(f))!.AsObject();
-            packs.Add(new JsonObject { ["packId"] = Path.GetFileName(d), ["title"] = j["title"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["aiGenerated"] = j["aiGenerated"]?.DeepClone(), ["aiFlag"] = j["aiFlag"]?.DeepClone(), ["durationSeconds"] = j["durationSeconds"]?.DeepClone(), ["madeAt"] = j["made"]?["at"]?.DeepClone() });
+            packs.Add(new JsonObject { ["packId"] = Path.GetFileName(d), ["title"] = j["title"]?.DeepClone(), ["era"] = j["era"]?.DeepClone(), ["fantasy"] = j["fantasy"]?.DeepClone(), ["aiGenerated"] = j["aiGenerated"]?.DeepClone(), ["ending"] = j["ending"]?.DeepClone(), ["aiFlag"] = j["aiFlag"]?.DeepClone(), ["durationSeconds"] = j["durationSeconds"]?.DeepClone(), ["madeAt"] = j["made"]?["at"]?.DeepClone() });
         }
         File.WriteAllText(Path.Combine(outDir, "packs.json"), new JsonObject { ["v"] = 0, ["packs"] = packs }.ToJsonString(Opt));
     }

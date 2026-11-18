@@ -104,6 +104,46 @@ public sealed class FakeStore : IStore
         lock (gate) return Task.FromResult<IReadOnlyDictionary<string, string>?>(Blobs.TryGetValue(name, out var b) ? new Dictionary<string, string>(b.Tags) : null);
     }
 
+    /// <summary>Head with a real ETag ("v&lt;version&gt;", as GetAsync gives), size and metadata.</summary>
+    public Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
+    {
+        lock (gate) return Task.FromResult<BlobProps?>(Blobs.TryGetValue(name, out var b) ? new BlobProps(b.Data.Length, "\"v" + b.Version + "\"", new Dictionary<string, string>(b.Meta)) : null);
+    }
+
+    public int ZipPuts, ZipConflicts;
+    /// <summary>Set to change the named blob (a concurrent writer) right before its next PutZipIfMatchAsync is checked.</summary>
+    public Action<string>? BeforeIfMatch;
+    public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            if (Blobs.TryGetValue(name, out var o) && onlyIfNew) return Task.FromResult(false);
+            var b = o ?? (Blobs[name] = new Blob());
+            b.Data = File.ReadAllBytes(path); b.Meta = new(metadata); b.Tags = tags == null ? new() : new(tags); b.Version++; ZipPuts++;
+            return Task.FromResult(true);
+        }
+    }
+    public Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            BeforeIfMatch?.Invoke(name); BeforeIfMatch = null;
+            if (!Blobs.TryGetValue(name, out var b) || "\"v" + b.Version + "\"" != etag) { ZipConflicts++; return Task.FromResult(false); }
+            b.Data = File.ReadAllBytes(path); b.Meta = new(metadata); b.Tags = tags == null ? new() : new(tags); b.Version++; ZipPuts++;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            if (!Blobs.TryGetValue(name, out var b)) return Task.FromResult(new RangeRead(null, false));
+            if (ifMatch != null && "\"v" + b.Version + "\"" != ifMatch) return Task.FromResult(new RangeRead(null, true));
+            return Task.FromResult(new RangeRead(b.Data.AsSpan((int)Math.Min(off, b.Data.Length), (int)Math.Max(0, Math.Min(len, b.Data.Length - off))).ToArray(), false));
+        }
+    }
+
     public Task<bool> PutAsync(string name, byte[] data, IReadOnlyDictionary<string, string>? tags, string? leaseId, bool onlyIfNew, CancellationToken ct, string contentType = "application/json")
     {
         lock (gate)

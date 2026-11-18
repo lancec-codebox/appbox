@@ -7,6 +7,7 @@ public sealed class RecordingStore(IStore inner) : IStore
     readonly HashSet<string> written = new(StringComparer.Ordinal); readonly object gate = new();
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(name, ct);
     public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => inner.GetRangeAsync(name, off, len, ifMatch, ct);
+    public Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct) => inner.PutZipIfMatchAsync(name, path, metadata, tags, etag, ct);
     public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) => inner.PutZipAsync(name, path, metadata, tags, onlyIfNew, ct);
     public IReadOnlyCollection<string> Written { get { lock (gate) return written.ToArray(); } }
     public void Note(string name) { lock (gate) written.Add(name); }
