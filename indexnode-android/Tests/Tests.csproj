@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <AssemblyName>IndexNode.Android.Tests</AssemblyName>
+    <RootNamespace>IndexNode.Android.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Loader/Loader.csproj" />
+    <ProjectReference Include="../Medusa/Medusa.csproj" />
+    <ProjectReference Include="../Plugin/Plugin.csproj" />
+    <ProjectReference Include="../../indexnode/IndexNode.Core/IndexNode.Core.csproj" />
+    <Compile Include="../../indexnode/IndexNode.Tests/FakeStore.cs" Link="FakeStore.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="Xunit" />
+    <Compile Remove="TestPlugin/**" />
+    <None Remove="TestPlugin/**" />
+    <EmbeddedResource Remove="TestPlugin/**" />
+  </ItemGroup>
+  <!-- three builds of the tiny test plugin (good v1, good v2, smoke test fails), copied beside the tests -->
+  <Target Name="BuildTestPlugins" BeforeTargets="BeforeBuild">
+    <MSBuild Projects="TestPlugin/TestPlugin.csproj" Properties="Configuration=Release;Variant=;OutDir=$(MSBuildProjectDirectory)/obj/tp/v1/;IntermediateOutputPath=obj/tpv1/" Targets="Restore;Build" />
+    <MSBuild Projects="TestPlugin/TestPlugin.csproj" Properties="Configuration=Release;Variant=V2;OutDir=$(MSBuildProjectDirectory)/obj/tp/v2/;IntermediateOutputPath=obj/tpv2/" Targets="Build" />
+    <MSBuild Projects="TestPlugin/TestPlugin.csproj" Properties="Configuration=Release;Variant=BAD;OutDir=$(MSBuildProjectDirectory)/obj/tp/bad/;IntermediateOutputPath=obj/tpbad/" Targets="Build" />
+  </Target>
+  <Target Name="CopyTestPlugins" AfterTargets="Build">
+    <Copy SourceFiles="obj/tp/v1/TestPlugin.dll" DestinationFiles="$(OutDir)tp/v1.dll" />
+    <Copy SourceFiles="obj/tp/v2/TestPlugin.dll" DestinationFiles="$(OutDir)tp/v2.dll" />
+    <Copy SourceFiles="obj/tp/bad/TestPlugin.dll" DestinationFiles="$(OutDir)tp/bad.dll" />
+  </Target>
+</Project>

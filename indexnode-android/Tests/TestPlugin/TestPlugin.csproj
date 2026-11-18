@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>TestPlugin</AssemblyName>
+    <DefineConstants Condition="'$(Variant)' != ''">$(DefineConstants);$(Variant)</DefineConstants>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Plugin.cs" />
+    <ProjectReference Include="../../Contract/Contract.csproj" Private="false" />
+  </ItemGroup>
+</Project>

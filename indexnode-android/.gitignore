@@ -1,0 +1,5 @@
+bin/
+obj/
+*.keystore
+global.json
+out/

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>IndexNode.Plugin</AssemblyName>
+    <RootNamespace>IndexNode.Plugin</RootNamespace>
+    <Version>0.1.0</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <DebugType>none</DebugType>
+    <!-- the host's copy of the contract is the one the plugin binds to: not copied, not embedded -->
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Plugin.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Contract/Contract.csproj" Private="false" />
+    <ProjectReference Include="../../indexnode/IndexNode.Core/IndexNode.Core.csproj" Private="false" />
+  </ItemGroup>
+  <!-- IndexNode.Core goes into the plugin DLL as a resource; the loader resolves it from there (see Loader/PluginLoader.cs) -->
+  <Target Name="EmbedCore" DependsOnTargets="ResolveReferences" BeforeTargets="AssignTargetPaths">
+    <ItemGroup>
+      <_CoreRef Include="@(ReferencePath)" Condition="'%(Filename)' == 'IndexNode.Core'" />
+      <EmbeddedResource Include="@(_CoreRef)" LogicalName="asm.IndexNode.Core.dll" />
+    </ItemGroup>
+  </Target>
+</Project>
