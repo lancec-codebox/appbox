@@ -35,6 +35,7 @@ public class BatchTests
         if (also != null) await also(ctx);
         var file = ProcessStage.Outputs.First(x => x.Step == ctx.Stage).File;
         await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, file), "{\"v\":1}"u8.ToArray(), null, null, false, ctx.Token);
+        await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, ctx.Stage + ".zip"), [1], null, null, false, ctx.Token);   // the stage zip is the completion signal
     });
 
     private static NodeEngine Engine(FakeStore s, EngineOptions o, Func<string, IStageHandler> h) => new(s, P, o, Steps.ToDictionary(x => x, h));

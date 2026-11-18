@@ -494,6 +494,7 @@ public sealed partial class NodeEngine
         if (body == null) return false;
         var job = JobDescriptor.Parse(body.Data);
         if (job.Needs is { Length: > 0 } needs && await MissingNeedAsync(job, needs, ct) != null && !(IsPassStage(stage) && NeedsFromPass(job, needs))) return false;
+        if (NeedsLayout(stage) && await LooseAsync(job.JobId, ct)) return false;
         if (o.CanRun != null && !o.CanRun(job)) return false;
         return true;
     }
@@ -501,7 +502,7 @@ public sealed partial class NodeEngine
     /// <summary>True when every input still missing for a pass-stage job is an output of an earlier step of the pass.</summary>
     private static bool NeedsFromPass(JobDescriptor job, string[] needs)
     {
-        var earlier = StageOrder.PassOrder.TakeWhile(x => x != job.Stage).SelectMany(x => ProcessStage.Outputs.Where(y => y.Step == x).Select(y => y.File)).ToHashSet(StringComparer.Ordinal);
+        var earlier = StageOrder.PassOrder.TakeWhile(x => x != job.Stage).Select(x => x + ".zip").ToHashSet(StringComparer.Ordinal);
         return needs.Any(n => earlier.Contains(n));
     }
 
@@ -552,6 +553,12 @@ public sealed partial class NodeEngine
                 Log.Info($"[{stage}] {job.JobId} waits for {missing}");
                 return null;
             }
+            if (NeedsLayout(stage) && await LooseAsync(job.JobId, ct))
+            {
+                await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None);
+                w.IgnoreUntil[b.Name] = DateTimeOffset.UtcNow.AddMinutes(10);
+                return null;
+            }
             if (o.CanRun != null && !o.CanRun(job))
             {
                 // this node lacks a step the job needs: leave it to another node, and look again later
@@ -580,6 +587,20 @@ public sealed partial class NodeEngine
         DateTimeOffset? Dd = DateTimeOffset.TryParse(due, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var y) ? y : null;
         return A == null ? Dd : Dd == null ? A : (A > Dd ? A : Dd);
     }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTimeOffset At, bool Loose)> looseSeen = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> looseLogged = new();
+    /// <summary>0.10.0 refuses to process a drama that still has loose 0.9 files (it has to be repacked first: `indexnode repack`): its jobs stay pending, the log says so and `indexnode status` counts it.</summary>
+    private async Task<bool> LooseAsync(string id, CancellationToken ct)
+    {
+        if (StageZipStore.Find(store) is not StageZipStore z) return false;   // a plain store (tests, --local runs) has no layout to refuse
+        if (looseSeen.TryGetValue(id, out var c) && DateTimeOffset.UtcNow - c.At < TimeSpan.FromMinutes(5)) return c.Loose;
+        var loose = (await z.LooseFilesAsync(paths.Prefix, id, ct)).Count > 0;
+        looseSeen[id] = (DateTimeOffset.UtcNow, loose);
+        if (loose && looseLogged.TryAdd(id, 0)) Log.Info($"{id} is still in the loose 0.9 layout: not processing it until `indexnode repack` has run (its jobs stay pending)");
+        return loose;
+    }
+    private static bool NeedsLayout(string stage) => stage == "process" || Protocol.IsStep(stage);
 
     private async Task<string?> MissingNeedAsync(JobDescriptor job, string[] needs, CancellationToken ct, HashSet<string>? produced = null)
     {
@@ -625,6 +646,7 @@ public sealed partial class NodeEngine
 
         cts.Cancel();
         try { await renewTask; } catch { }
+        if (outcome != Outcome.Done) StageZipStore.Stage(jobStore)?.DiscardStaged(claim.Job.JobId, Protocol.IsStep(stage) || stage is "download" or "comments" ? stage : null);   // a failed or released run uploads no zip
         if (run.LeaseLost) outcome = Outcome.LeaseLost;
         // a stop that arrives while the handler finishes anyway still counts as done; a cancelled one is released
         try { await ApplyOutcomeAsync(w, stage, claim, outcome, error, watch.Elapsed, run); }

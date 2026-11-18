@@ -11,8 +11,6 @@ namespace IndexNode;
 public static class Thumbs
 {
     public const int Width = 36, Height = 64, Quality = 75;
-    /// <summary>Nexis ghosts blobs over 2 MB: a thumbs chunk file must stay under it, so it is never ghosted.</summary>
-    public const int MaxChunkBytes = 2_000_000;
 
     /// <summary>Box (area) downscale: each output pixel is the mean of the source area it covers, partial pixels weighted by their overlap.</summary>
     public static Rgb BoxResize(Rgb im, int ow, int oh)
@@ -52,7 +50,6 @@ public static class Thumbs
     public static (byte[] Data, List<(int Off, int Len)> Rows) Pack(string chunk, IReadOnlyList<byte[]> jpegs)
     {
         long total = jpegs.Sum(j => (long)j.Length);
-        if (total >= MaxChunkBytes) throw new InvalidOperationException($"thumbs/{chunk}.mjpeg would be {total} bytes for {jpegs.Count} thumbnails, over the {MaxChunkBytes} bytes at which Nexis ghosts a blob; refusing to write it");
         var data = new byte[total]; var rows = new List<(int, int)>(jpegs.Count); int pos = 0;
         foreach (var j in jpegs) { Buffer.BlockCopy(j, 0, data, pos, j.Length); rows.Add((pos, j.Length)); pos += j.Length; }
         return (data, rows);

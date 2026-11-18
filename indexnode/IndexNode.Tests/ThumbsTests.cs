@@ -54,12 +54,11 @@ public class ThumbsTests
     }
 
     [Fact]
-    public void A_chunk_over_the_ghosting_size_is_refused_with_a_clear_error()
+    public void A_chunk_may_be_any_size_now_that_thumbs_live_in_a_zip()
     {
-        var big = new byte[Thumbs.MaxChunkBytes / 2 + 1];
-        var e = Assert.Throws<InvalidOperationException>(() => Thumbs.Pack("0003", [big, big]));
-        Assert.Contains("thumbs/0003.mjpeg", e.Message); Assert.Contains("Nexis ghosts", e.Message);
-        var ok = new byte[Thumbs.MaxChunkBytes / 2 - 1]; Thumbs.Pack("0003", [ok, ok]);   // just under: fine
+        var big = new byte[1_500_000];
+        var (data, rows) = Thumbs.Pack("0003", [big, big]);   // 3 MB: no longer refused (0.10.0 removed the 2 MB ghosting rule)
+        Assert.Equal(3_000_000, data.Length); Assert.Equal(2, rows.Count);
     }
 
     [Fact]
@@ -90,7 +89,6 @@ public class ThumbsTests
                 var rows = Thumbs.ParseIndex((await store.GetAsync(paths.Video("vid", $"thumbs/{c.Chunk}.json"), default))!.Data, "idx");
                 Assert.Equal(c.Frames.Count, rows.Count);   // one row per frame, same order
                 var data = (await store.GetAsync(paths.Video("vid", $"thumbs/{c.Chunk}.mjpeg"), default))!.Data;
-                Assert.True(data.Length < Thumbs.MaxChunkBytes);
                 foreach (var (off, len) in rows) { var im = Imaging.DecodeJpeg(data.AsSpan(off, len).ToArray()); Assert.Equal((36, 64), (im.W, im.H)); }
             }
         }

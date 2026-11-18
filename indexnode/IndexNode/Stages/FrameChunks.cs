@@ -228,7 +228,7 @@ public static class FrameChunks
             var idx = frames.Container == "mjpeg"
                 ? JpegIndexJson(c.Chunk, c.Start, frames.W, frames.H, j.GetProperty("q").GetInt32(), list) // keeps each frame's byte range
                 : IndexJson(c.Chunk, c.Start, frames.W, frames.H, j.GetProperty("crf").GetInt32(), j.GetProperty("gop").GetInt32(), list, true);
-            await store.PutAsync(paths.Video(id, $"frames/{c.Chunk}.json"), idx, null, null, false, ct);
+            await store.PutAsync(paths.Video(id, $"sscd/frames/{c.Chunk}.json"), idx, null, null, false, ct);   // sscd.zip holds the rewritten index; frames.zip is never patched
         }
         await store.PutAsync(paths.Video(id, "sscd/keep.json"), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, cosine, lookback, rows = all.Count, kept = keep.Count, keep, rep }), null, null, false, ct);
     }

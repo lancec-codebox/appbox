@@ -178,7 +178,8 @@ public sealed class DownloadStage(Tools tools, IStore store, DownloadGate gate) 
                 subs = subFiles.Select(s => s.Name).ToArray(), embeddable = fmt?.Embeddable ?? false, nodeId = ctx.NodeId, at = Protocol.NowUtc(),
                 network = ctx.Job.Network == null ? null : new { ipv4 = ctx.Job.Network.Ipv4, ipv6Prefix = ctx.Job.Network.Ipv6Prefix, vpn = ctx.Job.Network.Vpn, transport = ctx.Job.Network.Transport },
             }, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
-            await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);
+            await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);   // download.zip's summary
+            await StageCommit.CommitAsync(ctx.Store, id, "download", ctx.NodeId, false, ct);   // video.mp4 is already up: the zip, last, marks the download complete
             await EnsureFollowUpJobs(ctx);
         }
         finally

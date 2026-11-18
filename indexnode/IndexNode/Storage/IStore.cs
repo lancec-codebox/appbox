@@ -9,6 +9,12 @@ public sealed record BlobEntry(
 
 public sealed record BlobContent(byte[] Data, string? ETag);
 
+/// <summary>A blob's size, ETag and metadata (Get Blob Properties).</summary>
+public sealed record BlobProps(long Size, string? ETag, IReadOnlyDictionary<string, string> Metadata);
+
+/// <summary>A range read pinned to an ETag: <see cref="Mismatch"/> when the blob changed since (412), <see cref="Data"/> null when it is gone.</summary>
+public sealed record RangeRead(byte[]? Data, bool Mismatch);
+
 public sealed record ConditionalResult(bool Changed, bool Exists, byte[]? Data, string? ETag);
 
 public class StorageException(int status, string? code, string message) : Exception(message)
@@ -53,5 +59,28 @@ public interface IStore
     }
     /// <summary>Delete under a blob lease (a hold blob is deleted by the node that holds its lease). The default ignores the lease id; RestStore and FakeStore send/check it.</summary>
     Task DeleteAsync(string name, string? leaseId, CancellationToken ct) => DeleteAsync(name, ct);
+    /// <summary>Size, ETag and metadata of one blob; null when it does not exist. The default lists the name (no ETag).</summary>
+    async Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
+    {
+        var e = (await ListAsync(name, false, true, ct)).FirstOrDefault(b => b.Name == name);
+        return e == null ? null : new BlobProps(e.Size, null, e.Metadata);
+    }
+    /// <summary>Bytes off..off+len of a blob, only while its ETag still equals <paramref name="ifMatch"/> (null = any). The default reads the whole blob.</summary>
+    async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    {
+        var c = await GetAsync(name, ct);
+        if (c == null) return new(null, false);
+        if (ifMatch != null && c.ETag != null && c.ETag != ifMatch) return new(null, true);
+        return new(c.Data.AsSpan((int)Math.Min(off, c.Data.Length), (int)Math.Max(0, Math.Min(len, c.Data.Length - off))).ToArray(), false);
+    }
+    /// <summary>Uploads a local file whole with its metadata (and tags) in one write; with <paramref name="onlyIfNew"/> false when the blob exists. A Put keeps neither metadata nor tags unless they are re-sent, so callers send all of both. The default is Put, then Set Metadata.</summary>
+    async Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct)
+    {
+        if (onlyIfNew && await HeadAsync(name, ct) != null) return false;
+        await PutFileAsync(name, path, "application/zip", null, ct);
+        await SetMetadataAsync(name, metadata, null, ct);
+        if (tags is { Count: > 0 }) await SetTagsAsync(name, tags, null, ct);
+        return true;
+    }
     Task DeleteAsync(string name, CancellationToken ct);
 }

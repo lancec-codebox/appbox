@@ -19,7 +19,7 @@ public class GpuTests
     private static async Task Frames(FakeStore s, string id)
     {
         await s.PutAsync(P.Video(id, "frames/manifest.json"), [1], null, null, false, default);
-        await s.PutAsync(P.Video(id, "keyframes/manifest.json"), [1], null, null, false, default); await s.PutAsync(P.Video(id, "sscd/manifest.json"), [1], null, null, false, default); // 0.7: cast waits for the SSCD pass
+        await s.PutAsync(P.Video(id, "keyframes/manifest.json"), [1], null, null, false, default); await s.PutAsync(P.Video(id, "sscd/manifest.json"), [1], null, null, false, default); foreach (var z in new[] { "frames", "sscd" }) await s.PutAsync(P.Video(id, z + ".zip"), [1], null, null, false, default); // 0.7: cast waits for the SSCD pass
     }
 
     private static async Task Job(FakeStore s, string stage, string id, TimeSpan age)

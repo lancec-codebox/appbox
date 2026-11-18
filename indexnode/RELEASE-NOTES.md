@@ -1,5 +1,15 @@
 # IndexNode release notes
 
+## 0.10.0
+
+- **One zip per stage per drama.** `index/videos/<id>/` now holds video.mp4 (and compact.mp4) plus `download`, `frames`, `sscd`, `thumbs`, `transcribe`, `ocrsubs`, `cast`, `sync`, `describe`, `translate` and `comments` zips: about 12 files per drama instead of about 430. Standard zips (real CRC-32, stored members, zip64), written whole by their own stage, never patched. Member names are the old relative paths.
+- **The zip is the completion signal.** downloaded.json and processed.json are no longer written; step needs are zips (cast: frames.zip + sscd.zip; describe: transcribe.zip, ocrsubs.zip, cast.zip; ...). Readers use the zips and download.zip's summary.
+- **Blob metadata on every zip:** idx_v, idx_sha256, idx_inputs, idx_node, idx_at, idx_summary (ASCII JSON, under 8 KB, re-sent on every write).
+- **Reads:** a node downloads the zips it needs and reads members locally; tools range-read one member (end record, central directory, member) pinned with If-Match on the ETag, restarting once on a 412. Ghosted zips are restored first.
+- **Cast crops** are one joined file per 10-minute chunk (cast/crops/NNNN.jpgs + NNNN.json + map.json). The 2 MB chunk rule of thumbs and sscd is gone.
+- **`indexnode repack [--videos id,id] [--dry] [--delete-loose] [--parallel 2]`:** the one-off conversion. It verifies each uploaded zip (members, sizes, CRCs, hash) before it deletes any loose file; dino/ files are deleted, not packed; resumable.
+- **`indexnode status`** prints the layout: repacked, loose and mixed dramas. A 0.10.0 node refuses to process a loose or mixed drama (its jobs stay pending and the log says so). No node reads both layouts: stop all nodes, repack, then update (see PROTOCOL.md).
+
 ## 0.9.1
 
 - **Every new download is classified first.** Download jobs from the watch stage (channels and playlists) and `enqueue` are created `idx_state=unclassified`, with `title`, `duration`, `channelId`, `channelName`, `availability` and `source` from the listing. No node claims them (claims and 0.9.0 stage batches match `pending` only; checked in IndexNode and Medusa).

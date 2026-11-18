@@ -108,6 +108,7 @@ public sealed class CommentsStage(Tools tools, IStore store, DownloadGate gate) 
             var snap = CommentsSnapshot.Build(infos.ToArray());
             var name = paths.Video(id, $"comments/{CommentsSnapshot.BlobTimestamp(DateTimeOffset.UtcNow)}.json");
             await ctx.Store.PutAsync(name, JsonSerializer.SerializeToUtf8Bytes(snap), null, null, false, ct);
+            await StageCommit.CommitAsync(ctx.Store, id, "comments", ctx.NodeId, true, ct);   // rounds add to comments.zip
             Log.Info($"comments {id}: snapshot with {(int)snap["count"]!} comments");
 
             // one round, then done: a follow-up is requested only by the AI step (CommentsFollowUp.RequestAsync)

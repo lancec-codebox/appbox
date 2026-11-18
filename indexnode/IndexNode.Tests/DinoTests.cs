@@ -125,7 +125,7 @@ public class DinoTests
     {
         Assert.Contains("dino", ProcessStage.KnownSteps); Assert.DoesNotContain("dino", Protocol.DefaultSteps); Assert.DoesNotContain("dino", ProcessStage.FullSteps);
         Assert.Contains("dino", Protocol.StepStages); Assert.Equal(["dino/"], ProcessStage.Owned["dino"]);
-        Assert.Equal(["frames/manifest.json"], Protocol.NeedsOf("dino"));
+        Assert.Equal(["frames.zip"], Protocol.NeedsOf("dino"));
     }
 
     [Fact]

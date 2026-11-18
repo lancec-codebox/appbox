@@ -173,6 +173,53 @@ Each decision is written to `classify/<id>.json` (`candidate`, `kind`, `reason`,
 
 A stage's marker (`downloaded.json`, `processed.json`) is the only signal that its outputs are complete.
 
+## One zip per stage (IndexNode 0.10.0 / Medusa 1.9.0)
+
+Per drama `index/videos/<id>/` holds `video.mp4` (and `compact.mp4`) as blobs plus one standard zip per stage: `download.zip`, `frames.zip`, `sscd.zip`, `thumbs.zip`, `transcribe.zip`, `ocrsubs.zip`, `cast.zip`, `sync.zip`, `describe.zip`, `translate.zip`, `comments.zip`. About 12 files per drama, not about 430. The per-file paths of "Outputs" above are unchanged: they are the **member names** (`frames/0003.mjpeg`, `cast/clusters.json`, `info.json`). Each file maps to exactly one stage zip:
+
+| zip | members |
+|---|---|
+| download | info.json, description.txt, thumb.jpg, subs/ (downloaded.json is not a member: it is the zip's `idx_summary`) |
+| frames | frames/, keyframes/ |
+| sscd | sscd/ (sscd/frames/NNNN.json are the frames indexes as the sscd pass rewrote them; frames.zip is never patched) |
+| thumbs | thumbs/ (the 2 MB chunk limit is gone: the zip may be ghosted) |
+| transcribe | asr/ |
+| ocrsubs | ocr/ |
+| cast | cast/ (face crops joined, see below) |
+| sync | sync.json |
+| describe | describe.json |
+| translate | subs/ai/ |
+| comments | comments/ |
+
+**Format.** A standard zip: real CRC-32, members **stored** (no compression), zip64 when a size, offset or count needs it; it opens in any zip tool. Written **whole, once, by its own stage**, and never patched: one upload (Put Blob, or Put Block + Put Block List with the metadata in the same call), no appends, no leases, no second writer. A rerun writes a new whole zip over the old one from the node's local copy; the comments rounds and partial redos merge the members they did not rewrite into the new zip. Block ids carry no meaning, so Nexis ghosting costs nothing.
+
+**Completion.** The zip's existence is the completion signal. `downloaded.json` and `processed.json` are no longer written; readers use download.zip and its summary (`downloaded.json` reads as that summary, `processed.json` as a view of the frames and transcribe zips' metadata).
+
+**Needs** are zips: sscd/dino/clip/thumbs need `frames.zip`; cast needs `frames.zip` + `sscd.zip`; sync needs `transcribe.zip` + `ocrsubs.zip`; describe needs `transcribe.zip`, `ocrsubs.zip`, `cast.zip`; translate needs `describe.zip`.
+
+**Blob metadata on every zip** (HTTP headers, so ASCII; under Azure's 8 KB; a Put keeps neither metadata nor tags, so every write sends all of both):
+- `idx_v`: the stage's format version (1).
+- `idx_sha256`: SHA-256 of the zip.
+- `idx_inputs`: SHA-256 of the input zips' `idx_sha256` values (in the order of Needs, "-" for a missing one): a stage is stale when it differs from the inputs' current fingerprint. download has no inputs.
+- `idx_node`, `idx_at`: who wrote it and when.
+- `idx_summary`: compact JSON, non-ASCII as \uXXXX. download: the former downloaded.json (duration, height, embeddable, audio language and tracks, subtitle tracks, network, origin ...); describe: `titleEn`, `leads`; transcribe: the ASR model. Over the limit it falls back to `{}`.
+Listing `index/videos/<id>/` with `include=metadata` returns every stage's summary of a drama in one call.
+
+**Cast crops.** `cast/cand_[hs_]C_K.jpg` are no longer one file each: per 10-minute chunk of the drama `cast/crops/NNNN.jpgs` holds the whole JPEGs back to back, `cast/crops/NNNN.json` is `[[off, len], ...]`, and `cast/crops/map.json` maps `cand_C_K` to `[chunk, index]`. IndexNode's reads keep the old names (the store turns a read of `cast/cand_0_3.jpg` into the slice); the publish step and describe's poster sheets read them the same way.
+
+**Reading.**
+- Pipeline nodes download the zips they need into their cache (a zip of at most 64 MB; `WholeZipLimit`) and read members locally.
+- Tools and the site range-read one member: Get Blob Properties (size, ETag), the end record, the central directory, the member, each range request with `If-Match: <etag>`. A 412 (the zip was rewritten) restarts the read once from the new ETag.
+- Ghosts: both modes go through the Nexis touch and restore first (`Tools/NexisAccess.cs`), as for any big blob.
+
+**Writing.** A stage writes its files into the node's local folder as before; when the stage finishes for the drama the whole zip is built, hashed and uploaded with its metadata, and only then is the step marked done. A failed or released step discards what it staged. Medusa 1.9.0 writes `download.zip` + `video.mp4` the same way (same members, same metadata, same summary): video.mp4 first, download.zip last. For the library store-to-index path download.zip is created with `If-None-Match: *` after video.mp4 is uploaded; a 409/412 means the drama is already in the index and nothing is replaced. A drama with a video and no download.zip is half-written, never complete.
+
+**Switch-over: no live transition, no node reads both layouts.**
+1. Stop all nodes (`indexnode control`).
+2. Put the **0.10.0 binary** on one node (not the hexad host); `repack` exists only in 0.10.0 and it is a one-shot command, not the node loop, so it runs fine on that machine while every node is stopped (the node's service stays stopped; run it from a shell with the node's config/SAS). Then run `indexnode repack --dry`, then `indexnode repack --delete-loose` (`--videos id,id` for some dramas, `--parallel N`, default 2). Per drama it downloads the loose files of each stage (restoring ghosts), builds the stage zips with their metadata, uploads them, re-reads the uploaded zip by ranges and compares the member list, sizes, CRCs and the stored hash with the loose files, and only then deletes the loose files. The retired `dino/` files, `processed.json` and `downloaded.json` are deleted, not packed. The optional `clip/` files stay loose, outside the zips. A drama with all its zips verified and no loose files is skipped, so an interrupted run resumes; a drama whose zip fails verification keeps its loose files and the command exits 1.
+3. Release IndexNode and Medusa with the new layout; `indexnode status` prints `Layout: N repacked, N loose, N mixed`.
+4. Resume. A 0.10.0 node **refuses to process a drama that still has loose files** (loose, or mixed: zips and loose files): its jobs stay pending, the log says so once and the status lists it.
+
 ## Cue shaping (no "bunching")
 
 Every subtitle track we write or serve: our transcript, OCR, uploaded or automatic YouTube subtitles, and AI translations. Each goes through one shaping pass so the subtitles stay **incremental**: short cues that follow the speech, never one cue that piles up a paragraph over many seconds and then drops away. On the test drama, the transcript had 47 cues over 7 s (the longest 26 s and 85 characters); the burned-in OCR had none.

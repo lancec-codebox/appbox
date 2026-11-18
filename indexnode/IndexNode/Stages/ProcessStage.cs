@@ -138,6 +138,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             else originalBytes = listing.GetValueOrDefault(videoBlob);
 
             Task Put(string name, byte[] data, string type) => wst.PutAsync(paths.Video(id, name), data, null, null, false, ct, type);
+            Task Commit(string stage) => StageCommit.CommitAsync(store, id, stage, ctx.NodeId, false, ct);   // the stage's zip goes up whole; its existence is the step's completion
             int frameCount = 0;
             if (need["frames"])
             {
@@ -145,7 +146,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 int segs = ctx.ThreadShare();
                 var r = await Frames.ProduceAsync(tools, video, work, FrameSettings.From(config), segs, duration, p => ctx.Report("frames", p), (name, bytes, type) => wst.PutAsync(paths.Video(id, name), bytes, null, null, false, ct, type), ct);
                 frameCount = r.Kept;
-                // both manifests are written last, so the three GPU steps are ready now: one marker each wakes the on-demand GPU node
+                await Commit("frames");
+                // frames.zip is up, so the three GPU steps are ready now: one marker each wakes the on-demand GPU node
                 var marked = await GpuRouting.WriteReadyMarkersAsync(store, paths, id, ct, GpuFlag);
                 Log.Info($"process {id}: gpu-ready markers written for {(marked.Length == 0 ? "(none: GPU routing is off or no pending GPU step)" : string.Join(',', marked))}");
                 Log.Info($"process {id}: {r.Kept} frames kept of {r.Sampled} sampled ({r.FrameBytes / 1048576.0:F1} MB AV1) and {r.Keyframes} keyframes ({r.KeyframeBytes / 1048576.0:F1} MB all-intra AV1)");
@@ -167,6 +169,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 var (keep, rep) = FrameChunks.SscdPass(fs.Times, bytes, Sscd.Dim, fset.SscdCosine, fset.LookbackSeconds);
                 await FrameChunks.ApplySscdPassAsync(wst, paths, id, fs, rep, keep, fset.SscdCosine, fset.LookbackSeconds, ct);
                 Log.Info($"process {id}: sscd pass kept {keep.Count} of {rep.Length} frames");
+                await Commit("sscd");
             }
             if (need["dino"])
             {   // after sscd: DINOv2-small vectors from the stored frames (opt-in step)
@@ -182,6 +185,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 int n = await Thumbs.RunStoredAsync(tools, wst, paths, id, Math.Max(1, ctx.ThreadShare()), m => ctx.Report("thumbs", m), ct, tm);
                 Log.Info($"process {id}: thumbs {tm}");
                 Log.Info($"process {id}: thumbs {n} thumbnails");
+                await Commit("thumbs");
             }
             if (need["clip"])
             {
@@ -195,11 +199,13 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             {
                 ctx.Report("transcribe", null);
                 Log.Info($"process {id}: transcribe {await StageSteps.TranscribeAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("transcribe", p), ct)}");
+                await Commit("transcribe");
             }
             if (need["ocrsubs"])
             {
                 ctx.Report("ocrsubs", null);
                 Log.Info($"process {id}: text {await StageSteps.TextAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("ocrsubs", p), ct)}");
+                await Commit("ocrsubs");
             }
             if (need["cast"])
             {
@@ -216,18 +222,20 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 foreach (var f in Directory.GetFiles(Path.Combine(castDir, "cast")))
                     await wst.PutAsync(paths.Video(id, "cast/" + Path.GetFileName(f)), await File.ReadAllBytesAsync(f, ct), null, null, false, ct, f.EndsWith(".jpg") ? "image/jpeg" : f.EndsWith(".f16") ? "application/octet-stream" : "application/json");
                 }
+                await Commit("cast");
             }
             if (need["describe"])
             {
                 ctx.Report("describe", null);
                 var d = await DescribeJob.GatherAsync(new StoreJob(store, paths, id), Path.Combine(work, "describe"), ct);
                 var bytes = await DescribeJob.RunAsync((Chat?.Invoke(http, Ai!) ?? new AiClient(http, Ai!)), Ai, d, ct);
-                if (bytes != null) await wst.PutAsync(paths.Video(id, "describe.json"), bytes, null, null, false, ct);
+                if (bytes != null) { await wst.PutAsync(paths.Video(id, "describe.json"), bytes, null, null, false, ct); await Commit("describe"); }
             }
             if (need["translate"])
             {
                 ctx.Report("translate", null);
                 Log.Info($"process {id}: translate {await StageSteps.TranslateAsync((Chat?.Invoke(http, Ai!) ?? new AiClient(http, Ai!)), Ai!, new StoreJob(store, paths, id), (n, b, type) => wst.PutAsync(paths.Video(id, n), b, null, null, false, ct, type), Redo, m => Log.Info($"process {id}: translate {m}"), ct)}");
+                await Commit("translate");
             }
             long compactBytes = 0;
             if (need["compress"])
@@ -281,6 +289,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 if (lines != null && asrFile != null && AvSync.FromFiles(lines.Data, asrFile.Data) is { } sync)
                 {
                     await wst.PutAsync(paths.Video(id, "sync.json"), AvSync.ToJson(sync), null, null, false, ct);
+                    await Commit("sync");
                     avOffset = sync.Offset; avSuspect = sync.Suspect;
                     Log.Info($"process {id}: av sync offset {sync.Offset:+0.00;-0.00} s, drift {sync.Drift:0.00} s{(sync.Suspect ? " (SUSPECT)" : "")}");
                 }

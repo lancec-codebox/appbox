@@ -23,7 +23,7 @@ public class StepJobTests
     public void Step_jobs_know_their_dependencies()
     {
         Assert.Null(JobDescriptor.NewStep("frames", "v").Needs);
-        Assert.Equal(["frames/manifest.json"], JobDescriptor.NewStep("sscd", "v").Needs);
+        Assert.Equal(["frames.zip"], JobDescriptor.NewStep("sscd", "v").Needs);
         Assert.Equal(2, JobDescriptor.NewStep("cast", "v").Needs!.Length);
         Assert.Equal(2, JobDescriptor.NewStep("sync", "v").Needs!.Length);
         Assert.Equal(3, JobDescriptor.NewStep("describe", "v").Needs!.Length);

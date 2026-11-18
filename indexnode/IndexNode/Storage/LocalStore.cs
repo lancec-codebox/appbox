@@ -78,6 +78,9 @@ public sealed class LocalStore(string root) : IStore
 /// </summary>
 public sealed class RedirectStore(IStore inner, string from, string to) : IStore
 {
+    public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(W(name), ct);
+    public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => inner.GetRangeAsync(W(name), off, len, ifMatch, ct);
+    public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) => inner.PutZipAsync(W(name), path, metadata, tags, onlyIfNew, ct);
     public IStore Inner => inner;
     string W(string name) => name.StartsWith(from, StringComparison.Ordinal) ? to + name[from.Length..] : name;
 

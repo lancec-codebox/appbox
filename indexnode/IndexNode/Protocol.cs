@@ -18,15 +18,15 @@ public static partial class Protocol
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
-    /// <summary>Files (relative to videos/&lt;id&gt;/) a step job waits for before a node claims it.</summary>
+    /// <summary>Stage zips (relative to videos/&lt;id&gt;/) a step job waits for before a node claims it: a zip's existence is its stage's completion signal (0.10.0).</summary>
     public static string[] NeedsOf(string step) => step switch
     {
-        "sscd" or "dino" or "clip" or "thumbs" => ["frames/manifest.json"],
+        "sscd" or "dino" or "clip" or "thumbs" => ["frames.zip"],
         // 0.7: cast reads the stored frames (no keyframes), after the SSCD pass has rewritten their index; jobs created before keep their stored needs
-        "cast" => ["frames/manifest.json", "sscd/manifest.json"],
-        "sync" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json"],
-        "describe" => ["asr/" + Transcribe.ModelName + ".zh.json", "ocr/lines.json", "cast/clusters.json"],
-        "translate" => ["describe.json"],
+        "cast" => ["frames.zip", "sscd.zip"],
+        "sync" => ["transcribe.zip", "ocrsubs.zip"],
+        "describe" => ["transcribe.zip", "ocrsubs.zip", "cast.zip"],
+        "translate" => ["describe.zip"],
         _ => [],
     };
     public static readonly TimeSpan NeedsRetry = TimeSpan.FromMinutes(2);

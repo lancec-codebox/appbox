@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "force", "json" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "force", "json", "delete-loose" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -52,6 +52,7 @@ public static class Program
         indexnode tools install --ytdlp-zipapp
         indexnode gpu markers [--dry]
         indexnode status [--json]
+        indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel 2]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
         indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
         indexnode publish [--out <dir>] [--job <id>] [--since <time>] [--local <dir>] [--force]   (site packs per PACK.md; default out: %LOCALAPPDATA%\indexnode\site)
@@ -89,6 +90,7 @@ public static class Program
                 "dev" => await DevCommands.RunAsync(a),
                 "stages" => await StagesCommand.RunAsync(a),
                 "ensure" => await EnsureCommand.RunAsync(a),
+                "repack" => await Commands.RepackAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
                 "search" => await Commands.SearchAsync(a),
                 "status" => await Commands.StatusAsync(a),
@@ -133,12 +135,12 @@ public static class Commands
         return h;
     }
 
-    internal static (NodeConfig Cfg, RestStore Store, Paths Paths, HttpClient Http) Open(Args a)
+    internal static (NodeConfig Cfg, IStore Store, Paths Paths, HttpClient Http) Open(Args a)
     {
         var cfg = NodeConfig.Load();
         if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
         var http = NewHttp();
-        return (cfg, new RestStore(http, cfg.Sas), new Paths(a.Get("prefix") ?? "index/"), http);
+        return (cfg, StageZipStore.Wrap(new RestStore(http, cfg.Sas)), new Paths(a.Get("prefix") ?? "index/"), http);
     }
 
     public static string VersionString => typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
@@ -500,6 +502,14 @@ public static class Commands
         return 0;
     }
 
+    public static async Task<int> RepackAsync(Args a)
+    {
+        var (cfg, store, paths, _) = Open(a);
+        var only = a.Get("videos")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Concat(a.Positional.Skip(1)).ToList();
+        using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        return await Repack.RunAsync(store, paths, cfg.NodeId ?? "repack", only is { Count: > 0 } ? only : null, a.Has("dry"), a.Has("delete-loose"), int.TryParse(a.Get("parallel"), out var par) ? par : 2, Console.WriteLine, cts.Token);
+    }
+
     public static async Task<int> StatusAsync(Args a)
     {
         var (cfg, store, paths, _) = Open(a);
@@ -507,6 +517,8 @@ public static class Commands
         if (a.Has("json")) { Console.WriteLine(StatusSnapshot.Serialize(await StatusSnapshot.BuildAsync(store, paths, now, default))); return 0; }
         Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  workers={cfg.Workers ?? 2}  threads={cfg.EffectiveThreads}");
 
+        var layout = await Repack.CountAsync(Repack.Raw(store), paths, default);
+        Console.WriteLine($"\nLayout: {layout.Repacked} repacked, {layout.Loose} loose, {layout.Mixed} mixed (0.10.0 nodes refuse loose and mixed dramas until `indexnode repack --delete-loose` has run){(layout.Loose + layout.Mixed > 0 ? "\n  " + string.Join(" ", layout.LooseIds.Concat(layout.MixedIds).Take(20)) : "")}");
         Console.WriteLine("\nNodes");
         var nodeBlobs = await store.ListAsync(paths.NodesDir, false, false, default);
         var nodes = new List<NodeInfo>();

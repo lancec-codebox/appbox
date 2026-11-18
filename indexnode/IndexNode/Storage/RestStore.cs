@@ -240,10 +240,46 @@ public sealed class RestStore : IStore
         return sb.Append("</BlockList>").ToString();
     }
 
-    public async Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct)
+    public async Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
+    {
+        for (int pass = 0; ; pass++)
+        {
+            using var r = await SendAsync(() => Req(HttpMethod.Head, ReadUri(name)), ct);
+            if (r.StatusCode == HttpStatusCode.NotFound) return null;
+            if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Properties");
+            long size = r.Content.Headers.ContentLength ?? 0;
+            if (size == 0 && pass == 0 && !ReadSnapshots.ContainsKey(name) && await HydrateGhostAsync(name, ct)) continue;   // a ghost: hydrated, asked again
+            var meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var h in r.Headers) if (h.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase)) meta[h.Key[10..]] = h.Value.FirstOrDefault() ?? "";
+            return new BlobProps(size, r.Headers.ETag?.Tag, meta);
+        }
+    }
+
+    public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1);
+            if (ifMatch != null) q.Headers.TryAddWithoutValidation("If-Match", ifMatch);
+            return q;
+        }, ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return new(null, false);
+        if (r.StatusCode == HttpStatusCode.PreconditionFailed) return new(null, true);
+        if (r.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable) return new([], false);
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (range)");
+        return new(await r.Content.ReadAsByteArrayAsync(ct), false);
+    }
+
+    public async Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) =>
+        await PutFileCoreAsync(name, path, "application/zip", null, metadata, tags, onlyIfNew, ct);
+
+    public Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct) =>
+        PutFileCoreAsync(name, path, contentType, progress, null, null, false, ct);
+
+    private async Task<bool> PutFileCoreAsync(string name, string path, string contentType, IProgress<long>? progress, IReadOnlyDictionary<string, string>? metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct)
     {
         var length = new FileInfo(path).Length;
-        if (length == 0) { await PutAsync(name, [], null, null, false, ct, contentType); return; }
+        if (length == 0) { return await PutAsync(name, [], tags, null, onlyIfNew, ct, contentType); }
         int count = (int)((length + BlockSize - 1) / BlockSize);
         var ids = Enumerable.Range(0, count).Select(BlockId).ToList();
         long done = 0;
@@ -286,10 +322,15 @@ public sealed class RestStore : IStore
         {
             var q = Req(HttpMethod.Put, BlobUri(name, "comp=blocklist"));
             q.Headers.TryAddWithoutValidation("x-ms-blob-content-type", contentType);
+            if (metadata != null) foreach (var kv in metadata) q.Headers.TryAddWithoutValidation("x-ms-meta-" + kv.Key, kv.Value);
+            if (tags is { Count: > 0 }) q.Headers.TryAddWithoutValidation("x-ms-tags", EncodeTags(tags));
+            if (onlyIfNew) q.Headers.TryAddWithoutValidation("If-None-Match", "*");
             q.Content = new StringContent(BlockListXml(ids), Encoding.UTF8, "application/xml");
             return q;
         }, ct);
+        if (onlyIfNew && (rl.StatusCode == HttpStatusCode.Conflict || rl.StatusCode == HttpStatusCode.PreconditionFailed)) return false;
         if (!rl.IsSuccessStatusCode) throw await Fail(rl, "Put Block List");
+        return true;
     }
 
     public async Task DownloadToFileAsync(string name, string path, CancellationToken ct)
