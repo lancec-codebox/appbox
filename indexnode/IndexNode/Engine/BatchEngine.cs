@@ -70,8 +70,8 @@ public sealed partial class NodeEngine
         return UnknownSeconds;
     }
 
-    /// <summary>The best dramas first (priority, then the oldest pending step), up to --batch of them or --batch-hours of video; each drama's pending steps this node runs are held (idx_hold) for 10 minutes.</summary>
-    private async Task<List<BatchDrama>> SelectBatchAsync(WorkerState state, List<string> open, CancellationToken ct)
+    /// <summary>The one selection both the node and `batch explain` use: the best dramas this node can run, skipping those another node holds BEFORE the --batch cap is applied (so a top-N held elsewhere never empties the batch).</summary>
+    private async Task<(List<DramaPick> Picks, HashSet<string> Foreign, int Examined, System.Collections.Concurrent.ConcurrentDictionary<string, int> Why)> PickAsync(WorkerState state, List<string> open, CancellationToken ct)
     {
         var foreign = await ForeignHoldsAsync(ct);
         var why = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(); int examined = 0;
@@ -81,7 +81,14 @@ public sealed partial class NodeEngine
             var r = await WhyNotAsync(state, st, b, c);
             if (r != null) why.AddOrUpdate(r.Split(':', ' ')[0] is "need" ? "a need missing" : r.StartsWith("loose") ? "loose layout" : r.StartsWith("ignored") ? "ignored" : r.StartsWith("gpu") ? "gpu hold" : r.StartsWith("CanRun") ? "CanRun false" : "job body gone", 1, (_, v) => v + 1);
             return r == null;
-        }, ct, Math.Max(1, o.Batch));
+        }, ct, Math.Max(1, o.Batch), foreign.Contains);
+        return (picks, foreign, examined, why);
+    }
+
+    /// <summary>The best dramas first (priority, then the oldest pending step), up to --batch of them or --batch-hours of video; each drama's pending steps this node runs are held (idx_hold) for 10 minutes.</summary>
+    private async Task<List<BatchDrama>> SelectBatchAsync(WorkerState state, List<string> open, CancellationToken ct)
+    {
+        var (picks, foreign, examined, why) = await PickAsync(state, open, ct);
         var root = Path.Combine(Path.GetTempPath(), "indexnode", "batch-" + Environment.ProcessId + "-" + instanceTag + "-" + (batchNumber + 1));
         var batch = new List<BatchDrama>(); double total = 0, cap = o.BatchHours * 3600; int foreignSkipped = 0;
         if (picks.Count == 0 && examined > 0) Log.Info($"batch: nothing eligible: {examined} pending step job(s) looked at: {string.Join(", ", why.OrderByDescending(k => k.Value).Select(k => k.Value + " " + k.Key))}; `indexnode batch explain` shows each");
@@ -120,6 +127,7 @@ public sealed partial class NodeEngine
         }
         say($"pending step jobs (due, tagged pending): {string.Join(", ", perStage.Select(k => k.Key + "=" + k.Value))}; {byDrama.Count} drama(s)");
         var order = Tags.ClaimOrder(byDrama.Select(g => new BlobEntry(g.Key, Tags.Job("pass", "pending", g.Value.Values.Select(b => b.Tags.GetValueOrDefault(Tags.Added) ?? "").OrderBy(x => x, StringComparer.Ordinal).First(), null, g.Value.Values.Max(b => Tags.PriorityOf(b.Tags))), new Dictionary<string, string>(), "available", 0))).ToList();
+        var chosen = (await PickAsync(state, open, ct)).Picks.Select(p => p.Id).ToHashSet();   // exactly what the node would take
         var reasons = new Dictionary<string, int>(); var picks = new List<string>(); int shown = 0;
         foreach (var key in order)
         {
@@ -131,7 +139,7 @@ public sealed partial class NodeEngine
                 if (why == null) eligible = true; else { var k = why.StartsWith("need") ? "a need missing" : why.Split(':')[0]; reasons[k] = reasons.GetValueOrDefault(k) + 1; }
             }
             if (eligible && foreign.Contains(key.Name)) { lines.Add("    held by another node: skipped"); eligible = false; reasons["foreign hold"] = reasons.GetValueOrDefault("foreign hold") + 1; }
-            if (eligible && picks.Count < Math.Max(1, o.Batch)) picks.Add(key.Name);
+            if (eligible && chosen.Contains(key.Name)) picks.Add(key.Name);
             if (shown++ < top) { say($"  {key.Name}  priority {Tags.PriorityOf(key.Tags)}  oldest pending {key.Tags.GetValueOrDefault(Tags.Added)}  {(eligible ? "-> ELIGIBLE" : "-> no")}"); foreach (var l in lines) say(l); }
             if (picks.Count >= Math.Max(1, o.Batch) && shown >= top) break;
         }

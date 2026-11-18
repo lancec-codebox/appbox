@@ -50,17 +50,19 @@ public static class PriorityTool
             var tags = await store.GetTagsAsync(name, ct);
             if (tags == null) { Skip("no such job"); continue; }
             var state = tags.GetValueOrDefault(Tags.State);
-            if (state != "pending") { Skip(state == "done" ? "done" : state == "failed" ? "failed" : $"state {state}"); continue; }
+            bool sourceDone = stage == "refresh" && state == "done"; // a source with the schedule once or off is done between runs: its priority still changes
+            if (state != "pending" && !sourceDone) { Skip(state == "done" ? "done" : state == "failed" ? "failed" : $"state {state}"); continue; }
             var lease = await store.AcquireLeaseAsync(name, Protocol.LeaseSeconds, ct);
             if (lease == null) { Skip("leased"); continue; }
             try
             {
                 tags = await store.GetTagsAsync(name, ct); // confirm under the lease
                 var body = await store.GetAsync(name, ct);
-                if (tags == null || body == null || tags.GetValueOrDefault(Tags.State) != "pending") { Skip("no longer pending"); continue; }
+                if (tags == null || body == null || tags.GetValueOrDefault(Tags.State) != state) { Skip("no longer pending"); continue; }
                 var job = JobDescriptor.Parse(body.Data); job.Priority = priority; job.Explicit = explicitSet ? true : null;
                 var next = new Dictionary<string, string>(tags);
-                if (priority == 0) next.Remove(Tags.Priority); else next[Tags.Priority] = priority.ToString(CultureInfo.InvariantCulture);
+                if (stage == "refresh" && state == "pending" && Tags.PriorityOf(tags) == Protocol.RefreshNowPriority) { } // a lookup that is due now keeps its boost; the body's priority is what its videos inherit
+                else if (priority == 0) next.Remove(Tags.Priority); else next[Tags.Priority] = priority.ToString(CultureInfo.InvariantCulture);
                 await store.PutAsync(name, job.ToBytes(), next, lease, false, ct);
                 changed++;
             }
@@ -90,14 +92,15 @@ public static class PriorityTool
     {
         Tags.CheckPriority(priority);
         var direct = sourceId.StartsWith("v-", StringComparison.Ordinal);
+        await Sources.MigrateLegacyAsync(store, paths, ct);
         var prios = new Dictionary<string, int>();
-        foreach (var b in await store.ListAsync(paths.JobsDir("watch"), true, false, ct))
+        foreach (var b in await store.ListAsync(paths.JobsDir("refresh"), true, false, ct))
             if (await store.GetAsync(b.Name, ct) is { } c) { var w = JobDescriptor.Parse(c.Data); prios[w.JobId] = w.Priority; }
         var skipped = new Dictionary<string, int>(); int changed = 0, matched = 0;
         if (!direct)
         {
             if (!prios.ContainsKey(sourceId)) throw new ArgumentException($"no source {sourceId}");
-            var r = await SetAsync(store, paths, priority, [("watch", sourceId)], ct, explicitSet: false);
+            var r = await SetAsync(store, paths, priority, [("refresh", sourceId)], ct, explicitSet: false);
             if (r.Changed == 0) throw new InvalidOperationException($"source {sourceId} could not be updated ({string.Join(", ", r.Skipped.Select(k => k.Key))}); try again");
             prios[sourceId] = priority;
         }

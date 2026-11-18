@@ -63,7 +63,7 @@ public static class ScriptsCommand
 
     static async Task<int> RunQueueAsync(IStore store, string prefix, Func<string, string> pending, Func<string, string, string> done, Args a)
     {
-        var idle = WatchStage.ParseEvery(a.Get("idle") ?? "2m"); var cap = WatchStage.ParseEvery(a.Get("max") ?? "2h");
+        var idle = RefreshStage.ParseEvery(a.Get("idle") ?? "2m"); var cap = RefreshStage.ParseEvery(a.Get("max") ?? "2h");
         var node = a.Get("node-name") ?? Environment.MachineName;
         var started = DateTime.UtcNow; var lastWork = DateTime.UtcNow; int ran = 0;
         Console.Error.WriteLine($"scripts: runner {node} watching {prefix}gpu-scripts/pending/ (idle exit {idle}, cap {cap})");

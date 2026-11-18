@@ -29,7 +29,7 @@ public class StepJobTests
         Assert.Equal(3, JobDescriptor.NewStep("describe", "v").Needs!.Length);
         Assert.Equal(["transcribe"], JobDescriptor.NewStep("transcribe", "v").Steps);
         Assert.Equal(Protocol.StepStages.Length + 1, Protocol.ExpandStages(["process"]).Length);
-        Assert.Equal(["watch"], Protocol.ExpandStages(["watch"]));
+        Assert.Equal(["refresh"], Protocol.ExpandStages(["refresh"]));
     }
 
     [Fact]

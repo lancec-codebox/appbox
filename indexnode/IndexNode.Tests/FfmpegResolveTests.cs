@@ -21,7 +21,7 @@ public class FfmpegResolveTests
     {
         Assert.Empty(Tools.MissingFfmpegCapabilities(["sscd"], Essentials, Dec));
         Assert.Equal(["an AV1 decoder (libdav1d)"], Tools.MissingFfmpegCapabilities(["sscd"], Full, " V....D h264  H.264\n"));
-        Assert.Empty(Tools.MissingFfmpegCapabilities(["comments", "watch"], "", ""));
+        Assert.Empty(Tools.MissingFfmpegCapabilities(["comments", "refresh"], "", ""));
     }
 
     [Fact]
@@ -49,7 +49,7 @@ public class FfmpegResolveTests
             Assert.Equal(own, await tools.FfmpegAsync(default));
             var e = await Assert.ThrowsAsync<InvalidOperationException>(() => tools.CheckFfmpegAsync(["frames"], default));
             Assert.Contains(own, e.Message); Assert.Contains("libsvtav1", e.Message);
-            await tools.CheckFfmpegAsync(["comments", "watch"], default);   // no ffmpeg stages: nothing checked
+            await tools.CheckFfmpegAsync(["comments", "refresh"], default);   // no ffmpeg stages: nothing checked
         }
         finally { Environment.SetEnvironmentVariable("PATH", oldPath); Environment.SetEnvironmentVariable("INDEXNODE_CONFIG_DIR", oldCfg); try { Directory.Delete(root, true); } catch { } }
     }

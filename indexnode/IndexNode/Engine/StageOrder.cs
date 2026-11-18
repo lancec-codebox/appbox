@@ -38,9 +38,9 @@ public static class StageOrder
         Func<string, BlobEntry, CancellationToken, Task<bool>> eligible, CancellationToken ct) =>
         (await HeadsAsync(stages, pending, eligible, ct)).Select(x => x.Stage).ToList();
 
-    /// <summary>The dramas (at most <paramref name="max"/>) with a claimable pending step in <paramref name="stages"/>, best first: priority descending, then the oldest pending step's idx_added, then id.</summary>
+    /// <summary>The dramas (at most <paramref name="max"/>, not counting those <paramref name="skip"/> excludes) with a claimable pending step in <paramref name="stages"/>, best first: priority descending, then the oldest pending step's idx_added, then id.</summary>
     public static async Task<List<DramaPick>> DramasAsync(IEnumerable<string> stages, Func<string, CancellationToken, Task<IReadOnlyList<BlobEntry>>> pending,
-        Func<string, BlobEntry, CancellationToken, Task<bool>> eligible, CancellationToken ct, int max = 5)
+        Func<string, BlobEntry, CancellationToken, Task<bool>> eligible, CancellationToken ct, int max = 5, Func<string, bool>? skip = null)
     {
         var groups = new Dictionary<string, Dictionary<string, BlobEntry>>(StringComparer.Ordinal);
         foreach (var stage in stages)
@@ -64,6 +64,7 @@ public static class StageOrder
         foreach (var key in Tags.ClaimOrder(picks.Select(p => p.Key)))
         {
             var pick = picks.First(p => ReferenceEquals(p.Key, key));
+            if (skip != null && skip(pick.Id)) continue;   // e.g. held by another node: not a candidate, so it never uses up a place in the batch
             foreach (var (stage, b) in pick.Members) if (await eligible(stage, b, ct)) { result.Add(pick); break; }
             if (result.Count >= max) break;
         }

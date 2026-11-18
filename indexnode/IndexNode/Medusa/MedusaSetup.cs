@@ -18,7 +18,7 @@ public static class MedusaSetup
         if (o.Conditions is not ("wifi+charging" or "wifi")) throw new ArgumentException("--conditions: wifi+charging or wifi");
         if (o.DailyCap < 0) throw new ArgumentException("--daily-cap must be 0 or more");
         if (o.Schedule != null) CronExpr.Parse(o.Schedule);
-        if (o.Window != null) WatchStage.ParseEvery(o.Window);
+        if (o.Window != null) RefreshStage.ParseEvery(o.Window);
         return new JsonObject
         {
             ["v"] = 1, ["kind"] = Kind, ["sas"] = o.Sas, ["nodeName"] = o.NodeName, ["conditions"] = o.Conditions, ["dailyCap"] = o.DailyCap,

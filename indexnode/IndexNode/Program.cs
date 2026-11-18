@@ -41,10 +41,13 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages watch,process,comments] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--batch 6] [--batch-hours 12] [--lanes 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--batch 6] [--batch-hours 12] [--lanes 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
-        indexnode sources add <url> [--every 1h] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
+        indexnode sources add <url> [--every 1d|6h|daily@03:00] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
+        indexnode sources schedule <id> off|once|1d|6h|daily@03:00   (new sources are "once": looked up on add, never refreshed unless scheduled)
+        indexnode sources lookup <id>   (full listing again: every member recorded, every unknown video queued)
+        indexnode sources refresh <id>|--all-due   (incremental: only videos new since the last run; due now at priority 500)
         indexnode ai test [--ai-base-url ...]
         indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F] [--priority N]
         indexnode priority set <N> --job <id>... | --from <file> | --channel <id|url> [--stage download] [--with-steps]
@@ -163,12 +166,13 @@ public static class Commands
         var requested = (a.Get("stages") ?? (gpu ? string.Join(',', GpuRouting.MarkerStages) : string.Join(',', Protocol.DefaultNodeStages))).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var stages = Protocol.ExpandStages(requested);
         foreach (var s in stages) if (!Protocol.Stages.Contains(s)) throw new ArgumentException($"unknown stage '{s}'");
+        if (!gpu && stages.Contains("download") && !stages.Contains("refresh") && !a.Has("no-refresh")) stages = [.. stages, "refresh"]; // 0.10.3: a download node also lists sources (a lookup on add, scheduled refreshes), unless --no-refresh
         if (gpu)
         {
             stages = GpuRouting.GpuNodeStages(stages);
             if (stages.Length == 0) throw new ArgumentException("--gpu runs only sscd, clip, cast and ocrsubs; --stages names none of them");
         }
-        TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? WatchStage.ParseEvery(ew) : null;
+        TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? RefreshStage.ParseEvery(ew) : null;
         foreach (var old in new[] { "jobs", "max-heavy", "workers" }) if (a.Get(old) != null) Console.Error.WriteLine($"indexnode: --{old} is ignored since 0.9.0 (a node runs stage batches: --batch N, --batch-hours H, --lanes N)");
         if (cfg.MaxHeavy != null || cfg.Jobs != null || cfg.Workers != null) Console.Error.WriteLine("indexnode: config jobs / max-heavy / workers are ignored since 0.9.0 (use batch, batch-hours, lanes)");
         int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 2;
@@ -192,7 +196,7 @@ public static class Commands
             ["download"] = new DownloadStage(tools, store, gate),
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
             ["comments"] = new CommentsStage(tools, store, gate),
-            ["watch"] = new WatchStage(tools, store),
+            ["refresh"] = new RefreshStage(tools, store),
             ["availability"] = new AvailabilityStage(tools, store),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
@@ -253,7 +257,7 @@ public static class Commands
             Window = a.Get("window") ?? cfg.Window,
         };
         if (local.Schedule != null) CronExpr.Parse(local.Schedule);
-        if (local.Window != null) WatchStage.ParseEvery(local.Window);
+        if (local.Window != null) RefreshStage.ParseEvery(local.Window);
         var stamp = a.Has("budget") ? "flag" : cfg.BudgetSetAt ?? "";
         return new LimitState(nodeId, local, stamp, Path.Combine(NodeConfig.ConfigDir(), "state.json"));
     }
@@ -270,23 +274,46 @@ public static class Commands
         var sub = a.Positional.FirstOrDefault();
         var (cfg, store, paths, http) = Open(a);
         int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480;
-        var every = a.Get("every");
+        var every = a.Get("every") ?? a.Get("schedule"); // null: "once" (a lookup on add, then nothing unless scheduled)
         switch (sub)
         {
             case "add":
             {
                 var url = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources add <url>");
-                var job = await Sources.ResolveAsync(new Tools(http, cfg), url, every ?? "1h", Sources.ParseTabs(a.Get("tabs")), a.Has("follow-channels"), a.Get("backfill") is { } bf ? int.Parse(bf) : 0, maxHeight, default);
+                var job = await Sources.ResolveAsync(new Tools(http, cfg), url, every ?? "once", Sources.ParseTabs(a.Get("tabs")), a.Has("follow-channels"), a.Get("backfill") is { } bf ? int.Parse(bf) : -1, maxHeight, default);
+                if (a.Get("backfill") == null && job.Kind == "channel") job.Backfill = 0; // a channel's lookup takes its newest uploads as before (100); a playlist's takes every video
                 job.Priority = priority;
                 var created = await Sources.AddAsync(store, paths, job, default);
-                Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId}  {job.Kind}  {job.Name}  every={job.Every} backfill={job.Backfill} followChannels={job.FollowChannels}");
+                Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId}  {job.Kind}  {job.Name}  schedule={Schedule.Of(job).Describe()} backfill={(job.Backfill?.ToString() ?? "all")} followChannels={job.FollowChannels}{(created ? "  lookup due now (priority " + Protocol.RefreshNowPriority + ")" : "")}");
                 return 0;
             }
             case "list":
             {
                 var list = await Sources.ListAsync(store, paths, default);
                 if (list.Count == 0) Console.WriteLine("(no followed sources)");
-                foreach (var j in list) Console.WriteLine(Sources.FormatRow(j));
+                var states = (await store.ListAsync(paths.JobsDir("refresh"), true, false, default)).ToDictionary(b => Path.GetFileNameWithoutExtension(b.Name), b => b.Tags.GetValueOrDefault(Tags.State));
+                foreach (var j in list) Console.WriteLine(Sources.FormatRow(j, states.GetValueOrDefault(j.JobId)));
+                return 0;
+            }
+            case "schedule":
+            {
+                var sid = PriorityTool.SourceId(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources schedule <id> off|once|6h|1d|daily@03:00"));
+                var j = await Sources.SetScheduleAsync(store, paths, sid, a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("sources schedule <id> off|once|6h|1d|daily@03:00"), default);
+                Console.WriteLine($"{sid}: schedule {Schedule.Of(j).Describe()}{(j.NextRefresh != null ? ", next refresh " + j.NextRefresh : ", no further refresh unless triggered (sources refresh " + sid + ")")}");
+                return 0;
+            }
+            case "lookup":
+            case "refresh":
+            {
+                if (sub == "refresh" && a.Has("all-due"))
+                {
+                    var due = await Sources.DueAsync(store, paths, default);
+                    int n = 0; foreach (var d in due) if (await Sources.TriggerAsync(store, paths, d, "refresh", default)) n++;
+                    Console.WriteLine($"{n} scheduled refresh(es) made due now at priority {Protocol.RefreshNowPriority}");
+                    return 0;
+                }
+                var sid = PriorityTool.SourceId(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException($"sources {sub} <id>|--all-due"));
+                Console.WriteLine(await Sources.TriggerAsync(store, paths, sid, sub, default) ? $"{sid}: {sub} due now (priority {Protocol.RefreshNowPriority}); the next free downloader runs it" : $"{sid}: a node is running it right now");
                 return 0;
             }
             case "priority":
@@ -308,7 +335,8 @@ public static class Commands
             case "remove":
             {
                 var id = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources remove <id>");
-                var name = paths.Job("watch", id);
+                await Sources.MigrateLegacyAsync(store, paths, default);
+                var name = paths.Job("refresh", id);
                 if (await store.GetTagsAsync(name, default) == null) { Console.Error.WriteLine($"no source {id}"); return 1; }
                 await store.DeleteAsync(name, default);
                 Console.WriteLine($"removed {id} (its downloaded videos stay)");
@@ -321,7 +349,7 @@ public static class Commands
                 Console.WriteLine($"{r.Added} added, {r.Existed} already existed{(r.Skipped > 0 ? $", {r.Skipped} skipped (no channelId)" : "")}");
                 return 0;
             }
-            default: throw new ArgumentException("sources add <url> | list | remove <id> | import <channels.json> | priority <source id|url> N");
+            default: throw new ArgumentException("sources add <url> | list | remove <id> | import <channels.json> | schedule <id> off|once|6h|1d|daily@03:00 | lookup <id> | refresh <id>|--all-due | priority <source id|url> N");
         }
     }
 
@@ -403,7 +431,7 @@ public static class Commands
         var format = a.Get("format"); int priority = PriorityTool.ParseOption(a.Get("priority"));
         var tools = new Tools(http, cfg);
         int added = 0, existed = 0;
-        var meta = new Dictionary<string, WatchStage.Entry>();
+        var meta = new Dictionary<string, RefreshStage.Entry>();
         foreach (var input in a.Positional)
         {
             var urls = new List<string>();
@@ -411,14 +439,14 @@ public static class Commands
             else
             {
                 Log.Info($"expanding {Redact.Sas(input)}");
-                var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(webpage_url,url)s\t" + WatchStage.ListPrint, input], default);
+                var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(webpage_url,url)s\t" + RefreshStage.ListPrint, input], default);
                 if (r.ExitCode != 0) throw new InvalidOperationException(YtDlp.LastErrorLine(r.Stderr));
                 foreach (var line in r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 {
                     var cut = line.IndexOf('\t'); var u = cut < 0 ? line : line[..cut];
                     if (!u.StartsWith("http")) continue;
                     urls.Add(u);
-                    if (cut >= 0 && WatchStage.ParseLine(line[(cut + 1)..]) is { } le) meta[u] = le;
+                    if (cut >= 0 && RefreshStage.ParseLine(line[(cut + 1)..]) is { } le) meta[u] = le;
                 }
             }
             foreach (var url in urls.Distinct())
@@ -428,8 +456,8 @@ public static class Commands
                 {   // a single video: one metadata call for the classifier (best effort: without it the AI is told the length is unknown)
                     try
                     {
-                        var mr = await tools.RunYtDlpAsync(["--no-warnings", "--skip-download", "--print", WatchStage.ListPrint, url], default);
-                        if (mr.ExitCode == 0 && mr.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() is { } ml) m = WatchStage.ParseLine(ml);
+                        var mr = await tools.RunYtDlpAsync(["--no-warnings", "--skip-download", "--print", RefreshStage.ListPrint, url], default);
+                        if (mr.ExitCode == 0 && mr.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() is { } ml) m = RefreshStage.ParseLine(ml);
                     }
                     catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"enqueue: no metadata for {url}: {e.Message}"); }
                 }
@@ -448,7 +476,7 @@ public static class Commands
     {
         if (a.Positional.FirstOrDefault() != "start") throw new ArgumentException("availability start [--every 1d]");
         var (_, store, paths, http) = Open(a); using var _h = http;
-        var job = AvailabilityStage.NewSweep(a.Get("every") ?? "1d"); WatchStage.ParseEvery(job.Every);
+        var job = AvailabilityStage.NewSweep(a.Get("every") ?? "1d"); RefreshStage.ParseEvery(job.Every);
         bool made = await store.PutAsync(paths.Job("availability", job.JobId), job.ToBytes(), Tags.Job("availability", "pending", job.AddedAt), null, true, default);
         Console.WriteLine(made ? $"availability sweep created (every {job.Every}); a yt-dlp node runs it with --stages ...,availability" : "the availability sweep already exists");
         return 0;
@@ -502,7 +530,7 @@ public static class Commands
         }
         if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain, stop, gpu-hold or --max-per-ip N|off");
         var stage = a.Get("stage");
-        if (stage != null && !Protocol.Stages.Contains(stage)) throw new ArgumentException("--stage must be download, process, comments or watch");
+        if (stage != null && !Protocol.Stages.Contains(stage = Protocol.CanonicalStage(stage))) throw new ArgumentException("--stage must be download, process, comments or refresh (watch is the old name)");
         var c = await ControlWatcher.WriteAsync(store, paths, level, stage, a.Get("message"), cfg.NodeName ?? Environment.UserName, default);
         Console.WriteLine($"control: mode={c.Mode} download={c.Effective("download")} process={c.Effective("process")}{(c.Message != null ? " message=" + c.Message : "")}");
         return 0;
@@ -738,7 +766,7 @@ public static class Commands
             {
                 case "budget": file.Budget = int.Parse(val); file.BudgetSetAt = Protocol.NowUtc(); break;
                 case "schedule": CronExpr.Parse(val); file.Schedule = val; break;
-                case "window": WatchStage.ParseEvery(val); file.Window = val; break;
+                case "window": RefreshStage.ParseEvery(val); file.Window = val; break;
                 case "ai.base-url": (file.Ai ??= new()).BaseUrl = val; break;
                 case "ai.key": (file.Ai ??= new()).Key = val; break;
                 case "ai.text-model": (file.Ai ??= new()).TextModel = val; break;

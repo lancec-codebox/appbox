@@ -465,8 +465,21 @@ public sealed partial class NodeEngine
 
     // ---------------------------------------------------------------- claim
 
+    private long refreshHousekeepingAt;
+
+    /// <summary>Before a node looks for refresh work: moves pre-0.10.3 watch jobs to refresh and answers the admin page's add requests (at most once a minute).</summary>
+    private async Task RefreshHousekeepingAsync(CancellationToken ct)
+    {
+        var last = Interlocked.Read(ref refreshHousekeepingAt); var tick = Environment.TickCount64;
+        if (last != 0 && tick - last < 60_000 || Interlocked.CompareExchange(ref refreshHousekeepingAt, tick, last) != last) return;
+        try { if (handlers.TryGetValue("refresh", out var h) && h is RefreshStage rs) await rs.HousekeepingAsync(paths, ct); else await Sources.MigrateLegacyAsync(store, paths, ct); }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { Log.Info($"refresh: housekeeping failed ({e.Message})"); Interlocked.Exchange(ref refreshHousekeepingAt, 0); }
+    }
+
     private async Task<IReadOnlyList<BlobEntry>> FindPendingAsync(string stage, CancellationToken ct)
     {
+        if (stage == "refresh") await RefreshHousekeepingAsync(ct);
         if (!fallbackListing[0])
         {
             try
@@ -716,7 +729,9 @@ public sealed partial class NodeEngine
         if (due.Length == 0) due = added;
         async Task Rewrite(string state, string? newDue = null)
         {
-            await store.PutAsync(claim.BlobName, job.ToBytes(), Tags.Job(stage, state, added, newDue ?? due, Tags.PriorityOf(claim.Tags)), claim.LeaseId, false, none);
+            // a refresh job is claimed at the high "now" priority; once it has run it goes back to the source's own
+            int prio = stage == "refresh" && state != "pending" || stage == "refresh" && newDue != null ? job.Priority : Tags.PriorityOf(claim.Tags);
+            await store.PutAsync(claim.BlobName, job.ToBytes(), Tags.Job(stage, state, added, newDue ?? due, prio), claim.LeaseId, false, none);
         }
         switch (outcome)
         {

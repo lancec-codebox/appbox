@@ -45,7 +45,7 @@ public sealed class AvailabilityStage(Tools tools, IStore store, Func<DateTimeOf
             var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(id)s", $"https://www.youtube.com/channel/{cid}/videos"], ct);
             var listed = r.ExitCode == 0 ? r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToHashSet() : [];
             if (r.ExitCode != 0) listingsFailed++;
-            bool ingest = await store.GetTagsAsync(paths.Job("watch", "ch-" + cid), ct) != null;
+            bool ingest = await store.GetTagsAsync(paths.Job("refresh", "ch-" + cid), ct) != null || await store.GetTagsAsync(paths.LegacyWatchDir + "ch-" + cid + ".json", ct) != null;
             channels.Add(new JsonObject { ["id"] = cid, ["name"] = members[ids[0] + "|name"]?.ToString(), ["mode"] = ingest ? "ingest" : "check", ["tracked"] = ids.Count, ["listed"] = r.ExitCode == 0 ? listed.Count : null, ["listingOk"] = r.ExitCode == 0 });
             foreach (var id in ids)
             {
@@ -74,7 +74,7 @@ public sealed class AvailabilityStage(Tools tools, IStore store, Func<DateTimeOf
             ["listingsFailed"] = listingsFailed, ["checkedAlone"] = checkedAlone, ["unavailable"] = unavailable, ["channelList"] = channels,
         }, ct);
         job.LastPolled = at; job.Attempts = 0; job.LastError = null;
-        ctx.NextDue = Protocol.Utc(now() + WatchStage.ParseEvery(job.Every ?? "1d"));
+        ctx.NextDue = Protocol.Utc(now() + RefreshStage.ParseEvery(job.Every ?? "1d"));
         Log.Info($"availability: {tracked.Count} tracked, {byChannel.Count} channels ({listingsFailed} listings failed), {checkedAlone} checked alone: {gone} newly unavailable, {restored} back, {unavailable.Count} unavailable in all");
     }
 

@@ -1,3 +1,14 @@
+## 0.10.3
+
+- Fix: a batch node no longer idles when another node holds the top `--batch` dramas. Dramas held by another node are skipped before the `--batch` cap is applied, so the node takes the next best ones. `indexnode batch explain` now uses the same selection as the node, so its picks are what the node takes.
+
+- **"refresh" replaces "watch".** Followed sources are stage `refresh`, jobs `index/jobs/refresh/<sourceId>.json`. The old name still works everywhere: `--stages watch`, `control --stage watch`, the `watch` key of control.json (read as refresh) and existing `jobs/watch/` jobs, which move to `jobs/refresh/` on first touch with their state, due time, priority and schedule.
+- **Adding a source looks it up at once.** `sources add`, the admin page's add request, a channel found by follow-channels and `sources import` create the job due now at priority 500, so the next free downloader lists it. This does not depend on the schedule. After the run the job returns to the source's own priority (its videos inherit that).
+- **Lookup and refresh are different runs** (`kind` on the one job per source: `run`, `lastRun`, `lastLookup`, `lastRefresh`). A lookup is a full listing: every member goes to `index/sources/<id>/members.json` (id, title, duration, channel, availability) and every video not yet known is queued, subject only to the source's backfill (playlists: all; channels: newest 100 as before). A refresh is incremental: a channel's newest uploads until known ones are reached, a playlist's full flat listing, and only new videos are queued.
+- **Schedules are per source.** New sources are `once`: a lookup on add, then nothing. `indexnode sources schedule <id> off|once|6h|1d|daily@03:00` (UTC); `sources add ... --every 1d` still sets one. Existing sources keep the interval they have (most are 1d). `sources list` shows schedule, last run (and kind) and next run.
+- **Manual runs.** `sources lookup <id>` (full listing again) and `sources refresh <id>|--all-due` make the job due now at priority 500; `--all-due` triggers the scheduled sources whose time has come.
+- **Download nodes refresh.** `indexnode run --stages download,...` adds `refresh` unless `--no-refresh`. Refresh jobs are not counted against the node's budget, as before.
+
 ## 0.10.2
 
 - **Claim order fixed (root cause):** Azure's Find Blobs by Tags returns only the tags the query names, so every claim that sorted its result saw no `idx_priority` and no `idx_added`: every job looked like priority 0 with no date and claims came in blob-name order (downloads, every non-batch stage, the batch selection, classify). `Tags.FindFullAsync` runs the query plus `idx_added/idx_due >= ''`, `idx_priority > '0'` and `idx_priority < '0'` and merges by blob name, so the order sees priority (numeric) and date. The test store now returns only the queried tags, as Azure does.

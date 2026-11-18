@@ -41,7 +41,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     {
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         if (value.Equals("off", StringComparison.OrdinalIgnoreCase)) cur.Gpu = null;
-        else { var d = WatchStage.ParseEvery(value); if (d <= TimeSpan.Zero) throw new ArgumentException("gpu-hold must be a positive duration or off"); cur.Gpu = new GpuControl { Hold = value }; }
+        else { var d = RefreshStage.ParseEvery(value); if (d <= TimeSpan.Zero) throw new ArgumentException("gpu-hold must be a positive duration or off"); cur.Gpu = new GpuControl { Hold = value }; }
         cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
         await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
         return cur;
@@ -64,14 +64,16 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     {
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         cur.V = 1;
+        if (stage != null) stage = Protocol.CanonicalStage(stage); // the old "watch" is the refresh stage
         if (stage == null)
         {
             cur.Mode = level;
-            cur.Stages = new() { ["download"] = "run", ["process"] = "run", ["watch"] = "run" }; // a global setting replaces per-stage overrides
+            cur.Stages = new() { ["download"] = "run", ["process"] = "run", ["refresh"] = "run" }; // a global setting replaces per-stage overrides
         }
         else
         {
-            cur.Stages ??= new() { ["download"] = "run", ["process"] = "run", ["watch"] = "run" };
+            cur.Stages ??= new() { ["download"] = "run", ["process"] = "run", ["refresh"] = "run" };
+            if (stage == "refresh") cur.Stages.Remove("watch"); // an old key would be shadowed by the new one
             cur.Stages[stage] = level;
         }
         if (message != null) cur.Message = message;

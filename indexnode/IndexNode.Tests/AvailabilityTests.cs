@@ -71,12 +71,12 @@ public class AvailabilityTests
         var s = new FakeStore(); var yt = new Yt();
         await Track(s, Id('a'), C1); await Track(s, Id('b'), C2);
         yt.Channels[C1] = [Id('a')]; yt.Channels[C2] = [Id('b')];
-        var w = JobDescriptor.NewWatch("channel", C2, "Two", "1h", ["videos"], false, 0, 480);
-        await s.PutAsync(P.Job("watch", w.JobId), w.ToBytes(), Tags.Job("watch", "pending", "2026-11-14T00:00:00Z"), null, false, default);
+        var w = JobDescriptor.NewSource("channel", C2, "Two", "1h", ["videos"], false, 0, 480);
+        await s.PutAsync(P.Job("refresh", w.JobId), w.ToBytes(), Tags.Job("refresh", "pending", "2026-11-14T00:00:00Z"), null, false, default);
         await Sweep(s, yt);
         var modes = J(s, AvailabilityStage.SummaryBlob(P))["channelList"]!.AsArray().ToDictionary(c => c!["id"]!.ToString(), c => c!["mode"]!.ToString());
         Assert.Equal("check", modes[C1]); Assert.Equal("ingest", modes[C2]);
-        Assert.False(s.Exists(P.Job("watch", "ch-" + C1)));
+        Assert.False(s.Exists(P.Job("refresh", "ch-" + C1)));
         Assert.Equal(C1, J(s, AvailabilityStage.MembersBlob(P))[Id('a')]!.ToString());           // learned once, remembered
     }
 }

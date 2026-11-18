@@ -18,12 +18,12 @@ public static class GpuRouting
     public static TimeSpan? EffectiveHold(TimeSpan? flag, ControlFile? control)
     {
         TimeSpan? h = flag;
-        if (h == null && control?.Gpu?.Hold is { Length: > 0 } s && !s.Equals("off", StringComparison.OrdinalIgnoreCase)) { try { h = WatchStage.ParseEvery(s); } catch (Exception) { h = null; } }
+        if (h == null && control?.Gpu?.Hold is { Length: > 0 } s && !s.Equals("off", StringComparison.OrdinalIgnoreCase)) { try { h = RefreshStage.ParseEvery(s); } catch (Exception) { h = null; } }
         return h is { } v && v > TimeSpan.Zero ? v : null;
     }
 
     /// <summary>The --gpu-fallback value: a duration, or "off" for no hold (which also beats the control file).</summary>
-    public static TimeSpan ParseFlag(string v) => v.Equals("off", StringComparison.OrdinalIgnoreCase) ? TimeSpan.Zero : WatchStage.ParseEvery(v);
+    public static TimeSpan ParseFlag(string v) => v.Equals("off", StringComparison.OrdinalIgnoreCase) ? TimeSpan.Zero : RefreshStage.ParseEvery(v);
 
     public const string MarkerDir = "gpu-ready/";
 

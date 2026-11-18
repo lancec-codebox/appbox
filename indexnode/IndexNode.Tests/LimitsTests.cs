@@ -81,7 +81,7 @@ public class LimitsTests
         var l = new LimitState("n", new NodeLimits { Budget = 1 }, "", TempState());
         Finish(l);
         Assert.False(l.TryAcquire("process"));
-        Assert.True(l.TryAcquire("watch")); l.Release("watch", true);
+        Assert.True(l.TryAcquire("refresh")); l.Release("refresh", true);
         Assert.Equal(0, l.Remaining);
     }
 
@@ -147,7 +147,7 @@ public class LimitsTests
     {
         var now = T(14, 12);
         var l = new LimitState("n", new NodeLimits { Schedule = "0 23 * * *", Window = "3h" }, "", null, () => now);
-        Assert.False(l.TryAcquire("process")); Assert.False(l.TryAcquire("watch"));
+        Assert.False(l.TryAcquire("process")); Assert.False(l.TryAcquire("refresh"));
         Assert.Equal("next window " + Protocol.Utc(new DateTimeOffset(T(14, 23))), l.Status());
         now = T(15, 0, 30);   // inside the window that started at 23:00
         Assert.True(l.TryAcquire("process")); Assert.Null(l.Status());

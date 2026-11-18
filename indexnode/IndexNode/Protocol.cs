@@ -14,7 +14,7 @@ public static partial class Protocol
     /// <summary>The step jobs an upload gets by default (download, enqueue, sources): every step stage except the opt-in ones (dino: owner 2026-11-16, not part of ingest; clip: dropped 2026-11-14), which run only when asked for (process --job --steps).</summary>
     public static readonly string[] IngestStepStages = StepStages.Where(s => s is not ("dino" or "clip")).ToArray();
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
-    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "watch", "classify", "availability"];
+    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "refresh", "classify", "availability"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
@@ -44,7 +44,13 @@ public static partial class Protocol
 
     /// <summary>"process" means the legacy stage and all step stages.</summary>
     public static string[] ExpandStages(IEnumerable<string> stages) =>
-        stages.SelectMany(s => s == "process" ? new[] { "process" }.Concat(StepStages) : [s]).Distinct().ToArray();
+        stages.Select(CanonicalStage).SelectMany(s => s == "process" ? new[] { "process" }.Concat(StepStages) : [s]).Distinct().ToArray();
+
+    /// <summary>0.10.3: the "watch" stage is now "refresh"; the old name is accepted everywhere (--stages, control.json, --stage).</summary>
+    public static string CanonicalStage(string stage) => stage.Equals("watch", StringComparison.OrdinalIgnoreCase) ? "refresh" : stage;
+
+    /// <summary>A source's lookup or refresh job is claimed at this priority when it is made due by hand or on add (the job body keeps the source's own priority, which its videos inherit).</summary>
+    public const int RefreshNowPriority = 500;
     // owner 2026-11-14: search vectors (clip) dropped from the default pipeline (weak matches; screenshot search is SSCD). The step still runs when asked for explicitly.
     public static readonly string[] DefaultSteps = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs"];
     public const int LeaseSeconds = 60;
@@ -82,6 +88,10 @@ public sealed class Paths(string prefix)
     public string Video(string id, string file) => $"{Prefix}videos/{id}/{file}";
     public string VideoDir(string id) => $"{Prefix}videos/{id}/";
     public string Control => $"{Prefix}control.json";
+    /// <summary>index/sources/&lt;id&gt;/members.json: every video the last lookup or refresh listed in the source (for the catalog).</summary>
+    public string SourceMembers(string sourceId) => $"{Prefix}sources/{sourceId}/members.json";
+    /// <summary>The pre-0.10.3 name of the refresh jobs folder (migrated on first touch).</summary>
+    public string LegacyWatchDir => $"{Prefix}jobs/watch/";
     public string Node(string nodeId) => $"{Prefix}nodes/{nodeId}.json";
     public string Seed(string file) => $"{Prefix}seeds/{file}";
     public string NodesDir => $"{Prefix}nodes/";
@@ -208,7 +218,20 @@ public sealed class JobDescriptor
     /// <summary>Playlist id, or channel id (UC...).</summary>
     public string? Id { get; set; }
     public string? Name { get; set; }
+    /// <summary>The interval of an "every" schedule (kept for jobs written before 0.10.3, whose only schedule is this); <see cref="Schedule"/> wins when set.</summary>
     public string? Every { get; set; }
+    /// <summary>0.10.3: "once" (the default of a new source: a lookup on add, then never), "off", "6h"/"1d" or "daily@03:00" (UTC).</summary>
+    public string? Schedule { get; set; }
+    /// <summary>0.10.3: what the next claim of this source job does: "lookup" (full listing: every member recorded, every unknown video queued) or "refresh" (incremental: only videos new since the last run).</summary>
+    public string? Run { get; set; }
+    /// <summary>The kind of the last completed run ("lookup" or "refresh").</summary>
+    public string? LastRun { get; set; }
+    public string? LastLookup { get; set; }
+    public string? LastRefresh { get; set; }
+    /// <summary>When the schedule makes the job due next; null when nothing is scheduled.</summary>
+    public string? NextRefresh { get; set; }
+    /// <summary>How many videos members.json lists.</summary>
+    public int? Members { get; set; }
     public string[]? Tabs { get; set; }
     public bool? FollowChannels { get; set; }
     public int? Backfill { get; set; }
@@ -252,11 +275,16 @@ public sealed class JobDescriptor
         Stage = "download", JobId = Protocol.JobIdFor(url), Url = url, MaxHeight = maxHeight, Format = format, Subs = true, AddedAt = Protocol.NowUtc(),
     };
 
-    public static JobDescriptor NewWatch(string kind, string id, string name, string every, string[] tabs, bool followChannels, int backfill, int maxHeight) => new()
+    /// <summary>A followed source. <paramref name="schedule"/> is once | off | 6h | 1d | daily@03:00; a negative <paramref name="backfill"/> means no limit (every unknown video of a playlist is queued on the lookup).</summary>
+    public static JobDescriptor NewSource(string kind, string id, string name, string schedule, string[] tabs, bool followChannels, int backfill, int maxHeight)
     {
-        Stage = "watch", JobId = (kind == "playlist" ? "pl-" : "ch-") + id, Kind = kind, Id = id, Name = name, Every = every, Tabs = tabs,
-        FollowChannels = followChannels, Backfill = backfill, MaxHeight = maxHeight, AddedAt = Protocol.NowUtc(), Attempts = 0,
-    };
+        var sched = IndexNode.Schedule.Parse(schedule);
+        return new()
+        {
+            Stage = "refresh", JobId = (kind == "playlist" ? "pl-" : "ch-") + id, Kind = kind, Id = id, Name = name, Schedule = sched.Text, Every = sched.Kind == "every" ? sched.Text : null, Tabs = tabs,
+            FollowChannels = followChannels, Backfill = backfill < 0 ? null : backfill, MaxHeight = maxHeight, AddedAt = Protocol.NowUtc(), Attempts = 0, Run = "lookup",
+        };
+    }
 
     public static JobDescriptor NewComments(string jobId, string url) => new()
     {
@@ -324,6 +352,7 @@ public sealed class ControlFile
     {
         var g = ParseLevel(Mode);
         var s = Stages != null && Stages.TryGetValue(stage, out var v) ? ParseLevel(v)
+            : stage == "refresh" && Stages != null && Stages.TryGetValue("watch", out var wv) ? ParseLevel(wv) // the control file's pre-0.10.3 "watch" key is the refresh stage
             : Protocol.IsStep(stage) && Stages != null && Stages.TryGetValue("process", out var pv) ? ParseLevel(pv) : Level.Run; // a step follows "process" unless set itself
         return (Level)Math.Max((int)g, (int)s);
     }

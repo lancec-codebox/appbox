@@ -62,7 +62,7 @@ public class GpuTests
     [Fact]
     public void A_gpu_node_keeps_only_the_gpu_stages()
     {
-        Assert.Equal(["sscd", "clip"], GpuRouting.GpuNodeStages(["download", "sscd", "clip", "watch", "sscd"]));
+        Assert.Equal(["sscd", "clip"], GpuRouting.GpuNodeStages(["download", "sscd", "clip", "refresh", "sscd"]));
         Assert.Empty(GpuRouting.GpuNodeStages(["download"]));
     }
 

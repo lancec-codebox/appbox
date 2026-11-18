@@ -56,9 +56,9 @@ public class ClassifyAllTests
     [Fact]
     public void A_listing_line_carries_the_classification_fields()
     {
-        var e = WatchStage.ParseLine("aaaaaaaaaaa\tUCbbbbbbbbbbbbbbbbbbbbbb\tChan\t3600\tNA\tTitle A\twith a tab")!;
+        var e = RefreshStage.ParseLine("aaaaaaaaaaa\tUCbbbbbbbbbbbbbbbbbbbbbb\tChan\t3600\tNA\tTitle A\twith a tab")!;
         Assert.Equal(("Chan", 3600d, "Title A with a tab", null), (e.ChannelName, e.Duration, e.Title, e.Availability));
-        var dead = WatchStage.ParseLine("aaaaaaaaaaa\tNA\tNA\tNA\tprivate\t[Private video]")!;
+        var dead = RefreshStage.ParseLine("aaaaaaaaaaa\tNA\tNA\tNA\tprivate\t[Private video]")!;
         Assert.Equal(("private", null), (dead.Availability, dead.Duration));
     }
 
@@ -162,7 +162,7 @@ public class ClassifyAllTests
     public async Task Old_per_channel_classify_jobs_still_complete_once()
     {
         var s = new FakeStore();
-        var job = JobDescriptor.NewClassify(JobDescriptor.NewWatch("channel", "UCaaaaaaaaaaaaaaaaaaaaaa", "Old", "1h", ["videos"], false, 0, 480),
+        var job = JobDescriptor.NewClassify(JobDescriptor.NewSource("channel", "UCaaaaaaaaaaaaaaaaaaaaaa", "Old", "1h", ["videos"], false, 0, 480),
             [new ClassifyEntry { Id = "aaaaaaaaaaa", Title = "Drama", Duration = 5400 }, new ClassifyEntry { Id = "bbbbbbbbbbb", Title = "clip", Duration = 60 }], "2026-11-14T12:00:00Z");
         var ctx = new JobContext { Job = job, Stage = "classify", BlobName = P.Job("classify", job.JobId), LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
         var chat = new Chat(_ => """{"videos":[{"id":"aaaaaaaaaaa","candidate":true,"kind":"full","reason":"x"}]}""");

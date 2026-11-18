@@ -13,7 +13,7 @@ public class ClassifyTests
     }
 
     private static JobDescriptor Job(params ClassifyEntry[] e) =>
-        JobDescriptor.NewClassify(JobDescriptor.NewWatch("channel", "UCaaaaaaaaaaaaaaaaaaaaaa", "Drama Channel", "1h", ["videos"], false, 0, 480), e.ToList(), "2026-11-14T12:00:00Z");
+        JobDescriptor.NewClassify(JobDescriptor.NewSource("channel", "UCaaaaaaaaaaaaaaaaaaaaaa", "Drama Channel", "1h", ["videos"], false, 0, 480), e.ToList(), "2026-11-14T12:00:00Z");
 
     private static ClassifyEntry E(string id, double? minutes, string title) => new() { Id = id, Title = title, Duration = minutes * 60 };
 

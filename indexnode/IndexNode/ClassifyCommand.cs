@@ -28,7 +28,7 @@ public static class ClassifyCommand
             case "list":
             {
                 if (!a.Has("rejected")) throw new ArgumentException("classify list --rejected [--since 1d]");
-                var since = WatchStage.ParseEvery(a.Get("since") ?? "1d");
+                var since = RefreshStage.ParseEvery(a.Get("since") ?? "1d");
                 var rows = await RejectedAsync(store, paths, DateTimeOffset.UtcNow - since, default);
                 foreach (var r in rows) Console.WriteLine(r);
                 Console.WriteLine($"{rows.Count} rejected since {a.Get("since") ?? "1d"} ago (overrule one with: indexnode classify set <videoId> drama)");

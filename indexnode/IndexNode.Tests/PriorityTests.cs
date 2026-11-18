@@ -136,12 +136,12 @@ public class PriorityTests
     public async Task A_sources_priority_reaches_its_downloads_playlist_poll()
     {
         var s = new FakeStore();
-        var watch = JobDescriptor.NewWatch("playlist", "PLp", "pl", "1h", ["videos"], false, 2, 360); watch.Priority = 12;
-        var name = P.Job("watch", watch.JobId);
-        await s.PutAsync(name, watch.ToBytes(), Tags.Job("watch", "pending", watch.AddedAt, null, 12), null, false, default);
+        var watch = JobDescriptor.NewSource("playlist", "PLp", "pl", "1h", ["videos"], false, 2, 360); watch.Priority = 12;
+        var name = P.Job("refresh", watch.JobId);
+        await s.PutAsync(name, watch.ToBytes(), Tags.Job("refresh", "pending", watch.AddedAt, null, 12), null, false, default);
         var tools = new Tools(new HttpClient()) { YtDlpOverride = (args, _, _) => Task.FromResult(new ProcResult(0, "aaaaaaaaaaa\tNA\tNA\nbbbbbbbbbbb\tNA\tNA\n", "")) };
-        var ctx = new JobContext { Job = watch, Stage = "watch", BlobName = name, LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
-        await new WatchStage(tools, s, () => new DateTimeOffset(2026, 11, 14, 12, 0, 0, TimeSpan.Zero)).RunAsync(ctx);
+        var ctx = new JobContext { Job = watch, Stage = "refresh", BlobName = name, LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+        await new RefreshStage(tools, s, () => new DateTimeOffset(2026, 11, 14, 12, 0, 0, TimeSpan.Zero)).RunAsync(ctx);
         foreach (var id in new[] { "aaaaaaaaaaa", "bbbbbbbbbbb" }) { Assert.Equal("12", s[P.Job("download", id)].Tags[Tags.Priority]); Assert.Equal(12, s.Job(P.Job("download", id)).Priority); }
     }
 
@@ -151,8 +151,8 @@ public class PriorityTests
         var s = new FakeStore();
         var json = System.Text.Encoding.UTF8.GetBytes("[{\"channelId\":\"UCabcdefghijklmnopqrstuv\",\"channelName\":\"A\"}]");
         await Sources.ImportAsync(s, P, json, "1d", ["videos"], 480, default, 20);
-        var n = P.Job("watch", "ch-UCabcdefghijklmnopqrstuv");
-        Assert.Equal("20", s[n].Tags[Tags.Priority]); Assert.Equal(20, s.Job(n).Priority);
+        var n = P.Job("refresh", "ch-UCabcdefghijklmnopqrstuv");
+        Assert.Equal(Protocol.RefreshNowPriority.ToString(), s[n].Tags[Tags.Priority]); Assert.Equal(20, s.Job(n).Priority); // the lookup is due now at 500; the body keeps 20 for its videos
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => Sources.ImportAsync(s, P, json, "1d", ["videos"], 480, default, 5000));
     }
 
@@ -244,8 +244,8 @@ public class PriorityTests
 
     private static async Task<JobDescriptor> Watch(FakeStore s, string id, int priority = 0)
     {
-        var w = JobDescriptor.NewWatch("playlist", id, "pl", "1h", ["videos"], false, 0, 360); w.Priority = priority;
-        await s.PutAsync(P.Job("watch", w.JobId), w.ToBytes(), Tags.Job("watch", "pending", w.AddedAt, null, priority), null, true, default);
+        var w = JobDescriptor.NewSource("playlist", id, "pl", "1h", ["videos"], false, 0, 360); w.Priority = priority;
+        await s.PutAsync(P.Job("refresh", w.JobId), w.ToBytes(), Tags.Job("refresh", "pending", w.AddedAt, null, priority), null, true, default);
         return w;
     }
 
@@ -275,7 +275,7 @@ public class PriorityTests
         Assert.Equal("", Tag(s, "sscd", "vid1")); Assert.Equal("", Tag(s, "thumbs", "vid1")); Assert.Equal("", Tag(s, "comments", "vid2")); // leased, done, failed
         Assert.Equal("", Tag(s, "download", "other"));
         Assert.Equal(new Dictionary<string, int> { ["leased"] = 1, ["done"] = 1, ["failed"] = 1 }, r.Skipped);
-        Assert.Equal("8", Tag(s, "watch", w.JobId)); Assert.Equal(8, s.Job(P.Job("watch", w.JobId)).Priority);
+        Assert.Equal("8", Tag(s, "refresh", w.JobId)); Assert.Equal(8, s.Job(P.Job("refresh", w.JobId)).Priority);
     }
 
     [Fact]
@@ -331,12 +331,12 @@ public class PriorityTests
     public async Task New_downloads_of_a_watch_record_their_source()
     {
         var s = new FakeStore();
-        var watch = JobDescriptor.NewWatch("playlist", "PLq", "pl", "1h", ["videos"], false, 1, 360); watch.Priority = 2;
-        var name = P.Job("watch", watch.JobId);
-        await s.PutAsync(name, watch.ToBytes(), Tags.Job("watch", "pending", watch.AddedAt, null, 2), null, false, default);
+        var watch = JobDescriptor.NewSource("playlist", "PLq", "pl", "1h", ["videos"], false, 1, 360); watch.Priority = 2;
+        var name = P.Job("refresh", watch.JobId);
+        await s.PutAsync(name, watch.ToBytes(), Tags.Job("refresh", "pending", watch.AddedAt, null, 2), null, false, default);
         var tools = new Tools(new HttpClient()) { YtDlpOverride = (args, _, _) => Task.FromResult(new ProcResult(0, "qqqqqqqqqqq\tNA\tNA\n", "")) };
-        var ctx = new JobContext { Job = watch, Stage = "watch", BlobName = name, LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
-        await new WatchStage(tools, s, () => new DateTimeOffset(2026, 11, 14, 12, 0, 0, TimeSpan.Zero)).RunAsync(ctx);
+        var ctx = new JobContext { Job = watch, Stage = "refresh", BlobName = name, LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+        await new RefreshStage(tools, s, () => new DateTimeOffset(2026, 11, 14, 12, 0, 0, TimeSpan.Zero)).RunAsync(ctx);
         Assert.Equal([watch.JobId], s.Job(P.Job("download", "qqqqqqqqqqq")).Sources);
         Assert.Contains("priority", Sources.FormatRow(watch));
     }

@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace IndexNode.Tests;
 
-public class WatchTests
+public class RefreshTests
 {
     private static readonly Paths P = new("index-test/");
     private static readonly DateTimeOffset Now = new(2026, 11, 14, 12, 0, 0, TimeSpan.Zero);
@@ -25,15 +25,15 @@ public class WatchTests
 
     private static async Task<(JobContext Ctx, JobDescriptor Job)> Poll(FakeStore s, Fake f, JobDescriptor job, DateTimeOffset? now = null)
     {
-        var name = P.Job("watch", job.JobId);
-        await s.PutAsync(name, job.ToBytes(), Tags.Job("watch", "pending", job.AddedAt), null, false, default);
-        var ctx = new JobContext { Job = job, Stage = "watch", BlobName = name, LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
-        await new WatchStage(f.Tools(), s, () => now ?? Now).RunAsync(ctx);
+        var name = P.Job("refresh", job.JobId);
+        await s.PutAsync(name, job.ToBytes(), Tags.Job("refresh", "pending", job.AddedAt), null, false, default);
+        var ctx = new JobContext { Job = job, Stage = "refresh", BlobName = name, LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+        await new RefreshStage(f.Tools(), s, () => now ?? Now).RunAsync(ctx);
         return (ctx, job);
     }
 
-    private static JobDescriptor Playlist(string id, int backfill = 0, bool follow = false, string every = "1h") =>
-        JobDescriptor.NewWatch("playlist", id, "pl " + id, every, ["videos", "shorts"], follow, backfill, 360);
+    private static JobDescriptor Playlist(string id, int backfill = -1, bool follow = false, string every = "1h") =>
+        JobDescriptor.NewSource("playlist", id, "pl " + id, every, ["videos", "shorts"], follow, backfill, 360);
 
     private static string PlUrl(string id) => $"https://www.youtube.com/playlist?list={id}";
 
@@ -42,7 +42,7 @@ public class WatchTests
     {
         var s = new FakeStore(); var f = new Fake();
         f.Listings[PlUrl("PLa")] = Lines(Id('a'), Id('b'), Id('c'));
-        var (ctx, job) = await Poll(s, f, Playlist("PLa"));
+        var (ctx, job) = await Poll(s, f, Playlist("PLa", backfill: 0));
         Assert.Empty(s.Blobs.Keys.Where(k => k.Contains("/jobs/download/")));
         Assert.Equal(3, job.Seen!.Count);
         Assert.Equal(0, job.Found);
@@ -66,17 +66,17 @@ public class WatchTests
         await Poll(s, f, Playlist("PLb", backfill: 3));
         var made = s.Blobs.Keys.Where(k => k.Contains("/jobs/download/")).OrderBy(k => k).ToList();
         Assert.Equal([P.Job("download", Id('a')), P.Job("download", Id('b')), P.Job("download", Id('c'))], made);
-        Assert.Contains(f.Calls, c => c.Contains("--playlist-end 30")); // max(30, backfill)
+        Assert.DoesNotContain(f.Calls, c => c.Contains("--playlist-end")); // a playlist lookup lists in full
     }
 
     [Fact]
     public async Task Backfill_asks_for_more_than_30_when_needed_and_uses_the_flat_listing_without_cookies()
     {
         var s = new FakeStore(); var f = new Fake();
-        f.Listings[PlUrl("PLc")] = Lines(Id('a'));
-        await Poll(s, f, Playlist("PLc", backfill: 50));
+        var cid = "UCeeeeeeeeeeeeeeeeeeeeee"; f.Listings[$"https://www.youtube.com/channel/{cid}/videos"] = Lines(Id('a'));
+        await Poll(s, f, JobDescriptor.NewSource("channel", cid, "c", "once", ["videos"], false, 150, 480));
         var call = Assert.Single(f.Calls);
-        Assert.Contains("--flat-playlist", call); Assert.Contains("--playlist-end 50", call); Assert.DoesNotContain("cookies", call);
+        Assert.Contains("--flat-playlist", call); Assert.Contains("--playlist-end 150", call); Assert.DoesNotContain("cookies", call);
     }
 
     [Fact]
@@ -116,8 +116,8 @@ public class WatchTests
         s.Listings[PlUrl("PLdrop")] = $"{Id('a')}\t{c1}\tOne\n{Id('b')}\t{c1}\tOne\n{Id('c')}\t{c2}\tTwo\n";
         var job = Playlist("PLdrop", follow: true); job.Seen = [];
         await Poll(st, s, job);
-        var chans = st.Blobs.Keys.Where(k => k.Contains("/jobs/watch/ch-")).OrderBy(k => k).ToList();
-        Assert.Equal([P.Job("watch", "ch-" + c1), P.Job("watch", "ch-" + c2)], chans);
+        var chans = st.Blobs.Keys.Where(k => k.Contains("/jobs/refresh/ch-")).OrderBy(k => k).ToList();
+        Assert.Equal([P.Job("refresh", "ch-" + c1), P.Job("refresh", "ch-" + c2)], chans);
         var ch = st.Job(chans[0]);
         Assert.Equal("channel", ch.Kind); Assert.Equal(0, ch.Backfill); Assert.False(ch.FollowChannels); Assert.Equal("One", ch.Name);
         Assert.Equal("pending", st.State(chans[0]));
@@ -125,7 +125,7 @@ public class WatchTests
         // polling again finds nothing new: no second add, and an existing channel source is not overwritten
         await Poll(st, s, job);
         Assert.Equal(puts, st.PutCount(chans[0]));
-        Assert.Equal(2, st.Blobs.Keys.Count(k => k.Contains("/jobs/watch/ch-")));
+        Assert.Equal(2, st.Blobs.Keys.Count(k => k.Contains("/jobs/refresh/ch-")));
     }
 
     [Fact]
@@ -137,8 +137,8 @@ public class WatchTests
         s.WatchPages[Id('a')] = c1 + "\tResolved";
         var job = Playlist("PLdrop2", follow: true); job.Seen = [];
         await Poll(st, s, job);
-        Assert.True(st.Exists(P.Job("watch", "ch-" + c1)));
-        Assert.Equal("Resolved", st.Job(P.Job("watch", "ch-" + c1)).Name);
+        Assert.True(st.Exists(P.Job("refresh", "ch-" + c1)));
+        Assert.Equal("Resolved", st.Job(P.Job("refresh", "ch-" + c1)).Name);
         Assert.Single(s.Calls, c => c.Contains("watch?v=") && c.Contains("--print") && !c.Contains("--flat-playlist"));
     }
 
@@ -149,11 +149,11 @@ public class WatchTests
         const string url = "https://www.youtube.com/playlist?list=PLreq";
         f.Listings[url] = "My Dramas\tNA\tUCrrrrrrrrrrrrrrrrrrrrrr\tChan\n";
         f.Listings[PlUrl("PLa")] = Lines(Id('a'));
-        await s.PutAsync(WatchStage.RequestsDir(P) + "r1.json", System.Text.Encoding.UTF8.GetBytes($$"""{"v":1,"url":"{{url}}","mode":"ingest","followChannels":true,"state":"pending"}"""), null, null, false, default);
+        await s.PutAsync(RefreshStage.RequestsDir(P) + "r1.json", System.Text.Encoding.UTF8.GetBytes($$"""{"v":1,"url":"{{url}}","mode":"ingest","followChannels":true,"state":"pending"}"""), null, null, false, default);
         await Poll(s, f, Playlist("PLa"));
-        var w = s.Job(P.Job("watch", "pl-PLreq"));
-        Assert.Equal("My Dramas", w.Name); Assert.True(w.FollowChannels); Assert.Equal(200, w.Backfill);   // curated: its videos so far are downloaded
-        var req = System.Text.Json.Nodes.JsonNode.Parse(s.Blobs[WatchStage.RequestsDir(P) + "r1.json"].Data)!;
+        var w = s.Job(P.Job("refresh", "pl-PLreq"));
+        Assert.Equal("My Dramas", w.Name); Assert.True(w.FollowChannels); Assert.Null(w.Backfill); Assert.Equal("once", w.Schedule);   // a playlist's lookup queues every video (no backfill limit); the schedule is once
+        var req = System.Text.Json.Nodes.JsonNode.Parse(s.Blobs[RefreshStage.RequestsDir(P) + "r1.json"].Data)!;
         Assert.Equal("done", req["state"]!.ToString()); Assert.Equal("pl-PLreq", req["jobId"]!.ToString());
     }
 
@@ -164,7 +164,7 @@ public class WatchTests
         const string c = "UCdddddddddddddddddddddd";
         f.Listings[$"https://www.youtube.com/channel/{c}/videos"] = Lines(Id('a'));
         f.Listings[$"https://www.youtube.com/channel/{c}/shorts"] = Lines(Id('b'));
-        var job = JobDescriptor.NewWatch("channel", c, "x", "1h", ["videos", "shorts"], false, 5, 480);
+        var job = JobDescriptor.NewSource("channel", c, "x", "1h", ["videos", "shorts"], false, 5, 480);
         await Poll(s, f, job);
         Assert.Equal(2, f.Calls.Count);
         // a channel's uploads become unclassified download jobs and no per-channel classify job: the singleton classify/all decides them
@@ -186,7 +186,7 @@ public class WatchTests
 
     [Theory]
     [InlineData("1h", 60)] [InlineData("30m", 30)] [InlineData("1d", 1440)] [InlineData(null, 60)]
-    public void Every_parses(string? every, int minutes) => Assert.Equal(TimeSpan.FromMinutes(minutes), WatchStage.ParseEvery(every));
+    public void Every_parses(string? every, int minutes) => Assert.Equal(TimeSpan.FromMinutes(minutes), RefreshStage.ParseEvery(every));
 
     [Fact]
     public async Task The_engine_reschedules_a_watch_job_as_pending_with_due_now_plus_every_and_lastPolled()
@@ -194,19 +194,19 @@ public class WatchTests
         var s = new FakeStore(); var f = new Fake();
         f.Listings[PlUrl("PLr")] = Lines(Id('a'));
         var job = Playlist("PLr", every: "2h");
-        await s.PutAsync(P.Job("watch", job.JobId), job.ToBytes(), Tags.Job("watch", "pending", "2026-01-01T00:00:00Z"), null, true, default);
+        await s.PutAsync(P.Job("refresh", job.JobId), job.ToBytes(), Tags.Job("refresh", "pending", "2026-01-01T00:00:00Z"), null, true, default);
         var o = new EngineOptions
         {
-            NodeId = "n-1", Name = "n", Stages = ["watch"], Jobs = new() { ["watch"] = 1 }, Threads = 1, Once = true,
+            NodeId = "n-1", Name = "n", Stages = ["refresh"], Jobs = new() { ["refresh"] = 1 }, Threads = 1, Once = true,
             PollInterval = TimeSpan.FromMilliseconds(20), RenewInterval = TimeSpan.FromMilliseconds(40), ControlInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromSeconds(30),
         };
         var before = DateTimeOffset.UtcNow;
-        await new NodeEngine(s, P, o, new Dictionary<string, IStageHandler> { ["watch"] = new WatchStage(f.Tools(), s) }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
-        var name = P.Job("watch", job.JobId);
+        await new NodeEngine(s, P, o, new Dictionary<string, IStageHandler> { ["refresh"] = new RefreshStage(f.Tools(), s) }).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        var name = P.Job("refresh", job.JobId);
         Assert.Equal("pending", s.State(name));
         var due = DateTimeOffset.Parse(s[name].Tags[Tags.Due]);
         Assert.InRange((due - before).TotalMinutes, 119, 121);
-        Assert.Equal("watch", s[name].Tags[Tags.Stage]);
+        Assert.Equal("refresh", s[name].Tags[Tags.Stage]);
         Assert.Equal("2026-01-01T00:00:00Z", s[name].Tags[Tags.Added]);
         var j = s.Job(name);
         Assert.NotNull(j.LastPolled); Assert.Equal(1, j.Seen!.Count);
@@ -233,14 +233,14 @@ public class WatchTests
             new { channelId = "UCbbbbbbbbbbbbbbbbbbbbbb", channelName = "B", channelHandle = "@b", videos = 1, sampleTitles = new string[0] },
             new { channelId = "UCcccccccccccccccccccccc", channelName = "C", channelHandle = "@c", videos = 9, sampleTitles = new[] { "y" } },
         });
-        var existing = JobDescriptor.NewWatch("channel", "UCbbbbbbbbbbbbbbbbbbbbbb", "B", "1h", ["videos"], false, 0, 480);
+        var existing = JobDescriptor.NewSource("channel", "UCbbbbbbbbbbbbbbbbbbbbbb", "B", "1h", ["videos"], false, 0, 480);
         await Sources.AddAsync(s, P, existing, default);
         var r = await Sources.ImportAsync(s, P, json, "1d", ["videos", "shorts"], 480, default);
         Assert.Equal(new Sources.ImportResult(2, 1, 0), r);
-        var a = s.Job(P.Job("watch", "ch-UCaaaaaaaaaaaaaaaaaaaaaa"));
+        var a = s.Job(P.Job("refresh", "ch-UCaaaaaaaaaaaaaaaaaaaaaa"));
         Assert.Equal("A", a.Name); Assert.Equal("1d", a.Every); Assert.Equal("channel", a.Kind); Assert.Equal(0, a.Backfill);
-        Assert.Equal("pending", s.State(P.Job("watch", "ch-UCaaaaaaaaaaaaaaaaaaaaaa")));
-        Assert.Equal("1h", s.Job(P.Job("watch", "ch-UCbbbbbbbbbbbbbbbbbbbbbb")).Every); // not overwritten
+        Assert.Equal("pending", s.State(P.Job("refresh", "ch-UCaaaaaaaaaaaaaaaaaaaaaa")));
+        Assert.Equal("1h", s.Job(P.Job("refresh", "ch-UCbbbbbbbbbbbbbbbbbbbbbb")).Every); // not overwritten
         Assert.Equal(3, (await Sources.ListAsync(s, P, default)).Count);
         var r2 = await Sources.ImportAsync(s, P, json, "1d", ["videos"], 480, default);
         Assert.Equal(new Sources.ImportResult(0, 3, 0), r2);

@@ -235,6 +235,32 @@ public class BatchTests
     }
 
     [Fact]
+    public async Task When_another_node_holds_the_top_dramas_this_node_still_gets_a_batch_and_explain_agrees()
+    {
+        var s = new FakeStore();
+        // ten dramas, d00 best; another node holds the top four, and this node runs --batch 3
+        foreach (var i in Enumerable.Range(0, 10)) await Drama(s, "d0" + i, "2026-11-17T10:00:0" + i + "Z", steps: ["frames"]);
+        foreach (var d in new[] { "d00", "d01", "d02", "d03" })
+        {
+            await s.PutAsync(P.Hold(d), "{}"u8.ToArray(), new Dictionary<string, string> { ["idx_hold_node"] = "other-node" }, null, true, default);
+            await s.SetMetadataAsync(P.Hold(d), new Dictionary<string, string> { ["idx_node"] = "other-node", ["idx_batch"] = "batch-1", ["idx_since"] = Protocol.NowUtc(), ["idx_until"] = Protocol.NowUtc() }, null, default);
+            await s.AcquireLeaseAsync(P.Hold(d), 60, default);
+        }
+        var o = Opts("mine-abc123", batch: 3);
+        var lines = new List<string>();
+        var rc = await Engine(s, o, _ => Writes()).ExplainAsync(50, lines.Add, default);
+        Assert.Equal(0, rc);
+        var picksLine = lines.Single(l => l.Contains("batch picks"));
+        Assert.Contains("d04, d05, d06", picksLine);                                 // explain shows what the node will take, not the held top
+        Assert.DoesNotContain("d00", picksLine);
+        var ran = new List<string>();
+        await Run(Engine(s, Opts("mine-abc123", batch: 3), _ => Writes(ctx => { lock (ran) ran.Add(ctx.Job.JobId); return Task.CompletedTask; })));
+        Assert.Contains("d04", ran); Assert.Contains("d05", ran); Assert.Contains("d06", ran);   // the first batch is exactly the picks explain named
+        foreach (var d in new[] { "d00", "d01", "d02", "d03" }) Assert.DoesNotContain(d, ran);   // never the other node's dramas
+        foreach (var d in new[] { "d00", "d01", "d02", "d03" }) Assert.Equal("pending", s.State(P.Job("frames", d)));
+    }
+
+    [Fact]
     public async Task A_stale_tag_query_that_still_lists_finished_steps_as_pending_never_runs_them_again()
     {
         var s = new FakeStore(); foreach (var d in new[] { "d1", "d2" }) await Drama(s, d, "2026-11-17T10:00:0" + d[1] + "Z", steps: ["frames", "sscd"]);

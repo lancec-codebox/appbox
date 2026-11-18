@@ -130,7 +130,7 @@ public sealed class LimitState
             var sched = o?.Schedule ?? local.Schedule;
             var win = o?.Window ?? local.Window;
             try { cron = string.IsNullOrWhiteSpace(sched) ? null : CronExpr.Parse(sched); } catch (ArgumentException e) { Log.Info("limits: " + e.Message + "; ignoring the schedule"); cron = null; }
-            try { window = WatchStage.ParseEvery(win ?? "1h"); } catch (ArgumentException e) { Log.Info("limits: window: " + e.Message + "; using 1h"); window = TimeSpan.FromHours(1); }
+            try { window = RefreshStage.ParseEvery(win ?? "1h"); } catch (ArgumentException e) { Log.Info("limits: window: " + e.Message + "; using 1h"); window = TimeSpan.FromHours(1); }
             if (newKey == key && budget == b) return;
             budget = b; key = newKey;
             if (b == null) { remaining = 0; return; }
@@ -178,7 +178,7 @@ public sealed class LimitState
         lock (gate)
         {
             if (!InWindow(out _)) return false;
-            if (stage == "watch" || budget == null) return true;
+            if (stage == "refresh" || budget == null) return true;
             if (remaining - inflight <= 0) return false;
             inflight++;
             return true;
@@ -190,7 +190,7 @@ public sealed class LimitState
     {
         lock (gate)
         {
-            if (stage == "watch" || budget == null) return;
+            if (stage == "refresh" || budget == null) return;
             if (inflight > 0) inflight--;
             if (finished && remaining > 0) { remaining--; Save(); }
         }
