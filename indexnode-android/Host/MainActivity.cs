@@ -20,6 +20,12 @@ public class MainActivity : Activity
     WebViewAssetLoader _assets = null!;
     string _origin = AssetOrigin;   // origin of the page now allowed to use the bridge
     bool _firstShown;
+    string? _autoJs;
+
+    sealed class Chrome(MainActivity a) : WebChromeClient
+    {
+        public override bool OnConsoleMessage(ConsoleMessage? m) { a._host.Log("console: " + m?.Message()); return true; }
+    }
 
     protected override void OnCreate(Bundle? savedInstanceState)
     {
@@ -31,6 +37,8 @@ public class MainActivity : Activity
         _web.Settings.AllowFileAccess = false;
         _web.Settings.AllowContentAccess = false;
         _web.SetWebViewClient(new Client(this));
+        _web.SetWebChromeClient(new Chrome(this));
+        _autoJs = Intent?.GetStringExtra("js");   // test hook: adb shell am start ... --es js "<javascript>"
         SetContentView(_web);
         LoadUi();
     }
@@ -106,6 +114,7 @@ public class MainActivity : Activity
             request?.Url == null ? null : a._assets.ShouldInterceptRequest(request.Url);
         public override void OnPageFinished(WebView? view, string? url)
         {
+            if (a._autoJs != null && url!.StartsWith(AssetOrigin)) { var js = a._autoJs; a._autoJs = null; view!.EvaluateJavascript(js!, null); }
             if (a._firstShown) return;
             a._firstShown = true;
             a._host.FirstScreenMs = SystemClock.ElapsedRealtime() - Android.OS.Process.StartElapsedRealtime;
