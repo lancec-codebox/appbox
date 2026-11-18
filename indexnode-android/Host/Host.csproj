@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0-android</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <ApplicationId>io.ref12.indexnode.spike</ApplicationId>
+    <ApplicationDisplayVersion>0.0.1</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
+    <SupportedOSPlatformVersion>26.0</SupportedOSPlatformVersion>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>
+    <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- Release: the normal settings (trim + AOT), plus what hot-loading needs -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>partial</TrimMode>
+    <RunAOTCompilation>true</RunAOTCompilation>
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <!-- Plugins call BCL APIs the host never uses; JIT is the fallback for the (non-AOT) plugin DLL.
+         UseInterpreter is NOT needed on Android (JIT is allowed); set true to force interpretation of non-AOT code. -->
+    <UseInterpreter>false</UseInterpreter>
+    <!-- Plugins use System.Text.Json reflection serialization; trimmed apps switch it off by default. -->
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
+    <DebugSymbols>false</DebugSymbols>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Contract/Contract.csproj" />
+    <ProjectReference Include="../Loader/Loader.csproj" />
+    <PackageReference Include="Xamarin.AndroidX.WebKit" Version="1.14.0.1" />
+  </ItemGroup>
+
+  <!-- Keep the contract whole and the BCL surface plugins are likely to use (the host itself only uses a slice). -->
+  <ItemGroup>
+    <TrimmerRootAssembly Include="Spike.Contract" />
+    <TrimmerRootAssembly Include="Spike.Loader" />
+    <TrimmerRootAssembly Include="Host" />
+    <TrimmerRootAssembly Include="System.Linq" />
+    <TrimmerRootAssembly Include="System.Collections" />
+    <TrimmerRootAssembly Include="System.Text.Json" />
+    <TrimmerRootAssembly Include="System.Text.RegularExpressions" />
+    <TrimmerRootAssembly Include="System.Net.Http" />
+    <TrimmerRootAssembly Include="System.Runtime" />
+  </ItemGroup>
+</Project>

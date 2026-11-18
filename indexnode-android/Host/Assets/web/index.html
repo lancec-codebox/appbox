@@ -1,0 +1,36 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IndexNode spike</title>
+<style>
+ body{font:14px system-ui,sans-serif;margin:8px;background:#111;color:#eee}
+ input{width:100%;box-sizing:border-box;margin:2px 0 6px;padding:6px;background:#222;color:#eee;border:1px solid #444}
+ button{margin:2px;padding:10px 12px;background:#2a6;border:0;color:#fff;border-radius:4px}
+ button.alt{background:#555} pre{white-space:pre-wrap;background:#000;padding:6px;height:42vh;overflow:auto;font-size:12px}
+ small{color:#999}
+</style></head><body>
+<b>IndexNode spike</b> <small id="origin"></small><br>
+<small>Manifest URL (plugin DLL = same name, .dll)</small>
+<input id="u1" value="https://github.com/lancec-codebox/appbox/releases/download/spike-dotnet-node-1/Plugin.V1.json">
+<input id="u2" value="https://github.com/lancec-codebox/appbox/releases/download/spike-dotnet-node-1/Plugin.V2.json">
+<small>Run args (v2: video URL, blank = default)</small><input id="args" value="">
+<button onclick="go('loadPlugin',u1.value)">Load v1</button>
+<button onclick="go('loadPlugin',u2.value)">Load v2</button>
+<button onclick="go('runPlugin',args.value)">Run</button>
+<button class="alt" onclick="go('unload')">Unload</button>
+<button class="alt" onclick="go('getInfo')">Info</button>
+<button class="alt" onclick="go('getLog')">Log</button><br>
+<small>UI URL (https, blank = bundled page)</small>
+<input id="ui" placeholder="https://example.com/ui/index.html">
+<button class="alt" onclick="go('setUiUrl',ui.value)">Set UI URL</button>
+<pre id="log"></pre>
+<script>
+let n=0; const pending={};
+function out(x){const l=document.getElementById('log');l.textContent+=(typeof x==='string'?x:JSON.stringify(x,null,1))+"\n";l.scrollTop=l.scrollHeight}
+document.getElementById('origin').textContent=location.origin+' bridge:'+(typeof hostBridge!=='undefined'?'yes':'NO');
+if(typeof hostBridge!=='undefined') hostBridge.onmessage=e=>{const r=JSON.parse(e.data);const p=pending[r.id];if(p){delete pending[r.id];r.ok?p.res(r.result):p.rej(new Error(r.error))}};
+function call(m,a){return new Promise((res,rej)=>{const id=++n;pending[id]={res,rej};hostBridge.postMessage(JSON.stringify({id,m,a:a??""}))})}
+// the four calls the owner asked for, plus unload/info
+const api={loadPlugin:u=>call('loadPlugin',u),runPlugin:a=>call('runPlugin',a),unload:()=>call('unload'),getLog:()=>call('getLog')};
+window.api=api;
+async function go(m,a){out('> '+m+(a?' '+a:''));try{out(await call(m,a))}catch(e){out('ERR '+e.message)}}
+</script></body></html>
