@@ -28,6 +28,7 @@ public sealed class FakeStore : IStore
     private readonly object gate = new();
 
     public Blob this[string name] { get { lock (gate) return Blobs[name]; } }
+    public List<string> Names(string prefix) { lock (gate) return Blobs.Keys.Where(k => k.StartsWith(prefix)).ToList(); }
     public bool Exists(string name) { lock (gate) return Blobs.ContainsKey(name); }
     public string? LeaseOf(string name) { lock (gate) return Blobs[name].Lease; }
     public int RenewCount(string name) { lock (gate) return Renews.GetValueOrDefault(name); }

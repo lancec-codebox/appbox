@@ -40,7 +40,7 @@ public class BatchTests
     private static NodeEngine Engine(FakeStore s, EngineOptions o, Func<string, IStageHandler> h) => new(s, P, o, Steps.ToDictionary(x => x, h));
     private static Task Run(NodeEngine e, CancellationToken ct = default) => e.RunAsync(ct).WaitAsync(TimeSpan.FromSeconds(30));
     private static string HoldName(string id) => P.Hold(id);
-    private static IEnumerable<string> HoldBlobs(FakeStore s) { lock (s.Blobs) return s.Blobs.Keys.Where(k => k.StartsWith(P.HoldsDir)).ToList(); }
+    private static IEnumerable<string> HoldBlobs(FakeStore s) => s.Names(P.HoldsDir);
 
     [Fact]
     public async Task A_stage_runs_for_the_whole_batch_before_the_next_stage_starts()
@@ -301,6 +301,36 @@ public class BatchTests
             foreach (var kv in runs.Where(k => k.Value > 1)) bad.Add($"run {i}: {kv.Key} x{kv.Value}");
             Assert.Empty(HoldBlobs(s));
             foreach (var st in new[] { "frames", "sscd" }) foreach (var d in new[] { "a", "b", "c", "d" }) if (s.State(P.Job(st, d)) != "done") bad.Add($"run {i}: {st}:{d} not done");
+        }
+        Assert.Empty(bad);
+    }
+
+    [Fact]
+    public async Task Stress_clean_stop_at_random_moments_then_resume_never_runs_a_step_twice()
+    {
+        var rnd = new Random(777); var bad = new List<string>();
+        for (int i = 0; i < 200; i++)
+        {
+            var s = new FakeStore();
+            foreach (var (d, n) in new[] { "a", "b", "c" }.Select((d, n) => (d, n))) await Drama(s, d, "2026-11-17T10:00:0" + n + "Z", 0, ["frames", "sscd", "thumbs"], seconds: 3700);
+            var runs = new ConcurrentDictionary<string, int>(); int seed = rnd.Next(); int stopAfter = rnd.Next(1, 9); int started = 0;
+            using var stop = new CancellationTokenSource();
+            IStageHandler H() => Writes(async ctx =>
+            {
+                runs.AddOrUpdate(ctx.Stage + ":" + ctx.Job.JobId, 1, (_, v) => v + 1);
+                if (Interlocked.Increment(ref started) == stopAfter) stop.Cancel();                    // the stop arrives while lanes are mid-step
+                var delay = new Random(seed ^ ctx.Job.JobId.GetHashCode() ^ ctx.Stage.GetHashCode()).Next(0, 25);
+                if (stopAfter % 2 == 0) await Task.Delay(delay); else await Task.Delay(delay, CancellationToken.None);   // some handlers honour the stop, some finish anyway
+            });
+            var o = Opts(lanes: 1 + i % 3, batch: 2 + i % 2);
+            await Run(Engine(s, o, _ => H()), stop.Token);
+            Assert.Empty(HoldBlobs(s));                                                       // a stop deletes every hold ...
+            foreach (var st in new[] { "frames", "sscd", "thumbs" }) foreach (var d in new[] { "a", "b", "c" }) if (s.LeaseOf(P.Job(st, d)) != null) bad.Add($"run {i}: lease left on {st}:{d}");   // ... and releases every lease
+            var finished = runs.Keys.Where(k => s.State(P.Job(k.Split(':')[0], k.Split(':')[1])) == "done").ToHashSet();
+            await Run(Engine(s, Opts("resume-def456", lanes: 2), _ => Writes(ctx => { if (finished.Contains(ctx.Stage + ":" + ctx.Job.JobId)) bad.Add($"run {i}: finished {ctx.Stage}:{ctx.Job.JobId} ran again"); return Task.CompletedTask; })));
+            foreach (var kv in runs.Where(k => k.Value > 1 && s.State(P.Job(k.Key.Split(':')[0], k.Key.Split(':')[1])) == "done")) bad.Add($"run {i}: {kv.Key} x{kv.Value}");
+            foreach (var st in new[] { "frames", "sscd", "thumbs" }) foreach (var d in new[] { "a", "b", "c" }) if (s.State(P.Job(st, d)) != "done") bad.Add($"run {i}: {st}:{d} not done after resume");
+            Assert.Empty(HoldBlobs(s));
         }
         Assert.Empty(bad);
     }
