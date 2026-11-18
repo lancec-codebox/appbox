@@ -39,6 +39,20 @@
             </intent-filter>
         </activity>
 
+        <!-- Asks the user to allow another app to use Medusa's tools (/v2); the token goes back as the activity result. -->
+        <activity
+            android:name=".v2.PairActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="io.ref12.medusa.action.PAIR" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".PlayerActivity"
             android:exported="false"

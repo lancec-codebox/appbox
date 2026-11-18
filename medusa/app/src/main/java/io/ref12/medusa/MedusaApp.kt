@@ -16,6 +16,10 @@ class MedusaApp : Application() {
         private set
     lateinit var ocr: OcrManager
         private set
+    /** Where /v1 downloads, /v2 runs and the index node's downloads take their turn. */
+    val gate by lazy { WorkGate { GateLimits(settings.heavyRuns, settings.lightRuns) } }
+    /** The /v2 capability API: pairing, tool runs, workspaces. */
+    val v2 by lazy { io.ref12.medusa.v2.V2Services(this) }
     lateinit var trackDl: TrackDownloads
         private set
 
@@ -45,7 +49,8 @@ class MedusaApp : Application() {
         media = MediaStore(root)
         // One job at a time: yt-dlp is heavy and the phone is small.
         jobs = JobManager(Storage(root), media, fetcher, Executors.newSingleThreadExecutor(), { settings.titleLanguage() }, onNoSubtitles = { id -> settings.setOcrOffered(id, true) },
-            onVideoDone = { jobId, mediaId -> val ns = io.ref12.medusa.node.NodeSettings(this); if (ns.storeQueue.finished(jobId, mediaId) != null) io.ref12.medusa.node.IndexStoreWorker.enqueue(this, ns) })
+            onVideoDone = { jobId, mediaId -> val ns = io.ref12.medusa.node.NodeSettings(this); if (ns.storeQueue.finished(jobId, mediaId) != null) io.ref12.medusa.node.IndexStoreWorker.enqueue(this, ns) },
+            gate = gate)
         ocr = OcrManager(this, media)
         io.ref12.medusa.node.CrashRedaction.install(filesDir, BuildConfig.VERSION_NAME)
         try { io.ref12.medusa.node.NodeWorker.schedule(this, io.ref12.medusa.node.NodeSettings(this)) } catch (e: Exception) { /* the node is optional */ }

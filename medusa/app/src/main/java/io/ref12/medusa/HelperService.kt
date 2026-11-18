@@ -23,7 +23,7 @@ class HelperService : Service() {
     private val tick = object : Runnable {
         override fun run() {
             val jobs = app.jobs
-            if (KeepAlive.shouldStop(app.settings.keepAlive, System.currentTimeMillis(), lastRequest, jobs.lastActivity, app.lastUiLeft, jobs.activeCount() + app.ocr.activeCount(), app.visibleScreens > 0)) {
+            if (KeepAlive.shouldStop(app.settings.keepAlive, System.currentTimeMillis(), lastRequest, jobs.lastActivity, app.lastUiLeft, jobs.activeCount() + app.ocr.activeCount() + app.v2.runs.activeCount(), app.visibleScreens > 0)) {
                 stopSelf()
                 return
             }
@@ -68,9 +68,9 @@ class HelperService : Service() {
             override fun removeTrack(mediaId: String, trackId: String) = app.media.removeTrack(mediaId, trackId)
             override fun setSubtitles(mediaId: String, language: String) =
                 app.jobs.setMainTrack(mediaId, language)?.let { MediaJson.item(it, app.media.sync(mediaId)).toString() }
-            override fun touch() { lastRequest = System.currentTimeMillis() }
+            override fun touch() { lastRequest = System.currentTimeMillis(); app.v2.housekeeping() }
         }
-        val s = HelperServer(Router(api) { app.settings.origins })
+        val s = HelperServer(Router(api) { app.settings.origins }, v2 = app.v2.router)
         try {
             s.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             server = s

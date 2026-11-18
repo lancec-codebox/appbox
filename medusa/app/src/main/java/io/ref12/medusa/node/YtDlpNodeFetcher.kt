@@ -4,6 +4,7 @@ import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLException
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import io.ref12.medusa.VideoRequest
+import io.ref12.medusa.WorkGate
 import io.ref12.medusa.YtDlpFetcher
 import org.json.JSONObject
 import java.io.File
@@ -66,7 +67,13 @@ class YtDlpVideoIo(private val yt: YtDlpFetcher, private val cancelledFlag: () -
 }
 
 /** Downloads through the same yt-dlp (and QuickJS, ffmpeg) that the rest of Medusa uses, under its own process id. The video goes through [NodeDownloader]; the info JSON, thumbnail, description and subtitles follow in separate calls. */
-class YtDlpNodeFetcher(private val yt: YtDlpFetcher, private val prefs: DownloadPrefs, private val env: NodeEnv = NodeEnv()) : NodeFetcher {
+class YtDlpNodeFetcher(private val yt: YtDlpFetcher, private val prefs: DownloadPrefs, private val env: NodeEnv = NodeEnv(), private val gate: WorkGate? = null) : NodeFetcher {
+    /** The node's work is background: it waits behind a caller's, and a caller waits at most for the one that already runs. */
+    private fun <T> turn(label: String, weight: WorkGate.Weight, block: () -> T): T {
+        val g = gate ?: return block()
+        try { return g.run(label, weight, WorkGate.Priority.BACKGROUND, { cancelled }, block = block) }
+        catch (e: java.util.concurrent.CancellationException) { throw NodeFetchException(FailureKind.TRANSIENT, "cancelled") }
+    }
     @Volatile private var cancelled = false
     private val io = YtDlpVideoIo(yt) { cancelled }
     private val downloader = NodeDownloader(io, prefs, env.sleep, env.gapMs) { NodeRunner.iso(env.clock()) }
@@ -80,6 +87,10 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher, private val prefs: Download
 
     override fun download(job: DownloadJob, dir: File, progress: (String?, String?) -> Unit): DownloadedFiles {
         cancelled = false
+        return turn("index-node download " + job.jobId, WorkGate.Weight.HEAVY) { downloadNow(job, dir, progress) }
+    }
+
+    private fun downloadNow(job: DownloadJob, dir: File, progress: (String?, String?) -> Unit): DownloadedFiles {
         dir.deleteRecursively(); dir.mkdirs()
         try { yt.ensureInit() } catch (e: Exception) { throw NodeFetchException(FailureKind.TRANSIENT, e.message ?: "yt-dlp did not start") }
         progress("starting", null)
@@ -157,6 +168,10 @@ class YtDlpNodeFetcher(private val yt: YtDlpFetcher, private val prefs: Download
     /** A source listing for the refresh stage: the flat playlist, no cookies, newest first. A 429 or "sign in" is a bot block, as for a download. */
     override fun list(url: String, end: Int): List<String> {
         cancelled = false
+        return turn("index-node listing", WorkGate.Weight.LIGHT) { listNow(url, end) }
+    }
+
+    private fun listNow(url: String, end: Int): List<String> {
         try { yt.ensureInit() } catch (e: Exception) { throw NodeFetchException(FailureKind.TRANSIENT, e.message ?: "yt-dlp did not start") }
         val lines = java.util.Collections.synchronizedList(ArrayList<String>())
         try {

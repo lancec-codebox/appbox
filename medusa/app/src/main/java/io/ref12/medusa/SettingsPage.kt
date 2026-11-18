@@ -50,6 +50,12 @@ class SettingsPage(a: MainActivity) : Page(a) {
             a.app.settings.keepAlive = KeepAliveMode.values()[it]
         })
 
+        val runs = section("Downloads at once")
+        runs.addView(Ui.muted(a, "How many big downloads (and other heavy tool runs) go at once. Medusa's own index-node downloads and web apps' downloads share these slots; more wait in line and say what they wait for."))
+        runs.addView(TrackUi.radios(a, listOf("1 (recommended)", "2", "3"), listOf("heavy:1", "heavy:2", "heavy:3"), (a.app.settings.heavyRuns - 1).coerceIn(0, 2)) { a.app.settings.heavyRuns = it + 1 })
+        runs.addView(Ui.muted(a, "Light runs at once (a playlist listing, ffprobe, a metadata read). They do not wait behind a download."), Ui.lp(-1, -2, 0f, 0, 10, 0, 0, a))
+        runs.addView(TrackUi.radios(a, listOf("1", "2 (default)", "3", "4"), listOf("light:1", "light:2", "light:3", "light:4"), (a.app.settings.lightRuns - 1).coerceIn(0, 3)) { a.app.settings.lightRuns = it + 1 })
+
         val web = section("Web apps")
         web.addView(Ui.muted(a, "Allowed origins, one per line"))
         val origins = field("https://example.app", a.app.settings.origins.joinToString("\n"), "origins", multi = true)
@@ -58,6 +64,23 @@ class SettingsPage(a: MainActivity) : Page(a) {
             a.app.settings.origins = origins.text.toString().lines().map { it.trim() }.filter { it.isNotEmpty() }
             Toast.makeText(a, "Saved", Toast.LENGTH_SHORT).show()
         }, Ui.lp(-2, -2, 0f, 0, 6, 0, 0, a))
+
+        val tools = section("Apps using Medusa's tools")
+        tools.addView(Ui.muted(a, "Apps you allowed to run yt-dlp, ffmpeg and Python through Medusa. Revoke one to stop it at once."))
+        val pairedBox = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL; tag = "paired-apps" }
+        tools.addView(pairedBox)
+        fun showPaired() {
+            pairedBox.removeAllViews()
+            val list = a.app.v2.pairing.list()
+            if (list.isEmpty()) pairedBox.addView(Ui.muted(a, "No apps are paired."))
+            for (p in list) {
+                val row = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
+                row.addView(Ui.muted(a, p.appName + " (since " + java.text.DateFormat.getDateInstance().format(java.util.Date(p.pairedAt)) + ")", 14f), Ui.lp(0, -2, 1f, 0, 0, 0, 0, a))
+                row.addView(Ui.button(a, "Revoke") { a.app.v2.pairing.revoke(p.id); showPaired() })
+                pairedBox.addView(row)
+            }
+        }
+        showPaired()
 
         val up = section("Updates")
         up.addView(CheckBox(a).apply {

@@ -35,6 +35,8 @@ class JobManager(
     private val onNoSubtitles: (String) -> Unit = {},
     /** Called with (job id, media id) when a capture that wanted video finished with a video: the app then stores it in the index when the owner asked for that. */
     private val onVideoDone: (String, String) -> Unit = { _, _ -> },
+    /** Where downloads take their turn (shared with /v2 runs and the index node); null = no waiting. */
+    private val gate: WorkGate? = null,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val jobs = ConcurrentHashMap<String, JobRecord>()
@@ -246,6 +248,18 @@ class JobManager(
     }
 
     private fun run(rec: JobRecord) {
+        if (rec.cancelled) return
+        val g = gate
+        if (g == null) { runBody(rec); return }
+        val ticket = WorkGate.Ticket("download " + rec.id, WorkGate.Weight.HEAVY, WorkGate.Priority.INTERACTIVE)
+        try {
+            // while it waits the job says so: queued, with its place and what is ahead (never "fetching")
+            g.enter(ticket, { rec.cancelled }) { w -> set(rec, JobState.QUEUED, null, WorkGate.describe(w), null) }
+        } catch (e: java.util.concurrent.CancellationException) { return }
+        try { runBody(rec) } finally { g.leave(ticket) }
+    }
+
+    private fun runBody(rec: JobRecord) {
         if (rec.cancelled) return
         set(rec, JobState.FETCHING, null, null, null, "Starting")
         // a stable folder: what a failed or cancelled attempt leaves behind is what the next one continues from

@@ -17,6 +17,16 @@ class Settings(ctx: Context) {
     /** The same as a languages list for a job (empty = original). */
     val defaultLanguages: List<String> get() = defaultLanguage.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList()
 
+    /** How many big downloads (and other heavy tool runs) go at once, in each of the interactive and background queues. Default 1. */
+    var heavyRuns: Int
+        get() = prefs.getInt("heavyRuns", 1).coerceIn(1, 4)
+        set(v) { prefs.edit().putInt("heavyRuns", v.coerceIn(1, 4)).apply() }
+
+    /** How many light runs (a playlist listing, ffprobe, a metadata read) go at once, so they do not wait behind a download. Default 2. */
+    var lightRuns: Int
+        get() = prefs.getInt("lightRuns", 2).coerceIn(1, 6)
+        set(v) { prefs.edit().putInt("lightRuns", v.coerceIn(1, 6)).apply() }
+
     /** How long the server stays up after the user leaves Medusa. */
     var keepAlive: KeepAliveMode
         get() = KeepAliveMode.fromMinutes(prefs.getInt("keepAliveMinutes", KeepAliveMode.DEFAULT.minutes))

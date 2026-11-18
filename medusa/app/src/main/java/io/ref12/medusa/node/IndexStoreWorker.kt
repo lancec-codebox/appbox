@@ -31,7 +31,7 @@ class IndexStoreWorker(private val ctx: Context, params: WorkerParameters) : Cor
                 val id = m0?.let { IndexStoreFiles.youtubeId(it.url) }
                 if (id == null) { s.storeQueue.remove(e.mediaId); continue }
                 if (!File(stage, "info.json").isFile || !File(stage, "thumb.jpg").isFile) {
-                    val f = YtDlpNodeFetcher(ctx.app.fetcher, s, NodeEnv())
+                    val f = YtDlpNodeFetcher(ctx.app.fetcher, s, NodeEnv(), ctx.app.gate)
                     val job = DownloadJob(id, "https://www.youtube.com/watch?v=" + id, 720, null, false)
                     val raw = File(stage, "raw").apply { mkdirs() }
                     if (!File(stage, "info.json").isFile) f.fetchInfo(job, raw)?.copyTo(File(stage, "info.json"), true)
