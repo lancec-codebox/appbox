@@ -15,12 +15,13 @@
     <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- Keep all of CoreLib: plugins call BCL APIs the host never uses (costs ~3 MB, see README). -->
-    <RootCoreLib Condition="'$(RootCoreLib)' == ''">true</RootCoreLib>
+    <RootCoreLib Condition="'$(RootCoreLib)' == '' and '$(Untrimmed)' != 'true'">true</RootCoreLib>
   </PropertyGroup>
 
   <!-- Release: the normal settings (trim + AOT), plus what hot-loading needs -->
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-    <PublishTrimmed>true</PublishTrimmed>
+    <PublishTrimmed Condition="'$(Untrimmed)' != 'true'">true</PublishTrimmed>
+    <PublishTrimmed Condition="'$(Untrimmed)' == 'true'">false</PublishTrimmed>
     <TrimMode>partial</TrimMode>
     <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
     <!-- Plugins call BCL APIs the host never uses; JIT is the fallback for the (non-AOT) plugin DLL.
@@ -47,13 +48,14 @@
     <PackageReference Include="Xamarin.AndroidX.WebKit" Version="1.14.0.1" />
   </ItemGroup>
 
-  <ItemGroup>
+  <!-- -p:Untrimmed=true: no trimming at all, so no roots are needed (variant 3). -->
+  <ItemGroup Condition="'$(Untrimmed)' != 'true'">
     <TrimmerRootDescriptor Include="ILLink.Descriptors.xml" />
     <TrimmerRootAssembly Include="System.Private.CoreLib" RootMode="All" Condition="'$(RootCoreLib)' == 'true'" />
   </ItemGroup>
 
   <!-- Keep the contract whole and the BCL surface plugins are likely to use (the host itself only uses a slice). -->
-  <ItemGroup>
+  <ItemGroup Condition="'$(Untrimmed)' != 'true'">
     <TrimmerRootAssembly Include="Spike.Contract" RootMode="All" />
     <TrimmerRootAssembly Include="Spike.Loader" RootMode="All" />
     <TrimmerRootAssembly Include="Host" RootMode="All" />
