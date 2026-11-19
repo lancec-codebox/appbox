@@ -29,14 +29,10 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      - name: Install ffmpeg and ffprobe (tests that cut frames and thumbnails need the real ones)
-        working-directory: ${{ github.workspace }}
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y ffmpeg; else choco install ffmpeg -y --no-progress; fi
-          ffmpeg -version | head -1; ffprobe -version | head -1
       - name: Build
         run: dotnet build IndexNode.Tests
+      - name: Install IndexNode's pinned ffmpeg/ffprobe (the build the nodes run, from IndexNode.Tests' own tools folder; distro ffmpeg builds differ and the frames/thumbs tests need the real one)
+        run: dotnet run --no-build --project IndexNode -- tools install --ffmpeg
       - name: Test
         run: dotnet test IndexNode.Tests --no-build
 
