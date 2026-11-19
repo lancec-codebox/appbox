@@ -6,7 +6,7 @@ name: indexnode-gpu
 on:
   push:
     branches: [main]
-    paths: ["indexnode/**", ".github/workflows/indexnode-gpu.yml"]
+    paths: ["indexnode/**", "indexnode-android/Contract/**", ".github/workflows/indexnode-gpu.yml"]
   workflow_dispatch:
     inputs:
       version:
@@ -54,7 +54,7 @@ jobs:
       - uses: docker/build-push-action@v6
         if: steps.v.outputs.push == 'true'
         with:
-          context: indexnode
+          context: .   # the repo root: IndexNode.Core and indexnode-android/Contract are referenced projects
           file: indexnode/Dockerfile
           push: true
           build-args: |

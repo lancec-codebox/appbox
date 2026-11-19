@@ -3,12 +3,12 @@ name: indexnode
 on:
   push:
     branches: ["**"]
-    paths: ["indexnode/**", ".github/workflows/indexnode.yml"]
+    paths: ["indexnode/**", "indexnode-android/Contract/**", ".github/workflows/indexnode.yml"]
   # Manual rebuild/publish of the version in the source (publishes only when its tag does not exist yet).
   # There is no tag trigger: the release job creates the tag itself, and a tag made with GITHUB_TOKEN does not start a workflow anyway.
   workflow_dispatch:
   pull_request:
-    paths: ["indexnode/**", ".github/workflows/indexnode.yml"]
+    paths: ["indexnode/**", "indexnode-android/Contract/**", ".github/workflows/indexnode.yml"]
 
 permissions:
   contents: read

@@ -1,3 +1,7 @@
+## 0.10.6
+
+- Build fix: the GPU image builds from the repo root (`docker build -f indexnode/Dockerfile .`; the workflow's `context: .`), copying IndexNode, IndexNode.Core and indexnode-android/Contract at their repo paths, so the ProjectReferences resolve (0.10.5's image build failed with CS0246). The indexnode and indexnode-gpu workflows also run when indexnode-android/Contract changes. No code change.
+
 ## 0.10.5
 
 - **`search.json` (Publish).** `publish` writes `search.json` at the top of the output, next to `packs.json`, from every pack's drama.json. It is built whole on each run (never patched) and ordered by packId. Shape: `{ "v": 1, "builtAt": "<UTC>", "dramas": [ … ] }`, plain compact UTF-8 JSON. Each entry: `packId`, `videos` (upload ids), `title {en, zh}`, `fullTitle.en`, `teaser.en`, `synopsis.en`, `tags`, `era`, `fantasy`, `ai` (no/partly/yes), `ending {kind, nextPart, nextPartHint}` or null, `cast [{en, zh, pinyin, role, label}]` (names only, no pictures or relations), `durationSeconds` and `channel {id, name}`. Missing optional fields are null. The teaser is spoiler-free and the synopsis is not: the site decides what to show. No storage URLs or keys.
