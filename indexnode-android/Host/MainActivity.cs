@@ -90,7 +90,7 @@ public class MainActivity : Activity
             case "getDiagnostics": return _rt.DiagnosticsJson();
             case "clearDiagnostics": _rt.Host.ClearLog(); CrashRecorder.Clear(); return true;
             case "shareLog": RunOnUiThread(ShareLog); return true;
-            case "runNow": RunWorker.RunNow(this); _rt.Host.Log("Run now requested"); return true;
+            case "runNow": if (_rt.Running) { _rt.Host.Log("Run now: " + RunGuard.Busy); return true; } RunWorker.RunNow(this); _rt.Host.Log("Run now requested"); return true;
             case "stopRun": _rt.Stop(); return true;
             case "saveSettings": _rt.SaveSettings(JsonNode.Parse(arg)!.AsObject()); RunWorker.Schedule(this); return true;
             case "importSetup": _rt.ImportSetup(arg); RunWorker.Schedule(this); return _rt.StateJson();

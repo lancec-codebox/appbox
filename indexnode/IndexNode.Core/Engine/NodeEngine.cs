@@ -37,6 +37,8 @@ public sealed class EngineOptions
     public string Name { get; init; } = "node";
     public string Kind { get; init; } = "desktop";
     public string Version { get; init; } = "0.1.0";
+    /// <summary>Stable id of this process's instance on the node record; null: a new random one per engine (desktop). The phone passes one per device so a restart is not reported as a second process.</summary>
+    public string? InstanceId { get; init; }
     public string[] Stages { get; init; } = ["download", "process", "comments"];
     public Dictionary<string, int> Jobs { get; init; } = new() { ["download"] = 1, ["process"] = 1, ["comments"] = 1 };
     public int Threads { get; init; } = 1;
@@ -148,7 +150,7 @@ public sealed partial class NodeEngine
     private Traffic traffic => o.Traffic ?? Traffic.Current;
     private Task Wait(TimeSpan t, CancellationToken ct) => (o.Delay ?? Task.Delay)(t, ct);
     private volatile bool recordLoaded; // no registry write before the previous record's traffic is loaded, or it would be counted twice
-    private readonly string instance = Guid.NewGuid().ToString("N");
+    private readonly string instance;
     public static readonly TimeSpan InstanceWindow = TimeSpan.FromMinutes(2);
     private Dictionary<string, string> peers = new();
 
@@ -158,6 +160,7 @@ public sealed partial class NodeEngine
     public NodeEngine(IStore store, Paths paths, EngineOptions options, IReadOnlyDictionary<string, IStageHandler> handlers)
     {
         this.store = store; this.paths = paths; o = options; this.handlers = handlers;
+        instance = string.IsNullOrEmpty(o.InstanceId) ? Guid.NewGuid().ToString("N") : o.InstanceId;   // a host that is one instance per device (the phone) passes a stable id, so its own earlier heartbeat is "me", not a peer
         Control = new ControlWatcher(store, paths);
         Control.Changed += OnControlChanged;
         o.Limits?.Apply(Control.Current);

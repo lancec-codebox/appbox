@@ -11,7 +11,7 @@ public sealed class Bridge(Func<string, string, Task<JsonNode?>> handler, Func<s
 {
     public static readonly string[] Methods =
     [
-        "getState", "getLog", "runNow", "stopRun", "saveSettings", "importSetup", "pairMedusa", "pairStatus", "checkPluginUpdate", "setUiUrl", "clearLog", "shareLog",
+        "getState", "getLog", "runNow", "stopRun", "saveSettings", "importSetup", "pairMedusa", "pairStatus", "checkPluginUpdate", "setUiUrl", "clearLog", "shareLog", "getDiagnostics", "clearDiagnostics",
     ];
 
     /// <summary>The reply text to post back, or null when the message was refused.</summary>

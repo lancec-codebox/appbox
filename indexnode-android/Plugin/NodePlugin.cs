@@ -16,7 +16,7 @@ internal sealed class HostLogWriter(IHost host) : TextWriter
 /// <summary>The node loop for phones: IndexNode.Core's engine with the download stage (and, when asked, refresh and comments), over IHost and ITools only.</summary>
 public sealed class NodePlugin : IPlugin
 {
-    public const string Version = "0.1.0";
+    public const string Version = "0.1.1";
 
     public Task<string> SmokeAsync(IHost host)
     {
@@ -71,7 +71,7 @@ public sealed class NodePlugin : IPlugin
         var limits = new LimitState(host.NodeId, new NodeLimits { Budget = budget }, "host", Path.Combine(host.FilesDir, "state.json"));
         var opts = new EngineOptions
         {
-            NodeId = host.NodeId, Name = host.NodeName, Kind = host.Kind, Version = Version,
+            NodeId = host.NodeId, Name = host.NodeName, Kind = host.Kind, Version = Version, InstanceId = InstanceId(host),
             Stages = stages, Workers = 1, Lanes = 1, Threads = 1, Once = once, MaxJobs = maxJobs, Limits = limits,
             Conditions = host.GetSetting("conditions"),
             StorageHost = Uri.TryCreate(host.StoreUrl, UriKind.Absolute, out var su) ? su.Host : null, PollInterval = TimeSpan.FromSeconds(30),
@@ -84,6 +84,14 @@ public sealed class NodePlugin : IPlugin
         await engine.RunAsync(ct);
         host.SetStatus("idle", null, null);
         return new JsonObject { ["jobsStarted"] = engine.JobsStarted, ["version"] = Version, ["stages"] = new JsonArray(stages.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()) }.ToJsonString();
+    }
+
+    /// <summary>One instance per phone: the id is made once and kept in the app's settings, so the app, WorkManager and a restart after an update all report as the same instance.</summary>
+    public static string InstanceId(IHost host)
+    {
+        var id = host.GetSetting("instanceId");
+        if (string.IsNullOrEmpty(id)) { id = Guid.NewGuid().ToString("N"); host.SetSetting("instanceId", id); }
+        return id;
     }
 
     private sealed class NoGhostBlob(string name) : IGhostBlob

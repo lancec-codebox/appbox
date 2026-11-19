@@ -21,6 +21,9 @@ Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android 
 
 ## Release notes
 
+### 0.1.3 (host 0.1.3, versionCode 4, plugin 0.1.1)
+- **Fixes from the Pixel log:** the diagnostics page loads (the bridge allow-list lacked `getDiagnostics`/`clearDiagnostics`; a test now checks the page, `Bridge.Methods` and `MainActivity` agree), "Run now" or a WorkManager start during a run logs "a run is already in progress" and is a no-op instead of "run failed", and the phone reports one stable node instance (saved `instanceId`) so a restart no longer warns "another process is already reporting" about its own last heartbeat.
+
 ### 0.1.1 + 0.1.2 (host 0.1.2, versionCode 3)
 - **Fix: "Run now" crashed the app.** WorkManager's `SystemForegroundService` is now declared in the manifest with `foregroundServiceType="dataSync"` (merged into WorkManager's own entry), which `startForeground` needs on Android 10+ (and Android 14 insists on). `RunWorker` waits for the foreground promotion inside its `try`: a refusal is logged and the run continues without the notification instead of killing the app; it also implements `ForegroundInfo` for expedited work on API < 31.
 - **Crash diagnostics.** Every unhandled failure (Android/AppDomain/unobserved task/Java default handler) writes `last-crash.txt` in the app's files dir (UTC time, host and plugin versions, device, Android version, exception type, message, full stack) and a rolling log of the last ~500 lines is kept. The top of the app shows the last crash and the recent log, with **Copy diagnostics** (no SAS or `sig=` ever) and **Clear**.

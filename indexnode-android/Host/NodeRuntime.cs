@@ -8,7 +8,7 @@ namespace IndexNode.Host;
 /// <summary>The one place that ties the pieces together for the process: settings, host, plugin manager, Medusa, a run. The UI and WorkManager both call it.</summary>
 public sealed class NodeRuntime
 {
-    public const string HostVersion = "0.1.2";
+    public const string HostVersion = "0.1.3";
     public const string AppName = "IndexNode";
     private static NodeRuntime? instance;
     public static NodeRuntime Get(Context ctx) => instance ??= new NodeRuntime(ctx.ApplicationContext!);
@@ -100,13 +100,16 @@ public sealed class NodeRuntime
 
     // ---- run ----
     public RunConditions Conditions => RunConditions.FromSettings(Prefs.Get);
-    public bool Running { get { lock (gate) return runCts != null; } }
+    private readonly RunGuard guard = new();
+    public bool Running => guard.Running;
 
     /// <summary>One node run. force = "Run now": the conditions are still checked, the daily cap too (the owner's rules hold).</summary>
     public async Task<JsonNode> RunAsync(bool force, CancellationToken outer)
     {
         CancellationTokenSource cts;
-        lock (gate) { if (runCts != null) throw new InvalidOperationException("a run is already going"); runCts = cts = CancellationTokenSource.CreateLinkedTokenSource(outer); }
+        // Run now during a run, or a WorkManager start while one is going, is not a failure: say so and do nothing
+        if (!guard.TryEnter()) { Host.Log(RunGuard.Busy); return new JsonObject { ["skipped"] = RunGuard.Busy }; }
+        lock (gate) runCts = cts = CancellationTokenSource.CreateLinkedTokenSource(outer);
         try
         {
             if (Prefs.Sas == null) throw new InvalidOperationException("not set up: import the node-setup QR or file first");
@@ -132,7 +135,7 @@ public sealed class NodeRuntime
         }
         catch (OperationCanceledException) { Host.Log("run stopped"); Host.SetStatus("stopped", null, null); throw; }
         catch (Exception e) { LastError = HostRedact.Text(e.GetType().Name + ": " + e.Message, Prefs.Sas, Prefs.MedusaToken); Host.Log("run failed: " + LastError); Host.SetStatus("failed", null, null); throw; }
-        finally { lock (gate) { runCts = null; } cts.Dispose(); Changed?.Invoke(); }
+        finally { lock (gate) { runCts = null; } cts.Dispose(); guard.Exit(); Changed?.Invoke(); }
     }
 
     public void Stop() { lock (gate) runCts?.Cancel(); }
