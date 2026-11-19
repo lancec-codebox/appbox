@@ -12,12 +12,19 @@ A phone node of the drama index. A small .NET 11 (CoreCLR, untrimmed) Android ho
 
 ## Build and test
 ```
-dotnet test indexnode-android/Tests -c Release            # 33 tests
+dotnet test indexnode-android/Tests -c Release            # 43 tests
 dotnet workload install android                            # once; SDK 11
 dotnet build indexnode-android/Plugin -c Release           # -> Plugin/bin/Release/net11.0/IndexNode.Plugin.dll
 dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release/net11.0-android/*-Signed.apk
 ```
 Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug"`, then `-p:AndroidKeyStore=true -p:AndroidSigningKeyStore=debug.keystore -p:AndroidSigningStorePass=android -p:AndroidSigningKeyAlias=androiddebugkey -p:AndroidSigningKeyPass=android`.
+
+## Release notes
+
+### 0.1.1 + 0.1.2 (host 0.1.2, versionCode 3)
+- **Fix: "Run now" crashed the app.** WorkManager's `SystemForegroundService` is now declared in the manifest with `foregroundServiceType="dataSync"` (merged into WorkManager's own entry), which `startForeground` needs on Android 10+ (and Android 14 insists on). `RunWorker` waits for the foreground promotion inside its `try`: a refusal is logged and the run continues without the notification instead of killing the app; it also implements `ForegroundInfo` for expedited work on API < 31.
+- **Crash diagnostics.** Every unhandled failure (Android/AppDomain/unobserved task/Java default handler) writes `last-crash.txt` in the app's files dir (UTC time, host and plugin versions, device, Android version, exception type, message, full stack) and a rolling log of the last ~500 lines is kept. The top of the app shows the last crash and the recent log, with **Copy diagnostics** (no SAS or `sig=` ever) and **Clear**.
+- 0.1.1: a VPN over Wi-Fi counts as Wi-Fi, precise status verdicts (no network, Wi-Fi without internet, on mobile data, Wi-Fi is metered, not charging), WorkManager uses `NetworkType.Connected` and the worker decides, releases are created with `--latest=false`.
 
 ## Releases (`.github/workflows/indexnode-android.yml`)
 Tests, plugin and APK build on every push; no store secret anywhere. On `main`: a new host version (`ApplicationDisplayVersion` in Host.csproj) publishes release `indexnode-android-v<version>` with the APK; a new plugin version (`<Version>` in Plugin.csproj) replaces the DLL and `manifest.json` on the rolling release `indexnode-android-plugin`. Signing uses the Medusa release keystore: secrets `MEDIA_HELPER_KEYSTORE_BASE64`, `MEDIA_HELPER_KEYSTORE_PASSWORD` (store) and `MEDIA_HELPER_KEY_PASSWORD` (key, a separate secret), alias `vars.MEDUSA_KEY_ALIAS` or `media-helper`, the same as `medusa.yml`. On `main` a missing keystore secret **fails the build**, so CI never publishes a debug-signed APK; branches and forks without the secrets are debug-signed (with a warning) so the tests and the build still run. A stable key matters: later APKs install over this one only when signed with the same key. Bump `ApplicationVersion` with the host version.

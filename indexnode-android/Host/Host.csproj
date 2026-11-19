@@ -9,8 +9,8 @@
     <RootNamespace>IndexNode.Host</RootNamespace>
     <ApplicationId>io.ref12.indexnode</ApplicationId>
     <!-- Host version: CI publishes a release indexnode-android-v&lt;version&gt; when this is new. ApplicationVersion must grow with it. -->
-    <ApplicationDisplayVersion>0.1.1</ApplicationDisplayVersion>
-    <ApplicationVersion>2</ApplicationVersion>
+    <ApplicationDisplayVersion>0.1.2</ApplicationDisplayVersion>
+    <ApplicationVersion>3</ApplicationVersion>
     <SupportedOSPlatformVersion>26.0</SupportedOSPlatformVersion>
     <AndroidPackageFormat>apk</AndroidPackageFormat>
     <RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>

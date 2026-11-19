@@ -59,6 +59,7 @@ public sealed class AndroidHost(Context ctx, Prefs prefs, Func<ITools> tools, Ac
         var line = DateTime.Now.ToString("MM-dd HH:mm:ss") + " " + HostRedact.Text(message, prefs.Sas, prefs.MedusaToken);
         lock (gate) { log.Add(line); if (log.Count > 1000) log.RemoveAt(0); }
         Android.Util.Log.Info("indexnode", line);
+        CrashRecorder.AppendLog(line);
     }
     public string[] LogLines() { lock (gate) return log.ToArray(); }
     public void ClearLog() { lock (gate) log.Clear(); }

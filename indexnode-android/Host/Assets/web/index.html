@@ -14,6 +14,12 @@
  progress{width:100%}
 </style></head><body>
 <h1>IndexNode <span id="ver"></span></h1>
+<section id="diag"><h2>Diagnostics</h2>
+ <div id="crashinfo">No crash recorded.</div>
+ <pre id="crash" style="display:none"></pre>
+ <button class="p" id="copyd">Copy diagnostics</button><button id="cleard">Clear</button> <span id="diagmsg"></span>
+ <details><summary>Recent log</summary><pre id="dlog"></pre></details>
+</section>
 <section><h2>Status</h2>
  <table id="st"></table><progress id="pg" max="1" value="0" style="display:none"></progress>
  <div id="why" class="bad"></div>
@@ -76,6 +82,14 @@ act('pair',async()=>{const r=await call('pairMedusa');return r.state==='approved
 act('save',async()=>{const o={};for(const k of ['wifiOnly','chargingOnly','periodic','v1Fallback','noRefresh'])o[k]=$(k).checked;for(const k of ['dailyCap','runMax','maxHeight','periodMinutes'])if($(k).value!=='')o[k]=+$(k).value;o.budget=$('budget').value;o.pluginUrl=$('pluginUrl').value;
  await call('saveSettings',o);await call('setUiUrl',$('uiUrl').value);return 'saved';},'savemsg');
 act('upd',async()=>{const r=await call('checkPluginUpdate');return r.outcome+(r.version?' '+r.version:'')+(r.detail?': '+r.detail:'');},'updmsg');
+let lastReport='';
+async function diag(){try{const d=await call('getDiagnostics');lastReport=d.report||'';
+ $('crashinfo').textContent=d.lastCrash?'Last crash:':'No crash recorded.'; $('crashinfo').className=d.lastCrash?'bad':'';
+ $('crash').style.display=d.lastCrash?'':'none'; $('crash').textContent=d.lastCrash||''; $('dlog').textContent=(d.log||[]).join('\n');}catch(e){$('crashinfo').textContent='Diagnostics unavailable: '+e.message;}}
+async function copyText(t){try{await navigator.clipboard.writeText(t);return true;}catch(e){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();let ok=false;try{ok=document.execCommand('copy');}catch(_){}a.remove();return ok;}}
+act('copyd',async()=>{await diag();return (await copyText(lastReport))?'copied ('+lastReport.length+' chars)':'copy failed: use Share in the Log section';},'diagmsg');
+act('cleard',async()=>{await call('clearDiagnostics');await diag();return 'cleared';},'diagmsg');
+diag(); setInterval(diag,5000);
 act('share',()=>call('shareLog'));act('clear',()=>call('clearLog'));act('reload',async()=>{});
 refresh(); setInterval(refresh,3000);
 </script></body></html>

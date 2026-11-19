@@ -87,6 +87,8 @@ public class MainActivity : Activity
             case "getState": { var s = _rt.StateJson(); s["medusa"] = await _rt.MedusaStatusAsync(); return s; }
             case "getLog": return new JsonArray(_rt.Host.LogLines().Select(l => (JsonNode?)JsonValue.Create(l)).ToArray());
             case "clearLog": _rt.Host.ClearLog(); return true;
+            case "getDiagnostics": return _rt.DiagnosticsJson();
+            case "clearDiagnostics": _rt.Host.ClearLog(); CrashRecorder.Clear(); return true;
             case "shareLog": RunOnUiThread(ShareLog); return true;
             case "runNow": RunWorker.RunNow(this); _rt.Host.Log("Run now requested"); return true;
             case "stopRun": _rt.Stop(); return true;

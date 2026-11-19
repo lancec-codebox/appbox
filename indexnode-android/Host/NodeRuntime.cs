@@ -8,7 +8,7 @@ namespace IndexNode.Host;
 /// <summary>The one place that ties the pieces together for the process: settings, host, plugin manager, Medusa, a run. The UI and WorkManager both call it.</summary>
 public sealed class NodeRuntime
 {
-    public const string HostVersion = "0.1.0";
+    public const string HostVersion = "0.1.2";
     public const string AppName = "IndexNode";
     private static NodeRuntime? instance;
     public static NodeRuntime Get(Context ctx) => instance ??= new NodeRuntime(ctx.ApplicationContext!);
@@ -136,6 +136,21 @@ public sealed class NodeRuntime
     }
 
     public void Stop() { lock (gate) runCts?.Cancel(); }
+
+    /// <summary>The diagnostics page: the last crash, the recent log (the rolling file, so it survives a restart) and the text behind "Copy diagnostics". The SAS and tokens never appear.</summary>
+    public JsonObject DiagnosticsJson()
+    {
+        var s = StateJson();
+        string? S(JsonNode? n) => n?.ToString();
+        var settings = new Dictionary<string, string?>(); foreach (var (k, v) in s["settings"]!.AsObject()) settings[k] = S(v);
+        var state = new Dictionary<string, string?>(); foreach (var (k, v) in s) if (k is not ("settings" or "device")) state[k] = S(v);
+        foreach (var (k, v) in s["device"]!.AsObject()) state["device." + k] = S(v);
+        settings["storeConfigured"] = (Prefs.Sas != null).ToString();
+        var crash = CrashRecorder.LastCrash(); var log = CrashRecorder.LogFileLines(); var secrets = new[] { Prefs.Sas, Prefs.MedusaToken };
+        var device = (Android.OS.Build.Manufacturer + " " + Android.OS.Build.Model).Trim(); var os = Android.OS.Build.VERSION.Release + " (API " + (int)Android.OS.Build.VERSION.SdkInt + ")";
+        var report = Diagnostics.Report(HostVersion, Plugins.Current?.Version, device, os, settings, state, crash, log, secrets);
+        return new JsonObject { ["lastCrash"] = crash == null ? null : HostRedact.Text(crash, secrets), ["log"] = new JsonArray(Diagnostics.TrimLog(log, 100, 400, secrets).Select(l => (JsonNode?)JsonValue.Create(l)).ToArray()), ["report"] = report };
+    }
 
     public JsonObject StateJson()
     {
