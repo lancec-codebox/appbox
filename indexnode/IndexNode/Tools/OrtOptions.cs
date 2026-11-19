@@ -22,13 +22,20 @@ public static class OrtOptions
     /// <summary>Frames per model call: the CPU size, or the GPU size (64-256 keeps an A100 busy).</summary>
     public static int Batch(int cpu, int gpu) => Cuda ? gpu : cpu;
 
+    /// <summary>Config entries every session gets, on every device. session.x64quantprecision=1: without it ONNX Runtime's u8s8 int8 kernels on x64 CPUs with AVX2 but no VNNI (AMD Zen 3, ...) saturate their 16-bit intermediate sums, so an int8 model (SSCD) gives different vectors on different machines. With 1 every CPU takes the non-saturating path. It only affects quantised ops (fp32 models are unchanged) and is a plain config entry the CUDA provider ignores.</summary>
+    public static readonly IReadOnlyList<(string Key, string Value)> ConfigEntries =
+    [
+        ("session.intra_op.allow_spinning", "0"),
+        ("session.inter_op.allow_spinning", "0"),
+        ("session.x64quantprecision", "1"),
+    ];
+
     public static SessionOptions Make(int intraThreads, bool quiet = false) => Make(intraThreads, quiet, Device, DeviceId);
 
     public static SessionOptions Make(int intraThreads, bool quiet, string device, int deviceId = 0)
     {
         var so = new SessionOptions { IntraOpNumThreads = Math.Max(1, intraThreads), InterOpNumThreads = 1 };
-        so.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
-        so.AddSessionConfigEntry("session.inter_op.allow_spinning", "0");
+        foreach (var (k, v) in ConfigEntries) so.AddSessionConfigEntry(k, v);
         if (quiet) so.LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR;
         if (device == "cuda")
         {

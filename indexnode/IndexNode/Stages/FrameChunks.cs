@@ -198,6 +198,7 @@ public static class FrameChunks
         {
             var ms = new MemoryStream();
             foreach (var c in JsonDocument.Parse(man).RootElement.GetProperty("chunks").EnumerateArray())
+                if (!(c.TryGetProperty("rows", out var rw) && rw.TryGetInt32(out var rn) && rn == 0))   // a 0-row chunk has an empty f16: skip it
                 ms.Write(await src.ReadAsync($"{step}/{c.GetProperty("chunk").GetString()}.f16", ct) ?? throw new InvalidOperationException($"{step} chunk missing"));
             return ms.ToArray();
         }
@@ -275,7 +276,7 @@ public sealed class ChunkDir
         foreach (var c in man.GetProperty("chunks").EnumerateArray())
         {
             var n = c.GetProperty("chunk").GetString()!;
-            chunks.Add(FrameChunks.ParseChunk(n, File.ReadAllBytes(Path.Combine(dir, n + ".json")), n + ".json"));
+        { var ci = FrameChunks.ParseChunk(n, File.ReadAllBytes(Path.Combine(dir, n + ".json")), n + ".json"); if (ci.Frames.Count > 0) chunks.Add(ci); }   // 0-frame chunks (older jobs) are skipped by every reader
         }
         int w = man.TryGetProperty("width", out var we) ? we.GetInt32() : 0, h = man.TryGetProperty("height", out var he) ? he.GetInt32() : 0;
         var container = man.TryGetProperty("container", out var co) ? co.GetString() ?? "mp4" : "mp4";

@@ -126,6 +126,7 @@ public static class Dino
         for (int i = 0; i < names.Count; i++)
         {
             var (c, data) = await nextT!; nextT = i + 1 < names.Count ? Fetch(names[i + 1]) : null;
+            if (c.Frames.Count == 0) { done++; continue; }   // a 0-frame chunk (older zips keep theirs)
             var f16 = await ChunkAsync(ffmpeg, data, c, w, h, batch, threads, embed, id, timing, ct); timing.Frames += c.Frames.Count;
             if (up != null) chunks.Add(await up);
             var us = System.Diagnostics.Stopwatch.StartNew(); var cc = c;

@@ -213,7 +213,9 @@ public static class Frames
                     }, ct);
                     tRead += swPart.Elapsed.TotalSeconds - (tGrid + tOffer + tWrite - inner0);
                 }
-                sw.Restart(); var bytes = jpeg ? jout.ToArray() : await enc!.FinishAsync(); tFinish += sw.Elapsed.TotalSeconds; fb += bytes.Length;
+                sw.Restart(); var bytes = jpeg ? jout.ToArray() : await enc!.FinishAsync(); tFinish += sw.Elapsed.TotalSeconds;
+                if (frames.Count == 0) { progress($"{c + 1}/{nChunks} chunks, {keptN}/{sampled} frames kept (chunk {name} has no frames: not written)"); continue; }   // never store an empty chunk (a 0-byte .mjpeg breaks every reader)
+                fb += bytes.Length;
                 sw.Restart(); await put(jpeg ? $"frames/{name}.mjpeg" : $"frames/{name}.mp4", bytes, jpeg ? "application/octet-stream" : "video/mp4"); tPut += sw.Elapsed.TotalSeconds; index.Add((name, c * FrameChunks.ChunkSeconds, frames, bytes.Length));
             }
             finally { enc?.Dispose(); }

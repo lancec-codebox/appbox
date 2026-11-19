@@ -90,6 +90,7 @@ public static class Thumbs
     /// <summary>ffmpeg route: one process per chunk reads the concatenated JPEGs (-f mjpeg, -lowres 3 = 1/8 DCT-scaled decode), scales with flags=area and writes mjpeg; the output is split on SOI. Exactly one JPEG per input frame, else it throws.</summary>
     public static async Task<List<byte[]>> ChunkFfmpegAsync(string ffmpeg, byte[] data, ChunkInfo c, int tw, int th, int threads, string id, CancellationToken ct)
     {
+        if (c.Frames.Count == 0 || data.Length == 0) return [];
         var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg) { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
         foreach (var x in new[] { "-v", "error", "-nostdin", "-threads", Math.Max(1, threads).ToString(), "-lowres", "3", "-f", "mjpeg", "-i", "pipe:0", "-vf", $"scale={tw}:{th}:flags=area", "-fps_mode", "passthrough", "-c:v", "mjpeg", "-q:v", "3", "-f", "mjpeg", "pipe:1" }) psi.ArgumentList.Add(x);
         psi.ArgumentList.Remove("-nostdin");
@@ -99,6 +100,7 @@ public static class Thumbs
         try { await p.StandardInput.BaseStream.WriteAsync(data, ct); } catch (IOException) { }   // ffmpeg quit early: its error is below
         try { p.StandardInput.Close(); } catch (IOException) { }
         await outT; await p.WaitForExitAsync(ct); var err = await errT;
+        if (p.ExitCode != 0 && err.Contains("does not contain any stream", StringComparison.OrdinalIgnoreCase)) throw new PermanentFailure($"{id}: frames/{c.Chunk}.mjpeg has no decodable frames (ffmpeg: {err.Trim()[..Math.Min(200, err.Trim().Length)]}); retrying cannot help");
         if (p.ExitCode != 0) throw new InvalidOperationException($"{id}: ffmpeg failed on frames/{c.Chunk}.mjpeg (exit {p.ExitCode}): {err.Trim()[..Math.Min(300, err.Trim().Length)]}");
         var all = outMs.ToArray(); var rows = FrameChunks.SplitJpegs(all);
         if (rows.Count != c.Frames.Count) throw new InvalidOperationException($"{id}: ffmpeg made {rows.Count} thumbnails for {c.Frames.Count} frames of frames/{c.Chunk}.mjpeg");
@@ -163,6 +165,7 @@ public static class Thumbs
         {
             var (c, data) = await next!;
             next = i + 1 < names.Count ? Fetch(names[i + 1]) : null;   // chunk n+1 downloads while n is processed
+            if (c.Frames.Count == 0) { done++; continue; }   // a 0-frame chunk (older zips keep theirs): nothing to thumbnail
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var jpegs = ffmpeg != null ? await ChunkFfmpegParallelAsync(ffmpeg, data, c, tw, th, threads, id, ct) : ChunkManaged(data, c, tw, th, threads, id);
             timing.ProcessMs += sw.ElapsedMilliseconds; timing.Frames += c.Frames.Count;
@@ -192,6 +195,7 @@ public static class Thumbs
         }
         foreach (var c in frames.Chunks)
         {
+            if (c.Frames.Count == 0) continue;
             List<byte[]> jpegs;
             if (fromVideo != null) jpegs = fromVideo[c.Chunk];
             else
