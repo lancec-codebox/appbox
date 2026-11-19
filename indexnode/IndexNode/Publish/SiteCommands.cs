@@ -74,6 +74,9 @@ public static class SiteCommands
     }
 
     /// <summary>`process --job &lt;id&gt; --steps cast,describe`: redo steps of one already-processed job in the store (needs the SAS; describe needs the AI endpoint). Nothing is queued or leased; processed.json is not rewritten.</summary>
+    /// <summary>The store a `process --job` redo works on: the raw store wrapped so downloaded.json, frames/, sscd/ ... are read from (and a step's outputs committed to) the stage zips.</summary>
+    public static IStore ProcessStore(IStore raw) => StageZipStore.Wrap(raw);
+
     public static async Task<int> ProcessAsync(Args a)
     {
         var id = a.Get("job") ?? throw new ArgumentException("process --job <id> [--steps frames,...] [--threads N] [--ai-... ]  (no --steps: the steps whose outputs are missing; --steps: rerun those, replacing their outputs)");
@@ -84,7 +87,7 @@ public static class SiteCommands
         foreach (var s in steps) if (!ProcessStage.KnownSteps.Contains(s)) throw new ArgumentException($"unknown step '{s}' (known: {string.Join(',', ProcessStage.KnownSteps)})");
         ProcessStage.Ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
         if ((steps.Contains("describe") || steps.Contains("translate")) && !ProcessStage.Ai.Configured) throw new InvalidOperationException("describe and translate need an AI endpoint: ai.* in the config, INDEXNODE_AI_* or --ai-base-url/--ai-key/--ai-text-model/--ai-vision-model");
-        var http = Commands.NewHttp(); var tools = new Tools(http, cfg); var store = new RestStore(http, cfg.Sas); var paths = new Paths(a.Get("prefix") ?? "index/");
+        var http = Commands.NewHttp(); var tools = new Tools(http, cfg); var store = ProcessStore(new RestStore(http, cfg.Sas)); var paths = new Paths(a.Get("prefix") ?? "index/");   // 0.10.8: the store holds only stage zips; downloaded.json, frames/ and the rest are served from them (and a step's zip is committed whole)
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         var threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         var ctx = new JobContext
