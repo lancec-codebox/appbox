@@ -92,8 +92,7 @@ public class Release0107Tests
         return null;
     }
 
-    // 2026-11-19: fails in CI (ffmpeg not installed / time-dependent); follow-up Victor39
-    [Fact(Skip = "2026-11-19: fails in CI (ffmpeg not installed); follow-up Victor39")]
+    [Fact]
     public async Task The_frames_step_never_writes_a_chunk_with_no_frames()
     {
         var ff = Real("ffmpeg"); var pr = Real("ffprobe"); Assert.True(ff != null && pr != null, "ffmpeg and ffprobe are required for this test");
@@ -129,8 +128,7 @@ public class Release0107Tests
         meta.Add((n, start, count, ms.Length));
     }
 
-    // 2026-11-19: fails in CI (ffmpeg not installed / time-dependent); follow-up Victor39
-    [Fact(Skip = "2026-11-19: fails in CI (ffmpeg not installed); follow-up Victor39")]
+    [Fact]
     public async Task Thumbs_skips_a_stored_0_frame_chunk_and_writes_nothing_for_it()
     {
         var s = new FakeStore(); var p = new Paths("index/"); var meta = new List<(string, double, int, long)>();

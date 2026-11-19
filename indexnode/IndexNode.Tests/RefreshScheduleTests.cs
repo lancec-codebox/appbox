@@ -298,17 +298,17 @@ public class RefreshScheduleTests
         Assert.Equal("lookup", s.Job(P.Job("refresh", "pl-PLk")).LastRun); Assert.NotNull(s.Job(P.Job("refresh", "pl-PLk")).LastLookup);
     }
 
-    // 2026-11-19: fails in CI (ffmpeg not installed / time-dependent); follow-up Victor39
-    [Fact(Skip = "2026-11-19: fails in CI (time-dependent); follow-up Victor39")]
+    [Fact]
     public async Task All_due_triggers_only_scheduled_sources_whose_time_has_come()
     {
+        var Later = DateTimeOffset.UtcNow.AddDays(2);   // AddAsync stamps "due" from the real clock, so a later time must be relative to it, not to the fixed Now
         var s = new FakeStore(); var f = new Fake();
         foreach (var (id, sch) in new[] { ("PLo", "once"), ("PLd", "1d"), ("PLl", "1d") }) { f.Listings[PlUrl(id)] = Lines(Id('a')); await Sources.AddAsync(s, P, Pl(id, sch), default); await RunJob(s, f, "pl-" + id); s.Blobs[P.Job("refresh", "pl-" + id)].Tags.Remove(Tags.Priority); } // as the engine leaves it after the run
         s.Blobs[P.Job("refresh", "pl-PLo")].Tags[Tags.State] = "done";
         Assert.Empty(await Sources.DueAsync(s, P, default, () => Now));                         // 1d sources are pending but their time has not come
-        Assert.Equal(["pl-PLd", "pl-PLl"], (await Sources.DueAsync(s, P, default, () => Now.AddDays(2))).OrderBy(x => x));
+        Assert.Equal(["pl-PLd", "pl-PLl"], (await Sources.DueAsync(s, P, default, () => Later)).OrderBy(x => x));
         await s.AcquireLeaseAsync(P.Job("refresh", "pl-PLl"), 60, default);
-        Assert.Equal(["pl-PLd"], await Sources.DueAsync(s, P, default, () => Now.AddDays(2)));  // one a node is running is skipped
+        Assert.Equal(["pl-PLd"], await Sources.DueAsync(s, P, default, () => Later));  // one a node is running is skipped
     }
 
     // ---- members.json
