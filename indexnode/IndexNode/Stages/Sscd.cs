@@ -64,7 +64,7 @@ public static class Sscd
         return local;
     }
 
-    static void Fill(DenseTensor<float> t, int row, byte[] rgb, int plane)
+    internal static void Fill(DenseTensor<float> t, int row, byte[] rgb, int plane)
     {
         var tb = t.Buffer.Span; int baseI = row * 3 * plane;
         for (int i = 0; i < plane; i++) for (int c = 0; c < 3; c++) tb[baseI + c * plane + i] = (rgb[i * 3 + c] / 255f - Mean[c]) / Std[c];

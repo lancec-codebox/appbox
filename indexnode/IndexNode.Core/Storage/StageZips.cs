@@ -30,6 +30,7 @@ public static class StageLayout
         if (member.StartsWith("frames/") || member.StartsWith("keyframes/")) return "frames";
         if (member.StartsWith("sscd/")) return "sscd";   // incl. sscd/frames/NNNN.json: the frames indexes as the sscd pass rewrote them (frames.zip is never patched)
         if (member.StartsWith("thumbs/")) return "thumbs";
+        if (member.StartsWith("centers/")) return "centers";   // 0.11.0: centers.zip = centers/centers.bin + centers/manifest.json (not in Stages: no loose layout ever existed, and the virtual processed.json hash stays as it was)
         if (member.StartsWith("asr/")) return "transcribe";
         if (member.StartsWith("ocr/")) return "ocrsubs";
         if (member.StartsWith("cast/")) return "cast";
@@ -41,13 +42,13 @@ public static class StageLayout
     }
 
     /// <summary>The zip a step job's output goes to (steps are stage names, but a few have none of their own).</summary>
-    public static string? ZipOfStep(string step) => Stages.Contains(step) ? step : null;
+    public static string? ZipOfStep(string step) => Stages.Contains(step) || step == "centers" ? step : null;
 
     public static string Inputs(IEnumerable<string?> shas) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.ASCII.GetBytes(string.Join("|", shas.Select(s => s ?? "-"))))).ToLowerInvariant();
 
     public static readonly Dictionary<string, string[]> InputStages = new()
     {
-        ["sscd"] = ["frames"], ["thumbs"] = ["frames"], ["cast"] = ["frames", "sscd"], ["sync"] = ["transcribe", "ocrsubs"],
+        ["sscd"] = ["frames"], ["centers"] = ["sscd"], ["thumbs"] = ["frames"], ["cast"] = ["frames", "sscd"], ["sync"] = ["transcribe", "ocrsubs"],
         ["describe"] = ["transcribe", "ocrsubs", "cast"], ["translate"] = ["describe"],
     };
 

@@ -10,6 +10,21 @@ public sealed class LocalStore(string root) : IStore
 {
     readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, string>> tags = new();
     string PathOf(string name) => Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar));
+    // blob metadata (idx_sha256, idx_inputs, ...) lives in a sidecar under <root>/.indexnode-meta so it survives between commands, like blob metadata does; listings skip that folder
+    const string MetaDir = ".indexnode-meta";
+    string MetaPath(string name) => Path.Combine(root, MetaDir, name.Replace('/', Path.DirectorySeparatorChar) + ".json");
+    IReadOnlyDictionary<string, string> MetaOf(string name)
+    {
+        var m = MetaPath(name);
+        try { return File.Exists(m) ? System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(m)) ?? new() : new Dictionary<string, string>(); } catch { return new Dictionary<string, string>(); }
+    }
+    void WriteMeta(string name, IReadOnlyDictionary<string, string> md)
+    {
+        var m = MetaPath(name); Directory.CreateDirectory(Path.GetDirectoryName(m)!);
+        File.WriteAllText(m, System.Text.Json.JsonSerializer.Serialize(md));
+    }
+    /// <summary>A stand-in ETag: changes whenever the file's size or write time does (If-Match on head.yaml, range reads pinned to a zip).</summary>
+    string? ETagOf(string name) { var f = new FileInfo(PathOf(name)); return f.Exists ? "\"" + f.Length.ToString("x") + "-" + f.LastWriteTimeUtc.Ticks.ToString("x") + "\"" : null; }
 
     public Task<IReadOnlyList<BlobEntry>> FindByTagsAsync(string where, CancellationToken ct) => Task.FromResult<IReadOnlyList<BlobEntry>>([]);
 
@@ -20,19 +35,33 @@ public sealed class LocalStore(string root) : IStore
             foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
             {
                 var name = Path.GetRelativePath(root, f).Replace(Path.DirectorySeparatorChar, '/');
+                if (name.StartsWith(MetaDir + "/", StringComparison.Ordinal)) continue;
                 if (name.StartsWith(prefix, StringComparison.Ordinal))
-                    list.Add(new BlobEntry(name, tags.GetValueOrDefault(name) ?? new Dictionary<string, string>(), new Dictionary<string, string>(), null, new FileInfo(f).Length));
+                    list.Add(new BlobEntry(name, tags.GetValueOrDefault(name) ?? new Dictionary<string, string>(), withMetadata ? MetaOf(name) : new Dictionary<string, string>(), null, new FileInfo(f).Length));
             }
         return Task.FromResult<IReadOnlyList<BlobEntry>>(list.OrderBy(e => e.Name, StringComparer.Ordinal).ToList());
     }
 
     public async Task<BlobContent?> GetAsync(string name, CancellationToken ct) =>
-        File.Exists(PathOf(name)) ? new BlobContent(await File.ReadAllBytesAsync(PathOf(name), ct), null) : null;
+        File.Exists(PathOf(name)) ? new BlobContent(await File.ReadAllBytesAsync(PathOf(name), ct), ETagOf(name)) : null;
+
+    public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) =>
+        Task.FromResult<BlobProps?>(File.Exists(PathOf(name)) ? new BlobProps(new FileInfo(PathOf(name)).Length, ETagOf(name), MetaOf(name)) : null);
+
+    public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    {
+        if (!File.Exists(PathOf(name))) return new(null, false);
+        if (ifMatch != null && ETagOf(name) != ifMatch) return new(null, true);
+        await using var fs = new FileStream(PathOf(name), FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var n = (int)Math.Max(0, Math.Min(len, fs.Length - off)); var buf = new byte[n]; fs.Seek(Math.Min(off, fs.Length), SeekOrigin.Begin);
+        int got = 0; while (got < n) { int r = await fs.ReadAsync(buf.AsMemory(got, n - got), ct); if (r <= 0) break; got += r; }
+        return new(buf, false);
+    }
 
     public async Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct)
     {
         var c = await GetAsync(name, ct);
-        return new ConditionalResult(c != null, c != null, c?.Data, null);
+        return new ConditionalResult(c != null && c.ETag != etag, c != null, c?.Data, c?.ETag);
     }
 
     public Task<IReadOnlyDictionary<string, string>?> GetTagsAsync(string name, CancellationToken ct) =>
@@ -44,6 +73,7 @@ public sealed class LocalStore(string root) : IStore
         if (onlyIfNew && File.Exists(p)) return false;
         Directory.CreateDirectory(Path.GetDirectoryName(p)!);
         await File.WriteAllBytesAsync(p, data, ct);
+        if (File.Exists(MetaPath(name))) File.Delete(MetaPath(name));   // a Put keeps no metadata unless it is re-sent
         if (t != null) tags[name] = t;
         return true;
     }
@@ -67,9 +97,9 @@ public sealed class LocalStore(string root) : IStore
     public Task<string?> AcquireLeaseAsync(string name, int seconds, CancellationToken ct) => Task.FromResult<string?>(Guid.NewGuid().ToString());
     public Task RenewLeaseAsync(string name, string leaseId, CancellationToken ct) => Task.CompletedTask;
     public Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct) => Task.CompletedTask;
-    public Task SetMetadataAsync(string name, IReadOnlyDictionary<string, string> metadata, string? leaseId, CancellationToken ct) => Task.CompletedTask;
+    public Task SetMetadataAsync(string name, IReadOnlyDictionary<string, string> metadata, string? leaseId, CancellationToken ct) { if (File.Exists(PathOf(name))) WriteMeta(name, metadata); return Task.CompletedTask; }
     public Task SetTagsAsync(string name, IReadOnlyDictionary<string, string> t, string? leaseId, CancellationToken ct) { tags[name] = t; return Task.CompletedTask; }
-    public Task DeleteAsync(string name, CancellationToken ct) { if (File.Exists(PathOf(name))) File.Delete(PathOf(name)); tags.TryRemove(name, out _); return Task.CompletedTask; }
+    public Task DeleteAsync(string name, CancellationToken ct) { if (File.Exists(PathOf(name))) File.Delete(PathOf(name)); if (File.Exists(MetaPath(name))) File.Delete(MetaPath(name)); tags.TryRemove(name, out _); return Task.CompletedTask; }
 }
 
 /// <summary>

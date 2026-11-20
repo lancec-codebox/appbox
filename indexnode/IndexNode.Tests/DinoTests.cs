@@ -136,7 +136,7 @@ public class DinoTests
         Assert.DoesNotContain("dino", steps); Assert.DoesNotContain("clip", steps);
         Assert.All(steps, s => Assert.True(ProcessStage.FullSteps.Contains(s) || s == "sync", s));
         Assert.All(ProcessStage.FullSteps, s => Assert.Contains(s, steps));
-        Assert.Equal(["frames", "sscd", "thumbs", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"], Protocol.IngestStepStages);
+        Assert.Equal(["frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"], Protocol.IngestStepStages);
         Assert.DoesNotContain("dino", Protocol.DefaultSteps); Assert.DoesNotContain("dino", ProcessStage.FullSteps);
         Assert.DoesNotContain("dino", JobDescriptor.NewProcess("x").Steps!);
     }

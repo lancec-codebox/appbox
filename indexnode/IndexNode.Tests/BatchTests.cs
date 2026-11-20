@@ -49,7 +49,7 @@ public class BatchTests
         var s = new FakeStore(); foreach (var d in new[] { "d1", "d2", "d3" }) await Drama(s, d, "2026-11-17T10:00:0" + d[1] + "Z");
         var seen = new List<string>();
         await Run(Engine(s, Opts(), _ => Writes(ctx => { lock (seen) seen.Add(ctx.Stage + ":" + ctx.Job.JobId); return Task.CompletedTask; })));
-        Assert.Equal(21, seen.Count);
+        Assert.Equal(Steps.Length * 3, seen.Count);
         var stages = seen.Select(x => Array.IndexOf(Steps, x.Split(':')[0])).ToList();
         Assert.Equal(stages.OrderBy(x => x).ToList(), stages);                          // frames x3, sscd x3, thumbs x3, ...
         Assert.Equal(Steps, seen.Select(x => x.Split(':')[0]).Distinct().ToArray());      // in the order frames, sscd, thumbs, transcribe, ocrsubs, cast, sync

@@ -15,7 +15,7 @@ public static class StageOrder
     // 0.10.1: no cap on dramas examined; selection goes on until the batch is full or the list ends (0.10.0 stopped after 20 and starved when they were all ineligible)
 
     /// <summary>The CPU steps a worker runs on one drama in one pass, in this order (only those the node runs and that are pending).</summary>
-    public static readonly string[] PassOrder = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs", "cast", "sync"];
+    public static readonly string[] PassOrder = ["frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "cast", "sync"];
 
     public static async Task<List<(string Stage, BlobEntry Head)>> HeadsAsync(IEnumerable<string> stages, Func<string, CancellationToken, Task<IReadOnlyList<BlobEntry>>> pending,
         Func<string, BlobEntry, CancellationToken, Task<bool>> eligible, CancellationToken ct)

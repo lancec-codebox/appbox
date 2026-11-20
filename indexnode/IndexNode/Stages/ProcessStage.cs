@@ -22,17 +22,17 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
     public static string[] SkippedAiSteps(AiConfig? ai) => ai is { Configured: true } ? [] : AiSteps;
 
     /// <summary>Every step of a fully processed video (sync is computed after transcribe + ocrsubs; clip is dropped).</summary>
-    public static readonly string[] FullSteps = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs", "cast", "describe", "translate"];
-    public static readonly string[] KnownSteps = ["frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "translate", "sync"];
+    public static readonly string[] FullSteps = ["frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "cast", "describe", "translate"];
+    public static readonly string[] KnownSteps = ["frames", "sscd", "centers", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "compress", "cast", "describe", "translate", "sync"];
 
     /// <summary>The outputs that make a video fully processed, per step: the node that writes the last one also writes processed.json.</summary>
     // owner 2026-11-16: DINOv2 is not part of ingest (duplicates use SSCD), and clip left the default pipeline on 2026-11-14: opt-in steps are NOT listed here, or an upload processed step by step without them would never be marked processed
-    public static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
+    public static readonly (string Step, string File)[] Outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("centers", "centers/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json"), ("translate", Translate.OutJson)];
 
     /// <summary>What each step derives, as paths under the video's folder (a trailing / is a folder). Never a source file: video.mp4, info.json, description.txt, thumb.jpg, subs/ (except our own subs/ai/), comments/, downloaded.json. sync.json is not listed: a redo never reruns sync.</summary>
     public static readonly IReadOnlyDictionary<string, string[]> Owned = new Dictionary<string, string[]>
     {
-        ["frames"] = ["frames/", "keyframes/"], ["sscd"] = ["sscd/"], ["dino"] = ["dino/"], ["thumbs"] = ["thumbs/"], ["clip"] = ["clip/"], ["transcribe"] = ["asr/"], ["ocrsubs"] = ["ocr/"],
+        ["frames"] = ["frames/", "keyframes/"], ["sscd"] = ["sscd/"], ["centers"] = ["centers/"], ["dino"] = ["dino/"], ["thumbs"] = ["thumbs/"], ["clip"] = ["clip/"], ["transcribe"] = ["asr/"], ["ocrsubs"] = ["ocr/"],
         ["cast"] = ["cast/"], ["describe"] = ["describe.json"], ["translate"] = ["subs/ai/"], ["compress"] = ["compact.mp4"],
     };
 
@@ -98,10 +98,13 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             ?? throw new InvalidOperationException($"{id} has no downloaded.json yet");
         double duration = StoredJson.Doc(downloaded.Data, $"{id}/downloaded.json").RootElement.TryGetProperty("durationSeconds", out var dEl) ? dEl.GetDouble() : 0;
 
+        // centers: also due again when sscd.zip changed since centers.zip was built (its idx_inputs no longer matches)
+        bool centersStale = steps.Contains("centers") && !Redo && Has("centers/manifest.json") && await CentersStep.StaleAsync(store, paths, id, ct);
         var need = new Dictionary<string, bool>
         {
             ["frames"] = steps.Contains("frames") && !Has("frames/manifest.json"),
             ["sscd"] = steps.Contains("sscd") && !Has("sscd/manifest.json"),
+            ["centers"] = steps.Contains("centers") && (!Has("centers/manifest.json") || centersStale),
             ["dino"] = steps.Contains("dino") && !Has("dino/manifest.json"),
             ["thumbs"] = steps.Contains("thumbs") && !Has("thumbs/manifest.json"),
             ["clip"] = steps.Contains("clip") && !Has("clip/manifest.json"),
@@ -170,6 +173,12 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 await FrameChunks.ApplySscdPassAsync(wst, paths, id, fs, rep, keep, fset.SscdCosine, fset.LookbackSeconds, ct);
                 Log.Info($"process {id}: sscd pass kept {keep.Count} of {rep.Length} frames");
                 await Commit("sscd");
+            }
+            if (need["centers"])
+            {   // after sscd: the per-drama k-means centers from the stored vectors (0.11.0)
+                ctx.Report("centers", null);
+                Log.Info($"process {id}: centers {await CentersStep.RunAsync(wst, paths, id, Math.Max(1, ctx.ThreadShare()), m => ctx.Report("centers", m), ct)}");
+                await Commit("centers");
             }
             if (need["dino"])
             {   // after sscd: DINOv2-small vectors from the stored frames (opt-in step)

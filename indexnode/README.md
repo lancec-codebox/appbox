@@ -23,6 +23,41 @@ indexnode config set <jobs|threads|model-url|model-path|node-name|ytdlp.command|
 
 All commands take `--prefix` (default `index/`). `INDEXNODE_SAS_URL` overrides the stored SAS.
 
+## Centers and screenshot search (0.11.0)
+
+`centers` is a step after `sscd`: per upload, spherical k-means (k = min(256, frames), k-means++, 10 iterations, seed from the upload id) over its stored SSCD vectors. Output `centers.zip` (stored, so a member block can be range-read) with `centers/centers.bin` and `centers/manifest.json`.
+
+```
+indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N]
+indexnode search-index build [--new-mean] | update
+indexnode search --vector <f32|f16 file of 512 values> | --image <file> [--top-centers 300] [--top 20]
+indexnode process --job <id> --steps centers
+```
+
+`centers.bin` (little-endian, offsets from the start of the file): header of 2144 bytes: 0 magic `IXCT`; 4 u32 version (1); 8 u32 k; 12 u32 dim (512); 16 u32 frames; 20 u32 build (1); 32 SHA-256 of the sscd f16 rows (32 bytes); 64 the upload's vector sum (512 f32); 2112 u64 centers offset (2144); 2120 u64 table offset; 2128 u64 members offset; 2136 u64 total length. Then k center vectors (f16, unit length), the center table (k x {u64 block offset, u32 block length, u32 member count}), then one member block per center, back to back: count x 512 f16 vectors, count x f32 times, count x i32 original row numbers (ascending). Bit codes are not stored per upload.
+
+Global search table: `index/search/head.yaml` (current version) and `index/search/vN/`: `mean.f32`, `bits.bin` (64-byte sign codes of center - mean, one per center), `refs.bin` (u32 upload index, u32 center index per row), `uploads.yaml`. `update` writes a new version with the same mean; `build --new-mean` recomputes it. A query reads only the table, then range-requests the member blocks of the best centers.
+
+**Local-only mode.** Input and output are separate stores, and the folder has the same `index/...` layout as the blob store (`index/videos/<id>/sscd.zip`, `index/videos/<id>/centers.zip`, `index/search/...`); no SAS and no network are needed once the data is local. `centers backfill`, `search-index build|update` and `search` all take:
+
+```
+--input-local <dir>    read the uploads' sscd.zip from a folder instead of the blob store
+--output-local <dir>   write centers.zip and the search index to a folder instead of the blob store
+--local <dir>          both at once
+```
+
+With neither, both are the blob store (SAS). Typical use: read sscd.zip from the remote store, write everything to a folder, search it locally (the member blocks are read from the folder):
+
+```
+indexnode centers backfill --output-local D:\idx
+indexnode search-index build --output-local D:\idx
+indexnode search --image shot.png --output-local D:\idx        # needs no SAS
+```
+
+With `--output-local` nothing is ever written to the store: a write that would reach it throws. The folder keeps each blob's metadata (`idx_sha256`, `idx_inputs`) in `<dir>/.indexnode-meta/`, so a second `backfill` skips what is built; `.indexnode-zips/` is the stage-zip cache.
+
+TODO: featureless frames are not filtered out yet.
+
 ## Download (0.5.1)
 
 Each release has, per platform: `indexnode-<v>-<rid>[.exe]` (self-contained single file: no .NET install, ONNX Runtime and sherpa-onnx inside; win-x64 45.7 MiB, linux-x64 49.4 MiB) and `indexnode-<v>-<rid>-fdd[.exe]` (framework-dependent, needs the .NET 10 runtime; 25.9 MiB and 35.2 MiB). Each has a `.sha256`. On a new machine: download, run `indexnode tools install --all`, then `indexnode config set-sas <url>`.

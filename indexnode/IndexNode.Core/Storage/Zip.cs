@@ -113,9 +113,10 @@ public static class ZipFormat
     }
 
     /// <summary>Reads the member list: the end record, then the central directory.</summary>
-    public static async Task<List<ZipEntry>> ReadDirectoryAsync(IZipSource src, CancellationToken ct)
+    public static async Task<List<ZipEntry>> ReadDirectoryAsync(IZipSource src, CancellationToken ct, int tailHint = 65535 + 22 + 20 + 56)
     {
-        int tailLen = (int)Math.Min(src.Length, 65535 + 22 + 20 + 56);
+        // tailHint: how much of the end to read first (at least 98); a zip with few members needs about 1 KB, so a range-reading query does not pull 64 KB per zip
+        int tailLen = (int)Math.Min(src.Length, Math.Max(tailHint, 22 + 20 + 56));
         long tailOff = src.Length - tailLen;
         var tail = await src.ReadAsync(tailOff, tailLen, ct);
         int eocd = -1;

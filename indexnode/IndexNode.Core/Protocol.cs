@@ -12,18 +12,20 @@ public static partial class Protocol
     /// <summary>Name of the speech model whose output the ASR step stores under asr/ (the cache key of the process zips).</summary>
     public const string AsrModelName = "sensevoice";
     /// <summary>The processing steps, each its own job stage (jobs/&lt;step&gt;/&lt;id&gt;.json).</summary>
-    public static readonly string[] StepStages = ["frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"];
+    public static readonly string[] StepStages = ["frames", "sscd", "centers", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate"];
     /// <summary>The step jobs an upload gets by default (download, enqueue, sources): every step stage except the opt-in ones (dino: owner 2026-11-16, not part of ingest; clip: dropped 2026-11-14), which run only when asked for (process --job --steps).</summary>
     public static readonly string[] IngestStepStages = StepStages.Where(s => s is not ("dino" or "clip")).ToArray();
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
     public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "refresh", "classify", "availability"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
-    public static readonly string[] HeavyStages = ["process", "frames", "sscd", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
+    public static readonly string[] HeavyStages = ["process", "frames", "sscd", "centers", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
     /// <summary>Stage zips (relative to videos/&lt;id&gt;/) a step job waits for before a node claims it: a zip's existence is its stage's completion signal (0.10.0).</summary>
     public static string[] NeedsOf(string step) => step switch
     {
         "sscd" or "dino" or "clip" or "thumbs" => ["frames.zip"],
+        // 0.11.0: the per-drama centers are built from the stored SSCD vectors
+        "centers" => ["sscd.zip"],
         // 0.7: cast reads the stored frames (no keyframes), after the SSCD pass has rewritten their index; jobs created before keep their stored needs
         "cast" => ["frames.zip", "sscd.zip"],
         "sync" => ["transcribe.zip", "ocrsubs.zip"],
@@ -54,7 +56,7 @@ public static partial class Protocol
     /// <summary>A source's lookup or refresh job is claimed at this priority when it is made due by hand or on add (the job body keeps the source's own priority, which its videos inherit).</summary>
     public const int RefreshNowPriority = 500;
     // owner 2026-11-14: search vectors (clip) dropped from the default pipeline (weak matches; screenshot search is SSCD). The step still runs when asked for explicitly.
-    public static readonly string[] DefaultSteps = ["frames", "sscd", "thumbs", "transcribe", "ocrsubs"];
+    public static readonly string[] DefaultSteps = ["frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs"];
     public const int LeaseSeconds = 60;
     public const int MaxAttempts = 3;
 

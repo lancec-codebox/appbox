@@ -57,6 +57,9 @@ public static class Program
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
         indexnode gpu markers [--dry]
+        indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
+        indexnode search-index build [--new-mean] | update [--threads N]   (the global search table under index/search/vN/)
+        indexnode search --vector <f32|f16 file of 512> | --image <file> [--top-centers 300] [--top 20] [--threads N]   (screenshot search over the centers; "search <text> --job <id>" is the clip text search)
         indexnode status [--json]
         indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]   (read-only: why each drama's steps are or are not eligible for the next batch)
         (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
@@ -102,7 +105,9 @@ public static class Program
                 "repack" => await Commands.RepackAsync(a),
                 "batch" => await Commands.BatchAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
-                "search" => await Commands.SearchAsync(a),
+                "search" => a.Has("vector") || a.Has("image") ? await CentersCommands.SearchAsync(a) : await Commands.SearchAsync(a),
+                "centers" => await CentersCommands.CentersAsync(a),
+                "search-index" => await CentersCommands.SearchIndexAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await Commands.RequeueAsync(a),
                 "classify" => await ClassifyCommand.RunAsync(a),
