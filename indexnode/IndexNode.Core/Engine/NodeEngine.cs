@@ -35,7 +35,7 @@ public sealed class JobSkipped(string message) : Exception(message);
 
 /// <summary>0.12.0/0.13.0: thrown by the pre-check (the first step of a process claim) when the upload is a copy / AI / a non-canonical dub of an upload we already have; the job ends in state "duplicate".</summary>
 public sealed class DuplicateFound(string upload, double share, string? speechLanguage = null, bool? dubbed = null, string? languageSource = null, string? metadataLanguage = null, string? url = null) : Exception($"duplicate of {upload} (share {share:0.00})")
-{ public string Upload { get; } = upload; public double Share { get; } = share; public string? SpeechLanguage { get; } = speechLanguage; public bool? Dubbed { get; } = dubbed; public string? LanguageSource { get; } = languageSource; public string? MetadataLanguage { get; } = metadataLanguage; public string? Url { get; } = url; public string? Why { get; init; } public double? AiScore { get; init; } }
+{ public string Upload { get; } = upload; public double Share { get; } = share; public string? SpeechLanguage { get; } = speechLanguage; public bool? Dubbed { get; } = dubbed; public string? LanguageSource { get; } = languageSource; public string? MetadataLanguage { get; } = metadataLanguage; public string? Url { get; } = url; public string? Why { get; init; } public double? AiScore { get; init; } public bool Ai { get; init; } }
 
 public interface IStageHandler
 {
@@ -44,6 +44,8 @@ public interface IStageHandler
 
 public sealed class EngineOptions
 {
+    /// <summary>0.13.1: at start, add the singleton search-index entry when none is pending (catch-up; tests of the follow-up turn it off).</summary>
+    public bool SearchIndexCatchUp { get; init; } = true;
     public required string NodeId { get; init; }
     public string Name { get; init; } = "node";
     public string Kind { get; init; } = "desktop";
@@ -362,6 +364,7 @@ public sealed partial class NodeEngine
             var rt = runCts.Token;
             queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now);
             await queue.LoadAsync(rt);
+            await EnsureSearchIndexAsync(rt);
             var workers = new List<Task>();
             for (int i = 0; i < Math.Max(1, o.Workers); i++) { int lane = i + 1; workers.Add(Task.Run(() => LaneLoop(lane, rt))); }
             await Task.WhenAll(workers);

@@ -47,6 +47,16 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         return cur;
     }
 
+    /// <summary>indexnode control ai-dramas on|off: whether nodes may claim a drama the pre-check held as AI.</summary>
+    public static async Task<ControlFile> SetAiDramasAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        if (!value.Equals("on", StringComparison.OrdinalIgnoreCase) && !value.Equals("off", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("ai-dramas must be on or off");
+        cur.AiDramas = value.ToLowerInvariant(); cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        return cur;
+    }
+
     /// <summary>indexnode control --max-per-ip N|off: the per-IP download cap (downloads.maxPerIp); off removes it. Everything else in the file stays.</summary>
     public static async Task<ControlFile> SetMaxPerIpAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
     {

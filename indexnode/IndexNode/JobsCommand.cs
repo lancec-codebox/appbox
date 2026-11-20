@@ -26,6 +26,12 @@ public static class JobsCommand
             {
                 var q = await Load(store, paths);
                 int top = a.Get("top") is { } t ? int.Parse(t) : 20;
+                if (a.Get("held") is { } held)
+                {
+                    foreach (var (sid, e) in q.Read(s => s.Subjects.Values.SelectMany(x => x.Entries.Values.Where(e => e.Hold == held && !e.Final).Select(e => (x.Id, e))).OrderBy(x => x.Id, StringComparer.Ordinal).ToList()))
+                        Console.WriteLine($"{e.Priority,6}  {e.Added}  {e.Stage}/{sid}  held={e.Hold}{(e.HoldAiScore != null ? $" score={e.HoldAiScore:0.000}" : "")}");
+                    return 0;
+                }
                 foreach (var row in PriorityTool.List(q, a.Get("stage"), top)) Console.WriteLine($"{row.Priority,6}  {row.Added}  {row.Stage}/{row.Id}");
                 return 0;
             }
@@ -61,7 +67,7 @@ public static class JobsCommand
                 Console.WriteLine($"{id}: released (the next claim starts from the first unfinished step)");
                 return 0;
             }
-            default: throw new ArgumentException("jobs migrate --to log [--dry-run] | list [--stage S] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>");
+            default: throw new ArgumentException("jobs migrate --to log [--dry-run] | list [--stage S] [--held ai] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>");
         }
     }
 

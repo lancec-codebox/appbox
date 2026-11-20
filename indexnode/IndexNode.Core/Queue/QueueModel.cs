@@ -33,6 +33,13 @@ public sealed class QLine
     [JsonPropertyName("trash")] public string? Trash { get; set; }
     /// <summary>done with a trash mark: why (the pre-check's reasons).</summary>
     [JsonPropertyName("why")] public string? Why { get; set; }
+    /// <summary>done (process): the pre-check's decision for this claim (new, partial, canonical, duplicate), also when it let the video through.</summary>
+    [JsonPropertyName("pc")] public string? PreCheck { get; set; }
+    /// <summary>done (step precheck, final): the claim is released and the entry is held for this reason ("ai"): not claimable while control.json aiDramas is off.</summary>
+    [JsonPropertyName("hold")] public string? Hold { get; set; }
+    [JsonPropertyName("ais")] public double? AiScore { get; set; }
+    /// <summary>done (step precheck): the pre-check record (decision, ai flag and score, every number it measured), so the log alone says why the entry was held.</summary>
+    [JsonPropertyName("pre")] public System.Text.Json.Nodes.JsonNode? Pre { get; set; }
 
     public string ToJson() => JsonSerializer.Serialize(this, Protocol.Json);
     public static QLine? Parse(string line) { try { return JsonSerializer.Deserialize<QLine>(line, Protocol.Json); } catch (JsonException) { return null; } }
@@ -59,6 +66,9 @@ public sealed class QEntry
     public string? Trash { get; set; }
     public string? TrashWhy { get; set; }
     public string? TrashDeletedAt { get; set; }
+    /// <summary>0.13.1: why this entry is held ("ai": the pre-check flagged it AI and control aiDramas is off), and the score. Cleared when the entry finishes.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Hold { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public double? HoldAiScore { get; set; }
 
     [JsonIgnore] public bool Final => State is "done" or "duplicate" || State == "failed";
     public bool Runnable(string nowUtc) => State == "pending" && string.CompareOrdinal(Due, nowUtc) <= 0;
@@ -74,6 +84,8 @@ public sealed class QSubject
     public string[]? ClaimStages { get; set; }
     public string? ClaimAt { get; set; }
     public string? LastAt { get; set; }
+    /// <summary>0.13.1: when this subject's centers step last finished (the done line's time): the pre-check searches these centers by brute force until the search index has been built after that time.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CentersAt { get; set; }
     [JsonIgnore] public bool Active => Entries.Values.Any(e => !e.Final);
 }
 
@@ -82,7 +94,7 @@ public sealed class QueueState
 {
     public Dictionary<string, QSubject> Subjects { get; set; } = new(StringComparer.Ordinal);
     /// <summary>The order a claim runs a subject's stages in.</summary>
-    public static readonly string[] StageOrder = ["download", "process", "describe", "translate", "refresh", "classify", "availability"];
+    public static readonly string[] StageOrder = ["download", "process", "describe", "translate", "refresh", "classify", "availability", "search-index"];
     public static int Rank(string stage) { var i = Array.IndexOf(StageOrder, stage); return i < 0 ? 99 : i; }
 
     public QSubject? Get(string subject) => Subjects.GetValueOrDefault(subject);
@@ -114,15 +126,17 @@ public sealed class QueueState
                     var sub = Get(l.S); if (sub == null) break;
                     if (l.Stage != null && sub.Entries.TryGetValue(l.Stage, out var e))
                     {
-                        if (l.Step != null) { (e.StepsDone ??= []).Remove(l.Step); e.StepsDone.Add(l.Step); }
+                        if (l.Step != null) { (e.StepsDone ??= []).Remove(l.Step); e.StepsDone.Add(l.Step); if (l.Hold != null) { e.Hold = l.Hold; e.HoldAiScore = l.AiScore; } }
                         else
                         {
+                            e.Hold = null; e.HoldAiScore = null;
                             if (l.Trash != null) { e.Trash = l.Trash; e.TrashWhy = l.Why; e.TrashDeletedAt = null; }
                             e.State = l.State ?? "done"; e.FinishedAt = l.At; e.Node = l.By; e.LastError = null; e.Permanent = null; if (l.Job != null) e.Job = l.Job;
                             if (e.State == "pending") { e.Due = l.Due ?? e.Due; e.Attempts = 0; e.StepsDone = null; if (l.Job != null) e.Priority = l.Job.Priority; }   // a source or the classifier: run again later
                             else if (e.State == "done") e.Job = Slim(e.Job);
                         }
                     }
+                    if (l.Step == "centers" && l.Stage == "process") sub.CentersAt = l.At;
                     if (l.Fin == true) EndClaim(sub, l);
                     sub.LastAt = l.At;
                     break;
@@ -222,7 +236,7 @@ public sealed class QueueState
             if (!allDone && s.ClaimBy == null && s.Entries.Values.All(e => e.Final) && !s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(SlimFinished(s)); continue; }   // finished, some failed for good: ids, states, priority and the reason are enough
             if (!allDone) { list.Add(s); continue; }
             if (s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(s); continue; }   // a trash mark is kept until `trash empty` has acted on it
-            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, Entries = { ["download"] = d } }));
+            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Entries = { ["download"] = d } }));
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
         return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { Seg = seg, Off = off, Blocks = blocks, At = at, Subjects = list }, Protocol.Json);
@@ -231,7 +245,7 @@ public sealed class QueueState
     /// <summary>A finished subject as the snapshot needs it: the stage states, priority, when it was added and finished, a cut-down error and a minimal job (id, url, reason, duplicate-of) so a retry or a duplicate check still works. Everything else (due, attempts, node, steps, network, titles, ...) is dropped.</summary>
     static QSubject SlimFinished(QSubject s)
     {
-        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt };
+        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt };
         foreach (var (k, e) in s.Entries)
         {
             var j = e.Job; var keepsJob = k is "download" or "refresh" or "classify" or "availability";

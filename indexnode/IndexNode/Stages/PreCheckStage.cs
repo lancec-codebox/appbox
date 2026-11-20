@@ -25,10 +25,11 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
             return;
         }
 
-        var run = await AnalyzeAsync(ctx, null, ct);
+        var run = await AnalyzeAsync(ctx, null, ct, strict: true);
         if (run == null) return;
         await store.PutAsync(paths.Video(id, "precheck.json"), Encoding.UTF8.GetBytes(run.Record.ToJsonString(new JsonSerializerOptions { WriteIndented = true })), null, null, false, ct);
         if (run.Decision.Decision == PreCheckDecision.Duplicate) { await FinishDuplicateAsync(ctx, run.Record, run.Summary, ct); return; }
+        // an AI-flagged upload is not skipped (0.13.1): the engine holds it until control aiDramas is on (the record says ai.flag)
         // anything else: the summary is kept in downloaded.json's cache copy only when the zip is re-committed by a later stage; download.zip itself is not touched
     }
 
@@ -36,12 +37,14 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
     public sealed record Run(PreCheckDecision Decision, JsonObject Record, JsonObject Summary, PreCheckAnalysis Analysis, bool Ai);
 
     /// <summary>The analysis on the stored video, with no write of any kind. Null when the pre-check is skipped (no video, no index, no model, a failed analysis: the drama is processed). keepSample: a folder the cut window is copied into.</summary>
-    public async Task<Run?> AnalyzeAsync(JobContext ctx, string? keepSample, CancellationToken ct)
+    public async Task<Run?> AnalyzeAsync(JobContext ctx, string? keepSample, CancellationToken ct, bool strict = false)
     {
+        // strict (the node's process claim): a pre-check that cannot run fails the claim loudly instead of silently going on to frames
+        Run? Skip(string why) => strict ? throw new InvalidOperationException($"pre-check could not run for {ctx.Job.JobId}: {why}") : null;
         var store = ctx.Store; var paths = ctx.Paths; var id = ctx.Job.JobId; var s = settings;
         var videoBlob = paths.Video(id, "video.mp4");
         if (await store.HeadAsync(videoBlob, ct) == null) { Log.Info($"process {id}: pre-check skipped (no video.mp4 stored)"); return null; }
-        if (await analyzer.UnavailableAsync(s, ct) is { } unavailable) { Log.Info($"process {id}: pre-check skipped ({unavailable})"); return null; }
+        if (await analyzer.UnavailableAsync(s, ct) is { } unavailable) { Log.Info($"process {id}: pre-check skipped ({unavailable})"); return Skip(unavailable); }
         var infoBlob = await store.GetAsync(paths.Video(id, "info.json"), ct);
         var info = infoBlob == null ? new JsonObject() : JsonNode.Parse(infoBlob.Data) as JsonObject ?? new JsonObject();
         var downloaded = await store.GetAsync(paths.Video(id, "downloaded.json"), ct) is { } d0 ? JsonNode.Parse(d0.Data) as JsonObject ?? new JsonObject() : new JsonObject();
@@ -55,7 +58,7 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
             await store.DownloadToFileAsync(videoBlob, video, ct);
             double duration = (double?)downloaded["durationSeconds"] ?? (double?)info["duration"] ?? 0;
             if (duration <= 0) duration = await Frames.DurationAsync(tools, video, ct);
-            if (duration <= 0) { Log.Info($"process {id}: pre-check skipped (no duration)"); return null; }
+            if (duration <= 0) { Log.Info($"process {id}: pre-check skipped (no duration)"); return Skip("no duration"); }
             var (start, end, whole) = PreCheck.Window(duration, s.WindowSeconds, s.WindowPosition);
             string sample = video;
             if (!whole)
@@ -63,21 +66,14 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
                 ctx.Report("precheck", $"sample {start:0}-{end:0}s");
                 sample = Path.Combine(work, "sample.mp4");
                 var r = await Proc.RunAsync(await tools.FfmpegAsync(ct), ["-hide_banner", "-loglevel", "error", "-y", "-ss", start.ToString(System.Globalization.CultureInfo.InvariantCulture), "-i", video, "-t", (end - start).ToString(System.Globalization.CultureInfo.InvariantCulture), "-c", "copy", sample], ct);
-                if (r.ExitCode != 0 || !File.Exists(sample)) { Log.Info($"process {id}: pre-check skipped (could not cut the window: {r.Stderr.Trim()})"); return null; }
+                if (r.ExitCode != 0 || !File.Exists(sample)) { Log.Info($"process {id}: pre-check skipped (could not cut the window: {r.Stderr.Trim()})"); return Skip("could not cut the window: " + r.Stderr.Trim()); }
             }
             if (keepSample != null) { Directory.CreateDirectory(keepSample); File.Copy(sample, Path.Combine(keepSample, "sample.mp4"), true); }
             PreCheckAnalysis analysis;
             try { analysis = await analyzer.AnalyzeAsync(sample, s, Math.Max(1, ctx.ThreadShare()), p => ctx.Report("precheck", p), ct); }
-            catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"process {id}: pre-check skipped (analysis failed: {e.Message})"); return null; }
-            if (analysis.SkippedReason != null) { Log.Info($"process {id}: pre-check skipped ({analysis.SkippedReason})"); return null; }
-            var known = new Dictionary<string, double?>();
-            foreach (var m in analysis.Top.Take(5))
-            {
-                double? d = null;
-                try { if (await store.GetAsync(paths.Video(m.Upload, "downloaded.json"), ct) is { } c) d = (double?)JsonNode.Parse(c.Data)?["durationSeconds"]; } catch (Exception e) when (e is not OperationCanceledException) { }
-                known[m.Upload] = d;
-            }
-            var decision = PreCheck.Decide(analysis, duration, u => known.GetValueOrDefault(u), s);
+            catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"process {id}: pre-check skipped (analysis failed: {e.Message})"); return Skip("analysis failed: " + e.Message); }
+            if (analysis.SkippedReason != null) { Log.Info($"process {id}: pre-check skipped ({analysis.SkippedReason})"); return Skip(analysis.SkippedReason); }
+            var decision = PreCheck.Decide(analysis, duration, _ => null, s);
             bool ai = analysis.AiScore >= s.AiFlag;
             if (PreCheckSettings.AiThresholdWarning(s, analysis.Frames) is { } warn) Log.Info($"process {id}: WARNING {warn}");
             var rec = PreCheck.Record(id, decision, analysis, info, DownloadedFormats.FromInfo(info), (start, end), duration, s, ctx.NodeId, version, ai, 0, decision.Decision != PreCheckDecision.Duplicate);

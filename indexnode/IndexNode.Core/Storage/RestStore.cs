@@ -194,6 +194,7 @@ public sealed class RestStore : IStore
     /// <summary>Bytes off..off+len of a blob (a ghost is hydrated first, like any read).</summary>
     public async Task<byte[]> GetRangeAsync(string name, long off, int len, CancellationToken ct)
     {
+        if (len <= 0) return [];   // no HTTP form for an empty range: off+len-1 < 0 made RangeHeaderValue throw "to ('-1') must be non-negative"
         if (!ReadSnapshots.ContainsKey(name)) await HydrateGhostAsync(name, ct);
         using var r = await SendAsync(() => { var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1); return q; }, ct);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (range)");
@@ -366,6 +367,7 @@ public sealed class RestStore : IStore
 
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
     {
+        if (len <= 0) return new([], false);
         using var r = await SendAsync(() =>
         {
             var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1);

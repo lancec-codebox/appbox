@@ -22,6 +22,7 @@ public sealed partial class NodeEngine
         bool listed = stage switch
         {
             "process" => o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s)),
+            "search-index" => handlers.ContainsKey("search-index") && (o.Stages.Contains("search-index") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.1: standard (non-AI) work of any processor node
             "describe" or "translate" => o.AiStages,   // opt-in: only a node started with the AI stages and an endpoint
             _ => o.Stages.Contains(stage),
         };
@@ -37,7 +38,7 @@ public sealed partial class NodeEngine
         return StandardSteps.Where(s => !done.Contains(s) && (o.Stages.Contains("process") || o.Stages.Contains(s)) && (o.Steps == null || o.Steps.Contains(s)) && Control.Effective(s) == Level.Run).ToArray();
     }
 
-    private bool CanRunEntry(QSubject s, QEntry e) => e.Stage != "process" || PlanSteps(e).Length > 0;
+    private bool CanRunEntry(QSubject s, QEntry e) => e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
 
     // ---------------------------------------------------------------- the lanes
 
@@ -79,7 +80,15 @@ public sealed partial class NodeEngine
         catch (OperationCanceledException) { }
     }
 
-    private static IEnumerable<string> QueueStages() => new[] { "download", "process", "describe", "translate", "refresh", "classify", "availability" };
+    /// <summary>0.13.1 catch-up: a node that runs the search-index stage adds one at start when none is pending (so the dramas processed since the last build get in).</summary>
+    private async Task EnsureSearchIndexAsync(CancellationToken ct)
+    {
+        if (!o.SearchIndexCatchUp || !handlers.ContainsKey("search-index") || !StageEnabled("search-index")) return;
+        try { await queue.AppendLinesAsync(st => SearchIndexJobs.AddLine(st, NowUtc, TimeSpan.Zero) is { } l ? [l] : null, ct); }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: catch-up add failed ({e.Message})"); }
+    }
+
+    private static IEnumerable<string> QueueStages() => new[] { "download", "process", "describe", "translate", "refresh", "classify", "availability", "search-index" };
 
     /// <summary>Claims one candidate subject (limits, per-IP cap, then the protocol's claim) and runs it. False when nothing was claimed.</summary>
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
@@ -257,12 +266,24 @@ public sealed partial class NodeEngine
         if (dl == null && await store.HeadAsync(paths.Video(id, "downloaded.json"), token) == null) return (Outcome.Permanent, "invalid: " + paths.Video(id, "download.zip") + " is missing (nothing was downloaded for this video)", false, null);
         w.Local ??= new LocalCacheStore(store, Path.Combine(Path.GetTempPath(), "indexnode", "c-" + instanceTag + "-" + id));
         // 0.13.0: the pre-check is the first step of a process claim, only for a drama with no processing done yet (a part-processed one resumes from its first unfinished step)
+        bool ranPre = false;
         if (handlers.TryGetValue("precheck", out var pre) && done.Count == 0 && !await HasProcessingAsync(id, token))
         {
+            ranPre = true;
             w.Run.Info.Stage = "precheck"; w.Run.Info.Step = null; RegistryChanged();
             var pj = JobDescriptor.NewStep("precheck", id); pj.Priority = entry.Priority;
             var pctx = NewContext(lane, w, "precheck", pj, w.Local, done.ToArray(), token);
             await pre.RunAsync(pctx);   // throws DuplicateFound for a skip (nothing was deleted or rewritten: the done line marks the video for `indexnode trash empty`)
+        }
+        // the pre-check's decision (PASS included) goes on the final done line, read from the record the stage wrote
+        string? pcDecision = null; bool pcAi = false; double pcScore = 0; System.Text.Json.Nodes.JsonNode? pcNode = null;
+        if (handlers.ContainsKey("precheck") && await store.GetAsync(paths.Video(id, "precheck.json"), token) is { } pcj) try { var pn = System.Text.Json.Nodes.JsonNode.Parse(pcj.Data); pcNode = pn; pcDecision = (string?)pn?["decision"]; pcAi = (bool?)pn?["ai"]?["flag"] == true; pcScore = (double?)pn?["ai"]?["score"] ?? 0; } catch (System.Text.Json.JsonException) { }
+        // 0.13.1: an AI-flagged drama that is not a duplicate (that was decided first) is held, not skipped: the pre-check's done step goes on the log and the claim is released; with aiDramas on it just goes on
+        if (ranPre && pcAi && pcDecision != "duplicate" && !Control.Current.AiDramasOn)
+        {
+            Log.Info($"process {id}: pre-check says AI (score {pcScore:0.000}): held, aiDramas is off");
+            await h.AppendAsync([new QLine { T = "done", Stage = "process", Step = "precheck", PreCheck = pcDecision, Hold = "ai", AiScore = pcScore, Why = $"ai: score {pcScore:0.000}", Pre = pcNode }], true, CancellationToken.None);
+            return (Outcome.Done, null, ClaimEnded(id), null);
         }
         var avail = new HashSet<string>(StringComparer.Ordinal);
         JobContext? ctx = null; var ran = new List<string>();
@@ -282,14 +303,17 @@ public sealed partial class NodeEngine
             ctx = NewContext(lane, w, step, sj, w.Local, done.ToArray(), token);
             await handlers[step].RunAsync(ctx);
             done.Add(step); ran.Add(step); avail.Add(step + ".zip");
-            await h.AppendAsync([new QLine { T = "done", Stage = "process", Step = step }], false, CancellationToken.None);
+            var stepLines = new List<QLine> { new() { T = "done", Stage = "process", Step = step } };
+            // 0.13.1: a new centers.zip means the search index is behind: add the singleton, due in 15 minutes (nothing when one is pending)
+            if (step == "centers" && handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } si) stepLines.Add(si);
+            await h.AppendAsync(stepLines, false, CancellationToken.None);
             continue;
             notReady:;
         }
         bool complete = StandardSteps.All(done.Contains);
         if (complete)
         {
-            var lines = new List<QLine> { new() { T = "done", Stage = "process" } };
+            var lines = new List<QLine> { new() { T = "done", Stage = "process", PreCheck = pcDecision } };
             lines.Add(QLine.Add(id, "describe", NewFollow("describe", id, entry.Priority), queue.NowUtc()));
             await h.AppendAsync(lines, !WillContinue(id, "process", lines), CancellationToken.None);
             return (Outcome.Done, null, ClaimEnded(id), ctx);
@@ -325,7 +349,7 @@ public sealed partial class NodeEngine
                 case Outcome.Duplicate:
                     {
                         var d = w.Run.Duplicate;
-                        job.FinishedAt = Protocol.NowUtc(); job.NodeId = o.NodeId; job.DuplicateOf = d?.Upload; job.DuplicateShare = d?.Share; job.LastError = null;
+                        job.FinishedAt = Protocol.NowUtc(); job.NodeId = o.NodeId; job.DuplicateOf = d is { Ai: true } ? null : d?.Upload; job.DuplicateShare = d is { Ai: true } ? null : d?.Share; job.LastError = null;
                         job.DuplicateSpeechLanguage = d?.SpeechLanguage; job.DuplicateDubbed = d?.Dubbed; job.DuplicateLanguageSource = d?.LanguageSource; job.DuplicateMetadataLanguage = d?.MetadataLanguage; job.DuplicateUrl = d?.Url;
                         await h.AppendAsync([new QLine { T = "done", Stage = stage, State = "duplicate", Job = job, Trash = "download.zip/video", Why = d?.Why }], true, none);   // the pre-check skipped it (process entry ends in 'duplicate': metadata only, no frames or later artifacts, no describe)
                         break;

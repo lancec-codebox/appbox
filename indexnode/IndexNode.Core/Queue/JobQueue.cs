@@ -68,7 +68,7 @@ public sealed class ClaimHandle
             var s = state.Get(Subject);
             if (s == null || s.Epoch != Epoch || s.ClaimBy != queue.NodeId) { MarkLost(); return null; }
             var at = queue.NowUtc();
-            foreach (var l in lines) { l.S = Subject; l.By = queue.NodeId; l.At ??= at; if (l.T is "done" or "failed" or "claim") l.Epoch = Epoch; }
+            foreach (var l in lines) { if (l.S.Length == 0) l.S = Subject; l.By = queue.NodeId; l.At ??= at; if (l.T is "done" or "failed" or "claim") l.Epoch = Epoch; }
             if (final) { var last = lines.LastOrDefault(l => l.T is "done" or "failed"); if (last != null) last.Fin = true; }
             return lines.ToList();
         }, ct);

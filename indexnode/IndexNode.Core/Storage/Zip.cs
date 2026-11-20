@@ -116,7 +116,9 @@ public static class ZipFormat
     public static async Task<List<ZipEntry>> ReadDirectoryAsync(IZipSource src, CancellationToken ct, int tailHint = 65535 + 22 + 20 + 56)
     {
         // tailHint: how much of the end to read first (at least 98); a zip with few members needs about 1 KB, so a range-reading query does not pull 64 KB per zip
+        if (src.Length < 22) throw new InvalidDataException($"not a zip: the blob is {src.Length} bytes (empty, or a ghost that was not hydrated)");
         int tailLen = (int)Math.Min(src.Length, Math.Max(tailHint, 22 + 20 + 56));
+
         long tailOff = src.Length - tailLen;
         var tail = await src.ReadAsync(tailOff, tailLen, ct);
         int eocd = -1;

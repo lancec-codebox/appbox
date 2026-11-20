@@ -95,9 +95,46 @@ public static class PreCheckSearch
         return (best, new Stats(scanMs, readMs, sw.Elapsed.TotalMilliseconds, cache.Count, requests, bytes));
     }
 
-    /// <summary>Shares per upload: the fraction of all frames whose best match is in the upload with cosine &gt;= tau. Best first.</summary>
-    public static (List<PreCheckMatch> Matches, int NoHit) Shares(SearchData idx, IReadOnlyList<FrameBest?> best, double tau)
+    /// <summary>
+    /// 0.13.1: the uploads whose centers.zip is newer than the index, searched by brute force (every center's members, exact cosine): their upload index is <c>idx.Uploads.Count + position in <paramref name="fresh"/></c>.
+    /// Merges into <paramref name="best"/> (the indexed result per frame) and returns the fresh uploads that could be read (a missing or unreadable one is skipped, not fatal: the index is a cache of these).
+    /// </summary>
+    public static async Task<List<SearchUpload>> MergeFreshAsync(IStore raw, Paths paths, SearchData idx, IReadOnlyList<string> fresh, IReadOnlyList<float[]> queries, FrameBest?[] best, int threads, CancellationToken ct)
     {
+        var used = new List<SearchUpload>(); int n = queries.Count; var q = new float[n][];
+        for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
+        foreach (var id in fresh)
+        {
+            CentersZip? z; List<(int Center, CentersFile.Members Members)> blocks;
+            try
+            {
+                z = await CentersZip.OpenAsync(raw, paths.Video(id, "centers.zip"), ct); if (z == null) continue;
+                var h = await z.ReadHeaderAsync(ct);
+                blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
+            }
+            catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"pre-check: fresh centers of {id} not searched ({e.Message})"); continue; }
+            var (sl, db) = await SearchIndexBuild.ReadSpeechAsync(raw, paths, id, ct);
+            int up = idx.Uploads.Count + used.Count; used.Add(new SearchUpload(id, "", z.ETag ?? "", z.ZipSize, z.DataStart, z.DataLength, 0, blocks.Count, 0, sl, db));
+            var vecs = blocks.Select(b => { var v = new float[b.Members.Count * CentersFile.Dim]; Vec.FromHalf(b.Members.Vectors, v); return (v, b.Members.Times); }).ToList();
+            Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, i =>
+            {
+                FrameBest? b = best[i];
+                foreach (var (v, times) in vecs)
+                    for (int m = 0; m < times.Length; m++)
+                    {
+                        float c = Vec.Dot(q[i], v.AsSpan(m * CentersFile.Dim, CentersFile.Dim));
+                        if (b == null || c > b.Cosine) b = new FrameBest(up, times[m], c);
+                    }
+                best[i] = b;
+            });
+        }
+        return used;
+    }
+
+    /// <summary>Shares per upload: the fraction of all frames whose best match is in the upload with cosine &gt;= tau. Best first. <paramref name="extra"/>: the fresh uploads of <see cref="MergeFreshAsync"/> (indices after the index's own).</summary>
+    public static (List<PreCheckMatch> Matches, int NoHit) Shares(SearchData idx, IReadOnlyList<FrameBest?> best, double tau, IReadOnlyList<SearchUpload>? extra = null)
+    {
+        SearchUpload Up(int i) => i < idx.Uploads.Count ? idx.Uploads[i] : extra![i - idx.Uploads.Count];
         int n = best.Count; int noHit = 0; var by = new Dictionary<int, (int Frames, float Cos, double Time)>();
         foreach (var b in best)
         {
@@ -105,7 +142,7 @@ public static class PreCheckSearch
             by.TryGetValue(b.Upload, out var cur);
             by[b.Upload] = (cur.Frames + 1, Math.Max(cur.Cos, b.Cosine), b.Cosine >= cur.Cos ? b.Time : cur.Time);
         }
-        var list = by.Select(kv => new PreCheckMatch(idx.Uploads[kv.Key].Id, n == 0 ? 0 : (double)kv.Value.Frames / n, kv.Value.Cos, kv.Value.Time, kv.Value.Frames, idx.Uploads[kv.Key].SpeechLanguage, idx.Uploads[kv.Key].Dubbed))
+        var list = by.Select(kv => new PreCheckMatch(Up(kv.Key).Id, n == 0 ? 0 : (double)kv.Value.Frames / n, kv.Value.Cos, kv.Value.Time, kv.Value.Frames, Up(kv.Key).SpeechLanguage, Up(kv.Key).Dubbed))
             .OrderByDescending(m => m.Share).ThenByDescending(m => m.BestCosine).ThenBy(m => m.Upload, StringComparer.Ordinal).ToList();
         return (list, noHit);
     }
@@ -143,11 +180,22 @@ public sealed class SearchIndexCache(string root, TimeSpan recheck, Func<DateTim
             try { d = await SearchData.LoadAsync(local, paths, version, ct); } catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException or InvalidDataException or FormatException) { }
             if (d == null)
             {
-                d = await SearchData.LoadAsync(store, paths, version, ct) ?? throw new FileNotFoundException("search index v" + version); Downloads++;
+                try { d = await SearchData.LoadAsync(store, paths, version, ct) ?? throw new FileNotFoundException("search index v" + version); }
+                catch (FileNotFoundException)
+                {
+                    // 404 on the loaded version's files: it was pruned after head.yaml was read. Re-read head.yaml and retry once on the current version.
+                    var h2 = await store.GetAsync(SearchData.HeadName(paths), ct) ?? throw new FileNotFoundException("head.yaml");
+                    var v2 = SearchData.ParseHead(h2.Data); if (v2 == version) throw;
+                    Log.Info($"search index: v{version} is gone; retrying on v{v2}");
+                    version = v2; headEtag = null; local = new LocalStore(root);
+                    d = await SearchData.LoadAsync(store, paths, version, ct) ?? throw new FileNotFoundException("search index v" + version);
+                }
+                Downloads++;
                 var dir = SearchData.Dir(paths, version);
                 await local.PutAsync(dir + "mean.f32", SearchData.MeanBytes(d.Mean), null, null, false, ct, "application/octet-stream");
                 await local.PutAsync(dir + "refs.bin", d.RefsBytes(), null, null, false, ct, "application/octet-stream");
                 await local.PutAsync(dir + "uploads.yaml", System.Text.Encoding.UTF8.GetBytes(d.UploadsYaml()), null, null, false, ct, "text/yaml");
+                if (d.Catalog != null) await local.PutAsync(dir + Catalog.File, d.Catalog.ToGzip(), null, null, false, ct, "application/gzip");
                 await local.PutAsync(dir + "bits.bin", d.Bits, null, null, false, ct, "application/octet-stream");   // last: a half-written folder fails the load above and is fetched again
             }
             return mem = d;

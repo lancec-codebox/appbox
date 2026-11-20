@@ -16,7 +16,7 @@ public static partial class Protocol
     /// <summary>The step jobs an upload gets by default (download, enqueue, sources): every step stage except the opt-in ones (dino: owner 2026-11-16, not part of ingest; clip: dropped 2026-11-14), which run only when asked for (process --job --steps).</summary>
     public static readonly string[] IngestStepStages = StepStages.Where(s => s is not ("dino" or "clip")).ToArray();
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
-    public static readonly string[] Stages = ["download", "process", .. StepStages, "refresh", "classify", "availability"];
+    public static readonly string[] Stages = ["download", "process", .. StepStages, "refresh", "classify", "availability", "search-index"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "centers", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
@@ -367,6 +367,9 @@ public sealed class ControlFile
     public GpuControl? Gpu { get; set; }
     /// <summary>Download limits (0.8.8): absent, null or maxPerIp 0 = no cap (the default).</summary>
     public DownloadsControl? Downloads { get; set; }
+    /// <summary>0.13.1: "on" lets nodes claim an AI-held drama (the pre-check flagged it AI); "off" or absent: they stay pending. Default off.</summary>
+    public string? AiDramas { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore] public bool AiDramasOn => string.Equals(AiDramas, "on", StringComparison.OrdinalIgnoreCase);
 
     public static Level ParseLevel(string? s) => s?.ToLowerInvariant() switch
     {

@@ -51,7 +51,7 @@ public sealed class PreCheckSettings
 }
 
 /// <summary>One candidate upload: the share of sample frames whose best match is in it with cosine &gt;= tau.</summary>
-public sealed record PreCheckMatch(string Upload, double Share, double BestCosine, double BestTime, int Frames, string? SpeechLanguage = null, bool? Dubbed = null);
+public sealed record PreCheckMatch(string Upload, double Share, double BestCosine, double BestTime, int Frames, string? SpeechLanguage = null, bool? Dubbed = null, double? Duration = null);
 
 /// <summary>What the analyzer measured on the sample clip (frames, SSCD, lookup, AI probe). SkippedReason set: nothing was measured.</summary>
 /// <summary>The spoken-language measurement (SenseVoice language ID on ~60 s of the sample's audio): majority language and dubbed flag, or why it could not run (then the record falls back to the metadata hint).</summary>
@@ -174,7 +174,7 @@ public static class PreCheck
         if (top == null || top.Share < s.PartialShare) return new(PreCheckDecision.New, [top == null ? "no sample frame matched any indexed upload" : $"top share {top.Share:0.00} < {s.PartialShare:0.00}"], top);
         if (top.Share >= s.SkipShare)
         {
-            var md = matchedDuration(top.Upload);
+            var md = top.Duration ?? matchedDuration(top.Upload);
             if (md == null) return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} >= {s.SkipShare:0.00} but the duration of {top.Upload} is unknown: not skipped"], top);
             if (DurationClose(duration, md.Value, s))
             {
@@ -194,10 +194,10 @@ public static class PreCheck
     public const string LangOriginal = "format-original", LangOnly = "format-only", LangVideo = "video", LangNone = "none";
 
     /// <summary>
-    /// Spoken language from yt-dlp's metadata (owner-accepted: on our corpus 23/24 dubs caught, 1/30 originals wrongly flagged). Exactly this order:
+    /// The metadata HINT of the spoken language (owner-accepted: on our corpus 23/24 dubs caught, 1/30 originals wrongly flagged). SenseVoice on the sample's audio decides (<see cref="LanguageVerdict"/>); this is only the fallback when it could not run. Exactly this order:
     /// (1) an audio format whose format_note says "original" or "(default)": its language; (2) else all audio formats carry exactly one language: that one;
     /// (3) else the video's <c>language</c>; (4) else none: language null, source "none", not dubbed. Dubbed = a language is present and it is not zh*.
-    /// The source says which rule fired. (TODO: SenseVoice language ID on the sample audio when it fits the ~20 s budget.)
+    /// The source says which rule fired. (TODO: drop this hint once SenseVoice has run on every upload; it is kept in the record as metadataLanguage.)
     /// </summary>
     public static (string? Language, bool Dubbed, string Source) LanguageFromInfo(JsonObject info, DownloadedFormats? fmt)
     {

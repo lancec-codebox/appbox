@@ -3,6 +3,7 @@ using Xunit;
 
 namespace IndexNode.Tests;
 
+[Collection("console")]
 public class CentersTests
 {
     static readonly Paths P = new("index/");

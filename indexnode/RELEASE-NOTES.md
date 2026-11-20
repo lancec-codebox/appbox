@@ -1,3 +1,16 @@
+## 0.13.1
+
+- **Pre-check can no longer be skipped silently on a process claim.** A missing search index or SSCD model, a missing duration, a failed cut or a failed analysis now fails the claim (transient, retried) with the reason, instead of logging "skipped" and going on to frames with no record.
+- **The pre-check decision is on the final `done` line** of a process claim (`"pc":"new|partial|canonical"`, read from precheck.json), PASS included; a duplicate still carries it in its trash/why fields.
+- **Claim order on a running node is covered by a test**: a `pri` line appended by another process while a claim runs reorders the next claims (priority, then added, then id).
+- **The search index builds itself as a queue job** (`search-index`): a follow-up is due 15 minutes after a build when more centers finished while it ran, a catch-up build runs when the head is behind the centers on the store, and each version records `builtAt` (the time it started).
+- **Old search-index versions are kept 3 back** (`search.keep-versions`, default 3; 0 keeps only the head); older `index/search/vN/` are deleted after `head.yaml` moves, and a reader that gets a 404 re-reads `head.yaml` once and retries.
+- **The catalog (`catalog.json.gz`, one per search-index version) lists every upload the pre-check has seen**, with duration, title, channel, speech language, dubbed, AI score/flag and the pre-check's match (upload, share, offset, cosine). Every entry has four status fields: `state` (processed | metadata-only), `held` ("ai" when held, else null), `checkedBy` (index | precheck) and `data` (full | precheck: sample estimates, no centers in the index). A held upload that is processed later is replaced by its full entry.
+- **AI dramas can be held**: the pre-check flags an AI drama and the process claim releases it as held; `indexnode control ai-dramas on|off` (off: held subjects are not claimed, on: they resume at frames) and `indexnode jobs list --held ai` (with the score).
+- **The matched upload's duration comes from `download.zip`'s `idx_summary` metadata** (HEAD only, never a hydrate), then the catalog; before, the repacked layout had no `downloaded.json` and every duplicate was "duration unknown: not skipped".
+- **Uploads newer than the search index are found by brute force**: the pre-check also compares the sample with the centers of uploads whose centers finished after the index's `builtAt`.
+- **A zero-length ranged read no longer sends an invalid range** (`to=-1`): reading an empty range of a blob now returns nothing instead of failing.
+
 ## 0.13.0
 
 There is no separate 0.12.0 release: 0.13.0 ships the 0.12.0 pre-check (below) together with the new job queue. Read docs/cutover.md before upgrading a store.

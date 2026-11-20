@@ -22,6 +22,10 @@ public sealed class SearchData
     public required int[] RefCenter { get; set; }
     public required List<SearchUpload> Uploads { get; set; }
     public int Count => RefUpload.Length;
+    /// <summary>0.13.1: when this version's build started (uploads.yaml builtAt); the pre-check searches centers finished after it by brute force. Null on an older version (then the file's creation time, else unknown).</summary>
+    public DateTimeOffset? BuiltAt { get; set; }
+    /// <summary>0.13.1: catalog.json.gz of this version (duration, language, AI per upload); null on a version published before it.</summary>
+    public Catalog? Catalog { get; set; }
 
     /// <summary>Bit d of a code (byte d/8, bit d%8, least significant first) is 1 when center[d] - mean[d] &gt; 0.</summary>
     public static void Code(ReadOnlySpan<float> center, ReadOnlySpan<float> mean, Span<byte> code)
@@ -80,12 +84,18 @@ public sealed class SearchData
     {
         var sb = new StringBuilder();
         sb.Append("version: ").Append(Version).Append('\n').Append("meanVersion: ").Append(MeanVersion).Append('\n').Append("meanFrames: ").Append(MeanFrames).Append('\n')
-          .Append("dim: 512\ncodeBytes: 64\ncenters: ").Append(Count).Append("\nuploads:\n");
+          .Append(BuiltAt == null ? "" : "builtAt: " + Protocol.Utc(BuiltAt.Value) + "\n").Append("dim: 512\ncodeBytes: 64\ncenters: ").Append(Count).Append("\nuploads:\n");
         foreach (var u in Uploads)
             sb.Append("  - id: ").Append(Q(u.Id)).Append("\n    sha: ").Append(Q(u.Sha)).Append("\n    etag: ").Append(Q(u.ETag)).Append("\n    zipSize: ").Append(u.ZipSize).Append("\n    dataStart: ").Append(u.DataStart)
               .Append("\n    dataLength: ").Append(u.DataLength).Append("\n    frames: ").Append(u.Frames).Append("\n    k: ").Append(u.K).Append("\n    rowStart: ").Append(u.RowStart).Append('\n')
               .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n");
         return sb.ToString();
+    }
+
+    public static DateTimeOffset? ParseBuiltAt(string yaml)
+    {
+        foreach (var l in yaml.Split('\n')) { if (l.StartsWith("uploads:")) break; if (l.StartsWith("builtAt:") && DateTimeOffset.TryParse(l[8..].Trim(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var t)) return t; }
+        return null;
     }
 
     static string Val(string v) { v = v.Trim(); return v.StartsWith('"') ? JsonSerializer.Deserialize<string>(v)! : v; }
@@ -109,17 +119,55 @@ public sealed class SearchData
     public static byte[] HeadYaml(int version, string dir) => Encoding.UTF8.GetBytes($"version: {version}\npath: {dir}\n");
     public static int ParseHead(byte[] b) { foreach (var l in Encoding.UTF8.GetString(b).Split('\n')) if (l.StartsWith("version:")) return int.Parse(l[8..].Trim(), CultureInfo.InvariantCulture); throw new InvalidDataException("head.yaml has no version"); }
 
-    /// <summary>Loads the version <paramref name="version"/> (null: the head's). Null when there is no head yet.</summary>
+    /// <summary>0.13.1: after head.yaml moved to vN, deletes index/search/vK/ (every file) for K &lt; N - keep. Versions are derived data; nothing else is touched. Returns the versions removed.</summary>
+    public static async Task<List<int>> PruneAsync(IStore store, Paths paths, int keep, CancellationToken ct)
+    {
+        var removed = new List<int>();
+        if (keep < 0 || await store.GetAsync(HeadName(paths), ct) is not { } h) return removed;
+        int n = ParseHead(h.Data); var root = paths.Prefix + "search/";
+        var files = (await store.ListAsync(root + "v", false, false, ct)).Select(b => (b.Name, V: VersionOf(root, b.Name))).Where(x => x.V is { } v && v < n - keep).ToList();
+        foreach (var g in files.GroupBy(x => x.V!.Value).OrderBy(g => g.Key))
+        {
+            foreach (var f in g) await store.DeleteAsync(f.Name, ct);
+            removed.Add(g.Key);
+        }
+        return removed;
+    }
+    static int? VersionOf(string root, string name)
+    {
+        if (!name.StartsWith(root + "v", StringComparison.Ordinal)) return null;
+        var rest = name[(root.Length + 1)..]; int slash = rest.IndexOf('/');
+        return slash > 0 && int.TryParse(rest[..slash], NumberStyles.None, CultureInfo.InvariantCulture, out var v) ? v : null;
+    }
+
+    /// <summary>Loads the version <paramref name="version"/> (null: the head's). Null when there is no head yet. For the head's version a missing file (the version was pruned after head.yaml was read) re-reads head.yaml and tries once more.</summary>
     public static async Task<SearchData?> LoadAsync(IStore store, Paths paths, int? version, CancellationToken ct)
+    {
+        if (version != null) return await LoadVersionAsync(store, paths, version, ct);
+        if (await store.GetAsync(HeadName(paths), ct) is not { } h) return null;
+        int v0 = ParseHead(h.Data);
+        try { return await LoadVersionAsync(store, paths, v0, ct); }
+        catch (FileNotFoundException)
+        {
+            if (await store.GetAsync(HeadName(paths), ct) is { } h2 && ParseHead(h2.Data) != v0) return await LoadVersionAsync(store, paths, ParseHead(h2.Data), ct);
+            throw;
+        }
+    }
+
+    static async Task<SearchData?> LoadVersionAsync(IStore store, Paths paths, int? version, CancellationToken ct)
     {
         if (version == null) { if (await store.GetAsync(HeadName(paths), ct) is not { } h) return null; version = ParseHead(h.Data); }
         var dir = Dir(paths, version.Value);
         async Task<byte[]> Get(string f) => (await store.GetAsync(dir + f, ct))?.Data ?? throw new FileNotFoundException(dir + f);
-        var (v, mv, mf, ups) = ParseUploadsYaml(Encoding.UTF8.GetString(await Get("uploads.yaml")));
+        var yaml = Encoding.UTF8.GetString(await Get("uploads.yaml"));
+        var (v, mv, mf, ups) = ParseUploadsYaml(yaml);
+        var builtAt = ParseBuiltAt(yaml);
+        if (builtAt == null) { try { builtAt = (await store.ListAsync(dir + "uploads.yaml", false, false, ct)).FirstOrDefault(b => b.Name == dir + "uploads.yaml")?.Created; } catch (Exception e) when (e is not OperationCanceledException) { } }
         var bits = await Get("bits.bin"); var refs = await Get("refs.bin"); var mean = ParseMean(await Get("mean.f32"));
         int n = refs.Length / 8; if (bits.Length != n * CodeBytes) throw new InvalidDataException($"bits.bin has {bits.Length / CodeBytes} codes, refs.bin {n}");
         var ru = new int[n]; var rc = new int[n]; for (int i = 0; i < n; i++) { ru[i] = BinaryPrimitives.ReadInt32LittleEndian(refs.AsSpan(i * 8)); rc[i] = BinaryPrimitives.ReadInt32LittleEndian(refs.AsSpan(i * 8 + 4)); }
-        return new SearchData { Version = version.Value, MeanVersion = mv, MeanFrames = mf, Mean = mean, Bits = bits, RefUpload = ru, RefCenter = rc, Uploads = ups };
+        Catalog? cat = null; try { cat = await IndexNode.Catalog.ReadAsync(store, paths, version.Value, ct); } catch (InvalidDataException) { }   // an unreadable catalog counts as none
+        return new SearchData { Version = version.Value, MeanVersion = mv, MeanFrames = mf, Mean = mean, Bits = bits, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = builtAt, Catalog = cat };
     }
 
     /// <summary>Writes vN (files created only if new: a second builder of the same version loses), then moves head.yaml (If-Match on a rewrite, If-None-Match on the first).</summary>
@@ -129,6 +177,7 @@ public sealed class SearchData
         async Task Put(string f, byte[] d, string type) { if (!await store.PutAsync(dir + f, d, null, null, true, ct, type)) throw new InvalidOperationException($"{dir}{f} already exists: another node is publishing version {Version}"); }
         await Put("mean.f32", MeanBytes(Mean), "application/octet-stream"); await Put("bits.bin", Bits, "application/octet-stream"); await Put("refs.bin", RefsBytes(), "application/octet-stream");
         await Put("uploads.yaml", Encoding.UTF8.GetBytes(UploadsYaml()), "text/yaml");
+        if (Catalog != null) { Catalog.Version = Version; await Put(IndexNode.Catalog.File, Catalog.ToGzip(), "application/gzip"); }   // both written before head.yaml moves
         var head = HeadName(paths); var body = HeadYaml(Version, dir);
         var cur = await store.GetAsync(head, ct);
         if (cur == null) { if (!await store.PutAsync(head, body, null, null, true, ct, "text/yaml")) throw new InvalidOperationException("head.yaml was created meanwhile: run again"); return; }

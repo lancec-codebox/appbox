@@ -6,6 +6,7 @@ using Xunit;
 namespace IndexNode.Tests;
 
 /// <summary>0.12.0: decision rules, the AI probe port, the search index cache, the duplicate state, the model download lock and the pre-check end to end in local mode (synthetic ffmpeg video, local search index, yt-dlp mocked).</summary>
+[Collection("console")]
 public class PreCheckTests : IDisposable
 {
     static readonly Paths P = new("index/");
@@ -334,10 +335,10 @@ public class PreCheckTests : IDisposable
         return ff != null && pr != null ? (ff, pr) : null;
     }
 
-    async Task<string> MakeVideoAsync((string Ff, string Probe) t, double seconds)
+    async Task<string> MakeVideoAsync((string Ff, string Probe) t, double seconds, int fps = 10)
     {
         var path = Path.Combine(root, "sample-src.mp4");
-        var r = await Proc.RunAsync(t.Ff, ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=10,format=yuv420p", "-t", seconds.ToString(System.Globalization.CultureInfo.InvariantCulture), "-c:v", "mpeg4", "-q:v", "2", path], default);
+        var r = await Proc.RunAsync(t.Ff, ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", $"testsrc2=s=640x360:r={fps},format=yuv420p", "-t", seconds.ToString(System.Globalization.CultureInfo.InvariantCulture), "-c:v", "mpeg4", "-q:v", "2", path], default);
         Assert.True(r.ExitCode == 0, r.Stderr);
         return path;
     }
@@ -351,7 +352,7 @@ public class PreCheckTests : IDisposable
     async Task<(Rig Rig, PreCheckStage Stage, string Id)> SetupAsync(string id, Func<int, byte[]> rows, bool withIndex = true, double infoDuration = 1750)
     {
         var t = await RealFfmpegAsync() ?? throw new InvalidOperationException("no ffmpeg");
-        var video = await MakeVideoAsync(t, 30);
+        var video = await MakeVideoAsync(t, infoDuration, 1);   // as long as the metadata says: since 0.13.0 the stage cuts its window out of the stored video.mp4
         var rig = new Rig { Rows = rows }; var cfg = new NodeConfig();
         rig.Tools = new Tools(new HttpClient(), cfg); rig.Tools.UseFfmpeg(t.Ff, t.Probe);
         var wsDir = Path.Combine(Path.GetTempPath(), "indexnode", id);
@@ -371,6 +372,7 @@ public class PreCheckTests : IDisposable
         // the downloaded.json of b2: 1800 s
         await rig.Fs.PutAsync(P.Video("b2", "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1800}"), null, null, false, default);
         IStore index = withIndex ? OpenLocal() : new FakeStore();
+        if (withIndex) await index.PutAsync(P.Video("b2", "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1800}"), null, null, false, default);   // the analyzer reads the matched duration from the index store
         var an = new PreCheckAnalyzer(rig.Tools, cfg, new HttpClient(), index, P, new SearchIndexCache(Path.Combine(root, "cache-" + id), TimeSpan.FromMinutes(10)))
         {
             SkipModelCheck = true,
@@ -756,4 +758,172 @@ public class PreCheckTests : IDisposable
         Assert.Equal(before.Count + 1, rig.Fs.Blobs.Count); Assert.True(rig.Fs.Exists(P.Video(id, "precheck.json")));
         Assert.Empty(rig.Calls);   // no yt-dlp: the window came from the stored video
     }
+
+    // ------------------------------------------------------------------ 0.13.1: "to ('-1') must be a non-negative value" in the pre-check lookup
+    [Fact]
+    public async Task A_zero_byte_centers_zip_fails_as_a_bad_zip_never_as_a_negative_range()
+    {
+        var fs = new FakeStore(); await fs.PutAsync(P.Video("ghost", "centers.zip"), [], null, null, false, default);
+        await Assert.ThrowsAsync<InvalidDataException>(() => CentersZip.OpenAsync(fs, P.Video("ghost", "centers.zip"), default));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(() => ZipFormat.ReadDirectoryAsync(new BlobZipSource(fs, P.Video("ghost", "centers.zip"), 0, null), default, 2048));
+        Assert.Contains("0 bytes", ex.Message);
+    }
+
+    [Fact]
+    public async Task The_real_store_sends_no_range_request_for_zero_bytes()
+    {
+        var calls = 0;
+        var h = new HitHandler(() => calls++);
+        var s = new RestStore(new HttpClient(h), "https://acct.blob.core.windows.net/media?sv=2021-12-02&sp=racwdlfti&sig=x") { RetryDelay = _ => TimeSpan.Zero };
+        var r = await s.GetRangeAsync("a/b.zip", 0, 0, "\"e\"", default);   // used to throw ArgumentOutOfRangeException: to ('-1')
+        Assert.Equal(0, r.Data!.Length); Assert.False(r.Mismatch);
+        Assert.Empty(await s.GetRangeAsync("a/b.zip", 5, 0, default)); Assert.Equal(0, calls);
+    }
+    sealed class HitHandler(Action hit) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) { hit(); return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.PartialContent) { Content = new ByteArrayContent([1]) }); }
+    }
+
+    // ------------------------------------------------------------------ 0.13.1: the duplicate skip reads the matched duration from the repacked layout; an AI upload is a skip
+    static async Task Repack(IStore fs, string id, double duration)
+    {   // the repacked (0.10.0+) layout: no downloaded.json blob, the summary is download.zip's idx_summary metadata
+        if (fs is FakeStore f0) f0.Blobs.Remove(P.Video(id, "downloaded.json")); else { try { await fs.DeleteAsync(P.Video(id, "downloaded.json"), default); } catch { } }
+        await fs.PutAsync(P.Video(id, "download.zip"), [1, 2, 3, 4], null, null, false, default);
+        await fs.SetMetadataAsync(P.Video(id, "download.zip"), new Dictionary<string, string> { ["idx_summary"] = "{\"durationSeconds\":" + duration.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}" }, null, default);
+    }
+
+    [Fact]
+    public async Task The_matched_duration_comes_from_download_zips_idx_summary_then_downloaded_json_never_a_get_of_the_zip()
+    {
+        var fs = new FakeStore(); await Repack(fs, "new1", 1800);
+        Assert.Equal(1800, await MatchedDuration.ReadAsync(fs, P, "new1", default));
+        await fs.PutAsync(P.Video("old1", "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1234}"), null, null, false, default);   // an old layout
+        Assert.Equal(1234, await MatchedDuration.ReadAsync(fs, P, "old1", default));
+        Assert.Null(await MatchedDuration.ReadAsync(fs, P, "none", default));
+        await fs.PutAsync(P.Video("empty", "download.zip"), [1], null, null, false, default); await fs.SetMetadataAsync(P.Video("empty", "download.zip"), new Dictionary<string, string> { ["idx_summary"] = "{}" }, null, default);
+        Assert.Null(await MatchedDuration.ReadAsync(fs, P, "empty", default));
+    }
+
+    [Fact]
+    public async Task A_real_duplicate_is_skipped_on_the_repacked_layout()
+    {
+        if (await RealFfmpegAsync() is null) return;
+        var v = await BuildIndexAsync();
+        var (rig, stage, id) = await SetupAsync("repackdup01", n => Take(v["b2"], 40, n));
+        await Repack(OpenLocal(), "b2", 1800);   // (the index store the analyzer reads) b2's duration is only in download.zip's metadata: before the fix this was always 'duration unknown: not skipped'
+        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=repackdup01", 480, null); job.JobId = id;
+        DuplicateFound? ex = null;
+        try { await stage.RunAsync(Ctx(rig.Fs, job)); } catch (DuplicateFound d) { ex = d; }
+        Assert.NotNull(ex); Assert.Equal("b2", ex!.Upload); Assert.False(ex.Ai);
+        Assert.Equal("duplicate", Json(rig.Fs, P.Video(id, "precheck.json")).GetProperty("decision").GetString());
+    }
+
+    [Fact]
+    public async Task An_ai_flagged_upload_is_not_skipped_by_the_precheck_stage_and_leaves_its_record_untouched()
+    {
+        // a repeat of a claim interrupted after the record: the stored record says ai (this part needs no ffmpeg)
+        var fs = new FakeStore();
+        var rec = new JsonObject { ["decision"] = "new", ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.61, ["threshold"] = 0.479 }, ["speech"] = new JsonObject { ["speechLanguage"] = "zh", ["dubbed"] = false } };
+        await fs.PutAsync(P.Video("aiaiaiai001", "precheck.json"), Encoding.UTF8.GetBytes(rec.ToJsonString()), null, null, false, default);
+        await fs.PutAsync(P.Video("aiaiaiai001", "download.zip"), [9, 9], null, null, false, default);
+        var an = new PreCheckAnalyzer(new Tools(new HttpClient(), new NodeConfig()), new NodeConfig(), new HttpClient(), fs, P, new SearchIndexCache(Path.Combine(root, "cache-ai0"), TimeSpan.FromMinutes(10)));
+        var stage = new PreCheckStage(new Tools(new HttpClient(), new NodeConfig()), an, new PreCheckSettings(), "t");
+        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=aiaiaiai001", 480, null); job.JobId = "aiaiaiai001";
+        var before = fs.Blobs.ToDictionary(kv => kv.Key, kv => kv.Value.Data.ToArray());
+        await stage.RunAsync(Ctx(fs, job));   // 0.13.1: no skip; the engine holds it (record: ai.flag)
+        Assert.True(Json(fs, P.Video("aiaiaiai001", "precheck.json")).GetProperty("ai").GetProperty("flag").GetBoolean());
+        foreach (var kv in before) Assert.Equal(kv.Value, fs[kv.Key].Data);   // nothing deleted or rewritten
+        Assert.Equal(before.Count, fs.Blobs.Count);
+    }
+
+    [Fact]
+    public async Task An_ai_flagged_new_drama_is_not_skipped_end_to_end()
+    {
+        if (await RealFfmpegAsync() is null) return;
+        var v = await BuildIndexAsync();
+        var (rig, _, id) = await SetupAsync("aiflagged01", n => F16(Gauss(new Random(7)).Concat(Gauss(new Random(8))).Take(n * D).ToArray()));
+        var s = new PreCheckSettings { AiFlag = -1000, AiStrict = 1000 };   // every score is at or above the flag
+        var stage = new PreCheckStage(rig.Tools, rig.An, s, "t");
+        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=aiflagged01", 480, null); job.JobId = id;
+        DuplicateFound? ex = null; try { await stage.RunAsync(Ctx(rig.Fs, job)); } catch (DuplicateFound d) { ex = d; }
+        Assert.Null(ex); { Assert.True(Json(rig.Fs, P.Video(id, "precheck.json")).GetProperty("ai").GetProperty("flag").GetBoolean()); }
+    }
+
+    // ------------------------------------------------------------------ 0.13.1: the catalog
+    async Task<(IStore Store, Dictionary<string, float[]> V)> CatalogRigAsync()
+    {
+        var v = await BuildIndexAsync(); var st = OpenLocal();
+        foreach (var (id, d) in new[] { ("a1", 900), ("c3", 600) }) await st.PutAsync(P.Video(id, "precheck.json"), Encoding.UTF8.GetBytes(new JsonObject { ["video"] = new JsonObject { ["duration"] = d } }.ToJsonString()), null, null, false, default);   // no download.zip metadata in this fixture: the catalog falls back to the measured duration
+        var rec = new JsonObject { ["speech"] = new JsonObject { ["speechLanguage"] = "en", ["dubbed"] = true }, ["ai"] = new JsonObject { ["flag"] = false, ["score"] = 0.12 }, ["video"] = new JsonObject { ["duration"] = 1800, ["title"] = "B two", ["channel"] = "Chan" } };
+        await st.PutAsync(P.Video("b2", "precheck.json"), Encoding.UTF8.GetBytes(rec.ToJsonString()), null, null, false, default);
+        var skipped = new JsonObject { ["speech"] = new JsonObject { ["speechLanguage"] = "zh", ["dubbed"] = false }, ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.7 }, ["video"] = new JsonObject { ["duration"] = 300, ["title"] = "skipped" } };
+        await st.PutAsync(P.Video("m9", "precheck.json"), Encoding.UTF8.GetBytes(skipped.ToJsonString()), null, null, false, default);
+        var dupRec = new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "b2", ["top"] = new JsonArray(new JsonObject { ["upload"] = "b2", ["share"] = 0.93, ["bestCosine"] = 0.88, ["bestTime"] = 12.5 }), ["speech"] = new JsonObject { ["speechLanguage"] = "en", ["dubbed"] = false }, ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.66 }, ["video"] = new JsonObject { ["duration"] = 1795, ["title"] = "dup of b2", ["channel"] = "Chan2" } };
+        await st.PutAsync(P.Video("d8", "precheck.json"), Encoding.UTF8.GetBytes(dupRec.ToJsonString()), null, null, false, default);   // a duplicate that is also AI-flagged: a duplicate skip, not a hold
+        var old = Console.Out; Console.SetOut(new StringWriter());
+        try { Assert.Equal(0, await CentersCommands.SearchIndexAsync(Args.Parse(["build", "--local", root, "--threads", "2"]))); } finally { Console.SetOut(old); }
+        return (st, v);
+    }
+
+    [Fact]
+    public async Task The_search_index_build_writes_catalog_json_gz_with_the_version_and_one_entry_per_upload()
+    {
+        var (st, _) = await CatalogRigAsync();
+        var idx = (await new SearchIndexCache(Path.Combine(root, "cat1"), TimeSpan.FromMinutes(10)).GetAsync(st, P, default))!;
+        Assert.Equal(2, idx.Version); Assert.True(File.Exists(Path.Combine(root, "index", "search", "v2", "catalog.json.gz")) || await st.HeadAsync(Catalog.Name(P, 2), default) != null);
+        var c = idx.Catalog!; Assert.NotNull(c); Assert.Equal(2, c.Version); Assert.Empty(c.Groups);
+        Assert.Equal(["a1", "b2", "c3", "d8", "m9"], c.Uploads.Select(u => u.Id).OrderBy(x => x, StringComparer.Ordinal));
+        var a1 = c.Find("a1")!; Assert.Equal(900, a1.DurationSeconds); Assert.Equal("processed", a1.State); Assert.NotNull(a1.Ai?.Score);   // scored from its centers (no precheck.json)
+        Assert.Null(a1.GroupId); Assert.False(a1.Canonical); Assert.False(a1.Mixed); Assert.Null(a1.GroupOffset);
+        var b2 = c.Find("b2")!; Assert.Equal(1800, b2.DurationSeconds); Assert.Equal("en", b2.SpeechLanguage); Assert.True(b2.Dubbed); Assert.Equal(0.12, b2.Ai!.Score); Assert.Equal("B two", b2.Title); Assert.Equal("Chan", b2.Channel);
+        Assert.Equal("index", a1.CheckedBy); Assert.Equal("index", b2.CheckedBy); Assert.Equal("full", a1.Data); Assert.Equal("full", b2.Data); Assert.Equal("full", c.Find("c3")!.Data);
+        var m9 = c.Find("m9")!; Assert.Equal("metadata-only", m9.State); Assert.Equal("ai", m9.Held); Assert.Equal("precheck", m9.CheckedBy); Assert.Equal("precheck", m9.Data); Assert.Equal(300, m9.DurationSeconds); Assert.True(m9.Ai!.Flag); Assert.Equal(0.7, m9.Ai.Score); Assert.Equal("zh", m9.SpeechLanguage); Assert.Equal("skipped", m9.Title);
+        var d8 = c.Find("d8")!; Assert.Equal("metadata-only", d8.State); Assert.Null(d8.Held); Assert.Equal("precheck", d8.CheckedBy); Assert.Equal("precheck", d8.Data); Assert.Equal("duplicate", d8.Decision);   // duplicate first, although AI-flagged
+        Assert.Equal(("b2", 0.93, 12.5, 0.88), (d8.MatchUpload, d8.MatchShare, d8.MatchOffset, d8.MatchCosine)); Assert.Equal(1795, d8.DurationSeconds); Assert.Equal("dup of b2", d8.Title); Assert.Equal("Chan2", d8.Channel); Assert.Equal(0.66, d8.Ai!.Score); Assert.Equal("en", d8.SpeechLanguage); Assert.False(d8.Dubbed);
+        Assert.Equal(c.Uploads.Count, Catalog.FromGzip(c.ToGzip()).Uploads.Count);
+    }
+
+    async Task<PreCheckAnalysis> AnalyzeB2Async(IStore st, Dictionary<string, float[]> v, string tag)
+    {
+        var rows = new float[40 * D]; Array.Copy(v["b2"], rows, rows.Length);
+        var an = new PreCheckAnalyzer(new Tools(new HttpClient(), new NodeConfig()), new NodeConfig(), new HttpClient(), st, P, new SearchIndexCache(Path.Combine(root, "cache-" + tag), TimeSpan.FromMinutes(10))) { SkipModelCheck = true, EmbedOverride = (dir, n, box, th, pr, ct) => Task.FromResult(F16(rows)) };
+        return await an.AnalyzeFramesAsync(root, 40, BarCrop.None, null, new PreCheckSettings(), 1, _ => { }, new Dictionary<string, double>(), null, default);
+    }
+
+    [Fact]
+    public async Task A_real_duplicate_is_skipped_with_the_duration_of_the_catalog()
+    {
+        var (st, v) = await CatalogRigAsync();
+        var a = await AnalyzeB2Async(st, v, "dup");
+        Assert.Equal("b2", a.Top[0].Upload); Assert.Equal(1800, a.Top[0].Duration);
+        var d = PreCheck.Decide(a, 1790, _ => null, new PreCheckSettings());   // no lookup of the matched upload at all
+        Assert.Equal("duplicate", d.Decision);
+    }
+
+    [Fact]
+    public async Task The_canonical_exception_uses_the_language_of_the_catalog()
+    {
+        var (st, v) = await CatalogRigAsync();
+        var a = await AnalyzeB2Async(st, v, "can");
+        Assert.Equal("en", a.Top[0].SpeechLanguage);
+        var zh = a with { Speech = new SpeechResult("zh", false, 1, 30, 60, null) };
+        Assert.Equal("canonical", PreCheck.Decide(zh, 1790, _ => null, new PreCheckSettings()).Decision);   // zh original of an en dub
+        var en = a with { Speech = new SpeechResult("en", true, 1, 30, 60, null) };
+        Assert.Equal("duplicate", PreCheck.Decide(en, 1790, _ => null, new PreCheckSettings()).Decision);
+    }
+
+    [Fact]
+    public async Task A_held_upload_that_is_later_processed_gets_its_entry_replaced_by_the_full_one()
+    {
+        var (st, _) = await CatalogRigAsync();
+        var idx = (await new SearchIndexCache(Path.Combine(root, "cat2"), TimeSpan.FromMinutes(10)).GetAsync(st, P, default))!;
+        Assert.Equal("ai", idx.Catalog!.Find("m9")!.Held);
+        var m9 = idx.Uploads[0] with { Id = "m9" };   // now it has a centers.zip and is in the index
+        await using var _ = default(IAsyncDisposable?) as IAsyncDisposable ?? new Nop();
+        var rebuilt = await CatalogBuild.BuildAsync(st, P, 3, idx.Uploads.Append(m9).ToList(), idx.Catalog, new PreCheckSettings().AiFlag, null, default);
+        var e = rebuilt.Find("m9")!; Assert.Equal("processed", e.State); Assert.Equal("index", e.CheckedBy); Assert.Equal("full", e.Data); Assert.Null(e.Held); Assert.Null(e.Decision);
+        Assert.Single(rebuilt.Uploads, u => u.Id == "m9");
+    }
+    sealed class Nop : IAsyncDisposable { public ValueTask DisposeAsync() => ValueTask.CompletedTask; }
+
 }

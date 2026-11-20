@@ -34,6 +34,8 @@ public sealed class NodeConfig
     public YtDlpConfig? Ytdlp { get; set; }
     /// <summary>0.12.0 download pre-check (config keys precheck.*): sample, duplicate lookup, AI flag. Null = defaults.</summary>
     public PreCheckSettings? PreCheck { get; set; }
+    /// <summary>0.13.1 (config key search.keep-versions): how many search-index versions to keep behind the head. Null = 3.</summary>
+    public SearchSettings? Search { get; set; }
 
     /// <summary>Run limits (see LimitState). BudgetSetAt restarts the countdown when the budget is set again.</summary>
     public int? Budget { get; set; }
@@ -250,3 +252,5 @@ public sealed class BrowserConfig
     public string ResolveProfileDir() => string.IsNullOrWhiteSpace(ProfileDir) ? DefaultProfileDir() : ProfileDir;
     public int ResolvePort() => Port ?? DefaultPort;
 }
+
+public sealed class SearchSettings { public int KeepVersions { get; set; } = 3; }

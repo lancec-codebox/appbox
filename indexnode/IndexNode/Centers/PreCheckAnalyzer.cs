@@ -38,6 +38,8 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
     }
     /// <summary>`precheck --exclude-self`: the upload whose own centers are left out of the lookup (its id), and how many centers that dropped in the last analysis.</summary>
     public string? ExcludeId { get; set; }
+    /// <summary>0.13.1: the uploads whose centers finished after the index was built (the node: from the queue log; the argument is the index's build time, null = unknown, then every recent one). Searched by brute force; the subject itself is left out.</summary>
+    public Func<DateTimeOffset?, IReadOnlyList<string>>? FreshUploads { get; set; }
     public int Excluded { get; private set; }
 
     public async Task<string?> UnavailableAsync(PreCheckSettings s, CancellationToken ct)
@@ -131,7 +133,27 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         int ex = excludeId == null ? -1 : idx.Uploads.FindIndex(u => u.Id == excludeId);
         int excluded = ex < 0 ? 0 : idx.RefUpload.Count(u => u == ex);
         var (best, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, rows, s.TopCenters, threads, ct, ex, Blocks);
-        var (matches, noHit) = PreCheckSearch.Shares(idx, best, s.Tau);
+        var fresh = new List<string>();
+        if (FreshUploads != null)
+        {
+            var have = idx.Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal);
+            fresh = FreshUploads(idx.BuiltAt).Where(id => id != excludeId && !have.Contains(id)).Distinct(StringComparer.Ordinal).ToList();
+        }
+        var used = fresh.Count == 0 ? [] : await PreCheckSearch.MergeFreshAsync(store, paths, idx, fresh, rows, best, threads, ct);
+        secs["freshUploads"] = used.Count;
+        var (matches, noHit) = PreCheckSearch.Shares(idx, best, s.Tau, used);
+        // duration and language of the matches: the catalog of the searched version; the uploads newer than it from their precheck.json / download.zip (never a hydrate)
+        var freshIds = used.Select(u => u.Id).ToHashSet(StringComparer.Ordinal);
+        for (int i = 0; i < matches.Count && i < 5; i++)
+        {
+            var m = matches[i];
+            if (idx.Catalog?.Find(m.Upload) is { DurationSeconds: not null } ce && !freshIds.Contains(m.Upload)) matches[i] = m with { Duration = ce.DurationSeconds, SpeechLanguage = ce.SpeechLanguage ?? m.SpeechLanguage, Dubbed = ce.Dubbed ?? m.Dubbed };
+            else
+            {
+                var p = await CatalogBuild.ReadPrecheckAsync(store, paths, m.Upload, ct);
+                matches[i] = m with { Duration = await CatalogBuild.DurationAsync(store, paths, m.Upload, p, ct), SpeechLanguage = p.Language ?? m.SpeechLanguage, Dubbed = p.Language != null ? p.Dubbed : m.Dubbed };
+            }
+        }
         secs["lookup"] = sw.Elapsed.TotalSeconds; secs["lookupScan"] = st.ScanMs / 1000; secs["lookupRead"] = st.ReadMs / 1000; secs["lookupScore"] = st.ScoreMs / 1000; secs["lookupRequests"] = st.Requests; secs["lookupBytes"] = st.Bytes; sw.Restart();
         double ai = AiProbe.Default.Score(rows);
         secs["ai"] = sw.Elapsed.TotalSeconds; sw.Restart();

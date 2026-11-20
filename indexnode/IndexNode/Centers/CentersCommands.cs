@@ -147,8 +147,9 @@ public static class CentersCommands
         var (cfg, store, paths, _) = OpenStore(a, remote);
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-        var sw = Stopwatch.StartNew();
+        var sw = Stopwatch.StartNew(); var startedAt = DateTimeOffset.UtcNow;
         var head = await SearchData.LoadAsync(store, paths, null, cts.Token);
+
         var ups = await SearchIndexBuild.ListCentersAsync(store, paths, cts.Token);
         Console.WriteLine($"search-index {sub}: {ups.Count} centers.zip, head {(head == null ? "none" : "v" + head.Version)}");
         SearchData next;
@@ -163,7 +164,13 @@ public static class CentersCommands
             next = await SearchIndexBuild.BuildAsync(store, paths, ups, newMean ? null : head!.Mean, null, (head?.Version ?? 0) + 1, newMean ? (head?.MeanVersion ?? 0) + 1 : head!.MeanVersion, threads, Console.WriteLine, cts.Token);
             if (!newMean) next.MeanFrames = head!.MeanFrames;
         }
+        next.BuiltAt = startedAt;
+        next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, Console.WriteLine, cts.Token);
+        Console.WriteLine($"catalog: {next.Catalog.Uploads.Count} uploads, {next.Catalog.ToGzip().Length / 1024.0:F1} KB gzipped");
         await next.PublishAsync(store, paths, cts.Token);
+        var pruned = await SearchData.PruneAsync(store, paths, cfg.Search?.KeepVersions ?? 3, cts.Token);
+        if (pruned.Count > 0) Console.WriteLine($"search-index: removed old versions {string.Join(", ", pruned.Select(g => "v" + g))}");
+
         Console.WriteLine($"search-index: published v{next.Version} (mean v{next.MeanVersion}): {next.Uploads.Count} uploads, {next.Count} centers, bits.bin {next.Bits.Length / 1048576.0:F1} MB, {sw.Elapsed.TotalSeconds:F1}s; head.yaml -> {SearchData.Dir(paths, next.Version)}");
         return 0;
     }

@@ -106,7 +106,11 @@ public sealed class CentersZip
     public static async Task<CentersZip?> OpenAsync(IStore store, string blob, CancellationToken ct)
     {
         var h = await store.HeadAsync(blob, ct); if (h == null) return null;
-        var src = new BlobZipSource(store, blob, h.Size, h.ETag);
+        // a Nexis ghost HEADs as 0 bytes (the data sits in uncommitted blocks): a whole read hydrates it (RestStore), then HEAD again. A zip of 0 bytes used to reach the range read as "bytes=0--1" (ArgumentOutOfRange 'to' = -1)
+        if (h.Size < 22) { await store.GetAsync(blob, ct); h = await store.HeadAsync(blob, ct) ?? throw new FileNotFoundException(blob); }
+        if (h.Size < 22) throw new InvalidDataException($"{blob} is {h.Size} bytes: not a zip (a ghost that could not be hydrated?)");
+        var src = new BlobZipSource
+(store, blob, h.Size, h.ETag);
         var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
         var e = es.FirstOrDefault(x => x.Name == CentersFile.Member) ?? throw new InvalidDataException($"{blob} has no {CentersFile.Member}");
         if (e.Method != 0) throw new NotSupportedException("centers.bin must be stored, not deflated");
@@ -125,8 +129,12 @@ public sealed class CentersZip
     {
         var h = await ReadHeaderAsync(ct);
         var table = await ReadTableAsync(h, ct); int k = h.K;
-        var want = centers.Where(c => c >= 0 && c < k).Distinct().Select(c => (C: c, B: table[c])).OrderBy(x => x.B.Offset).ToList();
+        var all = centers.Where(c => c >= 0 && c < k).Distinct().Select(c => (C: c, B: table[c])).ToList();
         var result = new List<(int, CentersFile.Members)>();
+        // an empty cluster has a zero-length block: no request for it (a ranged read of 0 bytes is "bytes=N--1" on the wire and throws)
+        foreach (var x in all.Where(x => x.B.Length == 0 || x.B.Count == 0)) result.Add((x.C, CentersFile.ParseBlock([], 0)));
+        var want = all.Where(x => x.B.Length > 0 && x.B.Count > 0).OrderBy(x => x.B.Offset).ToList();
+
         for (int i = 0; i < want.Count;)
         {
             int j = i; long start = want[i].B.Offset, end = start + want[i].B.Length;

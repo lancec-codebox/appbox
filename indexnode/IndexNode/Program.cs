@@ -80,6 +80,7 @@ public static class Program
         indexnode classify requeue --source <id>   (sets the source's pending downloads back to unclassified)
         indexnode control run|drain|stop [--stage download|process|comments] [--message M] [--max-per-ip N|off] [gpu-hold <30m|off>]
         indexnode control gpu-hold <duration like 30m>|off
+        indexnode control ai-dramas on|off
         indexnode control --max-per-ip N|off
         indexnode --version
         indexnode config set-sas <url>
@@ -203,15 +204,17 @@ public static class Commands
         try { await tools.CheckFfmpegAsync(stages, default); }
         catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 2; }
         var gate = new DownloadGate();
+        NodeEngine? engineRef = null;
         bool aiStages = a.Has("ai-stages");
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
         var handlers = new Dictionary<string, IStageHandler>
         {
             ["download"] = new DownloadStage(tools, store, gate),
-            ["precheck"] = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths), NoPre(a, cfg.PreCheck), Commands.VersionString),
+            ["precheck"] = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths, b => FreshFromQueue(engineRef, b)), NoPre(a, cfg.PreCheck), Commands.VersionString),
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
             ["refresh"] = new RefreshStage(tools, store),
             ["availability"] = new AvailabilityStage(tools, store),
+            ["search-index"] = new SearchIndexStage(store, cfg.Search?.KeepVersions ?? 3),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
@@ -232,7 +235,7 @@ public static class Commands
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");
-        var engine = new NodeEngine(store, paths, opts, handlers);
+        var engine = new NodeEngine(store, paths, opts, handlers); engineRef = engine;
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; Log.Info("Ctrl+C: releasing current jobs"); cts.Cancel(); };
@@ -514,6 +517,13 @@ public static class Commands
             Console.WriteLine($"control: downloads per IP = {(mc.Downloads?.MaxPerIp is > 0 ? mc.Downloads.MaxPerIp.ToString() : "no cap")}");
             if (level == null) return 0;
         }
+        if (level == "ai-dramas")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control ai-dramas on|off");
+            var ac = await ControlWatcher.SetAiDramasAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: aiDramas = {(ac.AiDramasOn ? "on (AI-held dramas are claimable and resume from frames)" : "off (AI-held dramas stay pending)")}");
+            return 0;
+        }
         if (level == "gpu-hold")
         {
             var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control gpu-hold <duration like 30m>|off");
@@ -521,7 +531,7 @@ public static class Commands
             Console.WriteLine($"control: gpu hold = {gc.Gpu?.Hold ?? "off"} (CPU nodes {(gc.Gpu?.Hold == null ? "claim sscd/clip/cast at once and no gpu-ready markers are written" : "wait that long for a GPU node before taking sscd/clip/cast; markers are written")}; a node's --gpu-fallback overrides this)");
             return 0;
         }
-        if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain, stop, gpu-hold or --max-per-ip N|off");
+        if (level is not ("run" or "drain" or "stop")) throw new ArgumentException("control needs run, drain, stop, gpu-hold, ai-dramas or --max-per-ip N|off");
         var stage = a.Get("stage");
         if (stage != null && !Protocol.Stages.Contains(stage = Protocol.CanonicalStage(stage))) throw new ArgumentException("--stage must be download, process, comments or refresh (watch is the old name)");
         var c = await ControlWatcher.WriteAsync(store, paths, level, stage, a.Get("message"), cfg.NodeName ?? Environment.UserName, default);
@@ -580,6 +590,7 @@ public static class Commands
         }
 
         var ctl = ControlFile.Parse((await store.GetAsync(paths.Control, default))?.Data);
+        Console.WriteLine($"\nAI dramas: {(ctl.AiDramasOn ? "on" : "off")}  held (pre-check flagged AI): {queue.Read(st => st.Subjects.Values.Count(s => s.Entries.Values.Any(e => e.Hold == "ai" && !e.Final)))}");
         Console.WriteLine($"\nControl: mode={ctl.Mode} download={ctl.Effective("download")} process={ctl.Effective("process")}  changed {ctl.ChangedAt} by {ctl.ChangedBy}{(ctl.Message != null ? "  \"" + ctl.Message + "\"" : "")}");
         return 0;
     }
@@ -691,8 +702,14 @@ public static class Commands
     }
 
     /// <summary>The pre-check analyzer of this node: the search index is cached under the config folder (search-cache/), re-checked at most every precheck.IndexRecheckMinutes.</summary>
-    public static IPreCheckAnalyzer MakePreCheck(Tools tools, NodeConfig cfg, HttpClient http, IStore store, Paths paths) =>
-        new PreCheckAnalyzer(tools, cfg, http, store, paths, new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes((cfg.PreCheck ?? new()).IndexRecheckMinutes)));
+    public static IPreCheckAnalyzer MakePreCheck(Tools tools, NodeConfig cfg, HttpClient http, IStore store, Paths paths, Func<DateTimeOffset?, IReadOnlyList<string>>? fresh = null) =>
+        new PreCheckAnalyzer(tools, cfg, http, store, paths, new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes((cfg.PreCheck ?? new()).IndexRecheckMinutes))) { FreshUploads = fresh };
+
+    /// <summary>The uploads whose process `centers` step finished (queue log) after the index build time.</summary>
+    static IReadOnlyList<string> FreshFromQueue(NodeEngine? e, DateTimeOffset? builtAt)
+    {
+        try { return e?.Queue is { } q ? SearchIndexJobs.FreshUploads(q, builtAt) : []; } catch (NullReferenceException) { return []; }
+    }
 
     static PreCheckSettings NoPre(Args a, PreCheckSettings? s) { s ??= new(); if (a.Has("no-precheck")) s.Enabled = false; return s; }
 
@@ -741,6 +758,7 @@ public static class Commands
                 case "storage.region": file.StorageRegion = val.Trim(); break;
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
+                case "search.keep-versions": case "search.keepversions": { var kv = int.Parse(val); if (kv < 0) throw new ArgumentException("search.keep-versions must be 0 or more"); (file.Search ??= new()).KeepVersions = kv; break; }
                 case "precheck.enabled": (file.PreCheck ??= new()).Enabled = bool.Parse(val); break;
                 case "precheck.tau": (file.PreCheck ??= new()).Tau = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.skip-share": (file.PreCheck ??= new()).SkipShare = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;

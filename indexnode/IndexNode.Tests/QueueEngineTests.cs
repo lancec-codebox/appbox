@@ -235,4 +235,99 @@ public class QueueEngineTests
         Assert.NotNull(rec.Ops);
         Assert.Equal("test-node", rec.NodeId);
     }
+
+    // ------------------------------------------------------------------ claim order on a running node
+
+    [Fact]
+    public async Task A_pri_line_appended_while_the_node_runs_reorders_its_next_claim_and_ties_go_by_added_then_id()
+    {
+        var s = new FakeStore();
+        // eight process entries, all added at the same time (as a migration does), upper case ids sort before lower case
+        foreach (var id in new[] { "Aaa", "Bbb", "Ccc", "Ddd", "nLk", "ntV", "o7U", "Zzz" }) { await s.AddJob(P, "process", id, T(0)); await Downloaded(s, id); }
+        var order = new List<string>(); var gate = new SemaphoreSlim(0); var first = new TaskCompletionSource();
+        var e = Engine(s, Opts(["process"], once: false, pollMs: 20), step: async ctx =>
+        {
+            lock (order) { if (!order.Contains(ctx.Job.JobId)) order.Add(ctx.Job.JobId); }
+            bool isFirst; lock (order) isFirst = order.Count == 1;
+            if (isFirst) { first.TrySetResult(); await gate.WaitAsync(); }
+        });
+        using var cts = new CancellationTokenSource(); var run = e.RunAsync(cts.Token);
+        await first.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        // another node (the CLI) sets priorities while the first claim is still running
+        var q = new JobQueue(s, P, "cli", () => DateTimeOffset.Parse("2026-11-20T12:00:00Z")); await q.LoadAsync(default);
+        await PriorityTool.SetAsync(q, 1000, ["nLk", "ntV", "o7U"], default);
+        gate.Release(20);
+        try { try { await Within(() => { lock (order) return order.Count == 8; }, 6000); } catch (TimeoutException) { throw new Exception("order so far: " + string.Join(",", order) + " / " + string.Join(";", Q(s).Subjects.Values.Select(x => x.Id + "=" + x.Entries["process"].State + "/" + x.Entries["process"].Priority + "/" + x.ClaimBy))); } } finally { gate.Release(20); cts.Cancel(); await run.WaitAsync(TimeSpan.FromSeconds(10)); }
+        Assert.Equal("Aaa", order[0]);
+        Assert.Equal(["nLk", "ntV", "o7U"], order.Skip(1).Take(3).ToList());   // the priority ones come next, then the rest by added, id
+        Assert.Equal(["Bbb", "Ccc", "Ddd", "Zzz"], order.Skip(4).ToList());
+    }
+
+    [Fact]
+    public async Task A_process_claim_runs_the_precheck_first_and_the_final_done_line_carries_its_decision()
+    {
+        var s = new FakeStore(); await s.AddJob(P, "process", "v1", T(0)); await Downloaded(s, "v1");
+        var order = new List<string>();
+        var h = new Dictionary<string, IStageHandler>();
+        foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
+        foreach (var st in Protocol.StepStages) h[st] = new Fn(ctx => { order.Add(ctx.Stage); return Task.CompletedTask; });
+        h["process"] = h["frames"];
+        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, "precheck.json"), System.Text.Encoding.UTF8.GetBytes("{\"decision\":\"new\"}"), null, null, false, default); });
+        await Run(new NodeEngine(s, P, Opts(["process"]), h));
+        Assert.Equal("precheck", order[0]);
+        Assert.Contains("\"pc\":\"new\"", s.AppendText("index-test/jobs/queue.log"));
+    }
+
+    // ------------------------------------------------------------------ 0.13.1: AI dramas are held, not skipped
+    static Dictionary<string, IStageHandler> AiHandlers(List<string> order, string decision)
+    {
+        var h = new Dictionary<string, IStageHandler>();
+        foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
+        foreach (var st in Protocol.StepStages) h[st] = new Fn(ctx => { order.Add(ctx.Stage); return Task.CompletedTask; });
+        h["process"] = h["frames"];
+        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, "precheck.json"), System.Text.Encoding.UTF8.GetBytes("{\"decision\":\"" + decision + "\",\"ai\":{\"flag\":true,\"score\":0.61,\"threshold\":0.479},\"share\":0.12}"), null, null, false, default); });
+        return h;
+    }
+    static Task SetAi(FakeStore s, string v) => s.PutAsync(P.Control, new ControlFile { AiDramas = v }.ToBytes(), null, null, false, default);
+
+    [Fact]
+    public async Task An_ai_flagged_upload_is_held_and_not_claimable_while_ai_dramas_is_off()
+    {
+        var s = new FakeStore(); await s.AddJob(P, "process", "ai1", T(0)); await Downloaded(s, "ai1");
+        var order = new List<string>();
+        await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        Assert.Equal(["precheck"], order);   // no step ran
+        var e = Q(s).Entry("ai1", "process")!;
+        Assert.Equal("pending", e.State); Assert.Equal("ai", e.Hold); Assert.Equal(0.61, e.HoldAiScore); Assert.Contains("precheck", e.StepsDone!);
+        Assert.Null(Q(s).Get("ai1")!.ClaimBy);
+        var log = s.AppendText("index-test/jobs/queue.log");
+        Assert.Contains("\"hold\":\"ai\"", log); Assert.Contains("\"threshold\":0.479", log);   // the pre-check numbers are on the line
+        // a second pass with it still off: nothing is claimed, priority unchanged
+        order.Clear(); await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        Assert.Empty(order); Assert.Equal(0, Q(s).Entry("ai1", "process")!.Priority);
+    }
+
+    [Fact]
+    public async Task A_held_ai_drama_is_claimable_with_ai_dramas_on_and_resumes_at_frames_without_a_second_precheck()
+    {
+        var s = new FakeStore(); await s.AddJob(P, "process", "ai2", T(0)); await Downloaded(s, "ai2");
+        var order = new List<string>();
+        await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        await SetAi(s, "on"); order.Clear();
+        await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        Assert.DoesNotContain("precheck", order); Assert.Equal("frames", order[0]);
+        var e = Q(s).Entry("ai2", "process")!;
+        Assert.Equal("done", e.State); Assert.Null(e.Hold);
+    }
+
+    [Fact]
+    public async Task A_duplicate_that_is_also_ai_flagged_is_skipped_as_a_duplicate()
+    {
+        var s = new FakeStore(); await s.AddJob(P, "process", "ai3", T(0)); await Downloaded(s, "ai3");
+        var h = AiHandlers([], "new");
+        h["precheck"] = new Fn(_ => throw new DuplicateFound("other1", 0.9) { Ai = false });
+        await Run(new NodeEngine(s, P, Opts(["process"]), h));
+        var e = Q(s).Entry("ai3", "process")!;
+        Assert.Equal("duplicate", e.State); Assert.Null(e.Hold);
+    }
 }
