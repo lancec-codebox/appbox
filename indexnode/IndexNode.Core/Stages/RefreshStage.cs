@@ -8,16 +8,16 @@ namespace IndexNode;
 /// A followed source (playlist or channel). Its job runs a <b>lookup</b> (full listing: on add, or by hand) or a <b>refresh</b> (incremental: scheduled, or by hand); after a run
 /// the engine rewrites the job as pending, due at the next scheduled time, or as done when there is none (schedule once/off). Listings are yt-dlp's flat listing, newest first, without cookies.
 /// </summary>
-public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTimeOffset>? clock = null) : IStageHandler
+public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTimeOffset>? clock = null, Func<int, int, int>? random = null) : IStageHandler
 {
     public const int ListSize = 30;
     public const int SeenCap = 500;
     private readonly Func<DateTimeOffset> now = clock ?? (() => DateTimeOffset.UtcNow);
 
-    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null, string? Availability = null);
+    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null, string? Availability = null, string? UploadDate = null);
 
     /// <summary>The yt-dlp --print template of a listing line (see <see cref="ParseLine"/>).</summary>
-    public const string ListPrint = "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(availability)s\t%(title)s";
+    public const string ListPrint = "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(availability)s\t%(upload_date)s\t%(title)s";
     /// <summary>A channel's first poll looks this far back: its back catalogue goes to classification too.</summary>
     public const int ChannelFirstList = 100;
 
@@ -47,7 +47,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         if (!Regex.IsMatch(id, @"^[A-Za-z0-9_-]{11}$")) return null;
         string? Field(int i) => p.Length > i && p[i].Trim() is { Length: > 0 } v && v != "NA" ? v : null;
         double? dur = Field(3) is { } d && double.TryParse(d, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var dv) ? dv : null;
-        return new Entry(id, Field(1), Field(2), dur, p.Length > 5 && string.Join(' ', p[5..]).Trim() is { Length: > 0 } title && title != "NA" ? title : null, Field(4));
+        return new Entry(id, Field(1), Field(2), dur, p.Length > 6 && string.Join(' ', p[6..]).Trim() is { Length: > 0 } title && title != "NA" ? title : null, Field(4), Field(5));
     }
 
     public async Task<List<Entry>> ListAsync(JobDescriptor j, int end, CancellationToken ct)
@@ -73,7 +73,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     /// yt-dlp node into watch jobs. A playlist is curated (its videos so far are downloaded, up to 200, and its channels followed); a channel is ingested
     /// (its new uploads, after its first look-back, go to classification). The request is marked done (with the job id) or failed (with the error).
     /// </summary>
-    public async Task ResolveRequestsAsync(Paths paths, CancellationToken ct)
+    public async Task ResolveRequestsAsync(Paths paths, JobQueue queue, CancellationToken ct)
     {
         foreach (var b in await store.ListAsync(RequestsDir(paths), false, false, ct))
         {
@@ -83,7 +83,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
             {
                 bool playlist = Sources.Classify(url)?.Kind == "playlist";
                 var job = await Sources.ResolveAsync(tools, url, req["schedule"]?.ToString() ?? "once", ["videos"], req["followChannels"]?.GetValue<bool>() ?? playlist, playlist ? -1 : 0, 480, ct);
-                bool made = await Sources.AddAsync(store, paths, job, ct);
+                bool made = await Sources.AddAsync(queue, job, ct);
                 req["state"] = "done"; req["jobId"] = job.JobId; req["name"] = job.Name; req["note"] = made ? "watch job created" : "already watched";
                 Log.Info($"watch: source request {url} -> {job.JobId} ({job.Name}){(made ? "" : " (already followed)")}");
             }
@@ -93,15 +93,11 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         }
     }
 
-    private async Task<bool> KnownAsync(Paths paths, string id, CancellationToken ct) =>
-        await store.GetTagsAsync(paths.Job("download", id), ct) != null || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0;
+    private async Task<bool> KnownAsync(JobQueue queue, Paths paths, string id, CancellationToken ct) =>
+        queue.Read(s => s.Entry(id, "download") != null) || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0;
 
-    /// <summary>Migrates pre-0.10.3 watch jobs and answers the admin page's add requests; run by the refresh node about once a minute, whether or not any source is due.</summary>
-    public async Task HousekeepingAsync(Paths paths, CancellationToken ct)
-    {
-        await Sources.MigrateLegacyAsync(store, paths, ct);
-        await ResolveRequestsAsync(paths, ct);
-    }
+    /// <summary>Answers the admin page's add requests; run by the refresh node about once a minute, whether or not any source is due.</summary>
+    public Task HousekeepingAsync(Paths paths, JobQueue queue, CancellationToken ct) => ResolveRequestsAsync(paths, queue, ct);
 
     /// <summary>What the next claim does: the job's own record ("lookup" | "refresh"), else a job written before 0.10.3 that has never run is a lookup and any other is a refresh.</summary>
     public static string KindOf(JobDescriptor j) => j.Run is "lookup" or "refresh" ? j.Run : j.Seen == null ? "lookup" : "refresh";
@@ -109,7 +105,8 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     public async Task RunAsync(JobContext ctx)
     {
         var job = ctx.Job; var ct = ctx.Token; var paths = ctx.Paths;
-        await HousekeepingAsync(paths, ct);
+        var queue = ctx.Queue ?? throw new InvalidOperationException("refresh runs on the queue");
+        await HousekeepingAsync(paths, queue, ct);
         if (string.IsNullOrEmpty(job.Id) || job.Kind is not ("playlist" or "channel")) throw new PermanentFailure("refresh job needs kind (playlist|channel) and id");
         var schedule = Schedule.Of(job);
         var run = KindOf(job); bool lookup = run == "lookup";
@@ -118,10 +115,14 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
 
         // lookup: the whole source (a playlist in full, a channel's newest ChannelFirstList or backfill); refresh: a channel's newest uploads until known ones are reached, a playlist in full
         int end = lookup ? (job.Kind == "playlist" ? 0 : Math.Max(ChannelFirstList, backfill)) : job.Kind == "playlist" ? 0 : ListSize;
+        var seenBlob = await store.GetAsync(paths.SourceSeen(job.JobId), ct);   // up to 500 ids: kept out of the log lines
+        job.Seen = seenBlob == null ? job.Seen : System.Text.Json.JsonSerializer.Deserialize<List<string>>(seenBlob.Data, Protocol.Json);
         var seen = new HashSet<string>(job.Seen ?? []);
+        bool firstPoll = job.LastPolled == null;
         var listed = await ListAsync(job, end, ct);
         while (!lookup && job.Kind == "channel" && end < 500 && listed.Count >= end && listed.All(e => !seen.Contains(e.Id))) { end *= 4; listed = await ListAsync(job, end, ct); } // every one new: go further back until a known one turns up
         var fresh = lookup ? listed : listed.Where(e => !seen.Contains(e.Id)).ToList();
+        bool changed = listed.Any(e => !seen.Contains(e.Id));   // the set changed: a new upload, or a new item in a playlist
         int made = 0, skipped = 0;
         var addedAt = Protocol.Utc(now());
 
@@ -129,13 +130,13 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         int limit = lookup && job.Kind == "playlist" && job.Backfill != null ? backfill : int.MaxValue;
         foreach (var e in fresh)
         {
-            if (await KnownAsync(paths, e.Id, ct)) { skipped++; continue; }
+            if (await KnownAsync(queue, paths, e.Id, ct)) { skipped++; continue; }
             if (made >= limit) break;
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={e.Id}", job.MaxHeight ?? 480, null);
             d.Source = job.JobId; d.Sources = [job.JobId]; d.AddedAt = addedAt; d.Priority = job.Priority;
             d.Title = e.Title; d.Duration = e.Duration; d.Availability = e.Availability;
             d.ChannelId = e.ChannelId ?? (job.Kind == "channel" ? job.Id : null); d.ChannelName = e.ChannelName ?? (job.Kind == "channel" ? job.Name : null);
-            if (await ClassifyJobs.CreateUnclassifiedAsync(store, paths, d, ct)) made++; else skipped++;
+            if (await ClassifyJobs.CreateUnclassifiedAsync(queue, d, ct)) made++; else skipped++;
         }
 
         if (job.FollowChannels == true)
@@ -154,22 +155,48 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
                 if (cid == null || !done.Add(cid)) continue;
                 var ch = JobDescriptor.NewSource("channel", cid, cname ?? cid, "once", ["videos"], false, 0, job.MaxHeight ?? 480); // Shorts are never dramas
                 ch.Source = job.JobId; ch.AddedAt = addedAt; ch.Priority = job.Priority;
-                if (await Sources.AddAsync(store, paths, ch, ct)) Log.Info($"{run} {job.JobId}: now following channel {ch.Name} ({cid})");
+                if (await Sources.AddAsync(queue, ch, ct)) Log.Info($"{run} {job.JobId}: now following channel {ch.Name} ({cid})");
             }
         }
 
         await WriteMembersAsync(paths, job, listed, lookup, addedAt, ct);
 
         job.Seen = fresh.Select(e => e.Id).Concat(job.Seen ?? []).Distinct().Take(SeenCap).ToList();
+        await store.PutAsync(paths.SourceSeen(job.JobId), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(job.Seen, Protocol.Json), null, null, false, ct);
+        job.Seen = [];   // the log line carries the job without its list (see seen.json); an empty list marks a source that has been looked at
         job.Found = (job.Found ?? 0) + made;
         job.LastPolled = addedAt; job.LastRun = run;
         if (lookup) job.LastLookup = addedAt; else job.LastRefresh = addedAt;
         job.Run = "refresh";
         job.Attempts = 0; job.LastError = null; job.Permanent = null;
-        var next = schedule.Next(now());
+        DateTimeOffset? next;
+        string tierText = "";
+        if (schedule.IsDynamic)
+        {
+            // 0.13.0 (owner): the tier follows the time since the source was last MODIFIED, recorded here: the last refresh that saw its set change. Only a channel's first poll
+            // uses the newest upload's approximate date from the listing (a dead channel must not look freshly changed); a playlist's first poll counts as changed now.
+            var nowT = now();
+            if (firstPoll)
+            {
+                var newest = listed.Select(e => DynamicSchedule.ParseUploadDate(e.UploadDate)).Where(d => d != null).Select(d => d!.Value).DefaultIfEmpty().Max();
+                DateTimeOffset? first = job.Kind == "playlist" ? nowT : newest == default ? null : newest;
+                job.LastModified = first == null ? null : Protocol.Utc(first.Value);
+            }
+            else if (changed) job.LastModified = Protocol.Utc(nowT);
+            DateTimeOffset? modified = DateTimeOffset.TryParse(job.LastModified, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var lm) ? lm : null;
+            if (DynamicSchedule.IsInactive(nowT, modified)) { next = null; job.Inactive = true; tierText = ", inactive (last modified over a year ago)"; }
+            else
+            {
+                job.Inactive = null;
+                int tier = DynamicSchedule.Tier(nowT, modified);
+                next = nowT + DynamicSchedule.Delay(tier, random);
+                tierText = $", tier {DynamicSchedule.TierText(tier)}";
+            }
+        }
+        else next = schedule.Next(now());
         job.NextRefresh = next == null ? null : Protocol.Utc(next.Value);
         ctx.NextDue = job.NextRefresh; // once / off: the job is done until triggered by hand
-        Log.Info($"{run} {job.JobId}: {listed.Count} listed, {fresh.Count} {(lookup ? "looked at" : "new")}, {made} download job(s) created, {skipped} already known; schedule {schedule.Describe()}{(next != null ? ", next " + job.NextRefresh : "")}");
+        Log.Info($"{run} {job.JobId}: {listed.Count} listed, {fresh.Count} {(lookup ? "looked at" : "new")}, {made} download job(s) created, {skipped} already known; schedule {schedule.Describe()}{tierText}{(next != null ? ", next " + job.NextRefresh : "")}");
     }
 
     public sealed record Member(string Id, string? Title, double? Duration, string? ChannelId, string? ChannelName, string? Availability);

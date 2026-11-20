@@ -87,7 +87,7 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
         var ct = ctx.Token;
         var job = ctx.Job; var id = job.JobId;
         var paths = ctx.Paths;
-        if (await ctx.Store.GetAsync(paths.Video(id, "downloaded.json"), ct) != null)
+        if (await ctx.Store.GetAsync(paths.Video(id, "downloaded.json"), ct) is { } done0)
         {
             await EnsureFollowUpJobs(ctx);
             return;
@@ -101,6 +101,7 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
             var common = new List<string> { "--no-playlist", "--retries", "3", "--no-warnings", "--newline" };
 
             ctx.Report("download", "starting");
+
             var main = new List<string>(common);
             main.AddRange(YtDlp.FormatArgs(job.MaxHeight ?? 480, job.Format));
             main.AddRange(new[] {
@@ -114,32 +115,7 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
             });
             if (r.ExitCode != 0) YtDlp.Throw(r.Stderr);
 
-            string? manualDir = null, autoDir = null;
-            if (job.Subs != false)
-            {
-                // exact tracks from the info JSON (never a regex: it would match every auto-translated track); two passes, because yt-dlp names uploaded and automatic subtitles alike (video.<lang>.vtt)
-                var plan = SubLangs.Plan(await work.ExistsAsync("video.info.json", ct) ? await work.ReadTextAsync("video.info.json", ct) : null);
-                foreach (var auto in new[] { false, true })
-                {
-                    var wanted = auto ? plan.AutoArg : plan.ManualArg;
-                    if (wanted.Length == 0) { Log.Info($"download {id}: no {(auto ? "original-language automatic captions" : "uploaded subtitles")} to request"); continue; }
-                    ctx.Report(auto ? "auto-subs" : "subs", null);
-                    var dir = auto ? "auto" : "manual";
-                    var subs = new List<string>(common)
-                    {
-                        "--skip-download", auto ? "--write-auto-subs" : "--write-subs", "--sub-langs", wanted, "--sub-format", "vtt", "--convert-subs", "vtt",
-                        "-o", dir + "/video.%(ext)s", job.Url,
-                    };
-                    var sr = await tools.RunAsync(work, "yt-dlp", subs, ct);
-                    if (sr.ExitCode != 0)
-                    {
-                        // a missing or rate-limited subtitle track must not lose a downloaded video
-                        if (!auto && YtDlp.Classify(sr.Stderr) == FailureKind.BotBlock) YtDlp.Throw(sr.Stderr);
-                        Log.Info($"download {id}: {(auto ? "automatic captions" : "subtitles")} unavailable ({YtDlp.LastErrorLine(sr.Stderr)})");
-                    }
-                    if (auto) autoDir = dir; else manualDir = dir;
-                }
-            }
+            var (manualDir, autoDir) = job.Subs != false ? await FetchSubsAsync(ctx, work, common, ct) : (null, null);
 
             const string videoName = "video.mp4", infoName = "video.info.json", descriptionName = "description.txt";
             if (!await work.ExistsAsync(videoName, ct)) throw new InvalidOperationException("yt-dlp finished but video.mp4 was not produced");
@@ -194,26 +170,58 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
         }
     }
 
-    /// <summary>The process job and the first comments job (due at once), each only where it does not exist yet.</summary>
-    internal async Task EnsureFollowUpJobs(JobContext ctx)
+    /// <summary>The subtitle passes of a download (uploaded, then automatic original-language captions) into manual/ and auto/.</summary>
+    private async Task<(string? Manual, string? Auto)> FetchSubsAsync(JobContext ctx, IToolWorkspace work, List<string> common, CancellationToken ct)
     {
-        var c = JobDescriptor.NewComments(ctx.Job.JobId, ctx.Job.Url ?? "https://www.youtube.com/watch?v=" + ctx.Job.JobId);
-        c.Priority = ctx.Job.Priority;
-        var made = await ctx.Store.PutAsync(ctx.Paths.Job("comments", ctx.Job.JobId), c.ToBytes(), Tags.Job("comments", "pending", c.AddedAt, null, c.Priority), null, true, ctx.Token);
-        Log.Info($"download {ctx.Job.JobId}: comments job {(made ? "created" : "already exists")}");
-        if (QueueProcessing) await EnsureProcessJob(ctx);
-        else Log.Info($"download {ctx.Job.JobId}: processing not queued (--no-process)");
+        var job = ctx.Job; var id = job.JobId; var infoName = "video.info.json";
+        var infoText = await work.ExistsAsync(infoName, ct) ? await work.ReadTextAsync(infoName, ct) : null;
+        string? manualDir = null, autoDir = null;
+        {
+                // exact tracks from the info JSON (never a regex: it would match every auto-translated track); two passes, because yt-dlp names uploaded and automatic subtitles alike (video.<lang>.vtt)
+                var plan = SubLangs.Plan(infoText);
+                foreach (var auto in new[] { false, true })
+                {
+                    var wanted = auto ? plan.AutoArg : plan.ManualArg;
+                    if (wanted.Length == 0) { Log.Info($"download {id}: no {(auto ? "original-language automatic captions" : "uploaded subtitles")} to request"); continue; }
+                    ctx.Report(auto ? "auto-subs" : "subs", null);
+                    var dir = auto ? "auto" : "manual";
+                    var subs = new List<string>(common)
+                    {
+                        "--skip-download", auto ? "--write-auto-subs" : "--write-subs", "--sub-langs", wanted, "--sub-format", "vtt", "--convert-subs", "vtt",
+                        "-o", dir + "/video.%(ext)s", job.Url,
+                    };
+                    var sr = await tools.RunAsync(work, "yt-dlp", subs, ct);
+                    if (sr.ExitCode != 0)
+                    {
+                        // a missing or rate-limited subtitle track must not lose a downloaded video
+                        if (!auto && YtDlp.Classify(sr.Stderr) == FailureKind.BotBlock) YtDlp.Throw(sr.Stderr);
+                        Log.Info($"download {id}: {(auto ? "automatic captions" : "subtitles")} unavailable ({YtDlp.LastErrorLine(sr.Stderr)})");
+                    }
+                    if (auto) autoDir = dir; else manualDir = dir;
+                }
+            }
+
+        return (manualDir, autoDir);
     }
 
-    private static async Task EnsureProcessJob(JobContext ctx)
+    /// <summary>0.13.0: the download fetches the upload's comments itself, and its done adds the `process` entry; its done always adds the `process` entry (the pre-check is the first step of processing, not of the download).</summary>
+    internal async Task EnsureFollowUpJobs(JobContext ctx)
     {
-        // one job per step; the dependent ones (sync, describe) carry "needs" and wait for those outputs
-        var made = new List<string>();
-        foreach (var step in Protocol.IngestStepStages)
+        var id = ctx.Job.JobId;
+        // comments are part of the download (owner decision, 0.13.0), a duplicate's metadata entry included; a repeat run does not fetch them again
+        if (await ctx.Store.HeadAsync(ctx.Paths.Video(id, "comments.zip"), ctx.Token) == null)
         {
-            var p = JobDescriptor.NewStep(step, ctx.Job.JobId); p.Priority = ctx.Job.Priority;
-            if (await ctx.Store.PutAsync(ctx.Paths.Job(step, ctx.Job.JobId), p.ToBytes(), Tags.Job(step, "pending", p.AddedAt, null, p.Priority), null, true, ctx.Token)) made.Add(step);
+            var cj = new JobDescriptor { Stage = "download", JobId = id, Url = ctx.Job.Url ?? "https://www.youtube.com/watch?v=" + id, MaxComments = 1000, Sort = "top", Round = 0, AddedAt = Protocol.NowUtc(), Priority = ctx.Job.Priority };
+            var cctx = new JobContext { Job = cj, Stage = "comments", BlobName = ctx.BlobName, LeaseId = ctx.LeaseId, Worker = ctx.Worker, Store = ctx.Store, Paths = ctx.Paths, NodeId = ctx.NodeId, Token = ctx.Token, ThreadShare = ctx.ThreadShare, Report = ctx.Report, Queue = ctx.Queue };
+            try { await new CommentsStage(tools, store, gate).FetchAsync(cctx, false); }
+            catch (Exception e) when (e is not OperationCanceledException and not BotBlocked) { Log.Info($"download {id}: comments not fetched ({Redact.Sas(e.Message)}); the video is stored without them"); }   // a missing comments snapshot never loses a download
         }
-        Log.Info($"download {ctx.Job.JobId}: step jobs created: {(made.Count == 0 ? "none (all exist)" : string.Join(',', made))}");
+        if (QueueProcessing)
+        {
+            var p = JobDescriptor.NewProcess(id); p.Priority = ctx.Job.Priority; p.Steps = null;
+            if (!ctx.FollowUps.Any(l => l.T == "add" && l.Stage == "process")) ctx.FollowUps.Add(QLine.Add(id, "process", p, Protocol.NowUtc()));
+            Log.Info($"download {id}: process entry added to the queue");
+        }
+        else Log.Info($"download {id}: processing not queued (--no-process)");
     }
 }

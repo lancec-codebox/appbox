@@ -38,6 +38,12 @@ public sealed class BlobZipSource(IStore store, string name, long length, string
 /// </summary>
 public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStore, IStageStore
 {
+    public Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct) => inner.CreateAppendBlobAsync(name, onlyIfNew, ct);
+    public Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct) => inner.AppendBlockAsync(name, data, appendPos, ct);
+    public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => inner.ReadAppendAsync(name, offset, maxLen, ct);
+    public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => inner.SealAppendBlobAsync(name, appendPos, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchAsync(name, data, etag, ct);
+    public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => inner.GetAppendInfoAsync(name, ct);
     public IStore Inner => inner;
     public static IStore? Find(IStore s) { for (int i = 0; i < 8 && s != null; i++) { if (s is StageZipStore z) return z; s = s switch { LocalCacheStore l => l.Inner, RecordingStore r => r.Inner, RedirectStore d => d.Inner, _ => null! }; } return null; }
     public static IStageStore? Stage(IStore s) => Find(s) as IStageStore;

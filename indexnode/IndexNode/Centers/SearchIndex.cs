@@ -7,7 +7,7 @@ using System.Text.Json;
 namespace IndexNode;
 
 /// <summary>One upload in the global search table: where its centers.zip is and which rows of bits.bin/refs.bin are its centers.</summary>
-public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart);
+public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null);
 
 /// <summary>The global search table, as published under index/search/vN/: mean.f32 (512 f32), bits.bin (64-byte sign codes of center - mean), refs.bin (per row: u32 upload index, u32 center index), uploads.yaml.</summary>
 public sealed class SearchData
@@ -46,7 +46,7 @@ public sealed class SearchData
     public static float ScoreCode(float[] lut, ReadOnlySpan<byte> code) { float s = 0; for (int b = 0; b < 64; b++) s += lut[b * 256 + code[b]]; return s; }
 
     /// <summary>The rows with the highest asymmetric score for <paramref name="q"/> (already minus the mean), best first. Parallel over row ranges, each keeping its own top C.</summary>
-    public int[] Scan(float[] q, int topC, int threads)
+    public int[] Scan(float[] q, int topC, int threads, int excludeUpload = -1)
     {
         var lut = Lut(q); int n = Count; topC = Math.Min(topC, n);
         if (topC <= 0) return [];
@@ -57,6 +57,7 @@ public sealed class SearchData
             var heap = new PriorityQueue<int, float>();   // min-heap on score: the worst kept row is on top
             for (int i = lo; i < hi; i++)
             {
+                if (RefUpload[i] == excludeUpload) continue;   // --exclude-self: the queried upload's own centers
                 float s = ScoreCode(lut, Bits.AsSpan(i * CodeBytes, CodeBytes));
                 if (heap.Count < topC) heap.Enqueue(i, s);
                 else if (heap.TryPeek(out _, out var worst) && s > worst) { heap.Dequeue(); heap.Enqueue(i, s); }
@@ -82,7 +83,8 @@ public sealed class SearchData
           .Append("dim: 512\ncodeBytes: 64\ncenters: ").Append(Count).Append("\nuploads:\n");
         foreach (var u in Uploads)
             sb.Append("  - id: ").Append(Q(u.Id)).Append("\n    sha: ").Append(Q(u.Sha)).Append("\n    etag: ").Append(Q(u.ETag)).Append("\n    zipSize: ").Append(u.ZipSize).Append("\n    dataStart: ").Append(u.DataStart)
-              .Append("\n    dataLength: ").Append(u.DataLength).Append("\n    frames: ").Append(u.Frames).Append("\n    k: ").Append(u.K).Append("\n    rowStart: ").Append(u.RowStart).Append('\n');
+              .Append("\n    dataLength: ").Append(u.DataLength).Append("\n    frames: ").Append(u.Frames).Append("\n    k: ").Append(u.K).Append("\n    rowStart: ").Append(u.RowStart).Append('\n')
+              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n");
         return sb.ToString();
     }
 
@@ -90,7 +92,7 @@ public sealed class SearchData
     public static (int Version, int MeanVersion, long MeanFrames, List<SearchUpload> Uploads) ParseUploadsYaml(string yaml)
     {
         int version = 0, meanVersion = 0; long meanFrames = 0; var ups = new List<SearchUpload>(); Dictionary<string, string>? cur = null;
-        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]))); cur = null; }
+        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null)); cur = null; }
         foreach (var raw in yaml.Split('\n'))
         {
             var line = raw.TrimEnd('\r'); if (line.Length == 0 || line.StartsWith('#')) continue;
@@ -168,7 +170,34 @@ public static class SearchIndexBuild
         if (need > buf.Length) buf = await z.ReadAsync(0, need, ct);
         var centers = CentersFile.ParseCenters(buf.AsSpan(CentersFile.HeaderSize, h.K * CentersFile.Dim * 2), h.K);
         var sha = (await raw.HeadAsync(z.Blob, ct))?.Metadata.GetValueOrDefault("idx_sha256") ?? "";
-        return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, z.DataStart, z.DataLength, h.Frames, h.K, 0), centers, h.Sum);
+        var (sl, db) = await ReadSpeechAsync(raw, paths, id, ct);
+        return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, z.DataStart, z.DataLength, h.Frames, h.K, 0, sl, db), centers, h.Sum);
+    }
+
+    /// <summary>The upload's speechLanguage and dubbed from transcribe.zip's asr/&lt;model&gt;.zh.json: a few range reads (zip directory, then the first bytes of the member, where the root fields sit before the segments). Null when there is no transcript.</summary>
+    public static async Task<(string? Language, bool? Dubbed)> ReadSpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct)
+    {
+        try
+        {
+            var blob = paths.Video(id, "transcribe.zip"); var h = await raw.HeadAsync(blob, ct); if (h == null) return (null, null);
+            var src = new BlobZipSource(raw, blob, h.Size, h.ETag);
+            var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
+            var e = es.FirstOrDefault(x => x.Name == "asr/" + Transcribe.ModelName + ".zh.json"); if (e == null) return (null, null);
+            var lh = await src.ReadAsync(e.LocalOffset, 30, ct); if (lh.Length < 30 || BitConverter.ToUInt32(lh, 0) != 0x04034b50) return (null, null);
+            long start = e.LocalOffset + 30 + BitConverter.ToUInt16(lh, 26) + BitConverter.ToUInt16(lh, 28);
+            var raw0 = await src.ReadAsync(start, (int)Math.Min(e.CompressedSize, 4096), ct); string head;
+            if (e.Method == 0) head = Encoding.UTF8.GetString(raw0);
+            else
+            {
+                using var ds = new System.IO.Compression.DeflateStream(new MemoryStream(raw0), System.IO.Compression.CompressionMode.Decompress); var o = new MemoryStream(); var b = new byte[1024];
+                try { int n; while (o.Length < 2048 && (n = ds.Read(b, 0, b.Length)) > 0) o.Write(b, 0, n); } catch (InvalidDataException) { }   // the slice ends mid-stream
+                head = Encoding.UTF8.GetString(o.ToArray());
+            }
+            int seg = head.IndexOf("\"segments\"", StringComparison.Ordinal); if (seg >= 0) head = head[..seg];
+            var lm = System.Text.RegularExpressions.Regex.Match(head, "\"language\"\\s*:\\s*\"([^\"]*)\""); var dm = System.Text.RegularExpressions.Regex.Match(head, "\"dubbed\"\\s*:\\s*(true|false)");
+            return (lm.Success && lm.Groups[1].Value.Length > 0 ? lm.Groups[1].Value : null, dm.Success ? dm.Groups[1].Value == "true" : null);
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { return (null, null); }
     }
 
     /// <summary>Builds the table of <paramref name="uploads"/>. <paramref name="keep"/>: rows of the previous version to copy for unchanged uploads (update); everything else is read from the store. <paramref name="mean"/> null: computed from the uploads' sums (frozen afterwards).</summary>
@@ -199,7 +228,8 @@ public static class SearchIndexBuild
             if (reuse[i])
             {
                 var ou = old![uploads[i].Id];
-                ups.Add(ou with { RowStart = row });
+                var (sl, db) = ou.SpeechLanguage != null ? (ou.SpeechLanguage, ou.Dubbed) : await ReadSpeechAsync(raw, paths, ou.Id, ct);   // a reused upload is read again only while its language is unknown
+                ups.Add(ou with { RowStart = row, SpeechLanguage = sl, Dubbed = db });
                 var chunk = new byte[ou.K * SearchData.CodeBytes]; Array.Copy(keep!.Bits, (long)ou.RowStart * SearchData.CodeBytes, chunk, 0, chunk.Length); bits.Add(chunk);
                 for (int c = 0; c < ou.K; c++) { ru.Add(ui); rc.Add(c); }
                 row += ou.K;

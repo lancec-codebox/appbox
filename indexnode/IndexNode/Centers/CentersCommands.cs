@@ -89,6 +89,56 @@ public static class CentersCommands
         return res;
     }
 
+    // ------------------------------------------------------------------ ai score
+    /// <summary>The frames that are scored for an upload: all of them, or a random sample of <paramref name="n"/> seeded by the id (stable between runs).</summary>
+    public static int[] AiSample(string id, int frames, int n, bool all)
+    {
+        if (all || frames <= n) return Enumerable.Range(0, frames).ToArray();
+        var seed = BitConverter.ToInt32(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(id)), 0);
+        var rng = new Random(seed); var idx = Enumerable.Range(0, frames).ToArray();
+        for (int i = 0; i < n; i++) { int j = rng.Next(i, frames); (idx[i], idx[j]) = (idx[j], idx[i]); }
+        return idx.Take(n).OrderBy(x => x).ToArray();
+    }
+
+    public static byte[] AiJson(string id, double score, int frames, int sampled, bool all, PreCheckSettings s) => System.Text.Encoding.UTF8.GetBytes(new System.Text.Json.Nodes.JsonObject
+    {
+        ["v"] = 1, ["id"] = id, ["model"] = AiProbe.ModelId, ["score"] = Math.Round(score, 4), ["flag"] = score >= s.AiFlag, ["flagStrict"] = score >= s.AiStrict, ["threshold"] = s.AiFlag, ["flagMax0"] = s.AiStrict, ["flagMax1"] = s.AiFlag,
+        ["frames"] = frames, ["sampled"] = sampled, ["sample"] = all ? "all" : "random230:seed=sha256(id)", ["at"] = Protocol.NowUtc(),
+    }.ToJsonString());
+
+    /// <summary>`indexnode ai score [--ids &lt;file&gt;] [--all-frames] [--redo]`: the AI probe on every upload that has an sscd.zip (a random 230-frame sample seeded by the id, or all frames), written to videos/&lt;id&gt;/ai.json.</summary>
+    public static async Task<int> AiScoreAsync(Args a, IStore? remote = null)
+    {
+        var (cfg, store, paths, _) = OpenStore(a, remote);
+        using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        HashSet<string>? only = a.Get("ids") is { } f ? File.ReadAllLines(f).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith('#')).ToHashSet(StringComparer.Ordinal) : null;
+        bool all = a.Has("all-frames"), redo = a.Has("redo"); var st = cfg.PreCheck ?? new();
+        var pre = paths.Prefix + "videos/"; var ids = new List<string>(); var have = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var b in await store.ListAsync(pre, false, false, cts.Token))
+        {
+            var rest = b.Name[pre.Length..]; int sl = rest.IndexOf('/'); if (sl < 0) continue; var id = rest[..sl]; var m = rest[(sl + 1)..];
+            if (m == "sscd.zip" && (only == null || only.Contains(id))) ids.Add(id); else if (m == "ai.json") have.Add(id);
+        }
+        ids.Sort(StringComparer.Ordinal); int ok = 0, skipped = 0, failed = 0;
+        foreach (var id in ids)
+        {
+            cts.Token.ThrowIfCancellationRequested();
+            if (!redo && have.Contains(id)) { skipped++; continue; }
+            try
+            {
+                var f16 = await FrameChunks.VectorsAsync(new StoreJob(store, paths, id), "sscd", cts.Token) ?? throw new InvalidOperationException("no sscd vectors");
+                var rows = AiProbe.RowsFromF16(f16); var pick = AiSample(id, rows.Length, 230, all);
+                double score = AiProbe.Default.Score(pick.Select(i => rows[i]).ToList());
+                await store.PutAsync(paths.Video(id, "ai.json"), AiJson(id, score, rows.Length, pick.Length, all, st), null, null, false, cts.Token);
+                ok++; Console.WriteLine($"  {id}: score {score:0.000}{(score >= st.AiFlag ? "  AI" : "")}  ({pick.Length} of {rows.Length} frames)");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception e) { failed++; Console.WriteLine($"  {id}: FAILED {e.Message}"); }
+        }
+        Console.WriteLine($"ai score: {ok} scored, {skipped} already scored (--redo), {failed} failed");
+        return failed == 0 ? 0 : 1;
+    }
+
     // ------------------------------------------------------------------ search-index
     public static async Task<int> SearchIndexAsync(Args a, IStore? remote = null)
     {
@@ -128,7 +178,7 @@ public static class CentersCommands
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         float[] q;
         if (a.Get("vector") is { } vf) q = ReadVector(File.ReadAllBytes(vf));
-        else if (a.Get("image") is { } img) q = await EmbedImageAsync(new Tools(http, cfg), cfg, http, img, cts.Token);
+        else if (a.Get("image") is { } img) q = await EmbedImageAsync(new Tools(http, cfg), cfg, http, img, cts.Token, a.Has("trim"));
         else throw new ArgumentException("search --vector <f32 or f16 file of 512 values> | --image <file> [--top-centers 300] [--top 20]");
         var sw = Stopwatch.StartNew();
         var idx = await SearchData.LoadAsync(store, paths, a.Get("version") is { } v ? int.Parse(v) : null, cts.Token) ?? throw new InvalidOperationException("no search index: run search-index build");
@@ -150,22 +200,38 @@ public static class CentersCommands
     }
 
     /// <summary>The node's own SSCD (the int8 model, session.x64quantprecision=1 through OrtOptions) on one image: short side 288, ImageNet normalisation, L2-normalised.</summary>
-    public static async Task<float[]> EmbedImageAsync(Tools tools, NodeConfig cfg, HttpClient http, string image, CancellationToken ct)
+    public static async Task<float[]> EmbedImageAsync(Tools tools, NodeConfig cfg, HttpClient http, string image, CancellationToken ct, bool trim = false) => (await EmbedImageDetailAsync(tools, cfg, http, image, ct, trim)).Vector;
+
+    /// <summary>As <see cref="EmbedImageAsync"/>; <paramref name="trim"/>: black bars at the edges of the screenshot (the frames step's bar rule, <see cref="Bars"/>) are cropped off first. Also returns the crop that was applied.</summary>
+    public static async Task<(float[] Vector, BarCrop Crop)> EmbedImageDetailAsync(Tools tools, NodeConfig cfg, HttpClient http, string image, CancellationToken ct, bool trim = false)
     {
         var model = await Sscd.EnsureModelAsync(cfg, http, ct); var ffmpeg = await tools.FfmpegAsync(ct); var probe = await tools.FfprobeAsync(ct);
         var pr = await Proc.RunAsync(probe, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", image], ct);
-        var wh = pr.Stdout.Trim().Split('x'); int w = int.Parse(wh[0]), h = int.Parse(wh[1]); var (tw, th) = Sscd.TargetSize(w, h);
+        var wh = pr.Stdout.Trim().Split('x'); int w = int.Parse(wh[0]), h = int.Parse(wh[1]);
+        var crop = BarCrop.None;
+        if (trim)
+        {
+            // the bar rule needs two frames to call a bar "fixed"; one screenshot is its own second sample
+            var graw = Path.Combine(Path.GetTempPath(), "indexnode-q-" + Guid.NewGuid().ToString("N")[..8] + ".gray");
+            try
+            {
+                var g = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", image, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", graw], ct);
+                if (g.ExitCode == 0 && new FileInfo(graw).Length == (long)w * h) { var lum = await File.ReadAllBytesAsync(graw, ct); crop = Bars.Detect([lum, lum], w, h); }
+            }
+            finally { try { File.Delete(graw); } catch { } }
+        }
+        var (tw, th) = Sscd.TargetSize(crop.Width(w), crop.Height(h));
         var raw = Path.Combine(Path.GetTempPath(), "indexnode-q-" + Guid.NewGuid().ToString("N")[..8] + ".rgb");
         try
         {
-            var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", image, "-frames:v", "1", "-vf", $"scale={tw}:{th}:flags=bicubic", "-f", "rawvideo", "-pix_fmt", "rgb24", raw], ct);
+            var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", image, "-frames:v", "1", "-vf", (crop.IsNone ? "" : crop.Filter(w, h) + ",") + $"scale={tw}:{th}:flags=bicubic", "-f", "rawvideo", "-pix_fmt", "rgb24", raw], ct);
             if (r.ExitCode != 0) throw new InvalidOperationException("ffmpeg could not read the image: " + r.Stderr.Trim());
             var rgb = await File.ReadAllBytesAsync(raw, ct); if (rgb.Length != tw * th * 3) throw new InvalidOperationException($"image decoded to {rgb.Length} bytes, expected {tw * th * 3}");
             var session = OrtOptions.Shared(model, Math.Max(1, cfg.EffectiveThreads));
             var tensor = new DenseTensor<float>([1, 3, th, tw]); Sscd.Fill(tensor, 0, rgb, th * tw);
             using var res = session.Run([NamedOnnxValue.CreateFromTensor(session.InputMetadata.Keys.First(), tensor)]);
             var o = res.First().AsTensor<float>(); var v = new float[Sscd.Dim]; for (int d = 0; d < v.Length; d++) v[d] = o[0, d];
-            Sscd.L2Normalize(v); return v;
+            Sscd.L2Normalize(v); return (v, crop);
         }
         finally { try { File.Delete(raw); } catch { } }
     }

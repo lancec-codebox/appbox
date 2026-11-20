@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "force", "json", "delete-loose" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -41,11 +41,11 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--batch 6] [--batch-hours 12] [--lanes 2] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode sources add <url> [--every 1d|6h|daily@03:00] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
-        indexnode sources schedule <id> off|once|1d|6h|daily@03:00   (new sources are "once": looked up on add, never refreshed unless scheduled)
+        indexnode sources schedule <id> dynamic|off|once|1d|6h|daily@03:00   (dynamic: the next check follows the age of the newest upload; new sources are "once" unless --every says otherwise)
         indexnode sources lookup <id>   (full listing again: every member recorded, every unknown video queued)
         indexnode sources refresh <id>|--all-due   (incremental: only videos new since the last run; due now at priority 500)
         indexnode ai test [--ai-base-url ...]
@@ -56,12 +56,16 @@ public static class Program
         indexnode enqueue --from watch-later [--max-height 480]
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
-        indexnode gpu markers [--dry]
-        indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
-        indexnode search-index build [--new-mean] | update [--threads N]   (the global search table under index/search/vN/)
-        indexnode search --vector <f32|f16 file of 512> | --image <file> [--top-centers 300] [--top 20] [--threads N]   (screenshot search over the centers; "search <text> --job <id>" is the clip text search)
+        indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
+        indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
+        indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
+        indexnode search-index build [--new-mean] | update [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (the global search table under index/search/vN/)
+        indexnode search --vector <f32|f16 file of 512> | --image <file> [--trim] [--top-centers 300] [--top 20] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (screenshot search over the centers; "search <text> --job <id>" is the clip text search)
+        indexnode ai score [--ids <file>] [--all-frames] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (0.12.0: the AI-drama probe on processed uploads' stored sscd.zip -> videos/<id>/ai.json)
         indexnode status [--json]
-        indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]   (read-only: why each drama's steps are or are not eligible for the next batch)
+        indexnode jobs migrate --to log [--dry-run]   (0.13.0: builds the first queue snapshot from today's job blobs; refuses while a job is running)
+        indexnode jobs list [--stage S] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>   (the queue)
+        indexnode video <id>   (what the queue knows about one video)
         (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
         indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel <cores>]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
@@ -74,12 +78,12 @@ public static class Program
         indexnode classify set <videoId> drama|not [--reason R]   (owner override: writes the decision and sets the download job)
         indexnode classify list --rejected [--since 1d]
         indexnode classify requeue --source <id>   (sets the source's pending downloads back to unclassified)
-        indexnode control run|drain|stop [--stage download|process|comments] [--message M]
+        indexnode control run|drain|stop [--stage download|process|comments] [--message M] [--max-per-ip N|off] [gpu-hold <30m|off>]
         indexnode control gpu-hold <duration like 30m>|off
         indexnode control --max-per-ip N|off
         indexnode --version
         indexnode config set-sas <url>
-        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port> <value>
+        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port|precheck.enabled|precheck.tau|precheck.skip-share|precheck.partial-share|precheck.duration-percent|precheck.duration-min|precheck.top-centers|precheck.window-seconds|precheck.language-seconds|precheck.language-min-seconds|precheck.window-position|precheck.ai-flag> <value>
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
         """;
 
@@ -97,29 +101,32 @@ public static class Program
                 "run" => await Commands.RunAsync(a),
                 "enqueue" => await Commands.EnqueueAsync(a),
                 "download" => await Commands.DownloadAsync(a),
+                "precheck" => await PreCheckCommand.RunAsync(a),
+                "serve" or "precheck-serve" => await ServeCommand.RunAsync(a),   // precheck-serve: the old name, a hidden alias
                 "unprocessed" => await Commands.UnprocessedAsync(a),
                 "seeds" => await Commands.SeedsAsync(a),
                 "dev" => await DevCommands.RunAsync(a),
                 "stages" => await StagesCommand.RunAsync(a),
                 "ensure" => await EnsureCommand.RunAsync(a),
                 "repack" => await Commands.RepackAsync(a),
-                "batch" => await Commands.BatchAsync(a),
+                "jobs" => await JobsCommand.RunAsync(a),
+                "trash" => await JobsCommand.TrashAsync(a),
+                "video" => await JobsCommand.VideoAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
                 "search" => a.Has("vector") || a.Has("image") ? await CentersCommands.SearchAsync(a) : await Commands.SearchAsync(a),
                 "centers" => await CentersCommands.CentersAsync(a),
                 "search-index" => await CentersCommands.SearchIndexAsync(a),
                 "status" => await Commands.StatusAsync(a),
-                "requeue" => await Commands.RequeueAsync(a),
+                "requeue" => await JobsCommand.RunAsync(Args.Parse(["retry", .. (a.Get("stage") is { } rs ? new[] { "--stage", rs } : [])])),
                 "classify" => await ClassifyCommand.RunAsync(a),
                 "availability" => await Commands.AvailabilityAsync(a),
                 "control" => await Commands.ControlAsync(a),
                 "config" => Commands.Config(a),
                 "browser" => await Commands.BrowserAsync(a),
-                "gpu" => await Commands.GpuAsync(a),
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
                 "priority" => await Commands.PriorityAsync(a),
-                "ai" => await Commands.AiAsync(a),
+                "ai" => a.Positional.FirstOrDefault() == "score" ? await CentersCommands.AiScoreAsync(a) : await Commands.AiAsync(a),
                 "publish" => await SiteCommands.PublishAsync(a),
                 "cast-candidates" => await CastCandidates.RunAsync(a),
                 "thumbs-bench" => await ThumbsBench.RunAsync(a),
@@ -130,6 +137,7 @@ public static class Program
                 _ => Fail($"unknown command '{cmd}'"),
             };
         }
+        catch (QueueNotMigratedException e) { Console.Error.WriteLine(e.Message); return 1; }
         catch (Exception e)
         {
             Console.Error.WriteLine("error: " + Redact.Sas(e.Message));
@@ -163,6 +171,7 @@ public static class Commands
     public static async Task<int> RunAsync(Args a)
     {
         var (cfg, store, paths, http) = Open(a);
+        await JobQueue.RequireSnapshotAsync(store, paths, default);   // 0.13.0 cutover: no queue, no node (and never old job blobs)
         // --gpu: a node that runs only the GPU stages (sscd, clip, cast, ocrsubs) on the CUDA provider and never falls back to the CPU
         bool gpu = a.Has("gpu");
         var device = OrtOptions.ParseDevice(gpu ? "cuda" : a.Get("device") ?? Environment.GetEnvironmentVariable("INDEXNODE_DEVICE") ?? cfg.Device);
@@ -179,14 +188,10 @@ public static class Commands
             if (stages.Length == 0) throw new ArgumentException("--gpu runs only sscd, clip, cast and ocrsubs; --stages names none of them");
         }
         TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? RefreshStage.ParseEvery(ew) : null;
-        foreach (var old in new[] { "jobs", "max-heavy", "workers" }) if (a.Get(old) != null) Console.Error.WriteLine($"indexnode: --{old} is ignored since 0.9.0 (a node runs stage batches: --batch N, --batch-hours H, --lanes N)");
-        if (cfg.MaxHeavy != null || cfg.Jobs != null || cfg.Workers != null) Console.Error.WriteLine("indexnode: config jobs / max-heavy / workers are ignored since 0.9.0 (use batch, batch-hours, lanes)");
-        int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 2;
+        foreach (var old in new[] { "jobs", "max-heavy", "workers", "batch", "batch-hours" }) if (a.Get(old) != null) Console.Error.WriteLine($"indexnode: --{old} is ignored since 0.13.0 (one video per claim; --lanes N runs more claims at once)");
+        int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 1;
         if (lanes < 1) throw new ArgumentException("--lanes needs at least 1");
-        int batchN = a.Get("batch") is { } bn ? int.Parse(bn) : 6;
-        double batchHours = a.Get("batch-hours") is { } bh ? double.Parse(bh, System.Globalization.CultureInfo.InvariantCulture) : 12;
-        if (batchN < 1 || batchHours <= 0) throw new ArgumentException("--batch needs at least 1 and --batch-hours more than 0");
-        int workers = gpu ? 1 : 2; // workers of the non-batch stages (download, comments, watch, ...)
+        int workers = lanes;
         int? workerThreads = a.Get("worker-threads") is { } wt ? int.Parse(wt) : cfg.WorkerThreads;
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         var (nodeId, nodeName) = cfg.ResolveIdentity(a.Get("node-name"), Environment.GetEnvironmentVariable(NodeConfig.NodeNameEnv));
@@ -198,12 +203,13 @@ public static class Commands
         try { await tools.CheckFfmpegAsync(stages, default); }
         catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 2; }
         var gate = new DownloadGate();
+        bool aiStages = a.Has("ai-stages");
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
         var handlers = new Dictionary<string, IStageHandler>
         {
             ["download"] = new DownloadStage(tools, store, gate),
+            ["precheck"] = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths), NoPre(a, cfg.PreCheck), Commands.VersionString),
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
-            ["comments"] = new CommentsStage(tools, store, gate),
             ["refresh"] = new RefreshStage(tools, store),
             ["availability"] = new AvailabilityStage(tools, store),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
@@ -215,16 +221,17 @@ public static class Commands
         ProcessStage.Ai = ai;
         var opts = new EngineOptions
         {
-            UnloadModels = DesktopModels.Unload, Device = () => OrtOptions.Device,
-            NodeId = nodeId, Name = nodeName,
+            Device = () => OrtOptions.Device,
+            NodeId = nodeId, Name = nodeName, AiStages = aiStages && ai.Configured,
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
-            Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
-            Stages = stages, Workers = workers, Lanes = lanes, Batch = batchN, BatchHours = batchHours, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
+            Steps = ProcessStage.SupportedSteps(cfg),
+            Stages = stages, Workers = workers, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
             Kind = gpu ? "gpu" : "desktop",
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
+        if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");
         var engine = new NodeEngine(store, paths, opts, handlers);
 
         using var cts = new CancellationTokenSource();
@@ -233,7 +240,7 @@ public static class Commands
 
         var budgetText = limits.Budget is { } bd ? $" budget={limits.Remaining}/{bd}" : "";
         var schedText = (a.Get("schedule") ?? cfg.Schedule) is { } sc ? " schedule=" + sc.Replace(' ', '_') + " window=" + (a.Get("window") ?? cfg.Window ?? "1h") : "";
-        Log.Info($"node {nodeId}: stages={string.Join(',', stages)}workers={workers} lanes={lanes} batch={batchN}/{batchHours}h threads={threads} worker-threads={opts.ThreadsPerWorker} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
+        Log.Info($"node {nodeId}: stages={string.Join(',', stages)}lanes={lanes} ai-stages={(aiStages && ai.Configured ? "on" : "off")} threads={threads} worker-threads={opts.ThreadsPerWorker} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
         Task? statusLoop = null;
         if (a.Get("status-out") is { } statusOut)
         {
@@ -274,7 +281,8 @@ public static class Commands
     public static async Task<int> PriorityAsync(Args a)
     {
         var (_, store, paths, _) = Open(a);
-        return await PriorityTool.RunAsync(a, store, paths);
+        var q = new JobQueue(store, paths, "cli"); await q.LoadAsync(default);
+        return await PriorityTool.RunAsync(a, q);
     }
 
     public static async Task<int> SourcesAsync(Args a)
@@ -282,6 +290,7 @@ public static class Commands
         int priority = PriorityTool.ParseOption(a.Get("priority"));
         var sub = a.Positional.FirstOrDefault();
         var (cfg, store, paths, http) = Open(a);
+        var queue = new JobQueue(store, paths, "cli"); await queue.LoadAsync(default);
         int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480;
         var every = a.Get("every") ?? a.Get("schedule"); // null: "once" (a lookup on add, then nothing unless scheduled)
         switch (sub)
@@ -292,22 +301,22 @@ public static class Commands
                 var job = await Sources.ResolveAsync(new Tools(http, cfg), url, every ?? "once", Sources.ParseTabs(a.Get("tabs")), a.Has("follow-channels"), a.Get("backfill") is { } bf ? int.Parse(bf) : -1, maxHeight, default);
                 if (a.Get("backfill") == null && job.Kind == "channel") job.Backfill = 0; // a channel's lookup takes its newest uploads as before (100); a playlist's takes every video
                 job.Priority = priority;
-                var created = await Sources.AddAsync(store, paths, job, default);
+                var created = await Sources.AddAsync(queue, job, default);
                 Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId}  {job.Kind}  {job.Name}  schedule={Schedule.Of(job).Describe()} backfill={(job.Backfill?.ToString() ?? "all")} followChannels={job.FollowChannels}{(created ? "  lookup due now (priority " + Protocol.RefreshNowPriority + ")" : "")}");
                 return 0;
             }
             case "list":
             {
-                var list = await Sources.ListAsync(store, paths, default);
+                var list = Sources.List(queue);
                 if (list.Count == 0) Console.WriteLine("(no followed sources)");
-                var states = (await store.ListAsync(paths.JobsDir("refresh"), true, false, default)).ToDictionary(b => Path.GetFileNameWithoutExtension(b.Name), b => b.Tags.GetValueOrDefault(Tags.State));
+                var states = queue.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("refresh")).ToDictionary(s => s.Id, s => s.Entries["refresh"].State));
                 foreach (var j in list) Console.WriteLine(Sources.FormatRow(j, states.GetValueOrDefault(j.JobId)));
                 return 0;
             }
             case "schedule":
             {
-                var sid = PriorityTool.SourceId(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources schedule <id> off|once|6h|1d|daily@03:00"));
-                var j = await Sources.SetScheduleAsync(store, paths, sid, a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("sources schedule <id> off|once|6h|1d|daily@03:00"), default);
+                var sid = PriorityTool.SourceId(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources schedule <id> dynamic|off|once|6h|1d|daily@03:00"));
+                var j = await Sources.SetScheduleAsync(queue, sid, a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("sources schedule <id> dynamic|off|once|6h|1d|daily@03:00"), default);
                 Console.WriteLine($"{sid}: schedule {Schedule.Of(j).Describe()}{(j.NextRefresh != null ? ", next refresh " + j.NextRefresh : ", no further refresh unless triggered (sources refresh " + sid + ")")}");
                 return 0;
             }
@@ -316,13 +325,13 @@ public static class Commands
             {
                 if (sub == "refresh" && a.Has("all-due"))
                 {
-                    var due = await Sources.DueAsync(store, paths, default);
-                    int n = 0; foreach (var d in due) if (await Sources.TriggerAsync(store, paths, d, "refresh", default)) n++;
+                    var due = await Sources.DueAsync(queue);
+                    int n = 0; foreach (var d in due) if (await Sources.TriggerAsync(queue, d, "refresh", default)) n++;
                     Console.WriteLine($"{n} scheduled refresh(es) made due now at priority {Protocol.RefreshNowPriority}");
                     return 0;
                 }
                 var sid = PriorityTool.SourceId(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException($"sources {sub} <id>|--all-due"));
-                Console.WriteLine(await Sources.TriggerAsync(store, paths, sid, sub, default) ? $"{sid}: {sub} due now (priority {Protocol.RefreshNowPriority}); the next free downloader runs it" : $"{sid}: a node is running it right now");
+                Console.WriteLine(await Sources.TriggerAsync(queue, sid, sub, default) ? $"{sid}: {sub} due now (priority {Protocol.RefreshNowPriority}); the next free downloader runs it" : $"{sid}: a node is running it right now");
                 return 0;
             }
             case "priority":
@@ -333,28 +342,26 @@ public static class Commands
                 List<string>? listed = null;
                 if (!sid.StartsWith("v-") && !a.Has("no-list"))
                 {
-                    var w = (await Sources.ListAsync(store, paths, default)).FirstOrDefault(x => x.JobId == sid) ?? throw new ArgumentException($"no source {sid}");
+                    var w = Sources.List(queue).FirstOrDefault(x => x.JobId == sid) ?? throw new ArgumentException($"no source {sid}");
                     try { listed = await PriorityTool.ListIdsAsync(new Tools(http, cfg), w, default); }
                     catch (Exception e) { Console.Error.WriteLine($"could not list {sid} with yt-dlp ({e.Message}); only videos with a recorded source are re-tagged (run this on a machine YouTube allows, e.g. a residential one, to match older jobs)"); }
                 }
-                var r = await PriorityTool.SetSourceAsync(store, paths, sid, np, listed, default);
+                var r = await PriorityTool.SetSourceAsync(queue, sid, np, listed, default);
                 Console.WriteLine($"{sid}: priority {np}; {r.Videos} video(s), {r.Changed} job(s) changed, skipped {r.Skipped.Values.Sum()}{(r.Skipped.Count > 0 ? " (" + string.Join(", ", r.Skipped.Select(k => $"{k.Value} {k.Key}")) + ")" : "")}{(r.Matched > 0 ? $"; {r.Matched} older job(s) matched by the listing" : "")}");
                 return 0;
             }
             case "remove":
             {
                 var id = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources remove <id>");
-                await Sources.MigrateLegacyAsync(store, paths, default);
-                var name = paths.Job("refresh", id);
-                if (await store.GetTagsAsync(name, default) == null) { Console.Error.WriteLine($"no source {id}"); return 1; }
-                await store.DeleteAsync(name, default);
+                if (queue.Read(st => st.Entry(id, "refresh")) == null) { Console.Error.WriteLine($"no source {id}"); return 1; }
+                await queue.AppendLinesAsync([new QLine { T = "drop", S = id, Stage = "refresh" }], default);
                 Console.WriteLine($"removed {id} (its downloaded videos stay)");
                 return 0;
             }
             case "import":
             {
                 var file = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources import <channels.json>");
-                var r = await Sources.ImportAsync(store, paths, File.ReadAllBytes(file), every ?? "1d", Sources.ParseTabs(a.Get("tabs")), maxHeight, default, priority);
+                var r = await Sources.ImportAsync(queue, File.ReadAllBytes(file), every ?? "dynamic", Sources.ParseTabs(a.Get("tabs")), maxHeight, default, priority);
                 Console.WriteLine($"{r.Added} added, {r.Existed} already existed{(r.Skipped > 0 ? $", {r.Skipped} skipped (no channelId)" : "")}");
                 return 0;
             }
@@ -386,6 +393,7 @@ public static class Commands
     {
         var (cfg, store, paths, http) = Open(a); using var _h = http;
         if (a.Positional.Count == 0) throw new ArgumentException("download <url|id>... [--no-process] [--max-height 480] [--format F]");
+        var jq = new JobQueue(store, paths, cfg.NodeId ?? "cli"); await jq.LoadAsync(default);
         var tools = new Tools(http, cfg); int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480; bool queue = !a.Has("no-process");
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         int failed = 0;
@@ -393,12 +401,14 @@ public static class Commands
         {
             var id = System.Text.RegularExpressions.Regex.IsMatch(input, @"^[A-Za-z0-9_-]{11}$") ? input : YtDlp.VideoId(input) ?? throw new ArgumentException($"not a video url or id: {input}");
             var job = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", maxHeight, a.Get("format")); job.JobId = id; job.Source = "one-off";
-            var ctx = new JobContext { Job = job, Stage = "download", BlobName = paths.Job("download", id), LeaseId = "", Worker = 0, Store = store, Paths = paths, NodeId = cfg.NodeId ?? "", Token = cts.Token, ThreadShare = () => 1, Report = (s, p) => Console.WriteLine($"  {s} {p}") };
+            var ctx = new JobContext { Job = job, Stage = "download", BlobName = id, LeaseId = "", Worker = 0, Queue = jq, Store = store, Paths = paths, NodeId = cfg.NodeId ?? "", Token = cts.Token, ThreadShare = () => 1, Report = (s, p) => Console.WriteLine($"  {s} {p}") };
             try
             {
-                await new DownloadStage(tools, store, new DownloadGate()) { QueueProcessing = queue }.RunAsync(ctx);
+                await new DownloadStage(tools, store, new DownloadGate()) { QueueProcessing = queue }.RunAsync(ctx);   // 0.13.0: no pre-check here; it is the first step of the process claim
                 job.FinishedAt = Protocol.NowUtc();
-                await store.PutAsync(paths.Job("download", id), job.ToBytes(), Tags.Job("download", "done", job.AddedAt), null, false, cts.Token);
+                // a one-off: known and tracked as a finished download; the stage's follow-ups (process) go to the queue in the same append
+                job.Stage = "download";
+                await jq.AppendLinesAsync([QLine.Add(id, "download", job, job.AddedAt, null, null, "done", force: true), .. ctx.FollowUps], cts.Token);
                 Console.WriteLine($"{id}: downloaded{(queue ? ", processing queued" : " (processing not queued: `indexnode process --job " + id + "` runs it)")}");
             }
             catch (Exception e) when (e is not OperationCanceledException) { failed++; Console.Error.WriteLine($"{id}: {Redact.Sas(e.Message)}"); Console.Error.WriteLine(Redact.Trace(e)); }
@@ -411,16 +421,15 @@ public static class Commands
     {
         var (_, store, paths, http) = Open(a); using var _h = http; Console.OutputEncoding = System.Text.Encoding.UTF8;
         (string Step, string File)[] outputs = [("frames", "frames/manifest.json"), ("sscd", "sscd/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/" + Transcribe.ModelName + ".zh.json"), ("ocrsubs", "ocr/lines.json"), ("cast", "cast/clusters.json"), ("describe", "describe.json")];
-        var ids = (await store.ListAsync(paths.JobsDir("download"), true, false, default)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "done").Select(b => Path.GetFileNameWithoutExtension(b.Name)).ToList();
+        var uq = new JobQueue(store, paths, "cli"); await uq.LoadAsync(default);
+        var ids = uq.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue("download", out var e) && e.State == "done").Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
         int n = 0;
         foreach (var id in ids)
         {
             var missing = new List<string>();
             foreach (var (step, file) in outputs) if (await store.GetTagsAsync(paths.Video(id, file), default) == null) missing.Add(step);
             if (missing.Count == 0) continue;
-            bool queued = false;
-            foreach (var st in Protocol.StepStages.Append("process"))
-                if (await store.GetTagsAsync(paths.Job(st, id), default) is { } t && t.GetValueOrDefault(Tags.State) is "pending" or "leased") { queued = true; break; }
+            bool queued = uq.Read(st => st.Get(id) is { } s && (s.ClaimBy != null || s.Entries.Values.Any(e => e.Stage is "process" or "describe" or "translate" && e.State == "pending")));
             if (queued) continue;
             var info = await store.GetAsync(paths.Video(id, "info.json"), default) is { } ib ? StoredJson.Parse(ib.Data, paths.Video(id, "info.json")) : null;
             var dl = await store.GetAsync(paths.Video(id, "downloaded.json"), default) is { } db ? StoredJson.Parse(db.Data, paths.Video(id, "downloaded.json")) : null;
@@ -439,6 +448,7 @@ public static class Commands
         if (a.Positional.Count == 0) throw new ArgumentException("enqueue needs at least one url");
         var format = a.Get("format"); int priority = PriorityTool.ParseOption(a.Get("priority"));
         var tools = new Tools(http, cfg);
+        var eq = new JobQueue(store, paths, "cli"); await eq.LoadAsync(default);
         int added = 0, existed = 0;
         var meta = new Dictionary<string, RefreshStage.Entry>();
         foreach (var input in a.Positional)
@@ -471,7 +481,7 @@ public static class Commands
                     catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"enqueue: no metadata for {url}: {e.Message}"); }
                 }
                 if (m != null) { job.Title = m.Title; job.Duration = m.Duration; job.ChannelId = m.ChannelId; job.ChannelName = m.ChannelName; job.Availability = m.Availability; }
-                var created = await ClassifyJobs.CreateUnclassifiedAsync(store, paths, job, default);
+                var created = await ClassifyJobs.CreateUnclassifiedAsync(eq, job, default);
                 if (created) added++; else existed++;
                 Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId} {url}");
             }
@@ -485,40 +495,14 @@ public static class Commands
     {
         if (a.Positional.FirstOrDefault() != "start") throw new ArgumentException("availability start [--every 1d]");
         var (_, store, paths, http) = Open(a); using var _h = http;
+        var aq = new JobQueue(store, paths, "cli"); await aq.LoadAsync(default);
         var job = AvailabilityStage.NewSweep(a.Get("every") ?? "1d"); RefreshStage.ParseEvery(job.Every);
-        bool made = await store.PutAsync(paths.Job("availability", job.JobId), job.ToBytes(), Tags.Job("availability", "pending", job.AddedAt), null, true, default);
+        bool made = false;
+        await aq.AppendLinesAsync(st => { made = false; if (st.Entry(AvailabilityStage.SweepId, "availability") != null) return null; made = true; return [QLine.Add(AvailabilityStage.SweepId, "availability", job, job.AddedAt)]; }, default);
         Console.WriteLine(made ? $"availability sweep created (every {job.Every}); a yt-dlp node runs it with --stages ...,availability" : "the availability sweep already exists");
         return 0;
     }
 
-    public static async Task<int> RequeueAsync(Args a)
-    {
-        var (_, store, paths, _) = Open(a);
-        var stages = a.Get("stage") is { } s ? new[] { s } : Protocol.Stages;
-        int n = 0;
-        foreach (var stage in stages)
-        {
-            IReadOnlyList<BlobEntry> failed;
-            try { failed = (await Tags.FindFullAsync(store, Tags.StateWhere(stage, "failed"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList(); }
-            catch (ForbiddenException)
-            {
-                failed = (await store.ListAsync(paths.JobsDir(stage), true, false, default)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "failed").ToList();
-            }
-            foreach (var b in failed)
-            {
-                var body = await store.GetAsync(b.Name, default);
-                if (body == null) continue;
-                var job = JobDescriptor.Parse(body.Data);
-                if (job.Reason?.StartsWith("classify:", StringComparison.Ordinal) == true) continue; // a rejection: overrule it with "classify set", not requeue
-                job.Attempts = 0; job.LastError = null; job.Permanent = null;
-                await store.PutAsync(b.Name, job.ToBytes(), Tags.Job(stage, "pending", b.Tags.GetValueOrDefault(Tags.Added) ?? job.AddedAt, b.Tags.GetValueOrDefault(Tags.Due)), null, false, default);
-                Console.WriteLine($"requeued {stage}/{job.JobId}");
-                n++;
-            }
-        }
-        Console.WriteLine($"{n} job(s) moved back to pending");
-        return 0;
-    }
 
     public static async Task<int> ControlAsync(Args a)
     {
@@ -545,31 +529,6 @@ public static class Commands
         return 0;
     }
 
-    /// <summary>indexnode batch explain [--stages ...] [--batch N] [--top 50]: why the batch selection picks what it picks (read-only).</summary>
-    public static async Task<int> BatchAsync(Args a)
-    {
-        // Main has already taken "batch" off the positionals: the subcommand is the first one left
-        if (a.Positional.FirstOrDefault() != "explain") { Console.Error.WriteLine("usage: indexnode batch explain [--stages frames,sscd,...] [--batch 6] [--top 50]"); return 2; }
-        var (cfg, store, paths, http) = Open(a); using var _h = http;
-        return await ExplainAsync(a, cfg, store, paths, Console.WriteLine);
-    }
-
-    /// <summary>The body of `batch explain`, with the store and the output given (tests run it on a fake store).</summary>
-    internal static async Task<int> ExplainAsync(Args a, NodeConfig cfg, IStore store, Paths paths, Action<string> say)
-    {
-        var requested = (a.Get("stages") ?? string.Join(',', StageOrder.PassOrder)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        var stages = Protocol.ExpandStages(requested);
-        TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null;
-        var opts = new EngineOptions
-        {
-            UnloadModels = DesktopModels.Unload, Device = () => OrtOptions.Device,
-            NodeId = cfg.NodeId ?? "explain", Name = "explain", Steps = ProcessStage.SupportedSteps(cfg), CanRun = job => !(job.Stage == "process" || Protocol.IsStep(job.Stage)) || ProcessStage.CanRun(job, ProcessStage.SupportedSteps(cfg)),
-            Stages = stages, Batch = a.Get("batch") is { } bn ? int.Parse(bn) : 6, Gpu = a.Has("gpu"), GpuFallback = gpuFlag,
-        };
-        var engine = new NodeEngine(store, paths, opts, new Dictionary<string, IStageHandler>());
-        return await engine.ExplainAsync(a.Get("top") is { } tp ? int.Parse(tp) : 50, say, default);
-    }
-
     public static async Task<int> RepackAsync(Args a)
     {
         var (cfg, store, paths, _) = Open(a);
@@ -583,7 +542,7 @@ public static class Commands
         var (cfg, store, paths, _) = Open(a);
         var now = DateTimeOffset.UtcNow;
         if (a.Has("json")) { Console.WriteLine(StatusSnapshot.Serialize(await StatusSnapshot.BuildAsync(store, paths, now, default))); return 0; }
-        Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  workers={cfg.Workers ?? 2}  threads={cfg.EffectiveThreads}");
+        Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  threads={cfg.EffectiveThreads}");
 
         var layout = await Repack.CountAsync(Repack.Raw(store), paths, default);
         Console.WriteLine($"\nLayout: {layout.Repacked} repacked, {layout.Loose} loose, {layout.Mixed} mixed (0.10.0 nodes refuse loose and mixed dramas until `indexnode repack --delete-loose` has run){(layout.Loose + layout.Mixed > 0 ? "\n  " + string.Join(" ", layout.LooseIds.Concat(layout.MixedIds).Take(20)) : "")}");
@@ -595,28 +554,29 @@ public static class Commands
         if (nodes.Count == 0) Console.WriteLine("  (none)");
         foreach (var n in nodes.OrderBy(n => n.NodeId))
         {
-            Console.WriteLine($"  {n.NodeId,-24} {n.Kind,-8} stages={string.Join('+', n.Stages)} workers={(n.Workers > 0 ? n.Workers.ToString() : string.Join(',', n.Jobs.Select(j => j.Key + "=" + j.Value)))} threads={n.Threads} state={n.EffectiveState(now)} control={n.Control} lastSeen={n.LastSeen}");
+            Console.WriteLine($"  {n.NodeId,-24} {n.Kind,-8} stages={string.Join('+', n.Stages)} lanes={n.Workers} threads={n.Threads} state={n.EffectiveState(now)} control={n.Control} lastSeen={n.LastSeen}{(n.Ops != null ? "  storage ops: " + n.Ops : "")}");
             foreach (var r in n.Running)
-                Console.WriteLine($"      worker {r.Worker}: {r.Stage}/{r.JobId} {r.Step} {r.Progress}");
+                Console.WriteLine($"      lane {r.Worker}: {r.Stage}/{r.JobId} {r.Step} {r.Progress}");
         }
 
-        var all = await store.ListAsync(paths.Prefix + "jobs/", true, true, default);
-        Console.WriteLine("\nQueue");
+        var queue = new JobQueue(store, paths, "status"); await queue.LoadAsync(default);
+        Console.WriteLine($"\nQueue (segment {queue.Segment}, {queue.Blocks} appends, {queue.Offset} bytes read)");
+        var subjects = queue.Read(st => st.Subjects.Values.SelectMany(s => s.Entries.Values.Select(e => (Subject: s, Entry: e))).ToList());
         foreach (var stage in Protocol.Stages)
         {
-            var inStage = all.Where(b => b.Tags.GetValueOrDefault(Tags.Stage) == stage).ToList();
-            var counts = (stage == "download" ? new[] { Tags.Unclassified, "pending", "done", "failed" } : new[] { "pending", "done", "failed" }).Select(s => $"{s}={inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s)}");
-            int prio = inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == "pending" && Tags.PriorityOf(b.Tags) != 0);
-            Console.WriteLine($"  {stage,-9} {string.Join("  ", counts)}  leased={inStage.Count(b => b.LeaseState == "leased")}{(prio > 0 ? $"  pending with priority={prio}" : "")}");
+            var inStage = subjects.Where(x => x.Entry.Stage == stage).ToList();
+            var counts = (stage == "download" ? new[] { Tags.Unclassified, "pending", "done", Tags.Duplicate, "failed" } : new[] { "pending", "done", "failed" }).Select(s => $"{s}={inStage.Count(x => x.Entry.State == s)}");
+            int prio = inStage.Count(x => x.Entry.State == "pending" && x.Entry.Priority != 0);
+            Console.WriteLine($"  {stage,-9} {string.Join("  ", counts)}  claimed={inStage.Count(x => x.Subject.ClaimBy != null && x.Subject.ClaimStages?.Contains(stage) == true)}{(prio > 0 ? $"  pending with priority={prio}" : "")}");
         }
-        var (cDay, cDone, cRejected) = await ClassifyCommand.TodayAsync(store, paths, now, default);
-        Console.WriteLine($"  classify  unclassified={all.Count(b => b.Tags.GetValueOrDefault(Tags.Stage) == "download" && b.Tags.GetValueOrDefault(Tags.State) == Tags.Unclassified)}  classified today={cDone}  rejected today={cRejected}  (UTC {cDay}; review: indexnode classify list --rejected)");
-        var leased = all.Where(b => b.LeaseState == "leased").ToList();
-        if (leased.Count > 0)
+        var (cDay, cDone, cRejected) = ClassifyCommand.Today(queue, now);
+        Console.WriteLine($"  classify  unclassified={subjects.Count(x => x.Entry.Stage == "download" && x.Entry.State == Tags.Unclassified)}  classified today={cDone}  rejected today={cRejected}  (UTC {cDay}; review: indexnode classify list --rejected)");
+        var claimed = queue.Read(st => st.Subjects.Values.Where(s => s.ClaimBy != null).ToList());
+        if (claimed.Count > 0)
         {
-            Console.WriteLine("\nLeased jobs");
-            foreach (var b in leased)
-                Console.WriteLine($"  {b.Tags.GetValueOrDefault(Tags.Stage)}/{Path.GetFileNameWithoutExtension(b.Name)}  node={b.Metadata.GetValueOrDefault("node")} progress={b.Metadata.GetValueOrDefault("progress")} heartbeat={b.Metadata.GetValueOrDefault("heartbeat")}");
+            Console.WriteLine("\nClaimed subjects");
+            foreach (var s in claimed.OrderBy(s => s.Id, StringComparer.Ordinal))
+                Console.WriteLine($"  {string.Join('+', s.ClaimStages ?? [])}/{s.Id}  node={s.ClaimBy} epoch={s.Epoch} since={s.ClaimAt}");
         }
 
         var ctl = ControlFile.Parse((await store.GetAsync(paths.Control, default))?.Data);
@@ -701,31 +661,6 @@ public static class Commands
     }
 
     /// <summary>`indexnode gpu markers [--dry]`: writes the marker of every pending sscd/clip/cast job whose frames are done and that has none (videos framed before 0.6.0), so the GPU container starts for them.</summary>
-    public static async Task<int> GpuAsync(Args a)
-    {
-        var sub = a.Positional.FirstOrDefault();
-        if (sub != "markers") throw new ArgumentException("gpu markers [--dry]");
-        var (cfg, store, paths, http) = Open(a);
-        using var _ = http;
-        int made = 0, have = 0, waiting = 0;
-        foreach (var stage in GpuRouting.MarkerStages)
-        {
-            var pending = (await Tags.FindFullAsync(store, Tags.StateWhere(stage, "pending"), default)).Where(b => b.Name.StartsWith(paths.JobsDir(stage), StringComparison.Ordinal)).ToList();
-            foreach (var b in pending)
-            {
-                var id = Path.GetFileNameWithoutExtension(b.Name);
-                bool ready = true;
-                foreach (var need in Protocol.NeedsOf(stage)) if (await store.GetTagsAsync(paths.Video(id, need), default) == null) { ready = false; break; }
-                if (!ready) { waiting++; continue; }
-                if (await store.GetTagsAsync(GpuRouting.MarkerName(paths, stage, id), default) != null) { have++; continue; }
-                if (!a.Has("dry")) await GpuRouting.WriteMarkerAsync(store, paths, stage, id, default);
-                made++;
-            }
-        }
-        Console.WriteLine($"gpu markers: {(a.Has("dry") ? "would write" : "wrote")} {made}, {have} already there, {waiting} jobs still wait for their frames");
-        return 0;
-    }
-
     public static async Task<int> BrowserAsync(Args a)
     {
         var cfg = (LoadFileConfig().Browser ?? new BrowserConfig());
@@ -754,6 +689,12 @@ public static class Commands
         }
         throw new ArgumentException("browser login | browser status");
     }
+
+    /// <summary>The pre-check analyzer of this node: the search index is cached under the config folder (search-cache/), re-checked at most every precheck.IndexRecheckMinutes.</summary>
+    public static IPreCheckAnalyzer MakePreCheck(Tools tools, NodeConfig cfg, HttpClient http, IStore store, Paths paths) =>
+        new PreCheckAnalyzer(tools, cfg, http, store, paths, new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes((cfg.PreCheck ?? new()).IndexRecheckMinutes)));
+
+    static PreCheckSettings NoPre(Args a, PreCheckSettings? s) { s ??= new(); if (a.Has("no-precheck")) s.Enabled = false; return s; }
 
     public static int Config(Args a)
     {
@@ -800,6 +741,22 @@ public static class Commands
                 case "storage.region": file.StorageRegion = val.Trim(); break;
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
+                case "precheck.enabled": (file.PreCheck ??= new()).Enabled = bool.Parse(val); break;
+                case "precheck.tau": (file.PreCheck ??= new()).Tau = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.skip-share": (file.PreCheck ??= new()).SkipShare = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.partial-share": (file.PreCheck ??= new()).PartialShare = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.duration-percent": (file.PreCheck ??= new()).DurationPercent = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.duration-min": (file.PreCheck ??= new()).DurationMinSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.top-centers": (file.PreCheck ??= new()).TopCenters = int.Parse(val); break;
+                case "precheck.window-seconds": (file.PreCheck ??= new()).WindowSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.language-seconds": (file.PreCheck ??= new()).LanguageSeconds = PreCheckSettings.ParseLanguageSeconds(val); break;
+                case "precheck.language-min-seconds": (file.PreCheck ??= new()).LanguageMinSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.frames": (file.PreCheck ??= new()).Frames = PreCheckSettings.ParseFrames(val); break;
+                case "precheck.video-height": (file.PreCheck ??= new()).VideoHeight = int.Parse(val); break;
+                case "precheck.audio-format": (file.PreCheck ??= new()).AudioFormat = val.Trim(); break;
+                case "precheck.window-position": (file.PreCheck ??= new()).WindowPosition = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.ai-flag": (file.PreCheck ??= new()).AiFlag = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.index-recheck-minutes": (file.PreCheck ??= new()).IndexRecheckMinutes = int.Parse(val); break;
                 case "node-name": file.NodeName = NodeConfig.SanitizeName(val); break;
                 case "ytdlp.command": file.Ytdlp = new YtDlpConfig { Command = ParseCommand(val) }; break;
                 case "ytdlp.js-runtime": (file.Ytdlp ??= new()).JsRuntime = val; break;

@@ -1,6 +1,6 @@
 ﻿namespace IndexNode;
 
-/// <summary>Re-reads index/control.json with a conditional GET (If-None-Match on the ETag).</summary>
+/// <summary>Re-reads jobs/control.json with a conditional GET (If-None-Match on the ETag).</summary>
 public sealed class ControlWatcher(IStore store, Paths paths)
 {
     private readonly SemaphoreSlim gate = new(1, 1);

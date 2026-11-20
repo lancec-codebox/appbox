@@ -263,7 +263,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 // the new outputs are all in: now (and only now) the old files of the redone steps that this run did not write again go
                 var vdir = paths.VideoDir(id); var written = wst.Written;
                 foreach (var step in KnownSteps.Where(x => need.GetValueOrDefault(x)))
-                    foreach (var old in Stale(step, vdir, listing.Keys, written)) { await store.DeleteAsync(old, ct); Log.Info($"process {id}: redo {step}: removed stale {old[vdir.Length..]}"); }
+                    foreach (var old in Stale(step, vdir, listing.Keys, written)) Log.Info($"process {id}: redo {step}: stale {old[vdir.Length..]} left in place (0.13.0 deletes no upload data on its own)");
             }
 
             if (stepJob)
@@ -313,8 +313,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
 
             if (!compress.KeepOriginal && steps.Contains("compress") && (need["compress"] || compactBytes > 0))
             {
-                await store.DeleteAsync(videoBlob, CancellationToken.None);
-                Log.Info($"process {id}: deleted video.mp4 (keepOriginal=false)");
+                Log.Info($"process {id}: keepOriginal=false: video.mp4 is kept (0.13.0 deletes no upload data on its own)");
             }
         }
         finally

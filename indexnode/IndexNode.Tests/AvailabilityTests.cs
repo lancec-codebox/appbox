@@ -29,14 +29,17 @@ public class AvailabilityTests
 
     private static async Task Track(FakeStore s, string id, string channel)
     {
-        await s.PutAsync(P.Job("download", id), [1], Tags.Job("download", "done", "2026-11-14T00:00:00Z"), null, false, default);
+        var q = new JobQueue(s, P, "t"); await q.LoadAsync(default);
+        await q.AppendLinesAsync([QLine.Add(id, "download", new JobDescriptor { Stage = "download", JobId = id }, "2026-11-14T00:00:00Z", null, null, "done")], default);
         await s.PutAsync(P.Video(id, "info.json"), System.Text.Encoding.UTF8.GetBytes($$"""{"channel_id":"{{channel}}","channel":"Name {{channel[2]}}"}"""), null, null, false, default);
     }
+
+    private static async Task<JobQueue> Loaded(FakeStore s) { var q = new JobQueue(s, P, "t"); await q.LoadAsync(default); return q; }
 
     private static async Task<JobContext> Sweep(FakeStore s, Yt yt)
     {
         var job = AvailabilityStage.NewSweep();
-        var ctx = new JobContext { Job = job, Stage = "availability", BlobName = P.Job("availability", job.JobId), LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+        var ctx = new JobContext { Job = job, Stage = "availability", BlobName = job.JobId, LeaseId = "l", Worker = 1, Queue = await Loaded(s), Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
         await new AvailabilityStage(yt.Tools(), s, () => Now).RunAsync(ctx);
         return ctx;
     }
@@ -72,11 +75,11 @@ public class AvailabilityTests
         await Track(s, Id('a'), C1); await Track(s, Id('b'), C2);
         yt.Channels[C1] = [Id('a')]; yt.Channels[C2] = [Id('b')];
         var w = JobDescriptor.NewSource("channel", C2, "Two", "1h", ["videos"], false, 0, 480);
-        await s.PutAsync(P.Job("refresh", w.JobId), w.ToBytes(), Tags.Job("refresh", "pending", "2026-11-14T00:00:00Z"), null, false, default);
+        await (await Loaded(s)).AppendLinesAsync([QLine.Add(w.JobId, "refresh", w, "2026-11-14T00:00:00Z")], default);
         await Sweep(s, yt);
         var modes = J(s, AvailabilityStage.SummaryBlob(P))["channelList"]!.AsArray().ToDictionary(c => c!["id"]!.ToString(), c => c!["mode"]!.ToString());
         Assert.Equal("check", modes[C1]); Assert.Equal("ingest", modes[C2]);
-        Assert.False(s.Exists(P.Job("refresh", "ch-" + C1)));
+        Assert.False(s.InQueue(P.Job("refresh", "ch-" + C1)));
         Assert.Equal(C1, J(s, AvailabilityStage.MembersBlob(P))[Id('a')]!.ToString());           // learned once, remembered
     }
 }

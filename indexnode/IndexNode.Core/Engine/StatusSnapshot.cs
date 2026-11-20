@@ -9,51 +9,39 @@ public static class StatusSnapshot
     /// <summary>At most this many newest-added done/failed job blobs per stage are read for elapsed/node/error details.</summary>
     public const int DetailCap = 150;
 
-    public static async Task<JsonObject> BuildAsync(IStore store, Paths paths, DateTimeOffset now, CancellationToken ct)
+    /// <summary>0.13.0: the queue part comes from the loaded queue (its memory), not from listing and reading job blobs: only the node records and the control file are read from storage.</summary>
+    public static async Task<JsonObject> BuildAsync(IStore store, Paths paths, DateTimeOffset now, CancellationToken ct, JobQueue? jobQueue = null)
     {
         var ctl = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         var nodes = new List<NodeInfo>();
         foreach (var b in await store.ListAsync(paths.NodesDir, false, false, ct))
             if (await store.GetAsync(b.Name, ct) is { } c && NodeInfo.Parse(c.Data) is { } n) nodes.Add(n);
-        var all = await store.ListAsync(paths.Prefix + "jobs/", true, true, ct);
+        if (jobQueue == null) { jobQueue = new JobQueue(store, paths, "status"); await jobQueue.LoadAsync(ct); }
+        var subjects = jobQueue.Read(st => st.Subjects.Values.Select(s => (Subject: s, Entries: s.Entries.Values.ToList())).ToList());
 
         var queue = new JsonObject(); var leased = new JsonArray(); var finished = new List<(DateTimeOffset At, JsonObject Row, string Node, string Stage)>(); var failures = new List<(DateTimeOffset At, JsonObject Row)>();
         foreach (var stage in Protocol.Stages)
         {
-            var inStage = all.Where(b => b.Tags.GetValueOrDefault(Tags.Stage) == stage).ToList();
+            var inStage = subjects.SelectMany(s => s.Entries.Where(e => e.Stage == stage).Select(e => (s.Subject, Entry: e))).ToList();
             var q = new JsonObject();
-            foreach (var s in stage == "download" ? new[] { Tags.Unclassified, "pending", "done", "failed" } : new[] { "pending", "done", "failed" }) q[s] = inStage.Count(b => b.Tags.GetValueOrDefault(Tags.State) == s);
-            q["leased"] = inStage.Count(b => b.LeaseState == "leased"); queue[stage] = q;
-            foreach (var b in inStage.Where(b => b.LeaseState == "leased"))
+            foreach (var s in stage == "download" ? new[] { Tags.Unclassified, "pending", "done", Tags.Duplicate, "failed" } : new[] { "pending", "done", "failed" }) q[s] = inStage.Count(x => x.Entry.State == s);
+            q["leased"] = inStage.Count(x => x.Subject.ClaimBy != null && x.Subject.ClaimStages?.Contains(stage) == true); queue[stage] = q;
+            foreach (var x in inStage)
             {
-                DateTimeOffset.TryParse(b.Metadata.GetValueOrDefault("heartbeat"), out var hb);
-                leased.Add(new JsonObject
+                var j = x.Entry.Job;
+                if (x.Entry.State == "done" && DateTimeOffset.TryParse(x.Entry.FinishedAt, out var at))
+                    finished.Add((at, new JsonObject { ["stage"] = stage, ["jobId"] = x.Subject.Id, ["node"] = x.Entry.Node, ["elapsedSeconds"] = j?.ElapsedSeconds, ["bytes"] = 0, ["finishedAt"] = x.Entry.FinishedAt }, x.Entry.Node ?? "", stage));
+                else if (x.Entry.State == "failed")
                 {
-                    ["stage"] = stage, ["jobId"] = Path.GetFileNameWithoutExtension(b.Name), ["node"] = b.Metadata.GetValueOrDefault("node"), ["progress"] = b.Metadata.GetValueOrDefault("progress"),
-                    ["heartbeat"] = b.Metadata.GetValueOrDefault("heartbeat"), ["heartbeatAgeSeconds"] = hb == default ? null : Math.Round((now - hb).TotalSeconds),
-                });
-            }
-            foreach (var state in new[] { "done", "failed" })
-                foreach (var b in inStage.Where(b => b.Tags.GetValueOrDefault(Tags.State) == state).OrderByDescending(b => b.Tags.GetValueOrDefault(Tags.Added) ?? "").Take(DetailCap))
-                {
-                    if (await store.GetAsync(b.Name, ct) is not { } c) continue;
-                    JobDescriptor j; try { j = JobDescriptor.Parse(c.Data); } catch { continue; }
-                    if (state == "done")
-                    {
-                        if (!DateTimeOffset.TryParse(j.FinishedAt, out var at)) continue;
-                        long bytes = 0; // bytes of the job's own outputs are not known to the descriptor: the process marker holds them
-                        if (stage == "process" && await store.GetAsync(paths.Video(j.JobId, "processed.json"), ct) is { } pm)
-                            try { var r = JsonDocument.Parse(pm.Data).RootElement; bytes = (r.TryGetProperty("compactBytes", out var cb) ? cb.GetInt64() : 0); } catch { }
-                        finished.Add((at, new JsonObject { ["stage"] = stage, ["jobId"] = j.JobId, ["node"] = j.NodeId, ["elapsedSeconds"] = j.ElapsedSeconds, ["bytes"] = bytes, ["finishedAt"] = j.FinishedAt }, j.NodeId ?? "", stage));
-                    }
-                    else
-                    {
-                        DateTimeOffset.TryParse(j.FinishedAt ?? b.Tags.GetValueOrDefault(Tags.Added), out var at);
-                        failures.Add((at, new JsonObject { ["stage"] = stage, ["jobId"] = j.JobId, ["node"] = j.NodeId, ["error"] = Redact.Sas(j.LastError ?? ""), ["attempts"] = j.Attempts, ["permanent"] = j.Permanent == true }));
-                    }
+                    DateTimeOffset.TryParse(x.Entry.FinishedAt ?? x.Entry.Added, out var fat);
+                    failures.Add((fat, new JsonObject { ["stage"] = stage, ["jobId"] = x.Subject.Id, ["node"] = x.Entry.Node, ["error"] = Redact.Sas(x.Entry.LastError ?? ""), ["attempts"] = x.Entry.Attempts, ["permanent"] = x.Entry.Permanent == true }));
                 }
+            }
         }
+        foreach (var s in subjects.Where(s => s.Subject.ClaimBy != null))
+            leased.Add(new JsonObject { ["stage"] = s.Subject.ClaimStages?.FirstOrDefault(), ["jobId"] = s.Subject.Id, ["node"] = s.Subject.ClaimBy, ["epoch"] = s.Subject.Epoch, ["claimedAt"] = s.Subject.ClaimAt });
         finished.Sort((x, y) => y.At.CompareTo(x.At)); failures.Sort((x, y) => y.At.CompareTo(x.At));
+        finished = finished.Take(DetailCap * Protocol.Stages.Length).ToList();
 
         var throughput = new JsonObject();
         foreach (var stage in Protocol.Stages)
@@ -77,7 +65,7 @@ public static class StatusSnapshot
             nodeRows.Add(new JsonObject
             {
                 ["nodeId"] = n.NodeId, ["name"] = n.Name, ["kind"] = n.Kind, ["version"] = n.Version, ["stages"] = new JsonArray(n.Stages.Select(s => (JsonNode)s).ToArray()), ["state"] = state, ["workers"] = workers,
-                ["traffic"] = TrafficJson(n.Traffic, now), ["firstSeen"] = n.FirstSeen, ["placement"] = n.Placement == null ? null : JsonSerializer.SerializeToNode(n.Placement, Protocol.Json),
+                ["traffic"] = TrafficJson(n.Traffic, now), ["ops"] = n.Ops == null ? null : JsonSerializer.SerializeToNode(n.Ops, Protocol.Json), ["firstSeen"] = n.FirstSeen, ["placement"] = n.Placement == null ? null : JsonSerializer.SerializeToNode(n.Placement, Protocol.Json),
                 ["network"] = n.Network == null ? null : JsonSerializer.SerializeToNode(n.Network, Protocol.Json),
                 ["lastSeen"] = n.LastSeen, ["budget"] = lim?.Budget, ["budgetRemaining"] = remaining, ["nextWindow"] = nextWindow, ["etaBudgetHours"] = etaHours, ["finishedPerHour"] = perHour,
             });

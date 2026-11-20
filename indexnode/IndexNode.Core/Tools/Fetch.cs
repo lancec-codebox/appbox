@@ -17,7 +17,7 @@ public static class Fetch
     public static async Task VerifiedAsync(HttpClient http, string url, string dest, string sha256, CancellationToken ct)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dest))!);
-        var tmp = dest + ".part";
+        var tmp = dest + ".part-" + Guid.NewGuid().ToString("N")[..8];   // unique: two processes on one machine never share a part file
         try
         {
             using (var r = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct))

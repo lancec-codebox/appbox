@@ -3,35 +3,7 @@ using System.Text.Json.Nodes;
 
 namespace IndexNode;
 
-/// <summary>
-/// No continuous watching: one round at download, then done. At most one follow-up, and only when the name vote leaves a LEAD unconfirmed
-/// (the AI step rewrites the job once with round 1, reason "lead-names", due the download + 7 days); after that round the job is done.
-/// Supporting-cast names never ask for comments, and sequels come from the followed channel, not from comments.
-/// </summary>
-public static class CommentsFollowUp
-{
-    public const string LeadNames = "lead-names";
-    public static readonly TimeSpan Delay = TimeSpan.FromDays(7);
-
-    /// <summary>The job for the one follow-up round, or null (none wanted, or this job is already its follow-up).</summary>
-    public static (int Round, string Reason, DateTimeOffset Due)? Plan(DateTimeOffset downloadedAt, int completedRound, bool leadNameUnconfirmed) =>
-        leadNameUnconfirmed && completedRound == 0 ? (1, LeadNames, downloadedAt + Delay) : null;
-
-    /// <summary>Rewrites the finished comments job as pending with round 1 and reason "lead-names", due download + 7 days; false when not allowed.</summary>
-    public static async Task<bool> RequestAsync(IStore store, Paths paths, string jobId, DateTimeOffset downloadedAt, bool leadNameUnconfirmed, CancellationToken ct)
-    {
-        var name = paths.Job("comments", jobId);
-        var blob = await store.GetAsync(name, ct);
-        if (blob == null) return false;
-        var job = JobDescriptor.Parse(blob.Data);
-        if (Plan(downloadedAt, job.Round ?? 0, leadNameUnconfirmed) is not { } p) return false;
-        job.Round = p.Round; job.Reason = p.Reason; job.Attempts = 0;
-        var added = (await store.GetTagsAsync(name, ct))?.GetValueOrDefault(Tags.Added) ?? job.AddedAt;
-        await store.PutAsync(name, job.ToBytes(), Tags.Job("comments", "pending", added, Protocol.Utc(p.Due), job.Priority), null, false, ct);
-        return true;
-    }
-}
-
+/// <summary>0.13.0 (owner decision): comments are part of the download, fetched by the download claim itself (<see cref="CommentsStage.FetchAsync"/>); there is no comments stage on the queue, no comments job and no refresh rounds.</summary>
 public static class CommentsSnapshot
 {
     /// <summary>One snapshot from the two passes (top, then newest): comments are merged by id, top first.</summary>
@@ -76,10 +48,13 @@ public static class CommentsSnapshot
     ];
 }
 
-/// <summary>Takes a dated comments snapshot (no cookies) and schedules the next refresh.</summary>
+/// <summary>Takes a dated comments snapshot (no cookies): top comments, the same limits and blob names as before 0.13.0. Run by the download stage as part of the download.</summary>
 public sealed class CommentsStage(ITools tools, IStore store, DownloadGate gate) : IStageHandler
 {
-    public async Task RunAsync(JobContext ctx)
+    public Task RunAsync(JobContext ctx) => FetchAsync(ctx, true);
+
+    /// <summary>One comments snapshot for the video of <paramref name="ctx"/>. <paramref name="useGate"/> false: the caller (the download) has just waited its turn at YouTube.</summary>
+    public async Task FetchAsync(JobContext ctx, bool useGate)
     {
         var ct = ctx.Token; var job = ctx.Job; var id = job.JobId; var paths = ctx.Paths;
         if (string.IsNullOrEmpty(job.Url)) throw new PermanentFailure("job has no url");
@@ -89,7 +64,7 @@ public sealed class CommentsStage(ITools tools, IStore store, DownloadGate gate)
         int round = job.Round ?? 0;
         int max = job.MaxComments ?? 1000;
 
-        await gate.WaitTurnAsync(ct);
+        if (useGate) await gate.WaitTurnAsync(ct);
         await using var work = await tools.CreateWorkspaceAsync("c-" + id, ct);
         {
             var infos = new List<JsonObject?>();

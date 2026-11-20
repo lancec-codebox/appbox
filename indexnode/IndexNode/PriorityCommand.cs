@@ -15,18 +15,6 @@ public static class PriorityTool
     public static string SourceOrVideoId(string what) =>
         what.StartsWith("v-") ? what : YtDlp.IsSingleVideoUrl(what) ? "v-" + Protocol.JobIdFor(what) : SourceId(what);
 
-    /// <summary>Pending jobs of a stage that a watch job (id "ch-UC..." / "pl-...") created: their download jobs carry Source = the watch job id.</summary>
-    public static async Task<List<string>> JobsOfSourceAsync(IStore store, Paths paths, string stage, string sourceId, CancellationToken ct)
-    {
-        var ids = new List<string>();
-        foreach (var b in await store.ListAsync(paths.JobsDir(stage), true, false, ct))
-        {
-            if (b.Tags.GetValueOrDefault(Tags.State) != "pending") continue;
-            if (await store.GetAsync(b.Name, ct) is { } c && JobDescriptor.Parse(c.Data).Source == sourceId) ids.Add(Path.GetFileNameWithoutExtension(b.Name));
-        }
-        return ids;
-    }
-
     /// <summary>The watch job id for a channel id (UC...), a channel/playlist URL or an id that already is one.</summary>
     public static string SourceId(string channel)
     {
@@ -35,39 +23,29 @@ public static class PriorityTool
         return "ch-" + channel;
     }
 
+    /// <summary>The still-pending videos a source created: their download entries carry Source = the source id (0.13.0: read from the queue's memory).</summary>
+    public static List<string> JobsOfSource(JobQueue queue, string stage, string sourceId) =>
+        queue.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue(stage, out var e) && e.State == "pending" && e.Job?.Source == sourceId).Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
+
     /// <summary>
-    /// Sets idx_priority (and the job body's priority, which its follow-on jobs inherit) on the pending jobs named by (stage, id). Only pending jobs change: the lease is taken for the re-tag so a claim cannot race it,
-    /// and leased, done, failed and missing jobs are skipped and counted by reason.
+    /// Sets the priority of the subjects named: one "pri" line in the log, which changes every entry of the subject that is not finished (download, comments, process, describe, translate), so a video's stages keep one priority.
+    /// Finished and unknown subjects are skipped and counted by reason.
     /// </summary>
-    public static async Task<SetResult> SetAsync(IStore store, Paths paths, int priority, IEnumerable<(string Stage, string Id)> targets, CancellationToken ct, bool explicitSet = true)
+    public static async Task<SetResult> SetAsync(JobQueue queue, int priority, IEnumerable<string> subjects, CancellationToken ct)
     {
         Tags.CheckPriority(priority);
+        await queue.PollAsync(ct);
         int changed = 0; var skipped = new Dictionary<string, int>();
         void Skip(string why) => skipped[why] = skipped.GetValueOrDefault(why) + 1;
-        foreach (var (stage, id) in targets.Distinct())
+        var lines = new List<QLine>();
+        foreach (var id in subjects.Distinct())
         {
-            var name = paths.Job(stage, id);
-            var tags = await store.GetTagsAsync(name, ct);
-            if (tags == null) { Skip("no such job"); continue; }
-            var state = tags.GetValueOrDefault(Tags.State);
-            bool sourceDone = stage == "refresh" && state == "done"; // a source with the schedule once or off is done between runs: its priority still changes
-            if (state != "pending" && !sourceDone) { Skip(state == "done" ? "done" : state == "failed" ? "failed" : $"state {state}"); continue; }
-            var lease = await store.AcquireLeaseAsync(name, Protocol.LeaseSeconds, ct);
-            if (lease == null) { Skip("leased"); continue; }
-            try
-            {
-                tags = await store.GetTagsAsync(name, ct); // confirm under the lease
-                var body = await store.GetAsync(name, ct);
-                if (tags == null || body == null || tags.GetValueOrDefault(Tags.State) != state) { Skip("no longer pending"); continue; }
-                var job = JobDescriptor.Parse(body.Data); job.Priority = priority; job.Explicit = explicitSet ? true : null;
-                var next = new Dictionary<string, string>(tags);
-                if (stage == "refresh" && state == "pending" && Tags.PriorityOf(tags) == Protocol.RefreshNowPriority) { } // a lookup that is due now keeps its boost; the body's priority is what its videos inherit
-                else if (priority == 0) next.Remove(Tags.Priority); else next[Tags.Priority] = priority.ToString(CultureInfo.InvariantCulture);
-                await store.PutAsync(name, job.ToBytes(), next, lease, false, ct);
-                changed++;
-            }
-            finally { try { await store.ReleaseLeaseAsync(name, lease, CancellationToken.None); } catch { } }
+            var s = queue.Read(st => st.Get(id));
+            if (s == null) { Skip("no such job"); continue; }
+            if (!s.Entries.Values.Any(e => !e.Final || e.Stage == "refresh")) { Skip(s.Entries.Values.Any(e => e.State == "failed") ? "failed" : "done"); continue; }
+            lines.Add(new QLine { T = "pri", S = id, Pri = priority }); changed++;
         }
+        if (lines.Count > 0) await queue.AppendLinesAsync(lines, ct);
         return new SetResult(changed, skipped);
     }
 
@@ -83,58 +61,39 @@ public static class PriorityTool
     public sealed record SourceResult(int Videos, int Changed, Dictionary<string, int> Skipped, int Matched);
 
     /// <summary>
-    /// Sets a source's priority and re-tags the still-pending jobs (download, comments, step jobs) of every video that came from it, as "priority set --with-steps" does. A video's priority is the highest of its own and its
-    /// sources' priorities; this replaces an explicit "priority set" on its jobs (the explicit value wins only until a source priority of the video is changed). <paramref name="listedIds"/> are the video ids a yt-dlp listing of
-    /// the source gave: videos queued before download jobs recorded their source are matched by them and get the source recorded.
+    /// Sets a source's priority and the priority of every video that came from it, as "priority set" does. A video's priority is the highest of its own and its sources' priorities.
+    /// <paramref name="listedIds"/> are the video ids a yt-dlp listing of the source gave: videos queued before download entries recorded their source are matched by them and get the source recorded.
     /// A direct video (id "v-&lt;videoId&gt;") has no source record: its own priority is set.
     /// </summary>
-    public static async Task<SourceResult> SetSourceAsync(IStore store, Paths paths, string sourceId, int priority, IReadOnlyCollection<string>? listedIds, CancellationToken ct)
+    public static async Task<SourceResult> SetSourceAsync(JobQueue queue, string sourceId, int priority, IReadOnlyCollection<string>? listedIds, CancellationToken ct)
     {
         Tags.CheckPriority(priority);
         var direct = sourceId.StartsWith("v-", StringComparison.Ordinal);
-        await Sources.MigrateLegacyAsync(store, paths, ct);
-        var prios = new Dictionary<string, int>();
-        foreach (var b in await store.ListAsync(paths.JobsDir("refresh"), true, false, ct))
-            if (await store.GetAsync(b.Name, ct) is { } c) { var w = JobDescriptor.Parse(c.Data); prios[w.JobId] = w.Priority; }
+        await queue.PollAsync(ct);
+        var prios = queue.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("refresh")).ToDictionary(s => s.Id, s => s.Entries["refresh"].Priority));
         var skipped = new Dictionary<string, int>(); int changed = 0, matched = 0;
+        var lines = new List<QLine>();
         if (!direct)
         {
             if (!prios.ContainsKey(sourceId)) throw new ArgumentException($"no source {sourceId}");
-            var r = await SetAsync(store, paths, priority, [("refresh", sourceId)], ct, explicitSet: false);
-            if (r.Changed == 0) throw new InvalidOperationException($"source {sourceId} could not be updated ({string.Join(", ", r.Skipped.Select(k => k.Key))}); try again");
-            prios[sourceId] = priority;
+            lines.Add(new QLine { T = "pri", S = sourceId, Pri = priority }); changed++; prios[sourceId] = priority;
         }
         var listed = listedIds?.ToHashSet() ?? [];
         var videos = new List<(string Id, JobDescriptor Dl)>();
-        foreach (var b in await store.ListAsync(paths.JobsDir("download"), true, false, ct))
+        foreach (var (id, e) in queue.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("download")).Select(s => (s.Id, s.Entries["download"])).ToList()))
         {
-            var id = Path.GetFileNameWithoutExtension(b.Name);
             if (direct && id != sourceId[2..]) continue;
-            if (await store.GetAsync(b.Name, ct) is not { } c) continue;
-            var dl = JobDescriptor.Parse(c.Data);
+            var dl = e.Job ?? new JobDescriptor { JobId = id };
             bool recorded = (dl.Sources ?? []).Contains(sourceId) || dl.Source == sourceId;
             if (!direct && !recorded && !listed.Contains(id)) continue;
             if (direct) dl.OwnPriority = priority;
-            else if (!recorded)
-            {   // queued before the source was recorded: record it now (a leased job is left alone)
-                dl.Sources = (dl.Sources ?? (dl.Source != null ? [dl.Source] : [])).Append(sourceId).Distinct().ToList(); matched++;
-            }
-            if (direct || !recorded)
-            {
-                var lease = await store.AcquireLeaseAsync(b.Name, Protocol.LeaseSeconds, ct);
-                if (lease != null) { try { await store.PutAsync(b.Name, dl.ToBytes(), new Dictionary<string, string>(b.Tags), lease, false, ct); } finally { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); } }
-                else skipped["leased (source not recorded)"] = skipped.GetValueOrDefault("leased (source not recorded)") + 1;
-            }
+            else if (!recorded) { dl.Sources = (dl.Sources ?? (dl.Source != null ? [dl.Source] : [])).Append(sourceId).Distinct().ToList(); matched++; }
+            if (direct || !recorded) lines.Add(new QLine { T = "upd", S = id, Stage = "download", Job = dl });
             videos.Add((id, dl));
         }
-        foreach (var (id, dl) in videos)
-        {
-            int p = Effective(dl, prios);
-            var targets = new[] { "download", "comments" }.Concat(Protocol.StepStages).Select(s => (s, id));
-            var r = await SetAsync(store, paths, p, targets, ct, explicitSet: false);
-            changed += r.Changed;
-            foreach (var (k, v) in r.Skipped) if (k != "no such job") skipped[k] = skipped.GetValueOrDefault(k) + v;
-        }
+        foreach (var (id, dl) in videos) lines.Add(new QLine { T = "pri", S = id, Pri = Effective(dl, prios) });
+        if (lines.Count > 0) await queue.AppendLinesAsync(lines, ct);
+        changed += videos.Count;
         return new SourceResult(videos.Count, changed, skipped, matched);
     }
 
@@ -152,37 +111,30 @@ public static class PriorityTool
         return ids;
     }
 
-    /// <summary>Pending jobs in the order nodes claim them: priority, added, name.</summary>
-    public static async Task<List<(string Stage, string Id, int Priority, string Added)>> ListAsync(IStore store, Paths paths, string? stage, int top, CancellationToken ct)
-    {
-        var all = new List<BlobEntry>();
-        foreach (var s in stage != null ? [stage] : Protocol.Stages) all.AddRange((await store.ListAsync(paths.JobsDir(s), true, false, ct)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "pending"));
-        return Tags.ClaimOrder(all).Take(top).Select(b => (b.Tags.GetValueOrDefault(Tags.Stage) ?? "", Path.GetFileNameWithoutExtension(b.Name), Tags.PriorityOf(b.Tags), b.Tags.GetValueOrDefault(Tags.Added) ?? "")).ToList();
-    }
+    /// <summary>Pending entries in the order nodes claim them: priority, added, subject.</summary>
+    public static List<(string Stage, string Id, int Priority, string Added)> List(JobQueue queue, string? stage, int top) =>
+        queue.Read(st => st.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => e.State == "pending" && (stage == null || e.Stage == stage)).Select(e => (e.Stage, s.Id, e.Priority, e.Added))).ToList())
+            .OrderByDescending(x => x.Priority).ThenBy(x => x.Added, StringComparer.Ordinal).ThenBy(x => x.Id, StringComparer.Ordinal).Take(top).ToList();
 
-    public static async Task<int> RunAsync(Args a, IStore store, Paths paths)
+    public static async Task<int> RunAsync(Args a, JobQueue queue)
     {
         var sub = a.Positional.FirstOrDefault();
         if (sub == "list")
         {
             int top = a.Get("top") is { } t ? int.Parse(t) : 20;
-            foreach (var row in await ListAsync(store, paths, a.Get("stage"), top, default)) Console.WriteLine($"{row.Priority,6}  {row.Added}  {row.Stage}/{row.Id}");
+            foreach (var row in List(queue, a.Get("stage"), top)) Console.WriteLine($"{row.Priority,6}  {row.Added}  {row.Stage}/{row.Id}");
             return 0;
         }
-        if (sub != "set") throw new ArgumentException("priority set <N> --job <id>... | --from <file> | --channel <id|url> [--stage S] [--with-steps]  |  priority list [--stage S] [--top 20]");
+        if (sub != "set") throw new ArgumentException("priority set <N> --job <id>... | --from <file> | --channel <id|url> [--stage S]  |  priority list [--stage S] [--top 20]");
         int p = ParseOption(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("priority set <N> ..."));
         var stage = a.Get("stage") ?? "download";
         var ids = new List<string>();
         if (a.Get("job") is { } j) ids.AddRange(new[] { j }.Concat(a.Positional.Skip(2)));
         if (a.Get("from") is { } f) ids.AddRange(File.ReadAllLines(f).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith('#')));
-        if (a.Get("channel") is { } ch) ids.AddRange(await JobsOfSourceAsync(store, paths, stage, SourceId(ch), default));
+        if (a.Get("channel") is { } ch) ids.AddRange(JobsOfSource(queue, stage, SourceId(ch)));
         if (ids.Count == 0) throw new ArgumentException("priority set: no jobs (use --job, --from or --channel)");
-        var targets = ids.Select(i => (stage, i)).ToList();
-        if (a.Has("with-steps")) targets.AddRange(ids.SelectMany(i => Protocol.StepStages.Select(s => (s, i))));
-        var r = await SetAsync(store, paths, p, targets, default);
-        // a step the video never had is not interesting when --with-steps tried them all
-        var skipped = a.Has("with-steps") ? r.Skipped.Where(k => k.Key != "no such job").ToDictionary(k => k.Key, k => k.Value) : r.Skipped;
-        Console.WriteLine($"{r.Changed} job(s) changed to priority {p}; skipped {skipped.Values.Sum()}{(skipped.Count > 0 ? " (" + string.Join(", ", skipped.Select(k => $"{k.Value} {k.Key}")) + ")" : "")}");
+        var r = await SetAsync(queue, p, ids, default);   // one priority per video: every stage of it (--with-steps is no longer needed)
+        Console.WriteLine($"{r.Changed} video(s) changed to priority {p}; skipped {r.Skipped.Values.Sum()}{(r.Skipped.Count > 0 ? " (" + string.Join(", ", r.Skipped.Select(k => $"{k.Value} {k.Key}")) + ")" : "")}");
         return 0;
     }
 }

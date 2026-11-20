@@ -1,0 +1,22 @@
+# Cutover to the queue log (0.13.0)
+
+0.13.0 keeps its job queue in one append log (`index/jobs/queue.log`, `index/jobs/queue.snapshot.json.gz`, `index/jobs/active/*`; every path here is under the store prefix `index/`). The snapshot is gzip-compressed and slimmed (finished subjects keep ids, states, priority, a short reason); a plain `queue.snapshot.json` from the first migration is still read and replaced by the `.gz` at the first rollover. It never reads or writes the old job blobs (`index/jobs/<stage>/<id>.json`).
+Its control file is `index/jobs/control.json` (mode, stages, downloads, gpu, message). `index/control.json` is ignored; leave it at mode=stop for ever so an old binary never resumes on the old store.
+
+## Steps
+1. **Stop the old nodes**, and `indexnode control stop` them on the old binary (that writes `index/control.json` mode=stop; keep it).
+2. **Ghostignore**: `.ghostignore.json` must list `index/jobs/` (and `index/holds/`, `index/gpu-ready/`) on every machine that syncs the store, so the queue log, the snapshot and the old job blobs are never synced or re-created there.
+3. **Dry run**: `indexnode jobs migrate --to log --dry-run` (or `--verify`). It prints the blob-side counts per stage/state, the queue entries it would write per stage/state, and what is not carried over (holds, gpu-ready markers, comments jobs). Compare the two. It refuses (exit 1) when any job or hold is leased: stop the nodes or wait.
+4. **Real run**: `indexnode jobs migrate --to log`. Writes the first segment (`index/jobs/queue.log/…`), the snapshot (`index/jobs/queue.snapshot.json.gz`) and `index/sources/<id>/seen.json`; the old blobs stay. `--force` builds the snapshot again.
+5. **First nodes**: start one node on 0.13.0 (`indexnode run`); it exits non-zero with one line pointing at the migration if the snapshot is missing. Set the mode with `indexnode control run` (`index/jobs/control.json` is new: absent means run). Then start the rest.
+
+## What carries over
+Pending, failed (permanent, attempts, last error) and done state; unclassified downloads stay unclassified; refresh sources keep their schedules (channel `every 1d` becomes dynamic, `off` stays off); priorities and due times; the finished steps of part-processed dramas.
+Dramas with processing already done resume from their first unfinished step and **skip the pre-check**; only dramas with no processing done get it (first step of their process claim).
+Not carried: holds, GPU markers, comments jobs (counted in the report).
+
+## Pre-check skip and trash
+A skip (duplicate, AI, non-canonical dub) changes nothing: the `done` line carries the decision, the reason and `trash: download.zip/video`, and processing stops. `indexnode trash list` shows the marks; `indexnode trash empty --older-than 30d [--dry-run]` removes the video blobs by hand (download.zip stays) and appends `deleted`. No node runs it.
+
+## Rollback limits
+Before step 4 nothing has changed. After it the old blobs are untouched but stale: going back means old binaries on a store whose queue moved on (work done by 0.13.0 is unknown to them), and `index/control.json` is mode=stop, so you must set it to run yourself. Treat the migration as one way.

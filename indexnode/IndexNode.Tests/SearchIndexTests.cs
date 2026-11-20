@@ -36,7 +36,7 @@ public class SearchIndexTests(ITestOutputHelper output)
         Assert.Equal("p1", (string)e["packId"]!); Assert.Equal("ytp1", (string)e["videos"]![0]!);
         Assert.Equal("Reborn Sisters", (string)e["title"]!["en"]!); Assert.Equal("重生姐妹", (string)e["title"]!["zh"]!); Assert.Contains("Border Guard", (string)e["fullTitle"]!["en"]!);
         Assert.Equal("Two sisters wake up in the past.", (string)e["teaser"]!["en"]!); Assert.Contains("Shi An", (string)e["synopsis"]!["en"]!);
-        Assert.Equal("rebirth", (string)e["tags"]![0]!); Assert.Equal("ancient", (string)e["era"]!); Assert.True((bool)e["fantasy"]!); Assert.Equal("partly", (string)e["ai"]!);
+        Assert.Equal("rebirth", (string)e["tags"]![0]!); Assert.Equal("ancient", (string)e["era"]!); Assert.True((bool)e["fantasy"]!); Assert.Null(e["ai"]);   // 0.12.0: describe no longer says; the flag comes from the probe
         Assert.Equal("cliffhanger", (string)e["ending"]!["kind"]!); Assert.True((bool)e["ending"]!["nextPart"]!); Assert.Equal("Part 2", (string)e["ending"]!["nextPartHint"]!);
         var c = e["cast"]![0]!; Assert.Equal("Shi An 0", (string)c["en"]!); Assert.Equal("石安0", (string)c["zh"]!); Assert.Equal("Shi An 0", (string)c["pinyin"]!); Assert.Equal("male lead", (string)c["role"]!); Assert.Equal("border guard", (string)c["label"]!);
         Assert.Equal(1800, (double)e["durationSeconds"]!); Assert.Equal("UC123", (string)e["channel"]!["id"]!); Assert.Equal("Drama Channel", (string)e["channel"]!["name"]!);

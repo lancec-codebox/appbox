@@ -125,6 +125,6 @@ public class DescribeShapeTests
         var res = Two(); var check = JsonNode.Parse("""{"flaggedCast":[1],"reasons":["x"]}""")!.AsObject();
         var pr = Describe.BuildRewrite(res, check, "m").Prompt;
         Assert.DoesNotContain("\"cluster\":0,\"roleAtStart\":\"\"", pr); Assert.Contains("[1]", pr); Assert.Contains("Xiao Linyuan", pr);
-        Assert.Equal("describe-7", Describe.PromptVersion);
+        Assert.Equal("describe-8", Describe.PromptVersion);
     }
 }

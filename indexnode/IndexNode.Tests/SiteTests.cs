@@ -126,7 +126,7 @@ public class DescribeTests
         Assert.Equal(4, arr.Count(x => x!["type"]!.GetValue<string>() == "image_url"));
         var prompt = arr[0]!["text"]!.GetValue<string>();
         Assert.Contains("新娘重生 #shorts FULL", prompt); Assert.Contains("主演：张三", prompt); Assert.Contains("第7句", prompt); Assert.Contains("ENGLISH ONLY", prompt); Assert.Contains("never invent", prompt, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal("describe-7", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
+        Assert.Equal("describe-8", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
     }
 
     [Fact]
@@ -397,11 +397,16 @@ public class StatusSnapshotTests
         var store = new FakeStore(); var paths = new Paths("index/"); var now = DateTimeOffset.Parse("2026-01-01T12:00:00Z");
         string Ago(int min) => now.AddMinutes(-min).ToString("yyyy-MM-ddTHH:mm:ssZ");
         await store.AddJob(paths, "process", "a", Ago(300)); await store.AddJob(paths, "process", "b", Ago(300)); await store.AddJob(paths, "download", "c", Ago(300)); await store.AddJob(paths, "download", "d", Ago(300));
-        foreach (var (id, stage, state) in new[] { ("a", "process", "done"), ("b", "process", "failed"), ("c", "download", "done") }) store.Blobs[paths.Job(stage, id)].Tags[Tags.State] = state;
-        var ja = store.Job(paths.Job("process", "a")); ja.FinishedAt = Ago(10); ja.NodeId = "n1"; ja.ElapsedSeconds = 42; store.Blobs[paths.Job("process", "a")].Data = ja.ToBytes();
-        var jc = store.Job(paths.Job("download", "c")); jc.FinishedAt = Ago(600); jc.NodeId = "n1"; jc.ElapsedSeconds = 5; store.Blobs[paths.Job("download", "c")].Data = jc.ToBytes();
-        var jb = store.Job(paths.Job("process", "b")); jb.LastError = "boom https://x.blob.core.windows.net/c?sv=1&sig=TOPSECRET&se=2"; jb.Attempts = 3; jb.Permanent = true; jb.NodeId = "n2"; store.Blobs[paths.Job("process", "b")].Data = jb.ToBytes();
-        store.Blobs[paths.Job("download", "d")].Lease = "L"; store.Blobs[paths.Job("download", "d")].Meta = new() { ["node"] = "n1", ["progress"] = "download 40%", ["heartbeat"] = Ago(1) };
+        // the queue log: a (process) done 10 min ago on n1, c (download) done 10 h ago on n1, b (process) failed for good, d (download) claimed by n1
+        async Task Log(params QLine[] ls) { var info = await store.GetAppendInfoAsync(paths.QueueLog, default); await store.AppendBlockAsync(paths.QueueLog, System.Text.Encoding.UTF8.GetBytes(string.Concat(ls.Select(l => l.ToJson() + "\n"))), info!.Length, default); }
+        await Log(
+            new QLine { T = "claim", S = "a", Stages = ["process"], By = "n1", Epoch = 1, At = Ago(11) },
+            new QLine { T = "done", S = "a", Stage = "process", By = "n1", Epoch = 1, Fin = true, At = Ago(10), Job = new JobDescriptor { Stage = "process", JobId = "a", ElapsedSeconds = 42 } },
+            new QLine { T = "claim", S = "c", Stages = ["download"], By = "n1", Epoch = 1, At = Ago(601) },
+            new QLine { T = "done", S = "c", Stage = "download", By = "n1", Epoch = 1, Fin = true, At = Ago(600), Job = new JobDescriptor { Stage = "download", JobId = "c", ElapsedSeconds = 5 } },
+            new QLine { T = "claim", S = "b", Stages = ["process"], By = "n2", Epoch = 1, At = Ago(20) },
+            new QLine { T = "failed", S = "b", Stage = "process", State = "failed", By = "n2", Epoch = 1, Fin = true, At = Ago(19), Attempt = 3, Permanent = true, Error = "boom https://x.blob.core.windows.net/c?sv=1&sig=TOPSECRET&se=2" },
+            new QLine { T = "claim", S = "d", Stages = ["download"], By = "n1", Epoch = 1, At = Ago(1) });
         store.Blobs[paths.Node("n1")] = new FakeStore.Blob { Data = new NodeInfo { NodeId = "n1", Name = "desk", Kind = "desktop", Stages = ["download", "process"], LastSeen = Ago(0), State = "working", Running = [new RunningJob { JobId = "d", Stage = "download", Step = "download", Progress = "40%", Worker = 1 }] }.ToBytes() };
         store.Blobs[paths.Control] = new FakeStore.Blob { Data = new ControlFile { Mode = "run", Nodes = new() { ["n1"] = new NodeLimits { Budget = 5 } } }.ToBytes() };
         var before = store.Puts.Values.Sum();
@@ -410,7 +415,7 @@ public class StatusSnapshotTests
         Assert.Equal("run", (string)s["control"]!["mode"]!);
         var n = s["nodes"]![0]!; Assert.Equal("desk", (string)n["name"]!); Assert.Equal("working", (string)n["state"]!); Assert.Equal("d", (string)n["workers"]![0]!["jobId"]!);
         Assert.Equal(1, (int)s["queue"]!["process"]!["done"]!); Assert.Equal(1, (int)s["queue"]!["process"]!["failed"]!); Assert.Equal(1, (int)s["queue"]!["download"]!["leased"]!);
-        Assert.Equal(1, (int)s["leased"]!.AsArray().Count); Assert.Equal(60, (double)s["leased"]![0]!["heartbeatAgeSeconds"]!);
+        Assert.Equal(1, (int)s["leased"]!.AsArray().Count); Assert.Equal("d", (string)s["leased"]![0]!["jobId"]!); Assert.Equal("n1", (string)s["leased"]![0]!["node"]!);   // 0.13.0: leases come from the log, heartbeats are never in it
         Assert.Equal(2, s["finished"]!.AsArray().Count); Assert.Equal("a", (string)s["finished"]![0]!["jobId"]!); Assert.Equal(42, (double)s["finished"]![0]!["elapsedSeconds"]!);
         var f = s["failures"]![0]!; Assert.Equal(3, (int)f["attempts"]!); Assert.True((bool)f["permanent"]!); Assert.DoesNotContain("TOPSECRET", f.ToJsonString());
         Assert.Equal(1, (int)s["throughput"]!["process"]!["lastHour"]!); Assert.Equal(1, (int)s["throughput"]!["download"]!["last24h"]!); Assert.Equal(0, (int)s["throughput"]!["download"]!["lastHour"]!);

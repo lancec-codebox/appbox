@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 
 namespace IndexNode;
 
-/// <summary>indexnode sources add | list | remove | import | schedule | lookup | refresh: followed playlists and channels, stored as refresh jobs (index/jobs/refresh/&lt;sourceId&gt;.json; before 0.10.3 jobs/watch/).</summary>
+/// <summary>indexnode sources add | list | remove | import | schedule | lookup | refresh: followed playlists and channels, kept as refresh entries of the queue (0.13.0; subject ch-&lt;id&gt; / pl-&lt;id&gt;).</summary>
 public static partial class Sources
 {
     [GeneratedRegex(@"[?&]list=([A-Za-z0-9_-]+)")] private static partial Regex ListParam();
@@ -45,107 +45,87 @@ public static partial class Sources
     }
 
     /// <summary>
-    /// Adds a source: its lookup job is due NOW at <see cref="Protocol.RefreshNowPriority"/>, so the next free downloader lists it (whatever the schedule: "once" means no refresh after this lookup).
-    /// False when the source exists already (as a refresh job or an old watch job).
+    /// Adds a source: its lookup is due NOW at <see cref="Protocol.RefreshNowPriority"/>, so the next free downloader lists it (whatever the schedule: "once" means no refresh after this lookup).
+    /// False when the source exists already.
     /// </summary>
-    public static async Task<bool> AddAsync(IStore store, Paths paths, JobDescriptor job, CancellationToken ct)
+    public static async Task<bool> AddAsync(JobQueue queue, JobDescriptor job, CancellationToken ct)
     {
-        await MigrateLegacyAsync(store, paths, ct);
-        if (await store.GetTagsAsync(paths.Job("refresh", job.JobId), ct) != null) return false;
-        job.Run = "lookup";
-        return await store.PutAsync(paths.Job("refresh", job.JobId), job.ToBytes(), Tags.Job("refresh", "pending", job.AddedAt, job.AddedAt, Protocol.RefreshNowPriority), null, true, ct);
+        job.Run = "lookup"; job.Stage = "refresh";
+        bool made = false;
+        await queue.AppendLinesAsync(st =>
+        {
+            made = false;
+            if (st.Entry(job.JobId, "refresh") != null) return null;
+            made = true;
+            return [QLine.Add(job.JobId, "refresh", job, job.AddedAt, Protocol.RefreshNowPriority, job.AddedAt)];
+        }, ct);
+        return made;
     }
 
-    /// <summary>
-    /// Moves jobs/watch/&lt;id&gt;.json (pre-0.10.3) to jobs/refresh/&lt;id&gt;.json, state, due time, priority and body kept: the job keeps its schedule (its "every"), so an old source goes on as before.
-    /// A job another node holds is left for the next call. Returns how many moved.
-    /// </summary>
-    public static async Task<int> MigrateLegacyAsync(IStore store, Paths paths, CancellationToken ct)
-    {
-        int moved = 0;
-        foreach (var b in await store.ListAsync(paths.LegacyWatchDir, true, false, ct))
-        {
-            var id = Path.GetFileNameWithoutExtension(b.Name); var target = paths.Job("refresh", id);
-            var lease = await store.AcquireLeaseAsync(b.Name, Protocol.LeaseSeconds, ct);
-            if (lease == null) continue;
-            try
-            {
-                if (await store.GetAsync(b.Name, ct) is not { } c) continue;
-                var job = JobDescriptor.Parse(c.Data); job.Stage = "refresh"; job.Run ??= RefreshStage.KindOf(job);
-                var tags = new Dictionary<string, string>(b.Tags) { [Tags.Stage] = "refresh" };
-                if (await store.PutAsync(target, job.ToBytes(), tags, null, true, ct)) moved++;
-                await store.DeleteAsync(b.Name, lease, ct);
-            }
-            finally { try { await store.ReleaseLeaseAsync(b.Name, lease, CancellationToken.None); } catch { } }
-        }
-        if (moved > 0) Log.Info($"sources: moved {moved} watch job(s) to refresh");
-        return moved;
-    }
+    private static JobDescriptor WithSeen(JobDescriptor j) => j;
 
     /// <summary>Changes a source's schedule (once | off | 6h | 1d | daily@03:00): its job body and, for a pending job, the due time. A lookup that is due now stays due.</summary>
-    public static async Task<JobDescriptor> SetScheduleAsync(IStore store, Paths paths, string sourceId, string schedule, CancellationToken ct, Func<DateTimeOffset>? now = null)
+    public static async Task<JobDescriptor> SetScheduleAsync(JobQueue queue, string sourceId, string schedule, CancellationToken ct, Func<DateTimeOffset>? now = null)
     {
         var sched = Schedule.Parse(schedule);
-        await MigrateLegacyAsync(store, paths, ct);
-        var name = paths.Job("refresh", sourceId);
-        var tags = await store.GetTagsAsync(name, ct) ?? throw new ArgumentException($"no source {sourceId}");
-        var lease = await store.AcquireLeaseAsync(name, Protocol.LeaseSeconds, ct) ?? throw new InvalidOperationException($"{sourceId} is being refreshed right now; try again in a minute");
-        try
+        var clock = now ?? (() => DateTimeOffset.UtcNow);
+        JobDescriptor? result = null;
+        await queue.PollAsync(ct);
+        await queue.AppendLinesAsync(st =>
         {
-            tags = await store.GetTagsAsync(name, ct) ?? tags;
-            var job = JobDescriptor.Parse((await store.GetAsync(name, ct))!.Data);
-            job.Schedule = sched.Text; job.Every = sched.Kind == "every" ? sched.Text : null;
-            var t = new Dictionary<string, string>(tags);
-            var clock = now ?? (() => DateTimeOffset.UtcNow);
-            bool dueNow = tags.GetValueOrDefault(Tags.State) == "pending" && Tags.DueOf(tags).CompareTo(Protocol.Utc(clock())) <= 0 && Tags.PriorityOf(tags) == Protocol.RefreshNowPriority;
+            var e = st.Entry(sourceId, "refresh") ?? throw new ArgumentException($"no source {sourceId}");
+            if (st.Get(sourceId)?.ClaimBy != null && st.Get(sourceId)!.Entries.Values.Any(x => x.Stage == "refresh" && x.State == "pending") && false) throw new InvalidOperationException($"{sourceId} is being refreshed right now; try again in a minute");
+            var job = Clone(e.Job ?? new JobDescriptor { JobId = sourceId, Stage = "refresh" });
+            job.Schedule = sched.Text; job.Every = sched.Kind == "every" ? sched.Text : null; job.Inactive = null;   // a new schedule brings an inactive source back
+            bool dueNow = e.State == "pending" && string.CompareOrdinal(e.Due, Protocol.Utc(clock())) <= 0 && e.Priority == Protocol.RefreshNowPriority;
+            var line = new QLine { T = "upd", S = sourceId, Stage = "refresh", Job = job };
+            var lines = new List<QLine> { line };
             if (!dueNow)
             {
-                // from the last run, so a new interval does not push a source that is already late, nor start one that just ran
                 var last = DateTimeOffset.TryParse(job.LastPolled, out var lp) ? lp : clock();
-                var next = sched.Kind == "every" ? last + sched.Interval : sched.Next(clock());
-                if (next == null) { t[Tags.State] = "done"; t[Tags.Due] = Protocol.Utc(clock()); if (job.Priority != 0) t[Tags.Priority] = job.Priority.ToString(); else t.Remove(Tags.Priority); job.NextRefresh = null; }
-                else { t[Tags.State] = "pending"; t[Tags.Due] = Protocol.Utc(next.Value < clock() ? clock() : next.Value); job.NextRefresh = t[Tags.Due]; if (job.Priority != 0) t[Tags.Priority] = job.Priority.ToString(); else t.Remove(Tags.Priority); }
+                var next = sched.IsDynamic ? clock() : sched.Kind == "every" ? last + sched.Interval : sched.Next(clock());   // dynamic: first check now, which computes the tier
+                if (next == null) { job.NextRefresh = null; lines.Add(new QLine { T = "done", S = sourceId, Stage = "refresh", State = "done", At = Protocol.Utc(clock()) }); }
+                else { var due = Protocol.Utc(next.Value < clock() ? clock() : next.Value); job.NextRefresh = due; lines.Add(new QLine { T = "retry", S = sourceId, Stage = "refresh", Due = due }); lines.Add(new QLine { T = "pri", S = sourceId, Pri = job.Priority }); }
             }
-            await store.PutAsync(name, job.ToBytes(), t, lease, false, ct);
-            return job;
-        }
-        finally { try { await store.ReleaseLeaseAsync(name, lease, CancellationToken.None); } catch { } }
+            result = job;
+            return lines;
+        }, ct);
+        return result!;
     }
 
-    /// <summary>Makes the source's job due now at <see cref="Protocol.RefreshNowPriority"/>: kind "lookup" (a full listing again) or "refresh" (incremental). A job a node is running right now is left alone (false).</summary>
-    public static async Task<bool> TriggerAsync(IStore store, Paths paths, string sourceId, string kind, CancellationToken ct, Func<DateTimeOffset>? now = null)
+    internal static JobDescriptor Clone(JobDescriptor j) => JobDescriptor.Parse(j.ToBytes());
+
+    /// <summary>Makes the source due now at <see cref="Protocol.RefreshNowPriority"/>: kind "lookup" (a full listing again) or "refresh" (incremental). A source a node is running right now is left alone (false).</summary>
+    public static async Task<bool> TriggerAsync(JobQueue queue, string sourceId, string kind, CancellationToken ct, Func<DateTimeOffset>? now = null)
     {
         if (kind is not ("lookup" or "refresh")) throw new ArgumentException("kind is lookup or refresh");
-        await MigrateLegacyAsync(store, paths, ct);
-        var name = paths.Job("refresh", sourceId);
-        if (await store.GetTagsAsync(name, ct) == null) throw new ArgumentException($"no source {sourceId}");
-        var lease = await store.AcquireLeaseAsync(name, Protocol.LeaseSeconds, ct);
-        if (lease == null) return false;
-        try
+        bool ok = false;
+        await queue.PollAsync(ct);
+        await queue.AppendLinesAsync(st =>
         {
-            var job = JobDescriptor.Parse((await store.GetAsync(name, ct))!.Data);
+            ok = false;
+            var e = st.Entry(sourceId, "refresh") ?? throw new ArgumentException($"no source {sourceId}");
+            if (st.Get(sourceId)?.ClaimBy != null) return null;
+            var job = Clone(e.Job ?? new JobDescriptor { JobId = sourceId, Stage = "refresh" });
             var at = Protocol.Utc((now ?? (() => DateTimeOffset.UtcNow))());
-            job.Run = kind; job.Attempts = 0; job.LastError = null; job.Permanent = null;
-            await store.PutAsync(name, job.ToBytes(), Tags.Job("refresh", "pending", at, at, Protocol.RefreshNowPriority), lease, false, ct);
-            return true;
-        }
-        finally { try { await store.ReleaseLeaseAsync(name, lease, CancellationToken.None); } catch { } }
+            job.Run = kind; job.Attempts = 0; job.LastError = null; job.Permanent = null;   // a manual refresh also revives an inactive source; the run decides again from the upload dates
+            ok = true;
+            return [new QLine { T = "retry", S = sourceId, Stage = "refresh", Due = at, Job = job, At = at }, new QLine { T = "pri", S = sourceId, Pri = Protocol.RefreshNowPriority }];
+        }, ct);
+        return ok;
     }
 
     /// <summary>The sources a schedule has made due (pending, due, not running): what "sources refresh --all-due" triggers. Sources whose schedule is once or off are done and never are.</summary>
-    public static async Task<List<string>> DueAsync(IStore store, Paths paths, CancellationToken ct, Func<DateTimeOffset>? now = null)
+    public static Task<List<string>> DueAsync(JobQueue queue, Func<DateTimeOffset>? now = null)
     {
-        await MigrateLegacyAsync(store, paths, ct);
         var at = Protocol.Utc((now ?? (() => DateTimeOffset.UtcNow))());
-        return (await store.ListAsync(paths.JobsDir("refresh"), true, false, ct))
-            .Where(b => b.Tags.GetValueOrDefault(Tags.State) == "pending" && Tags.DueOf(b.Tags).CompareTo(at) <= 0 && b.LeaseState != "leased" && Tags.PriorityOf(b.Tags) != Protocol.RefreshNowPriority) // not a lookup or manual run that is already queued
-            .Select(b => Path.GetFileNameWithoutExtension(b.Name)).ToList();
+        return Task.FromResult(queue.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Entries.TryGetValue("refresh", out var e) && e.State == "pending" && string.CompareOrdinal(e.Due, at) <= 0 && e.Priority != Protocol.RefreshNowPriority).Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal).ToList()));
     }
 
     public sealed record ImportResult(int Added, int Existed, int Skipped);
 
     /// <summary>One watch job per channel of a channels.json ([{channelId, channelName, ...}]); existing ones are left alone.</summary>
-    public static async Task<ImportResult> ImportAsync(IStore store, Paths paths, byte[] json, string every, string[] tabs, int maxHeight, CancellationToken ct, int priority = 0)
+    public static async Task<ImportResult> ImportAsync(JobQueue queue, byte[] json, string every, string[] tabs, int maxHeight, CancellationToken ct, int priority = 0)
     {
         Schedule.Parse(every); Tags.CheckPriority(priority);
         var items = JsonDocument.Parse(json).RootElement;
@@ -157,24 +137,21 @@ public static partial class Sources
             if (string.IsNullOrWhiteSpace(id) || !Regex.IsMatch(id, @"^UC[A-Za-z0-9_-]{22}$")) { skipped++; continue; }
             var name = it.TryGetProperty("channelName", out var n) ? n.GetString() : null;
             var job = JobDescriptor.NewSource("channel", id, string.IsNullOrWhiteSpace(name) ? id : name, every, tabs, false, 0, maxHeight); job.Priority = priority;
-            if (await AddAsync(store, paths, job, ct)) added++; else existed++;
+            if (await AddAsync(queue, job, ct)) added++; else existed++;
         }
         return new ImportResult(added, existed, skipped);
     }
 
-    public static async Task<List<JobDescriptor>> ListAsync(IStore store, Paths paths, CancellationToken ct)
-    {
-        var list = new List<JobDescriptor>();
-        await MigrateLegacyAsync(store, paths, ct);
-        foreach (var b in await store.ListAsync(paths.JobsDir("refresh"), false, false, ct))
-            if (await store.GetAsync(b.Name, ct) is { } c) list.Add(JobDescriptor.Parse(c.Data));
-        return list.OrderBy(j => j.Name, StringComparer.OrdinalIgnoreCase).ToList();
-    }
+    public static List<JobDescriptor> List(JobQueue queue) =>
+        queue.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("refresh")).Select(s => { var j = Clone(s.Entries["refresh"].Job ?? new JobDescriptor()); j.JobId = s.Id; j.Priority = s.Entries["refresh"].Priority; return j; }).ToList())
+            .OrderBy(j => j.Name, StringComparer.OrdinalIgnoreCase).ToList();
 
     /// <summary>One line of "sources list": the schedule, what the job does next, the last and next run.</summary>
     public static string FormatRow(JobDescriptor j, string? state = null)
     {
-        var next = state == "pending" ? (RefreshStage.KindOf(j) + (j.NextRefresh != null ? " " + j.NextRefresh : " now")) : state == "done" ? "-" : j.NextRefresh ?? "-";
-        return $"{j.JobId,-40} {j.Kind,-8} schedule {Schedule.Of(j).Describe(),-14} priority {j.Priority,4}  last {(j.LastRun ?? "-")} {(j.LastPolled ?? "never"),-20} next {next,-30} new {j.Found ?? 0,4}  {j.Name}";
+        var sch = Schedule.Of(j);
+        var next = j.Inactive == true ? "inactive" : state == "pending" ? (RefreshStage.KindOf(j) + (j.NextRefresh != null ? " " + j.NextRefresh : " now")) : state == "done" ? "-" : j.NextRefresh ?? "-";
+        string tier = sch.IsDynamic ? (j.Inactive == true ? " (inactive)" : DateTimeOffset.TryParse(j.LastModified, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var nu) ? " (tier " + DynamicSchedule.TierText(DynamicSchedule.Tier(DateTimeOffset.UtcNow, nu)) + ")" : j.LastPolled != null ? " (tier 32d)" : "") : "";
+        return $"{j.JobId,-40} {j.Kind,-8} schedule {(sch.IsDynamic ? "dynamic" : "explicit " + sch.Describe()) + tier,-30} priority {j.Priority,4}  last {(j.LastRun ?? "-")} {(j.LastPolled ?? "never"),-20} next {next,-30} new {j.Found ?? 0,4}  {j.Name}";
     }
 }

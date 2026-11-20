@@ -26,8 +26,8 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
     {
         var ct = ctx.Token; var paths = ctx.Paths; var job = ctx.Job; var at = Protocol.Utc(now());
         // 1. tracked videos: finished downloads
-        var tracked = (await store.ListAsync(paths.JobsDir("download"), true, false, ct))
-            .Where(b => b.Tags.GetValueOrDefault(Tags.State) == "done").Select(b => Path.GetFileNameWithoutExtension(b.Name)).ToList();
+        var queue = ctx.Queue ?? throw new InvalidOperationException("availability runs on the queue");
+        var tracked = queue.Read(s => s.Subjects.Values.Where(x => x.Entries.TryGetValue("download", out var e) && e.State == "done").Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
         ctx.Report("availability", $"{tracked.Count} tracked videos");
         // 2. each video's channel, read once and remembered
         var members = await J(MembersBlob(paths), ct) ?? new JsonObject(); int learned = 0;
@@ -45,7 +45,7 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
             var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(id)s", $"https://www.youtube.com/channel/{cid}/videos"], ct);
             var listed = r.ExitCode == 0 ? r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToHashSet() : [];
             if (r.ExitCode != 0) listingsFailed++;
-            bool ingest = await store.GetTagsAsync(paths.Job("refresh", "ch-" + cid), ct) != null || await store.GetTagsAsync(paths.LegacyWatchDir + "ch-" + cid + ".json", ct) != null;
+            bool ingest = queue.Read(s => s.Entry("ch-" + cid, "refresh") != null);
             channels.Add(new JsonObject { ["id"] = cid, ["name"] = members[ids[0] + "|name"]?.ToString(), ["mode"] = ingest ? "ingest" : "check", ["tracked"] = ids.Count, ["listed"] = r.ExitCode == 0 ? listed.Count : null, ["listingOk"] = r.ExitCode == 0 });
             foreach (var id in ids)
             {

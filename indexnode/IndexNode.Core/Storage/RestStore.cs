@@ -14,6 +14,15 @@ public sealed class RestStore : IStore
 
     /// <summary>Where this store counts its bytes (the node's counters unless a test sets its own).</summary>
     public Traffic Counters { get; set; } = Traffic.Current;
+    /// <summary>Counts every HTTP request by kind (read, write, list) for the node's storage-ops report.</summary>
+    public OpCounter Ops { get; set; } = OpCounter.Current;
+    private void Count(HttpRequestMessage req)
+    {
+        var q = req.RequestUri?.Query ?? "";
+        if (req.Method == HttpMethod.Get && (q.Contains("comp=list") || q.Contains("comp=blobs"))) Ops.List();
+        else if (req.Method == HttpMethod.Get || req.Method == HttpMethod.Head) Ops.Read();
+        else Ops.Write();
+    }
 
     private readonly HttpClient http;
     private readonly string origin;        // https://acct.blob.core.windows.net
@@ -92,6 +101,7 @@ public sealed class RestStore : IStore
             try
             {
                 var req = make();
+                Count(req);
                 var sent = req.Content?.Headers.ContentLength ?? 0;
                 var resp = await http.SendAsync(req, opt, ct);
                 Counters.Add(Traffic.StorageWrite, sent);
@@ -149,7 +159,8 @@ public sealed class RestStore : IStore
                 foreach (var m in b.Element("Metadata")?.Elements() ?? []) meta[m.Name.LocalName] = m.Value;
                 var props = b.Element("Properties");
                 long.TryParse(props?.Element("Content-Length")?.Value, out var size);
-                all.Add(new BlobEntry(b.Element("Name")!.Value, ParseTagSet(b.Element("Tags")), meta, props?.Element("LeaseState")?.Value, size));
+                DateTimeOffset? created = DateTimeOffset.TryParse(props?.Element("Creation-Time")?.Value ?? props?.Element("Last-Modified")?.Value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var ct0) ? ct0 : null;
+                all.Add(new BlobEntry(b.Element("Name")!.Value, ParseTagSet(b.Element("Tags")), meta, props?.Element("LeaseState")?.Value, size, created));
             }
             marker = doc.Root?.Element("NextMarker")?.Value;
             if (string.IsNullOrEmpty(marker)) marker = null;
@@ -231,6 +242,23 @@ public sealed class RestStore : IStore
         return true;
     }
 
+    /// <summary>Put Blob with If-Match (or If-None-Match: * for a null etag): false on 412/409/404.</summary>
+    public async Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name));
+            q.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            q.Headers.TryAddWithoutValidation(etag == null ? "If-None-Match" : "If-Match", etag ?? "*");
+            q.Content = new ByteArrayContent(data);
+            q.Content.Headers.TryAddWithoutValidation("Content-Type", "application/json");
+            return q;
+        }, ct);
+        if (r.StatusCode is HttpStatusCode.PreconditionFailed or HttpStatusCode.Conflict or HttpStatusCode.NotFound) return false;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Put Blob");
+        return true;
+    }
+
     public static string BlockId(int index) => Convert.ToBase64String(Encoding.ASCII.GetBytes($"blk{index:D8}"));
 
     public static string BlockListXml(IEnumerable<string> ids)
@@ -240,19 +268,100 @@ public sealed class RestStore : IStore
         return sb.Append("</BlockList>").ToString();
     }
 
+    /// <summary>Size, ETag and metadata. 0.13.0: this never hydrates a ghost (a metadata check must not make Nexis bring 1 GB back); only reading the contents does. A ghost's size is what is committed (0) and its ETag and metadata are the blob's own.</summary>
     public async Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
     {
-        for (int pass = 0; ; pass++)
+        using var r = await SendAsync(() => Req(HttpMethod.Head, ReadUri(name)), ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return null;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Properties");
+        long size = r.Content.Headers.ContentLength ?? 0;
+        var meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var h in r.Headers) if (h.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase)) meta[h.Key[10..]] = h.Value.FirstOrDefault() ?? "";
+        return new BlobProps(size, r.Headers.ETag?.Tag, meta);
+    }
+
+    // ---------------------------------------------------------------- append blobs (the queue log)
+
+    private static bool Sealed(HttpResponseMessage r) => r.Headers.TryGetValues("x-ms-blob-sealed", out var v) && v.FirstOrDefault() == "true";
+    private static int Blocks(HttpResponseMessage r) => r.Headers.TryGetValues("x-ms-blob-committed-block-count", out var v) && int.TryParse(v.FirstOrDefault(), out var n) ? n : 0;
+    private static string? ErrorCode(HttpResponseMessage r) => r.Headers.TryGetValues("x-ms-error-code", out var c) ? c.FirstOrDefault() : null;
+
+    public async Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
         {
-            using var r = await SendAsync(() => Req(HttpMethod.Head, ReadUri(name)), ct);
-            if (r.StatusCode == HttpStatusCode.NotFound) return null;
-            if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Properties");
-            long size = r.Content.Headers.ContentLength ?? 0;
-            if (size == 0 && pass == 0 && !ReadSnapshots.ContainsKey(name) && await HydrateGhostAsync(name, ct)) continue;   // a ghost: hydrated, asked again
-            var meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var h in r.Headers) if (h.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase)) meta[h.Key[10..]] = h.Value.FirstOrDefault() ?? "";
-            return new BlobProps(size, r.Headers.ETag?.Tag, meta);
+            var q = Req(HttpMethod.Put, BlobUri(name));
+            q.Headers.TryAddWithoutValidation("x-ms-blob-type", "AppendBlob");
+            if (onlyIfNew) q.Headers.TryAddWithoutValidation("If-None-Match", "*");
+            q.Content = new ByteArrayContent([]);
+            q.Content.Headers.TryAddWithoutValidation("Content-Type", "application/x-ndjson");
+            return q;
+        }, ct);
+        if (onlyIfNew && r.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.PreconditionFailed) return false;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Create Append Blob");
+        return true;
+    }
+
+    public async Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name, "comp=appendblock"));
+            q.Headers.TryAddWithoutValidation("x-ms-blob-condition-appendpos", appendPos.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            q.Content = new ByteArrayContent(data);
+            return q;
+        }, ct);
+        if (r.StatusCode == HttpStatusCode.PreconditionFailed) return new(AppendOutcome.PositionMismatch);
+        if (r.StatusCode == HttpStatusCode.NotFound) return new(AppendOutcome.NotFound);
+        if (r.StatusCode == HttpStatusCode.Conflict && (ErrorCode(r) ?? "").Contains("Sealed", StringComparison.OrdinalIgnoreCase)) return new(AppendOutcome.Sealed);
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Append Block");
+        return new(AppendOutcome.Ok, appendPos + data.Length, Blocks(r));
+    }
+
+    /// <summary>One ranged read from the last byte already known (offset - 1: always satisfiable, and it is the newline that ends the previous line), so an idle poll is one request that also says whether the segment is sealed. Offset 0 of an empty blob is a 416: its length comes from a HEAD.</summary>
+    public async Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct)
+    {
+        long from = Math.Max(0, offset - 1);
+        using var r = await SendAsync(() => { var q = Req(HttpMethod.Get, BlobUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(from, from + maxLen); return q; }, ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return new([], 0, false, 0, true);
+        if (r.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            var info = await GetAppendInfoAsync(name, ct);
+            return info == null ? new([], 0, false, 0, true) : new([], info.Length, info.Sealed, info.Blocks);
         }
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (append read)");
+        var body = await r.Content.ReadAsByteArrayAsync(ct);
+        long total = r.Content.Headers.ContentRange?.Length ?? (from + body.Length);
+        if (offset > 0)
+        {
+            if (body.Length == 0 || body[0] != (byte)'\n') throw new InvalidDataException($"{name}: the byte before offset {offset} is not a newline: the log was changed under us");
+            body = body[1..];
+        }
+        return new(body, total, Sealed(r), Blocks(r));
+    }
+
+    public async Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name, "comp=seal"));
+            q.Headers.TryAddWithoutValidation("x-ms-blob-condition-appendpos", appendPos.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            q.Content = new ByteArrayContent([]);
+            return q;
+        }, ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return null;
+        if (r.StatusCode == HttpStatusCode.PreconditionFailed) return false;
+        if (r.StatusCode == HttpStatusCode.Conflict && (ErrorCode(r) ?? "").Contains("Sealed", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Seal Append Blob");
+        return true;
+    }
+
+    public async Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct)
+    {
+        using var r = await SendAsync(() => Req(HttpMethod.Head, BlobUri(name)), ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return null;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Properties");
+        return new(r.Content.Headers.ContentLength ?? 0, Sealed(r), Blocks(r));
     }
 
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)

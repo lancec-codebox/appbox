@@ -59,7 +59,7 @@ public class EndingBackfillTests
     [Fact]
     public void The_prompt_is_describe_7_and_asks_for_the_ending()
     {
-        Assert.Equal("describe-7", Describe.PromptVersion);
+        Assert.Equal("describe-8", Describe.PromptVersion);
         var d = new DescribeInput { JobId = "j", Title = "t", Duration = 100, Clusters = [] };
         var main = Describe.BuildMain(d, "m").Prompt;
         Assert.Contains("- ending:", main); Assert.Contains("\"ending\":{\"kind\":\"complete\",\"signs\":[],\"nextPart\":null,\"nextPartHint\":null}", main);
@@ -97,7 +97,7 @@ public class EndingBackfillTests
     {
         var d = JsonNode.Parse("""{"cutoffSeconds":10,"title":{"en":"t"},"fullTitle":{"en":"t"},"teaser":{"en":"t"},"synopsis":{"en":"s"},"tags":[],"cast":[],"relations":[],"aiGenerated":{"level":"no","signs":[]},"ending":{"kind":"cliffhanger","signs":["to be continued"],"nextPart":true,"nextPartHint":"EP 5"}}""")!.AsObject();
         var o = Publish.BuildDrama(d, null, null, null, null, "j", "transcript", false, new Dictionary<int, List<(string, double, bool)>>(), "t");
-        Assert.Equal("cliffhanger", (string)o["ending"]!["kind"]!); Assert.True((bool)o["ending"]!["nextPart"]!); Assert.Equal("EP 5", (string)o["ending"]!["nextPartHint"]!); Assert.Equal("no", (string)o["aiGenerated"]!);
+        Assert.Equal("cliffhanger", (string)o["ending"]!["kind"]!); Assert.True((bool)o["ending"]!["nextPart"]!); Assert.Equal("EP 5", (string)o["ending"]!["nextPartHint"]!); Assert.Null(o["aiGenerated"]); Assert.Null(o["ai"]);
         var noEnding = JsonNode.Parse(d.ToJsonString())!.AsObject(); noEnding.Remove("ending");
         Assert.Null(Publish.BuildDrama(noEnding, null, null, null, null, "j", "transcript", false, new Dictionary<int, List<(string, double, bool)>>(), "t")["ending"]);
 

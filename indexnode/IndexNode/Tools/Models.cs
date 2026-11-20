@@ -70,10 +70,22 @@ public static class Models
     {
         var path = PathOf(m, dir);
         if (File.Exists(path)) return path;
-        Log.Info($"models: downloading {m.File} ({m.Size / 1_000_000} MB)");
-        await Fetch.VerifiedAsync(http, m.Url, path, m.Sha256, ct);
-        return path;
+        // 0.12.0: one download per model file. With --lanes 2 on a fresh machine both lanes asked at once and collided on the .part file; the second now waits and finds the finished file.
+        var gate = Locks.GetOrAdd(Path.GetFullPath(path), _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            if (File.Exists(path)) return path;
+            Log.Info($"models: downloading {m.File} ({m.Size / 1_000_000} MB)");
+            await Fetch.VerifiedAsync(http, m.Url, path, m.Sha256, ct);
+            return path;
+        }
+        finally { gate.Release(); }
     }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> Locks = new(StringComparer.Ordinal);
+    /// <summary>The lock of a model file path (also used for the configured modelUrl download).</summary>
+    public static SemaphoreSlim LockOf(string path) => Locks.GetOrAdd(Path.GetFullPath(path), _ => new SemaphoreSlim(1, 1));
 
     /// <summary>InsightFace's small pack (det_500m + w600k_mbf), published only inside buffalo_s.zip: downloaded once from InsightFace's own release, checked, and the two models extracted (the zip is then deleted).</summary>
     public static readonly ModelFile BuffaloSZip = new("face-buffalo-s", "buffalo_s.zip", "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip", "d85a87f503f691807cd8bb97128bdf7a0660326cd9cd02657127fa978bab8b5e", 127_607_557, "NON-COMMERCIAL (InsightFace buffalo_s)");

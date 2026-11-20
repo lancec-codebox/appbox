@@ -3,36 +3,16 @@ using System.Text.Json.Nodes;
 
 namespace IndexNode.Tests;
 
-public class CommentsTests
+[Collection("path-env")]
+public class CommentsTests : IDisposable
 {
+    public void Dispose() => CommentsTests.RestorePath();
     private static readonly Paths P = new("index-test/");
     private static readonly DateTimeOffset D = DateTimeOffset.Parse("2026-11-13T19:00:00Z");
 
     // ------------------------------------------------------------ schedule
 
-    [Fact]
-    public void Only_an_unconfirmed_lead_name_asks_for_one_follow_up_a_week_after_the_download()
-    {
-        var p = CommentsFollowUp.Plan(D, 0, true)!.Value;
-        Assert.Equal((1, "lead-names", D.AddDays(7)), (p.Round, p.Reason, p.Due));
-        Assert.Null(CommentsFollowUp.Plan(D, 0, false));   // leads confirmed (supporting-cast names never count): done after round 0
-        Assert.Null(CommentsFollowUp.Plan(D, 1, true));    // the follow-up round is the last, whatever the vote says
-    }
 
-    [Fact]
-    public async Task The_follow_up_rewrites_the_job_once_as_round_1_with_a_reason_and_keeps_its_added_time()
-    {
-        var s = new FakeStore();
-        var added = Ago(90);
-        await s.AddJob(P, "comments", "vid", added);
-        var name = P.Job("comments", "vid");
-        Assert.False(await CommentsFollowUp.RequestAsync(s, P, "vid", D, false, default));
-        Assert.True(await CommentsFollowUp.RequestAsync(s, P, "vid", D, true, default));
-        var job = s.Job(name);
-        Assert.Equal(1, job.Round); Assert.Equal("lead-names", job.Reason);
-        Assert.Equal("pending", s.State(name)); Assert.Equal(Protocol.Utc(D.AddDays(7)), s[name].Tags[Tags.Due]); Assert.Equal(added, s[name].Tags[Tags.Added]);
-        Assert.False(await CommentsFollowUp.RequestAsync(s, P, "vid", D, true, default));   // no second follow-up
-    }
 
     // ------------------------------------------------------------ snapshot
 
@@ -97,68 +77,11 @@ public class CommentsTests
     private static string Ago(int minutes) => Protocol.Utc(DateTimeOffset.UtcNow.AddMinutes(-minutes));
     private static string Ahead(int minutes) => Protocol.Utc(DateTimeOffset.UtcNow.AddMinutes(minutes));
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)] // the SAS lacks permission f: listing with tags must respect idx_due too
-    public async Task Work_is_found_only_when_idx_due_has_arrived(bool forbidFind)
-    {
-        var s = new FakeStore { ForbidFind = forbidFind };
-        await s.AddJob(P, "comments", "later", Ago(60), due: Ahead(60));
-        await s.AddJob(P, "comments", "ready", Ago(30), due: Ago(5));
-        var ran = new List<string>();
-        await Engine(s, "comments", ctx => { ran.Add(ctx.Job.JobId); return Task.CompletedTask; }).RunAsync(default);
-        Assert.Equal(["ready"], ran);
-        Assert.Equal("pending", s.State(P.Job("comments", "later")));
-        Assert.Equal("done", s.State(P.Job("comments", "ready")));
-    }
-
     [Fact]
     public void Pending_query_includes_the_due_condition()
     {
         Assert.Equal("\"idx_stage\"='comments' AND \"idx_state\"='pending' AND \"idx_due\" <= '2026-11-13T20:00:00Z'", Tags.PendingWhere("comments", "2026-11-13T20:00:00Z"));
         Assert.DoesNotContain("idx_due", Tags.PendingWhere("comments"));
-    }
-
-    [Fact]
-    public async Task A_finished_comments_round_goes_back_to_pending_with_the_next_due_and_keeps_its_added_time()
-    {
-        var s = new FakeStore();
-        var added = Ago(90);
-        await s.AddJob(P, "comments", "vid", added);
-        var next = Ahead(24 * 60);
-        await Engine(s, "comments", ctx => { ctx.Job.Round = 1; ctx.NextDue = next; return Task.CompletedTask; }).RunAsync(default);
-        var name = P.Job("comments", "vid");
-        Assert.Equal("pending", s.State(name));
-        Assert.Equal(next, s[name].Tags[Tags.Due]);
-        Assert.Equal(added, s[name].Tags[Tags.Added]);
-        Assert.Equal("comments", s[name].Tags[Tags.Stage]);
-        Assert.Equal(1, s.Job(name).Round);
-        Assert.Null(s.LeaseOf(name));
-        // not due yet: another run finds nothing
-        var ran = 0;
-        await Engine(s, "comments", _ => { ran++; return Task.CompletedTask; }).RunAsync(default);
-        Assert.Equal(0, ran);
-    }
-
-    [Fact]
-    public async Task Without_a_next_due_the_comments_job_ends_as_done()
-    {
-        var s = new FakeStore();
-        await s.AddJob(P, "comments", "vid", Ago(10));
-        await Engine(s, "comments", _ => Task.CompletedTask).RunAsync(default);
-        Assert.Equal("done", s.State(P.Job("comments", "vid")));
-    }
-
-    [Fact]
-    public async Task A_transient_failure_keeps_the_due_tag()
-    {
-        var s = new FakeStore();
-        var due = Ago(3);
-        await s.AddJob(P, "comments", "vid", Ago(30), due: due);
-        await Engine(s, "comments", _ => throw new IOException("net")).RunAsync(default);
-        var name = P.Job("comments", "vid");
-        Assert.Equal(due, s[name].Tags[Tags.Due]);
-        Assert.Equal(1, s.Job(name).Attempts);
     }
 
     // ------------------------------------------------------------ unknown steps (transcribe)
@@ -179,25 +102,12 @@ public class CommentsTests
         Assert.Null(s.LeaseOf(name));
     }
 
-    [Fact]
-    public async Task Skipping_a_job_does_not_stop_the_node_taking_other_work()
-    {
-        var s = new FakeStore();
-        await s.AddJob(P, "process", "skipme", Ago(20));
-        await s.AddJob(P, "process", "other", Ago(10));
-        var ran = new List<string>();
-        var e = new NodeEngine(s, P, new EngineOptions { Workers = 1, NodeId = "n-1", Stages = ["process"], Jobs = new() { ["process"] = 1 }, Once = false, MaxJobs = 2,
-            PollInterval = TimeSpan.FromMilliseconds(30), ControlInterval = TimeSpan.FromMilliseconds(40), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromSeconds(30) },
-            new Dictionary<string, IStageHandler> { ["process"] = new FuncHandler(ctx => { ran.Add(ctx.Job.JobId); return ctx.Job.JobId == "skipme" ? throw new JobSkipped("unknown step") : Task.CompletedTask; }) });
-        await e.RunAsync(default).WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(["skipme", "other"], ran);
-        Assert.Equal("pending", s.State(P.Job("process", "skipme")));
-        Assert.Equal("done", s.State(P.Job("process", "other")));
-    }
-
     // ------------------------------------------------------------ the stages with a fake yt-dlp
 
-    private static string Setup(out NodeConfig cfg)
+    /// <summary>PATH before the first fake ffmpeg/yt-dlp dir was put in front of it; the classes that call <see cref="Setup"/> restore it when each test ends (tests that look for a real ffmpeg must not see the fake).</summary>
+    internal static string? OriginalPath;
+    internal static void RestorePath() { if (OriginalPath != null) Environment.SetEnvironmentVariable("PATH", OriginalPath); }
+    internal static string Setup(out NodeConfig cfg)
     {
         var dir = Path.Combine(Path.GetTempPath(), "idx-fake-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(dir);
@@ -232,88 +142,21 @@ public class CommentsTests
             esac
             """.Replace("\r", ""));
         foreach (var n in new[] { "ffmpeg", "ffprobe" }) { File.WriteAllText(Path.Combine(dir, n), "#!/bin/bash\nexit 0\n"); File.SetUnixFileMode(Path.Combine(dir, n), (UnixFileMode)0b111_101_101); }
-        Environment.SetEnvironmentVariable("PATH", dir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"));
+        OriginalPath ??= Environment.GetEnvironmentVariable("PATH");
+        Environment.SetEnvironmentVariable("PATH", dir + Path.PathSeparator + OriginalPath);
         cfg = new NodeConfig { Ytdlp = new YtDlpConfig { Command = ["bash", Path.Combine(dir, "yt-dlp.sh")] } };
         return dir;
     }
 
-    private static JobContext Ctx(FakeStore s, JobDescriptor job, string stage) => new()
+    internal static JobContext Ctx(IStore s, JobDescriptor job, string stage) => new()
     {
         Job = job, Stage = stage, BlobName = P.Job(stage, job.JobId), LeaseId = "L", Worker = 1, Store = s, Paths = P, NodeId = "n-1", Token = default,
         ThreadShare = () => 1, Report = (_, _) => { },
     };
 
-    private static readonly DownloadGate NoWait = new((_, _) => Task.CompletedTask);
+    internal static readonly DownloadGate NoWait = new((_, _) => Task.CompletedTask);
 
-    [Fact]
-    public async Task Download_writes_description_subtitles_marker_and_creates_the_follow_up_jobs()
-    {
-        if (OperatingSystem.IsWindows()) return;
-        var dir = Setup(out var cfg);
-        var s = new FakeStore();
-        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=abcdefghij1", 480, null);
-        job.Network = new JobNetwork { Ipv4 = "203.0.113.7", Ipv6Prefix = "2001:db8:1:2::/64" };
-        await new DownloadStage(new Tools(new HttpClient(), cfg), s, NoWait).RunAsync(Ctx(s, job, "download"));
 
-        var id = "abcdefghij1";
-        foreach (var f in new[] { "video.mp4", "info.json", "description.txt", "thumb.jpg", "downloaded.json", "subs/en.vtt", "subs/zh-Hans.vtt", "subs/zh-orig.auto.vtt" })
-            Assert.True(s.Exists(P.Video(id, f)), f);
-        Assert.Equal("line one\nline two", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "description.txt")].Data));
-        Assert.DoesNotContain("comments", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "info.json")].Data)); // comments live in their own snapshots
-        Assert.Contains("subs en", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "subs/en.vtt")].Data));
-        Assert.Contains("auto zh-orig", System.Text.Encoding.UTF8.GetString(s[P.Video(id, "subs/zh-orig.auto.vtt")].Data));
-        Assert.False(s.Exists(P.Video(id, "subs/en.auto.vtt"))); // a translation track is never requested
-
-        var marker = JsonDocument.Parse(s[P.Video(id, "downloaded.json")].Data).RootElement;
-        Assert.Equal(new[] { "en", "zh-Hans", "zh-orig.auto" }.OrderBy(x => x), marker.GetProperty("subs").EnumerateArray().Select(x => x.GetString()!).OrderBy(x => x));
-        Assert.Equal(480, marker.GetProperty("height").GetInt32());
-        Assert.Equal("203.0.113.7", marker.GetProperty("network").GetProperty("ipv4").GetString());
-        Assert.Equal("2001:db8:1:2::/64", marker.GetProperty("network").GetProperty("ipv6Prefix").GetString());
-        Assert.False(marker.GetProperty("network").TryGetProperty("vpn", out _)); // IndexNode leaves transport and vpn out
-        Assert.Equal(12.5, marker.GetProperty("durationSeconds").GetDouble());
-        Assert.Equal(("av01.0.04M.08", "opus", "398+251-0", "zh-Hans", "Chinese, original (default)"),
-            (marker.GetProperty("vcodec").GetString(), marker.GetProperty("acodec").GetString(), marker.GetProperty("formatId").GetString(), marker.GetProperty("audioLanguage").GetString(), marker.GetProperty("audioNote").GetString()));
-        Assert.Equal(["zh-Hans", "en-US"], marker.GetProperty("audioTracks").EnumerateArray().Select(t => t.GetProperty("language").GetString()!));
-        Assert.True(marker.GetProperty("embeddable").GetBoolean());
-        foreach (var step in new[] { "dino", "clip" }) Assert.False(s.Exists(P.Job(step, id)), step); // opt-in steps get no job on ingest
-        foreach (var step in Protocol.IngestStepStages) { Assert.Equal("pending", s.State(P.Job(step, id))); Assert.Equal([step], s.Job(P.Job(step, id)).Steps); }
-        Assert.Equal(Protocol.NeedsOf("describe"), s.Job(P.Job("describe", id)).Needs);
-        Assert.False(s.Exists(P.Job("process", id))); // step jobs replace the all-in-one process job
-
-        var cn = P.Job("comments", id);
-        Assert.Equal("pending", s.State(cn));
-        Assert.Equal(s[cn].Tags[Tags.Added], s[cn].Tags[Tags.Due]); // due at once
-        Assert.Equal(0, s.Job(cn).Round);
-        Assert.True(s.Exists(P.Job("sscd", id)));
-
-        // two subtitle passes with the language list; no cookies anywhere
-        var calls = File.ReadAllLines(Path.Combine(dir, "calls.log"));
-        Assert.Contains(calls, c => c.Contains("--write-subs") && !c.Contains("--write-auto-subs") && c.Contains("--sub-langs zh-Hans,en "));
-        Assert.Contains(calls, c => c.Contains("--write-auto-subs") && !c.Contains("--write-subs") && c.Contains("--sub-langs zh-orig "));
-        Assert.DoesNotContain(calls, c => c.Contains("en.*") || c.Contains("en-ar") || c.Contains("en-ja"));
-        Assert.DoesNotContain(calls, c => c.Contains("cookies"));
-    }
-
-    [Fact]
-    public async Task Missing_subtitles_are_not_an_error_and_a_repeat_run_keeps_the_existing_jobs()
-    {
-        if (OperatingSystem.IsWindows()) return;
-        var dir = Setup(out var cfg);
-        var s = new FakeStore();
-        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=nosubsvid01", 480, null);
-        var stage = new DownloadStage(new Tools(new HttpClient(), cfg), s, NoWait);
-        await stage.RunAsync(Ctx(s, job, "download"));
-        var id = "nosubsvid01";
-        Assert.True(s.Exists(P.Video(id, "downloaded.json")));
-        Assert.Empty(JsonDocument.Parse(s[P.Video(id, "downloaded.json")].Data).RootElement.GetProperty("subs").EnumerateArray());
-        Assert.DoesNotContain(s.Blobs.Keys, k => k.Contains("/subs/"));
-
-        var callsBefore = File.ReadAllLines(Path.Combine(dir, "calls.log")).Length;
-        await stage.RunAsync(Ctx(s, job, "download")); // marker exists: nothing downloaded again
-        Assert.Equal(callsBefore, File.ReadAllLines(Path.Combine(dir, "calls.log")).Length);
-        Assert.Equal("pending", s.State(P.Job("comments", id)));
-        Assert.Equal(0, s.Job(P.Job("comments", id)).Round);
-    }
 
     [Fact]
     public void Subtitle_files_are_named_lang_vtt_and_lang_auto_vtt()
@@ -327,31 +170,4 @@ public class CommentsTests
         Assert.Empty(DownloadStage.CollectSubs(Path.Combine(root, "none"), null));
     }
 
-    [Fact]
-    public async Task Comments_round_saves_a_dated_snapshot_and_is_then_done()
-    {
-        if (OperatingSystem.IsWindows()) return;
-        var dir = Setup(out var cfg);
-        var s = new FakeStore();
-        var id = "abcdefghij1";
-        var at = DateTimeOffset.UtcNow.AddHours(-1);
-        await s.PutAsync(P.Video(id, "downloaded.json"), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, at = Protocol.Utc(at) }), null, null, false, default);
-        var job = JobDescriptor.NewComments(id, "https://www.youtube.com/watch?v=" + id);
-        var ctx = Ctx(s, job, "comments");
-        await new CommentsStage(new Tools(new HttpClient(), cfg), s, NoWait).RunAsync(ctx);
-
-        var snaps = s.Blobs.Keys.Where(k => k.StartsWith(P.Video(id, "comments/"))).ToList();
-        var snapName = Assert.Single(snaps);
-        Assert.Matches(@"comments/\d{8}T\d{6}Z\.json$", snapName);
-        var snap = JsonDocument.Parse(s[snapName].Data).RootElement;
-        Assert.Equal(3, snap.GetProperty("count").GetInt32()); // c1, c2 (top) and c3 (new); c2 once
-        Assert.Equal(42, snap.GetProperty("commentCount").GetInt32());
-        Assert.Equal(0, job.Round);
-        Assert.Null(ctx.NextDue); // one round, then done: no refresh schedule
-
-        var calls = File.ReadAllLines(Path.Combine(dir, "calls.log"));
-        Assert.Contains(calls, c => c.Contains("comment_sort=top") && c.Contains("--write-comments") && c.Contains("--skip-download"));
-        Assert.Contains(calls, c => c.Contains("comment_sort=new"));
-        Assert.DoesNotContain(calls, c => c.Contains("cookies"));
-    }
 }

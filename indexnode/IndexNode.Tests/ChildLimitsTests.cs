@@ -89,10 +89,6 @@ public class ChildLimitsTests
         var name = P.Job("download", "vid"); var j = s.Job(name);
         Assert.Equal("pending", s.State(name)); Assert.Equal(1, j.Attempts); Assert.NotEqual(true, j.Permanent); Assert.Contains("timed out after 2 s", j.LastError);   // transient: retried with the usual back-off
         await AssertDead(pid);
-        // after the usual attempt limit it stays failed with the reason
-        j.Attempts = Protocol.MaxAttempts - 1; await s.PutAsync(name, j.ToBytes(), new Dictionary<string, string> { [Tags.Stage] = "download", [Tags.State] = "pending", [Tags.Added] = "2026-11-13T19:00:00Z" }, null, false, default);
-        await Engine(s, Opts(), _ => throw new ChildTimeoutException("yt-dlp timed out after 5 min")).RunAsync(default).WaitAsync(TimeSpan.FromSeconds(60));
-        Assert.Equal("failed", s.State(name)); Assert.Contains("timed out after 5 min", s.Job(name).LastError);
     }
 
     [Fact]
@@ -105,7 +101,7 @@ public class ChildLimitsTests
             var (f, a, pidFile) = Child();
             var run = Proc.RunAsync(f, a, ctx.Token);
             pid = await GrandchildPid(pidFile);
-            s.Blobs[name].Lease = "someone-else";   // another node took the job: the next renewal says LeaseLost
+            s.Blobs[P.Active("vid")].Lease = "someone-else";   // another node took the job: the next renewal says LeaseLost
             try { await run; } catch (OperationCanceledException) { cancelled = true; throw; }
         });
         var sw = Stopwatch.StartNew();
@@ -131,6 +127,12 @@ public class ChildLimitsTests
         public Task SetMetadataAsync(string n, IReadOnlyDictionary<string, string> m, string? l, CancellationToken ct) => inner.SetMetadataAsync(n, m, l, ct);
         public Task SetTagsAsync(string n, IReadOnlyDictionary<string, string> t, string? l, CancellationToken ct) => inner.SetTagsAsync(n, t, l, ct);
         public Task DeleteAsync(string n, CancellationToken ct) => inner.DeleteAsync(n, ct);
+        public Task<bool> CreateAppendBlobAsync(string n, bool o, CancellationToken ct) => inner.CreateAppendBlobAsync(n, o, ct);
+        public Task<AppendResult> AppendBlockAsync(string n, byte[] d, long p, CancellationToken ct) => inner.AppendBlockAsync(n, d, p, ct);
+        public Task<AppendRead> ReadAppendAsync(string n, long o, int m, CancellationToken ct) => inner.ReadAppendAsync(n, o, m, ct);
+        public Task<bool?> SealAppendBlobAsync(string n, long p, CancellationToken ct) => inner.SealAppendBlobAsync(n, p, ct);
+        public Task<bool> PutIfMatchAsync(string n, byte[] d, string? e, CancellationToken ct) => inner.PutIfMatchAsync(n, d, e, ct);
+        public Task<AppendInfo?> GetAppendInfoAsync(string n, CancellationToken ct) => inner.GetAppendInfoAsync(n, ct);
     }
 
     [Theory]

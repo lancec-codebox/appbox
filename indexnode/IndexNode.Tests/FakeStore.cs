@@ -11,8 +11,22 @@ public sealed class FakeStore : IStore
         public Dictionary<string, string> Tags = new();
         public Dictionary<string, string> Meta = new();
         public string? Lease;
+        public DateTimeOffset LeaseUntil;
         public int Version;
+        public bool Append, Sealed;
+        public int Blocks;
+        public DateTimeOffset Created = DateTimeOffset.UtcNow;
     }
+
+    /// <summary>The store's clock. When set, a lease lapses once it passes (acquire time + seconds); null: leases never lapse (the old behaviour).</summary>
+    public Func<DateTimeOffset>? Clock;
+    private DateTimeOffset Now => Clock?.Invoke() ?? DateTimeOffset.UtcNow;
+    private void Lapse(Blob b) { if (Clock != null && b.Lease != null && b.LeaseUntil <= Now) b.Lease = null; }
+    /// <summary>Counts of every call by kind, for the op-count tests.</summary>
+    public readonly Dictionary<string, int> Ops = new();
+    private void Op(string k) { Ops[k] = Ops.GetValueOrDefault(k) + 1; }
+    /// <summary>Test hook: runs right before the next Append Block is checked (a racing writer gets in first).</summary>
+    public Action<string>? BeforeAppend;
 
     public readonly Dictionary<string, Blob> Blobs = new();
     public readonly Dictionary<string, int> Renews = new();
@@ -30,18 +44,64 @@ public sealed class FakeStore : IStore
     public Blob this[string name] { get { lock (gate) return Blobs[name]; } }
     public List<string> Names(string prefix) { lock (gate) return Blobs.Keys.Where(k => k.StartsWith(prefix)).ToList(); }
     public bool Exists(string name) { lock (gate) return Blobs.ContainsKey(name); }
-    public string? LeaseOf(string name) { lock (gate) return Blobs[name].Lease; }
+    public string? LeaseOf(string name)
+    {
+        lock (gate)
+        {
+            if (Blobs.TryGetValue(name, out var b)) return b.Lease;
+            if (ParseJobName(name) is { } n && Blobs.TryGetValue(n.Prefix + "jobs/active/" + n.Id + ".json", out var a)) return a.Lease;
+            return null;
+        }
+    }
     public int RenewCount(string name) { lock (gate) return Renews.GetValueOrDefault(name); }
     public int PutCount(string name) { lock (gate) return Puts.GetValueOrDefault(name); }
-    public JobDescriptor Job(string name) { lock (gate) return JobDescriptor.Parse(Blobs[name].Data); }
-    public string State(string name) { lock (gate) return Blobs[name].Tags[Tags.State]; }
+    // ---- 0.13.0 queue shims: a job "blob name" (jobs/<stage>/<id>.json) that no longer exists as a blob is looked up in the queue log, so the old assertions keep working on the new state
+    private static (string Prefix, string Stage, string Id)? ParseJobName(string name)
+    {
+        var i = name.IndexOf("jobs/", StringComparison.Ordinal); if (i < 0) return null;
+        var rest = name[(i + 5)..]; var slash = rest.IndexOf('/'); if (slash < 0) return null;
+        return (name[..i], rest[..slash], Path.GetFileNameWithoutExtension(rest[(slash + 1)..]));
+    }
+    /// <summary>The queue as the log says it is now (every segment replayed).</summary>
+    public QueueState Replay(string prefix)
+    {
+        var st = new QueueState();
+        lock (gate)
+            for (int n = 1; Blobs.TryGetValue(n == 1 ? prefix + "jobs/queue.log" : $"{prefix}jobs/queue.{n}.log", out var b); n++)
+                foreach (var l in System.Text.Encoding.UTF8.GetString(b.Data).Split('\n', StringSplitOptions.RemoveEmptyEntries)) if (QLine.Parse(l) is { } q) st.Apply(q);
+        return st;
+    }
+    public QEntry? QEntry(Paths p, string subject, string stage) => Replay(p.Prefix).Entry(subject, stage);
+    public JobDescriptor Job(string name)
+    {
+        lock (gate) { if (Blobs.TryGetValue(name, out var b)) return JobDescriptor.Parse(b.Data); }
+        if (ParseJobName(name) is { } n && Replay(n.Prefix).Entry(n.Id, n.Stage) is { } e) { var j = e.Job ?? new JobDescriptor { JobId = n.Id, Stage = n.Stage }; j.Attempts = e.Attempts; j.LastError = e.LastError; j.Permanent = e.Permanent; j.FinishedAt ??= e.FinishedAt; j.NodeId ??= e.Node; return j; }
+        throw new KeyNotFoundException(name);
+    }
+    public string State(string name)
+    {
+        lock (gate) { if (Blobs.TryGetValue(name, out var b)) return b.Tags[Tags.State]; }
+        if (ParseJobName(name) is { } n && Replay(n.Prefix).Entry(n.Id, n.Stage) is { } e) return e.State;
+        throw new KeyNotFoundException(name);
+    }
+    /// <summary>A queue entry exists for this old-style job name.</summary>
+    public bool InQueue(string name) => ParseJobName(name) is { } n && Replay(n.Prefix).Entry(n.Id, n.Stage) != null;
 
-    public async Task AddJob(Paths p, string stage, string id, string added, string? due = null)
+    /// <summary>Adds a pending entry to the queue log (0.13.0): what the old tests did with a job blob.</summary>
+    public async Task AddJob(Paths p, string stage, string id, string added, string? due = null, int priority = 0)
     {
         var url = "https://www.youtube.com/watch?v=" + id.PadRight(11, 'x');
-        var job = stage == "download" ? JobDescriptor.NewDownload(url, 480, null) : stage == "comments" ? JobDescriptor.NewComments(id, url) : JobDescriptor.NewProcess(id);
-        job.JobId = id; job.AddedAt = added;
-        await PutAsync(p.Job(stage, id), job.ToBytes(), Tags.Job(stage, "pending", added, due), null, true, default);
+        var job = stage == "download" ? JobDescriptor.NewDownload(url, 480, null) : JobDescriptor.NewProcess(id);
+        job.Stage = stage; job.JobId = id; job.AddedAt = added; job.Priority = priority;
+        var line = QLine.Add(id, stage, job, added, priority, due) .ToJson() + "\n";
+        await CreateAppendBlobAsync(p.QueueLog, true, default);
+        for (int i = 0; i < 20; i++)
+        {
+            var info = await GetAppendInfoAsync(p.QueueLog, default);
+            var r = await AppendBlockAsync(p.QueueLog, System.Text.Encoding.UTF8.GetBytes(line), info!.Length, default);
+            if (r.Outcome == AppendOutcome.Ok) return;
+        }
+        throw new InvalidOperationException("AddJob: the log kept changing");
     }
 
     /// <summary>Azure's Find Blobs by Tags returns only the tags the where expression names (verified on the real store): the fake does the same, so no code can lean on tags it did not ask for.</summary>
@@ -52,7 +112,7 @@ public sealed class FakeStore : IStore
     }
 
     private static BlobEntry Entry(string name, Blob b) =>
-        new(name, new Dictionary<string, string>(b.Tags), new Dictionary<string, string>(b.Meta), b.Lease != null ? "leased" : "available", b.Data.Length);
+        new(name, new Dictionary<string, string>(b.Tags), new Dictionary<string, string>(b.Meta), b.Lease != null ? "leased" : "available", b.Data.Length, b.Created);
 
     public Task<IReadOnlyList<BlobEntry>> FindByTagsAsync(string where, CancellationToken ct)
     {
@@ -78,7 +138,8 @@ public sealed class FakeStore : IStore
     {
         lock (gate)
         {
-            Calls.Add("list");
+            Calls.Add("list"); Op("list");
+            foreach (var kv in Blobs) Lapse(kv.Value);
             IReadOnlyList<BlobEntry> r = Blobs.Where(b => b.Key.StartsWith(prefix)).OrderBy(b => b.Key, StringComparer.Ordinal).Select(b => Entry(b.Key, b.Value)).ToList();
             return Task.FromResult(r);
         }
@@ -86,7 +147,7 @@ public sealed class FakeStore : IStore
 
     public Task<BlobContent?> GetAsync(string name, CancellationToken ct)
     {
-        lock (gate) return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"") : null);
+        lock (gate) { Op("get"); return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"") : null); }
     }
 
     public Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct)
@@ -148,15 +209,32 @@ public sealed class FakeStore : IStore
     {
         lock (gate)
         {
-            Puts[name] = Puts.GetValueOrDefault(name) + 1;
+            Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
+            if (Blobs.TryGetValue(name, out var lb)) Lapse(lb);
             T("put", name, (tags != null && tags.TryGetValue(Tags.State, out var st) ? st : "-") + " lease=" + leaseId + " new=" + onlyIfNew);
             if (Blobs.TryGetValue(name, out var b))
             {
                 if (onlyIfNew) return Task.FromResult(false);
                 if (b.Lease != null && b.Lease != leaseId) throw new StorageException(412, "LeaseIdMismatchWithBlobOperation", "lease mismatch on put");
             }
-            else b = Blobs[name] = new Blob();
+            else b = Blobs[name] = new Blob { Created = Now };
             b.Data = data; b.Tags = tags == null ? new() : new(tags); b.Meta = new(); b.Version++;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            if (!Blobs.TryGetValue(name, out var b))
+            {
+                if (etag != null) return Task.FromResult(false);
+                Blobs[name] = new Blob { Created = Now, Data = data, Version = 1 }; Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
+                return Task.FromResult(true);
+            }
+            if (etag == null || "\"v" + b.Version + "\"" != etag) return Task.FromResult(false);
+            b.Data = data; b.Version++; Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
             return Task.FromResult(true);
         }
     }
@@ -174,9 +252,11 @@ public sealed class FakeStore : IStore
     {
         lock (gate)
         {
-            var b = Blobs[name];
+            Op("lease");
+            if (!Blobs.TryGetValue(name, out var b)) throw new StorageException(404, "BlobNotFound", "no such blob");
+            Lapse(b);
             if (b.Lease != null) { T("lease-denied", name); return Task.FromResult<string?>(null); }
-            b.Lease = Guid.NewGuid().ToString(); T("lease", name, b.Lease[..4]);
+            b.Lease = Guid.NewGuid().ToString(); b.LeaseUntil = Now.AddSeconds(seconds); LeaseSeconds[name] = seconds; T("lease", name, b.Lease[..4]);
             return Task.FromResult<string?>(b.Lease);
         }
     }
@@ -185,7 +265,10 @@ public sealed class FakeStore : IStore
     {
         lock (gate)
         {
+            Op("lease");
+            if (Blobs.TryGetValue(name, out var rb)) Lapse(rb);
             if (!Blobs.TryGetValue(name, out var b) || b.Lease != leaseId) throw new LeaseLostException("lost");
+            b.LeaseUntil = Now.AddSeconds(LeaseSeconds.GetValueOrDefault(name, 60));
             Renews[name] = Renews.GetValueOrDefault(name) + 1;
         }
         return Task.CompletedTask;
@@ -193,7 +276,7 @@ public sealed class FakeStore : IStore
 
     public Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct)
     {
-        lock (gate) { T("release", name, leaseId?[..4]); if (Blobs.TryGetValue(name, out var b) && b.Lease == leaseId) b.Lease = null; }
+        lock (gate) { Op("lease"); T("release", name, leaseId?[..4]); if (Blobs.TryGetValue(name, out var b) && b.Lease == leaseId) b.Lease = null; }
         return Task.CompletedTask;
     }
 
@@ -230,8 +313,73 @@ public sealed class FakeStore : IStore
     {
         lock (gate)
         {
-            if (Blobs.TryGetValue(name, out var b) && b.Lease != null && b.Lease != leaseId) throw new StorageException(412, "LeaseIdMissing", "blob is leased");
+            Op("delete");
+            if (Blobs.TryGetValue(name, out var b)) Lapse(b);
+            if (b != null && b.Lease != null && b.Lease != leaseId) throw new StorageException(412, "LeaseIdMissing", "blob is leased");
             T("delete", name); Blobs.Remove(name); return Task.CompletedTask;
         }
     }
+
+    // ---------------------------------------------------------------- append blobs (real semantics: appendpos condition, 412, Seal, block count)
+    public Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            Op("put");
+            if (Blobs.ContainsKey(name) && onlyIfNew) return Task.FromResult(false);
+            Blobs[name] = new Blob { Append = true, Created = Now };
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct)
+    {
+        Action<string>? hook; lock (gate) { hook = BeforeAppend; BeforeAppend = null; }
+        hook?.Invoke(name);
+        lock (gate)
+        {
+            Op("append");
+            if (!Blobs.TryGetValue(name, out var b) || !b.Append) return Task.FromResult(new AppendResult(AppendOutcome.NotFound));
+            if (b.Sealed) return Task.FromResult(new AppendResult(AppendOutcome.Sealed));
+            if (b.Data.Length != appendPos) return Task.FromResult(new AppendResult(AppendOutcome.PositionMismatch));
+            if (b.Blocks >= 50000) throw new StorageException(409, "BlockCountExceedsLimit", "append blob block limit");
+            b.Data = [.. b.Data, .. data]; b.Blocks++; b.Version++;
+            return Task.FromResult(new AppendResult(AppendOutcome.Ok, b.Data.Length, b.Blocks));
+        }
+    }
+
+    public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            Op("get");
+            if (!Blobs.TryGetValue(name, out var b) || !b.Append) return Task.FromResult(new AppendRead([], 0, false, 0, true));
+            var from = (int)Math.Min(offset, b.Data.Length);
+            return Task.FromResult(new AppendRead(b.Data.AsSpan(from, Math.Min(maxLen, b.Data.Length - from)).ToArray(), b.Data.Length, b.Sealed, b.Blocks));
+        }
+    }
+
+    public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            Op("put");
+            if (!Blobs.TryGetValue(name, out var b) || !b.Append) return Task.FromResult<bool?>(null);
+            if (b.Sealed) return Task.FromResult<bool?>(true);
+            if (b.Data.Length != appendPos) return Task.FromResult<bool?>(false);
+            b.Sealed = true; return Task.FromResult<bool?>(true);
+        }
+    }
+
+    public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            Op("get");
+            return Task.FromResult<AppendInfo?>(Blobs.TryGetValue(name, out var b) && b.Append ? new AppendInfo(b.Data.Length, b.Sealed, b.Blocks) : null);
+        }
+    }
+
+    /// <summary>The whole text of an append blob (for assertions).</summary>
+    public string AppendText(string name) { lock (gate) return System.Text.Encoding.UTF8.GetString(Blobs[name].Data); }
 }

@@ -18,20 +18,25 @@ public static class Transcribe
     private static extern void SherpaOnnxDestroyOfflineStreamResultJson(IntPtr json);
 
     /// <summary>The "lang" of the stream's result ("&lt;|zh|&gt;"), or "" when the native call is unavailable.</summary>
-    private static string NativeLang(OfflineStream st)
+    private static string NativeLang(OfflineStream st) => NativeTags(st).Lang;
+
+    /// <summary>The "lang" and "event" of the stream's result, bare and lower case ("zh", "speech"); "" when absent or the native call is unavailable.</summary>
+    internal static (string Lang, string Event) NativeTags(OfflineStream st)
     {
+        static string Bare(string? s) => (s ?? "").Trim().Trim('<', '>', '|').ToLowerInvariant();
         try
         {
             var ptr = SherpaOnnxGetOfflineStreamResultAsJson(st.Handle);
-            if (ptr == IntPtr.Zero) return "";
+            if (ptr == IntPtr.Zero) return ("", "");
             try
             {
                 using var doc = System.Text.Json.JsonDocument.Parse(System.Runtime.InteropServices.Marshal.PtrToStringUTF8(ptr) ?? "{}");
-                return doc.RootElement.TryGetProperty("lang", out var l) ? l.GetString() ?? "" : "";
+                var r = doc.RootElement;
+                return (r.TryGetProperty("lang", out var l) ? l.GetString() ?? "" : "", r.TryGetProperty("event", out var e) ? Bare(e.GetString()) : "");
             }
             finally { SherpaOnnxDestroyOfflineStreamResultJson(ptr); }
         }
-        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException) { return ""; }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException) { return ("", ""); }
     }
 
     public const string ModelName = Protocol.AsrModelName;
@@ -258,6 +263,43 @@ public static class Transcribe
         if (!SharedModel) foreach (var rr in recs) rr.Dispose(); // the shared one lives as long as the process
         Log.Info($"transcribe: {(SharedModel ? "one shared model, " : "")}voice detection {vadSecs:F1}s ({pieces} pieces), recognition {wall.Elapsed.TotalSeconds - vadSecs:F1}s ({segs.Count} segments, {speech:F0}s of speech; {workers} recognisers x {threadsPer} thread(s), batch {batch}), wall {wall.Elapsed.TotalSeconds:F1}s; model load {loadSecs:F1}s (alongside voice detection; {waitLoad:F1}s waited after it), decode time summed over recognisers {decodeSum / (double)Stopwatch.Frequency:F1}s");
         return res.Where(r => r != null).Select(r => r!).ToList();
+    }
+
+    public const double LanguageChunkSeconds = 15;
+
+    /// <summary>
+    /// Language ID for the download pre-check, no VAD: the audio is cut into ~15 s chunks, tried from the middle outwards, each one SenseVoice pass. Each chunk is reported with SenseVoice's own audio-event tag
+    /// and language token (language "und" for nospeech or empty text). Stops once <paramref name="langSeconds"/> of audio has been tagged Speech with a language (<= 0: no limit) or the window runs out.
+    /// The verdict (<see cref="PreCheck.LanguageVerdict"/>) counts only Speech chunks, so music cannot make a language call.
+    /// </summary>
+    public static List<LangChunk> LanguageId(string modelPath, string tokensPath, float[] audio, int threads, double langSeconds, CancellationToken ct)
+    {
+        int size = (int)(LanguageChunkSeconds * SampleRate); double total = audio.Length / (double)SampleRate, mid = total / 2;
+        var chunks = new List<(int Pos, int Len)>();
+        for (int p = 0; p < audio.Length; p += size) { int n = Math.Min(size, audio.Length - p); if (n >= 2 * SampleRate || chunks.Count == 0) chunks.Add((p, n)); }
+        var rec = SharedRecognizer(modelPath, tokensPath, threads); var res = new List<LangChunk>(); double got = 0;
+        foreach (var (pos, len) in chunks.OrderBy(c => Math.Abs((c.Pos + c.Len / 2.0) / SampleRate - mid)))
+        {
+            if (langSeconds > 0 && got >= langSeconds) break;
+            ct.ThrowIfCancellationRequested();
+            var st = rec.CreateStream(); st.AcceptWaveform(SampleRate, audio.AsSpan(pos, len).ToArray()); rec.Decode(st);
+            var text = st.Result.Text.Trim(); var (l, ev) = NativeTags(st); var lang = LangCode(l); st.Dispose();
+            if (text.Length == 0) lang = "und";
+            double secs = len / (double)SampleRate;
+            res.Add(new LangChunk(Math.Round(pos / (double)SampleRate, 3), secs, ev, lang));
+            if (ev == "speech" && lang != "und") got += secs;
+        }
+        return res.OrderBy(c => c.Start).ToList();
+    }
+
+    /// <summary>The pre-check's rule: the majority language by speech time (Cantonese counts as zh); dubbed = the majority is not zh/yue. (null, false) when nothing was recognised.</summary>
+    public static (string? Language, bool Dubbed, double SpeechSeconds) Majority(IEnumerable<AsrSegment> segments)
+    {
+        var secs = new Dictionary<string, double>();
+        foreach (var s in segments) { var l = s.Language; if (l == "und" || l.Length == 0) continue; if (l == "yue") l = "zh"; secs[l] = secs.GetValueOrDefault(l) + Math.Max(0, s.End - s.Start); }
+        if (secs.Count == 0) return (null, false, 0);
+        var maj = secs.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).First().Key;
+        return (maj, !IsChinese(maj), secs.Values.Sum());
     }
 
     /// <summary>Segments by Silero VAD, each recognised by SenseVoice; the character times are the segment start plus the token times.</summary>

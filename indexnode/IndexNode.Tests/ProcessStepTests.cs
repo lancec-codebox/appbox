@@ -325,30 +325,6 @@ public class StepAdvertisingTests
         Assert.False(ProcessStage.CanRun(job, all));
     }
 
-    [Fact]
-    public async Task The_engine_leaves_a_job_it_cannot_run_to_another_node_without_an_attempt_and_takes_the_next()
-    {
-        var s = new FakeStore(); var P = new Paths("index-test/");
-        await s.AddJob(P, "process", "needsocr", Protocol.Utc(DateTimeOffset.UtcNow.AddMinutes(-20)));
-        await s.AddJob(P, "process", "plain", Protocol.Utc(DateTimeOffset.UtcNow.AddMinutes(-10)));
-        var needs = s.Job(P.Job("process", "needsocr")); needs.Steps = ["frames", "ocrsubs"];
-        await s.PutAsync(P.Job("process", "needsocr"), needs.ToBytes(), Tags.Job("process", "pending", needs.AddedAt), null, false, default);
-        var plain = s.Job(P.Job("process", "plain")); plain.Steps = ["frames"];
-        await s.PutAsync(P.Job("process", "plain"), plain.ToBytes(), Tags.Job("process", "pending", plain.AddedAt), null, false, default);
-        var ran = new List<string>();
-        var e = new NodeEngine(s, P, new EngineOptions
-        {
-            NodeId = "n-1", Stages = ["process"], Jobs = new() { ["process"] = 1 }, MaxJobs = 1, Steps = ["frames", "sscd"], CanRun = j => ProcessStage.CanRun(j, ["frames", "sscd"]),
-            PollInterval = TimeSpan.FromMilliseconds(30), ControlInterval = TimeSpan.FromMilliseconds(40), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromSeconds(30),
-        }, new Dictionary<string, IStageHandler> { ["process"] = new Fh(ctx => { ran.Add(ctx.Job.JobId); return Task.CompletedTask; }) });
-        await e.RunAsync(default).WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(["plain"], ran);
-        Assert.Equal("pending", s.State(P.Job("process", "needsocr")));
-        Assert.Equal(0, s.Job(P.Job("process", "needsocr")).Attempts);
-        Assert.Null(s.LeaseOf(P.Job("process", "needsocr")));
-        var reg = System.Text.Json.JsonDocument.Parse(s[P.Node("n-1")].Data).RootElement;
-        Assert.Equal(["frames", "sscd"], reg.GetProperty("steps").EnumerateArray().Select(x => x.GetString()!));
-    }
 
     [Fact]
     public void Every_model_has_a_pinned_https_url_and_a_sha256()

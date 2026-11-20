@@ -22,6 +22,7 @@ public class ArgsDashIdTests
     public async Task Classify_set_takes_a_dash_id_both_ways()
     {
         var s = new FakeStore(); var P = new Paths("index-test/");
-        Assert.Contains("--QfpuGhs0U", await ClassifyCommand.SetAsync(s, P, "--QfpuGhs0U", "drama", null, DateTimeOffset.UtcNow, default));
+        var q = new JobQueue(s, P, "t"); await q.LoadAsync(default);
+        Assert.Contains("--QfpuGhs0U", await ClassifyCommand.SetAsync(s, q, P, "--QfpuGhs0U", "drama", null, DateTimeOffset.UtcNow, default));
     }
 }

@@ -16,7 +16,7 @@ public static partial class Protocol
     /// <summary>The step jobs an upload gets by default (download, enqueue, sources): every step stage except the opt-in ones (dino: owner 2026-11-16, not part of ingest; clip: dropped 2026-11-14), which run only when asked for (process --job --steps).</summary>
     public static readonly string[] IngestStepStages = StepStages.Where(s => s is not ("dino" or "clip")).ToArray();
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
-    public static readonly string[] Stages = ["download", "process", .. StepStages, "comments", "refresh", "classify", "availability"];
+    public static readonly string[] Stages = ["download", "process", .. StepStages, "refresh", "classify", "availability"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "centers", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
@@ -87,11 +87,23 @@ public static partial class Protocol
 public sealed class Paths(string prefix)
 {
     public string Prefix { get; } = prefix.Length == 0 || prefix.EndsWith('/') ? prefix : prefix + "/";
+    /// <summary>0.13.0 queue: the first log segment, the later numbered segments, the snapshot and the per-subject reservations (all under jobs/, never ghosted).</summary>
+    public string QueueLog => $"{Prefix}jobs/queue.log";
+    public string QueueSegment(int n) => n <= 1 ? QueueLog : $"{Prefix}jobs/queue.{n}.log";
+    /// <summary>The snapshot as 0.13.0 first wrote it (plain JSON, 25 MB on the real store); still read when the .gz does not exist yet.</summary>
+    public string QueueSnapshot => $"{Prefix}jobs/queue.snapshot.json";
+    public string QueueSnapshotGz => $"{Prefix}jobs/queue.snapshot.json.gz";
+    public string ActiveDir => $"{Prefix}jobs/active/";
+    public string Active(string subject) => $"{Prefix}jobs/active/{subject}.json";
+    /// <summary>The ids a source has already listed (kept out of the log lines: up to 500 ids).</summary>
+    public string SourceSeen(string sourceId) => $"{Prefix}sources/{sourceId}/seen.json";
     public string Job(string stage, string id) => $"{Prefix}jobs/{stage}/{id}.json";
     public string JobsDir(string stage) => $"{Prefix}jobs/{stage}/";
     public string Video(string id, string file) => $"{Prefix}videos/{id}/{file}";
     public string VideoDir(string id) => $"{Prefix}videos/{id}/";
-    public string Control => $"{Prefix}control.json";
+    /// <summary>0.13.0: the control file lives with the queue (jobs/control.json). The old index/control.json stays mode=stop for ever (so old binaries never resume on the old store) and is never read.</summary>
+    public string Control => $"{Prefix}jobs/control.json";
+    public string LegacyControl => $"{Prefix}control.json";
     /// <summary>index/sources/&lt;id&gt;/members.json: every video the last lookup or refresh listed in the source (for the catalog).</summary>
     public string SourceMembers(string sourceId) => $"{Prefix}sources/{sourceId}/members.json";
     /// <summary>The pre-0.10.3 name of the refresh jobs folder (migrated on first touch).</summary>
@@ -159,6 +171,8 @@ public static class Tags
         tags.GetValueOrDefault(Due) ?? tags.GetValueOrDefault(Added) ?? "";
     /// <summary>Download jobs waiting for the classify job; no node claims them (claims match idx_state='pending' only).</summary>
     public const string Unclassified = "unclassified";
+    /// <summary>0.12.0: terminal state of a download job whose pre-check sample matched a video we already have. Not failed, never retried, never claimed (claims match pending only), no follow-up jobs.</summary>
+    public const string Duplicate = "duplicate";
     public static string UnclassifiedWhere => StateWhere("download", Unclassified);
     public static string StateWhere(string stage, string state) => $"\"{Stage}\"='{stage}' AND \"{State}\"='{state}'";
 }
@@ -213,6 +227,15 @@ public sealed class JobDescriptor
     /// <summary>Why a comments follow-up round exists ("lead-names").</summary>
     public string? Reason { get; set; }
     public string? FinishedAt { get; set; }
+    /// <summary>0.12.0, download jobs in state duplicate: the upload the pre-check sample matched, and the share of sample frames that matched it.</summary>
+    public string? DuplicateOf { get; set; }
+    public double? DuplicateShare { get; set; }
+    /// <summary>Duplicate jobs also record what the site needs to point a user at the right YouTube audio: the sample's spoken language (SenseVoice), dubbed flag, where it came from, the metadata hint, and the YouTube url.</summary>
+    public string? DuplicateSpeechLanguage { get; set; }
+    public bool? DuplicateDubbed { get; set; }
+    public string? DuplicateLanguageSource { get; set; }
+    public string? DuplicateMetadataLanguage { get; set; }
+    public string? DuplicateUrl { get; set; }
     public string? NodeId { get; set; }
     public double? ElapsedSeconds { get; set; }
 
@@ -240,6 +263,10 @@ public sealed class JobDescriptor
     public bool? FollowChannels { get; set; }
     public int? Backfill { get; set; }
     public string? LastPolled { get; set; }
+    /// <summary>0.13.0 dynamic schedule: when the source was last modified (UTC): the last refresh that saw its set change. A channel's first poll uses the newest upload's approximate date, a playlist's first poll counts as now.</summary>
+    public string? LastModified { get; set; }
+    /// <summary>0.13.0: a dynamic source whose newest upload is over a year old; nothing is scheduled until a manual refresh or a new schedule.</summary>
+    public bool? Inactive { get; set; }
     /// <summary>Video ids already seen in this source, newest first, capped at 500. Null until the first poll.</summary>
     public List<string>? Seen { get; set; }
     /// <summary>classify jobs: the channel uploads to decide on (listed by the downloader's watch job <see cref="Source"/>).</summary>
@@ -289,11 +316,6 @@ public sealed class JobDescriptor
             FollowChannels = followChannels, Backfill = backfill < 0 ? null : backfill, MaxHeight = maxHeight, AddedAt = Protocol.NowUtc(), Attempts = 0, Run = "lookup",
         };
     }
-
-    public static JobDescriptor NewComments(string jobId, string url) => new()
-    {
-        Stage = "comments", JobId = jobId, Url = url, MaxComments = 1000, Sort = "top", Round = 0, AddedAt = Protocol.NowUtc(),
-    };
 
     public static JobDescriptor NewStep(string step, string jobId) => new()
     {
@@ -418,6 +440,8 @@ public sealed class NodeInfo
     public Dictionary<string, string>? Sources { get; set; }
     /// <summary>Bytes this node moved: totals since it started and the last 48 hourly buckets.</summary>
     public TrafficReport? Traffic { get; set; }
+    /// <summary>0.13.0: this node's storage operations per minute (reads, writes, lists) over the last five minutes, and totals since start.</summary>
+    public OpsReport? Ops { get; set; }
     /// <summary>Where the node runs, detected at start and refreshed daily.</summary>
     public Placement? Placement { get; set; }
     /// <summary>The node's public network (0.8.8), re-checked every 30 minutes.</summary>

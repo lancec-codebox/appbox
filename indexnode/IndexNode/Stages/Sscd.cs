@@ -50,18 +50,24 @@ public static class Sscd
         if (File.Exists(local)) return local;
         if (string.IsNullOrEmpty(cfg.ModelUrl)) return await Models.EnsureAsync(Models.SscdInt8, http, ct); // the pinned static int8 model
         if (string.IsNullOrEmpty(cfg.ModelUrl)) throw new InvalidOperationException("sscd model missing: set modelUrl or modelPath in the config (see tools/export_sscd_onnx.py)");
-        Log.Info("sscd: downloading the ONNX model");
-        Directory.CreateDirectory(NodeConfig.ToolsDir());
-        var tmp = local + ".part";
-        using (var r = await http.GetAsync(cfg.ModelUrl, HttpCompletionOption.ResponseHeadersRead, ct))
+        var gate = Models.LockOf(local); await gate.WaitAsync(ct);
+        try
         {
-            if (!r.IsSuccessStatusCode) throw new InvalidOperationException($"model download failed: HTTP {(int)r.StatusCode}");
-            await using var fs = File.Create(tmp);
-            await r.Content.CopyToAsync(fs, ct);
-            Traffic.Current.Add(Traffic.OtherIn, fs.Length);
+            if (File.Exists(local)) return local;   // another lane finished it while we waited
+            Log.Info("sscd: downloading the ONNX model");
+            Directory.CreateDirectory(NodeConfig.ToolsDir());
+            var tmp = local + ".part-" + Guid.NewGuid().ToString("N")[..8];
+            using (var r = await http.GetAsync(cfg.ModelUrl, HttpCompletionOption.ResponseHeadersRead, ct))
+            {
+                if (!r.IsSuccessStatusCode) throw new InvalidOperationException($"model download failed: HTTP {(int)r.StatusCode}");
+                await using var fs = File.Create(tmp);
+                await r.Content.CopyToAsync(fs, ct);
+                Traffic.Current.Add(Traffic.OtherIn, fs.Length);
+            }
+            File.Move(tmp, local, true);
+            return local;
         }
-        File.Move(tmp, local, true);
-        return local;
+        finally { gate.Release(); }
     }
 
     internal static void Fill(DenseTensor<float> t, int row, byte[] rgb, int plane)
@@ -73,6 +79,53 @@ public static class Sscd
     /// <summary>Descriptors for frames/000000.jpg ... : short side 288, ImageNet normalisation, L2-normalised, float16.</summary>
     /// <summary>The model input size for stored frames of w x h with the bar box cut first: the crop is applied to the stored pixels, then the result is resized to short side 288.</summary>
     public static (int W, int H) InputSize(int w, int h, BarCrop crop) => TargetSize(crop.Width(w), crop.Height(h));
+
+    /// <summary>In-process preprocessing (no ffmpeg) of a decoded rgb24 image: crop by the bar box, then libswscale's default bicubic (<see cref="Swscale.ScaleRgb"/>) to the model input size, as the ffmpeg path's <c>scale=W:H:flags=bicubic</c> does for an rgb source (PNG). Returns rgb24 and the size.</summary>
+    public static (byte[] Rgb, int W, int H) Prepare(Rgb im, BarCrop crop)
+    {
+        var (tw, th) = InputSize(im.W, im.H, crop);
+        if (!crop.IsNone) { int cw = crop.Width(im.W), ch = crop.Height(im.H); var c = new byte[cw * ch * 3]; for (int y = 0; y < ch; y++) Buffer.BlockCopy(im.Data, ((y + crop.Top) * im.W + crop.Left) * 3, c, y * cw * 3, cw * 3); im = new Rgb(c, cw, ch); }
+        return (Swscale.ScaleRgb(im, tw, th).Data, tw, th);
+    }
+
+    /// <summary>As <see cref="Prepare(Rgb, BarCrop)"/> for a JPEG file: the decoder's YCbCr planes (4:2:0, 4:2:2 or 4:4:4) go straight into the swscale port, so chroma is filtered exactly as ffmpeg does (decode -> crop -> scale -> rgb24 in one swscale pass); other JPEGs (gray, RGB, CMYK) go through rgb.</summary>
+    public static (byte[] Rgb, int W, int H) PrepareJpeg(byte[] jpg, BarCrop crop)
+    {
+        var yuv = JpegYuv.Decode(jpg);
+        if (yuv == null) return Prepare(Imaging.DecodeJpeg(jpg), crop);
+        var (tw, th) = InputSize(yuv.W, yuv.H, crop);
+        if (!crop.IsNone) yuv = yuv.Crop(crop.Left, crop.Top, crop.Width(yuv.W), crop.Height(yuv.H));
+        return (Swscale.ScaleYuv(yuv, tw, th).Data, tw, th);
+    }
+
+    /// <summary>One image through the loaded session: L2-normalised 512-d descriptor.</summary>
+    public static float[] EmbedRgb(Microsoft.ML.OnnxRuntime.InferenceSession session, byte[] rgb, int tw, int th)
+    {
+        var tensor = new DenseTensor<float>([1, 3, th, tw]); Fill(tensor, 0, rgb, th * tw);
+        using var res = session.Run([NamedOnnxValue.CreateFromTensor(session.InputMetadata.Keys.First(), tensor)]);
+        var o = res.First().AsTensor<float>(); var v = new float[Dim]; for (int d = 0; d < v.Length; d++) v[d] = o[0, d];
+        L2Normalize(v); return v;
+    }
+
+    /// <summary>As <see cref="DescribeAsync"/> without any child process: the stored JPEGs are decoded, cropped and resized in managed code, batches go through the loaded session.</summary>
+    public static async Task<byte[]> DescribeInProcessAsync(string modelPath, string framesDir, int count, int threads, Action<string> progress, CancellationToken ct, BarCrop crop = default)
+    {
+        var session = OrtOptions.Shared(modelPath, threads); var inputName = session.InputMetadata.Keys.First();
+        var rows = new List<float[]>(count); int batch = OrtOptions.Batch(32, 64);
+        for (int s = 0; s < count; s += batch)
+        {
+            int n = Math.Min(batch, count - s); var prep = new (byte[] Rgb, int W, int H)[n];
+            await Task.Run(() => Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct },
+                i => prep[i] = PrepareJpeg(File.ReadAllBytes(Path.Combine(framesDir, $"{s + i:D6}.jpg")), crop)), ct);
+            int tw = prep[0].W, th = prep[0].H; if (prep.Any(x => x.W != tw || x.H != th)) throw new InvalidOperationException("sscd: the frames differ in size");
+            var tensor = new DenseTensor<float>([n, 3, th, tw]); for (int i = 0; i < n; i++) Fill(tensor, i, prep[i].Rgb, th * tw);
+            using var results = session.Run([NamedOnnxValue.CreateFromTensor(inputName, tensor)]);
+            var outT = results.First().AsTensor<float>();
+            for (int i = 0; i < n; i++) { var row = new float[Dim]; for (int d = 0; d < Dim; d++) row[d] = outT[i, d]; L2Normalize(row); rows.Add(row); }
+            progress($"{rows.Count}/{count} frames");
+        }
+        return ToF16Bytes(rows);
+    }
 
     /// <summary>The ffmpeg filter that crops the stored frame by the box, then resizes to the model input size.</summary>
     public static string Filter(int w, int h, BarCrop crop) { var (tw, th) = InputSize(w, h, crop); return (crop.IsNone ? "" : crop.Filter(w, h) + ",") + $"scale={tw}:{th}:flags=bicubic"; }

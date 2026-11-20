@@ -7,6 +7,12 @@ namespace IndexNode;
 /// </summary>
 public sealed class SplitStore(IStore input, IStore output, string videosPrefix) : IStore
 {
+    public Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct) => output.CreateAppendBlobAsync(name, onlyIfNew, ct);
+    public Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct) => output.AppendBlockAsync(name, data, appendPos, ct);
+    public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => output.ReadAppendAsync(name, offset, maxLen, ct);
+    public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => output.SealAppendBlobAsync(name, appendPos, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => output.PutIfMatchAsync(name, data, etag, ct);
+    public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => output.GetAppendInfoAsync(name, ct);
     /// <summary>True for a blob that belongs to the input side.</summary>
     bool In(string name) => name.StartsWith(videosPrefix, StringComparison.Ordinal) && !name.EndsWith("/centers.zip", StringComparison.Ordinal);
     IStore R(string name) => In(name) ? input : output;

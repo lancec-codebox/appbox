@@ -50,7 +50,7 @@ public class RedoCleanupTests
         await Redo(s, "translate", new Chat());
         Assert.NotEqual("OLD", Encoding.UTF8.GetString(s.Blobs[V + "subs/ai/en.vtt"].Data));   // replaced
         Assert.NotEqual("OLD", Encoding.UTF8.GetString(s.Blobs[V + "subs/ai/en.json"].Data));
-        Assert.False(s.Exists(V + "subs/ai/en.old-run.vtt"));                                   // stale own file gone
+        Assert.True(s.Exists(V + "subs/ai/en.old-run.vtt"));                                    // 0.13.0: nothing deletes upload data on its own, the stale file stays
         foreach (var n in Source.Concat(Others)) Assert.True(s.Exists(V + n), n + " must stay");  // sources and other steps untouched (processed.json too)
     }
 

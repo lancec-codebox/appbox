@@ -99,10 +99,10 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         int made = 0;
         foreach (var id in yes)
         {
-            if (await store.GetTagsAsync(paths.Job("download", id), ct) != null || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0) continue;
+            if (ctx.Queue!.Read(s => s.Entry(id, "download") != null) || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0) continue;
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", job.MaxHeight ?? 480, null);
             d.Source = job.Source; d.Sources = job.Source == null ? null : [job.Source]; d.AddedAt = at; d.Priority = job.Priority;
-            if (await store.PutAsync(paths.Job("download", id), d.ToBytes(), Tags.Job("download", "pending", at, null, d.Priority), null, true, ct)) made++;
+            if (await ctx.Queue!.AppendLinesAsync(st => st.Entry(id, "download") != null ? null : [QLine.Add(id, "download", d, at, d.Priority)], ct) && ctx.Queue.Read(s => s.Entry(id, "download")?.Job?.AddedAt == at)) made++;
         }
         Log.Info($"classify {job.JobId}: {entries.Count} uploads: {stored} already decided, {rule} too short, {ask.Count} by AI ({aiYes} candidates); {made} download job(s) created");
     }
@@ -116,38 +116,38 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
     {
         var job = ctx.Job; var ct = ctx.Token; var paths = ctx.Paths;
         var at = Protocol.Utc(now());
-        var all = await ClassifyJobs.ListUnclassifiedAsync(store, paths, ct);
+        var queue = ctx.Queue ?? throw new InvalidOperationException("classify runs on the queue");
+        var all = ClassifyJobs.ListUnclassified(queue);   // from the queue's memory: no listing, no reads
         var todo = all.Take(MaxPerRun).ToList();
         ctx.Report("classify", $"{todo.Count} of {all.Count} unclassified");
         if (job.CountDay != at[..10]) { job.CountDay = at[..10]; job.Classified = 0; job.Rejected = 0; }
         int stored = 0, rule = 0, dead = 0, aiCount = 0, yes = 0, no = 0, noAnswer = 0;
-        var ask = new List<(BlobEntry Blob, JobDescriptor Job)>();
+        var ask = new List<(string Id, JobDescriptor Job)>(); var cls = new List<QLine>();
+        async Task Flush() { if (cls.Count == 0) return; var batch = cls.ToList(); cls.Clear(); await queue.AppendLinesAsync(batch, ct); }
 
-        async Task Decide(BlobEntry b, JobDescriptor d, bool candidate, string kind, string reason, string by, string? model, bool save)
+        async Task Decide(string id, JobDescriptor d, bool candidate, string kind, string reason, string by, string? model, bool save)
         {
-            var id = Path.GetFileNameWithoutExtension(b.Name);
             if (save) await SaveDecisionAsync(store, paths, id, d.ChannelId, d.ChannelName, d.Title, d.Duration, candidate, kind, reason, by, model, at, ct);
-            await ClassifyJobs.ApplyAsync(store, paths, b.Name, b.Tags, d, candidate, kind, reason, at, ct);
+            cls.Add(ClassifyJobs.Decision(id, d, candidate, kind, reason, at));
+            if (cls.Count >= 40) await Flush();
             if (candidate) yes++; else no++;
             job.Classified = (job.Classified ?? 0) + 1; if (!candidate) job.Rejected = (job.Rejected ?? 0) + 1;
         }
 
-        foreach (var b in todo)
+        foreach (var (id, entry) in todo)
         {
-            JobDescriptor d;
-            try { d = await store.GetAsync(b.Name, ct) is { } body ? JobDescriptor.Parse(body.Data) : throw new InvalidDataException("gone"); }
-            catch (Exception e) when (e is InvalidDataException or System.Text.Json.JsonException) { Log.Info($"classify: skipping unreadable {b.Name}: {e.Message}"); continue; }
-            var id = Path.GetFileNameWithoutExtension(b.Name);
+            var d = entry.Job ?? new JobDescriptor { JobId = id, Stage = "download" };
+            var b = id;
             if (await store.GetAsync(Blob(paths, id), ct) is { } sb)                                    // 1. a stored decision, never asked twice
             {
                 var n = JsonNode.Parse(sb.Data);
                 bool c = n?["candidate"]?.GetValue<bool>() == true;
-                await Decide(b, d, c, n?["kind"]?.ToString() ?? "", n?["reason"]?.ToString() ?? "", "stored", null, false); stored++; continue;
+                await Decide(id, d, c, n?["kind"]?.ToString() ?? "", n?["reason"]?.ToString() ?? "", "stored", null, false); stored++; continue;
             }
             if (d.Duration is { } dur && dur < MinMinutes * 60)                                          // 2. the length rule
-            { await Decide(b, d, false, "short", $"{dur / 60:F0} min: shorter than {MinMinutes} min", "rule", null, true); rule++; continue; }
+            { await Decide(id, d, false, "short", $"{dur / 60:F0} min: shorter than {MinMinutes} min", "rule", null, true); rule++; continue; }
             if (ClassifyJobs.IsUnavailable(d))                                                          // 3. dead videos, before any AI call
-            { await Decide(b, d, false, "unavailable", ClassifyJobs.UnavailableReason(d), "rule", null, true); dead++; continue; }
+            { await Decide(id, d, false, "unavailable", ClassifyJobs.UnavailableReason(d), "rule", null, true); dead++; continue; }
             ask.Add((b, d));                                                                            // 4. the AI
         }
         if (ask.Count > 0 && Ai() is not { } ai) throw new JobSkipped("no AI endpoint on this node: classify needs one");
@@ -155,23 +155,24 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         {
             var (chat, model) = Ai()!.Value;
             var batch = ask.Skip(i).Take(AiBatch).ToList();
-            var entries = batch.Select(x => new ClassifyEntry { Id = Path.GetFileNameWithoutExtension(x.Blob.Name), Title = x.Job.Title, Duration = x.Job.Duration, ChannelName = x.Job.ChannelName }).ToList();
+            var entries = batch.Select(x => new ClassifyEntry { Id = x.Id, Title = x.Job.Title, Duration = x.Job.Duration, ChannelName = x.Job.ChannelName }).ToList();
             var (byId, missing) = await AskAsync(chat, model, null, entries, ct);
             foreach (var (x, e) in batch.Zip(entries).Where(p => !byId.ContainsKey(p.Second.Id)))
             {
                 // no answer even one at a time: it stays unclassified with a counter; the third miss gives up on it
                 x.Job.ClassifyMisses = (x.Job.ClassifyMisses ?? 0) + 1; noAnswer++;
-                if (x.Job.ClassifyMisses >= MaxMisses) await Decide(x.Blob, x.Job, false, "no AI answer", "", "ai", model, false);
-                else { try { await store.PutAsync(x.Blob.Name, x.Job.ToBytes(), x.Blob.Tags, null, false, ct); } catch (StorageException ex) { Log.Info($"classify: could not record the miss for {e.Id} ({ex.Message})"); } }
+                if (x.Job.ClassifyMisses >= MaxMisses) await Decide(x.Id, x.Job, false, "no AI answer", "", "ai", model, false);
+                else cls.Add(new QLine { T = "upd", S = x.Id, Stage = "download", Job = x.Job });   // the miss counter is kept on the entry
                 Log.Info($"classify: no AI answer for {e.Id} (miss {x.Job.ClassifyMisses} of {MaxMisses}){(x.Job.ClassifyMisses >= MaxMisses ? ": given up (failed, classify: no AI answer)" : "")}");
             }
             foreach (var (x, e) in batch.Zip(entries).Where(p => byId.ContainsKey(p.Second.Id)))
             {
                 var o = byId[e.Id];
                 bool c = o["candidate"] is JsonValue cv && cv.TryGetValue<bool>(out var cb) && cb;
-                await Decide(x.Blob, x.Job, c, o["kind"]?.ToString() ?? "", (o["reason"]?.ToString() ?? "") + (o["language"] is { } l ? $" [{l}]" : ""), "ai", model, true); aiCount++;
+                await Decide(x.Id, x.Job, c, o["kind"]?.ToString() ?? "", (o["reason"]?.ToString() ?? "") + (o["language"] is { } l ? $" [{l}]" : ""), "ai", model, true); aiCount++;
             }
         }
+        await Flush();
         job.Attempts = 0; job.LastError = null; job.LastPolled = at;
         bool more = all.Count > todo.Count;   // (a drama left unclassified after a miss is picked up again in the next round)
         ctx.NextDue = Protocol.Utc(more ? now() : now() + IdleEvery);

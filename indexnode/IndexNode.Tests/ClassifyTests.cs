@@ -19,7 +19,8 @@ public class ClassifyTests
 
     private static async Task Run(FakeStore s, JobDescriptor job, IChat? chat)
     {
-        var ctx = new JobContext { Job = job, Stage = "classify", BlobName = P.Job("classify", job.JobId), LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+        var q = new JobQueue(s, P, "n"); await q.LoadAsync(default);
+        var ctx = new JobContext { Job = job, Stage = "classify", BlobName = job.JobId, LeaseId = "l", Worker = 1, Queue = q, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
         await new ClassifyStage(s) { Ai = () => chat == null ? null : (chat, "m") }.RunAsync(ctx);
     }
 
@@ -31,9 +32,9 @@ public class ClassifyTests
         await Run(s, Job(E("aaaaaaaaaaa", 120, "Full Movie"), E("bbbbbbbbbbb", 25, "Recap of ep 1-80"), E("ccccccccccc", 2, "Trailer")), chat);
         Assert.Single(chat.Prompts);
         Assert.DoesNotContain("ccccccccccc", chat.Prompts[0]);                                   // too short: decided by rule, not asked
-        Assert.True(s.Exists(P.Job("download", "aaaaaaaaaaa")));
-        Assert.False(s.Exists(P.Job("download", "bbbbbbbbbbb")));
-        Assert.False(s.Exists(P.Job("download", "ccccccccccc")));
+        Assert.True(s.InQueue(P.Job("download", "aaaaaaaaaaa")));
+        Assert.False(s.InQueue(P.Job("download", "bbbbbbbbbbb")));
+        Assert.False(s.InQueue(P.Job("download", "ccccccccccc")));
         Assert.Equal("rule", JsonNode.Parse(s.Blobs[ClassifyStage.Blob(P, "ccccccccccc")].Data)!["by"]!.ToString());
         Assert.Equal("ai", JsonNode.Parse(s.Blobs[ClassifyStage.Blob(P, "aaaaaaaaaaa")].Data)!["by"]!.ToString());
     }
@@ -44,10 +45,9 @@ public class ClassifyTests
         var s = new FakeStore();
         var chat = new Chat(_ => """{"videos":[{"id":"aaaaaaaaaaa","candidate":true,"kind":"full","reason":"x"}]}""");
         await Run(s, Job(E("aaaaaaaaaaa", 90, "Drama")), chat);
-        await s.DeleteAsync(P.Job("download", "aaaaaaaaaaa"), default);
-        await Run(s, Job(E("aaaaaaaaaaa", 90, "Drama")), chat);
+        await Run(s, Job(E("aaaaaaaaaaa", 90, "Drama")), chat);                                  // the entry already exists: nothing new is made, and the decision is stored
         Assert.Single(chat.Prompts);                                                             // second run used the stored decision
-        Assert.True(s.Exists(P.Job("download", "aaaaaaaaaaa")));
+        Assert.True(s.InQueue(P.Job("download", "aaaaaaaaaaa")));
     }
 
     [Fact]

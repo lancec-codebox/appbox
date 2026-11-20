@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.11.0</Version>
+    <Version>0.13.0</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
     <PackageId>IndexNode</PackageId>
@@ -16,6 +16,10 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <ValidateExecutableReferencesMatchSelfContained>false</ValidateExecutableReferencesMatchSelfContained>
   </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../IndexNode.Core/IndexNode.Core.csproj" />
@@ -39,6 +43,7 @@
     <InternalsVisibleTo Include="IndexNode.Tests" />
     <None Include="PROTOCOL.md" />
     <None Include="tools/**" />
+    <EmbeddedResource Include="Resources/ai-frames-v3.f32" LogicalName="ai-frames-v3.f32" />
     <EmbeddedResource Include="Resources/TSCharacters.txt" LogicalName="opencc.TSCharacters.txt" />
     <EmbeddedResource Include="Resources/TSPhrases.txt" LogicalName="opencc.TSPhrases.txt" />
   </ItemGroup>

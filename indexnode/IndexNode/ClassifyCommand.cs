@@ -11,6 +11,7 @@ public static class ClassifyCommand
     public static async Task<int> RunAsync(Args a)
     {
         var (_, store, paths, http) = Commands.Open(a); using var _h = http;
+        var queue = new JobQueue(store, paths, "cli"); await queue.LoadAsync(default);
         var sub = a.Positional.FirstOrDefault();
         switch (sub)
         {
@@ -22,14 +23,14 @@ public static class ClassifyCommand
                 else if (rest.Count > 0 && rest[0].ToLowerInvariant() is "drama" or "not" && rest.Count > 1) { verdict = rest[0]; id = rest[1]; }   // after "--" the id comes last
                 else { id = rest.ElementAtOrDefault(0); verdict = rest.ElementAtOrDefault(1); }
                 if (id == null || verdict == null) throw new ArgumentException(use);
-                Console.WriteLine(await SetAsync(store, paths, id, verdict, a.Get("reason"), DateTimeOffset.UtcNow, default));
+                Console.WriteLine(await SetAsync(store, queue, paths, id, verdict, a.Get("reason"), DateTimeOffset.UtcNow, default));
                 return 0;
             }
             case "list":
             {
                 if (!a.Has("rejected")) throw new ArgumentException("classify list --rejected [--since 1d]");
                 var since = RefreshStage.ParseEvery(a.Get("since") ?? "1d");
-                var rows = await RejectedAsync(store, paths, DateTimeOffset.UtcNow - since, default);
+                var rows = Rejected(queue, DateTimeOffset.UtcNow - since);
                 foreach (var r in rows) Console.WriteLine(r);
                 Console.WriteLine($"{rows.Count} rejected since {a.Get("since") ?? "1d"} ago (overrule one with: indexnode classify set <videoId> drama)");
                 return 0;
@@ -37,7 +38,7 @@ public static class ClassifyCommand
             case "requeue":
             {
                 var source = a.Get("source") ?? throw new ArgumentException("classify requeue --source <id>");
-                int n = await RequeueSourceAsync(store, paths, source, default);
+                int n = await RequeueSourceAsync(queue, source, default);
                 Console.WriteLine($"{n} pending download(s) of {source} set back to unclassified (stored decisions still apply)");
                 return 0;
             }
@@ -46,81 +47,61 @@ public static class ClassifyCommand
     }
 
     /// <summary>The singleton's counters for the UTC day of <paramref name="now"/> (zero when it has not run today).</summary>
-    public static async Task<(string Day, int Classified, int Rejected)> TodayAsync(IStore store, Paths paths, DateTimeOffset now, CancellationToken ct)
+    public static (string Day, int Classified, int Rejected) Today(JobQueue queue, DateTimeOffset now)
     {
         var day = Protocol.Utc(now)[..10];
-        if (await store.GetAsync(ClassifyJobs.SingletonBlob(paths), ct) is not { } c) return (day, 0, 0);
-        var j = JobDescriptor.Parse(c.Data);
-        return j.CountDay == day ? (day, j.Classified ?? 0, j.Rejected ?? 0) : (day, 0, 0);
+        var j = queue.Read(st => st.Entry(ClassifyJobs.Subject, "classify")?.Job);
+        return j != null && j.CountDay == day ? (day, j.Classified ?? 0, j.Rejected ?? 0) : (day, 0, 0);
     }
 
-    /// <summary>Writes the decision (by "owner") and sets the download job: drama -> pending, not -> failed + permanent. A job already leased or done is left alone and said so.</summary>
-    public static async Task<string> SetAsync(IStore store, Paths paths, string id, string verdict, string? reason, DateTimeOffset now, CancellationToken ct)
+    /// <summary>Writes the decision (by "owner") and sets the download entry: drama -> pending, not -> failed + permanent. An entry that is running or done is left alone and said so.</summary>
+    public static async Task<string> SetAsync(IStore store, JobQueue queue, Paths paths, string id, string verdict, string? reason, DateTimeOffset now, CancellationToken ct)
     {
         bool drama = verdict.ToLowerInvariant() switch { "drama" => true, "not" => false, _ => throw new ArgumentException("verdict must be drama or not") };
         if (!Regex.IsMatch(id, @"^[A-Za-z0-9_-]{11}$")) throw new ArgumentException($"'{id}' is not a video id");
         var at = Protocol.Utc(now);
-        var name = paths.Job("download", id);
-        JobDescriptor? d = await store.GetAsync(name, ct) is { } body ? JobDescriptor.Parse(body.Data) : null;
+        await queue.PollAsync(ct);
+        var e = queue.Read(st => st.Entry(id, "download"));
+        var d = e?.Job;
         var why = string.IsNullOrWhiteSpace(reason) ? "set by the owner" : reason.Trim();
         await ClassifyStage.SaveDecisionAsync(store, paths, id, d?.ChannelId, d?.ChannelName, d?.Title, d?.Duration, drama, drama ? "drama" : "not-drama", why, "owner", null, at, ct);
-        var tags = await store.GetTagsAsync(name, ct);
-        if (d == null || tags == null)
+        if (e == null || d == null)
         {
-            if (!drama) return $"{id}: decision stored (not a drama); no download job exists";
+            if (!drama) return $"{id}: decision stored (not a drama); no download entry exists";
             var nd = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", 480, null); nd.JobId = id; nd.AddedAt = at;
-            await store.PutAsync(name, nd.ToBytes(), new Dictionary<string, string>(Tags.Job("download", "pending", at)) { [Tags.Classified] = at }, null, true, ct);
-            return $"{id}: decision stored; download job created (pending)";
+            await queue.AppendLinesAsync([QLine.Add(id, "download", nd, at)], ct);
+            return $"{id}: decision stored; download entry created (pending)";
         }
-        var state = tags.GetValueOrDefault(Tags.State);
+        var state = e.State;
         bool classifyFailed = state == "failed" && d.Reason?.StartsWith("classify:", StringComparison.Ordinal) == true;
-        if (state is not (Tags.Unclassified or "pending") && !classifyFailed) return $"{id}: decision stored; the download job is {state}, left alone";
+        if (state is not (Tags.Unclassified or "pending") && !classifyFailed) return $"{id}: decision stored; the download is {state}, left alone";
         if (drama)
         {
             d.Reason = null; d.LastError = null; d.Permanent = null; d.FinishedAt = null; d.Attempts = 0;
-            var t = new Dictionary<string, string>(tags) { [Tags.State] = "pending", [Tags.Classified] = at };
-            await store.PutAsync(name, d.ToBytes(), t, null, false, ct);
-            return $"{id}: drama; download job pending";
+            await queue.AppendLinesAsync([new QLine { T = "retry", S = id, Stage = "download", Job = d, Due = at, At = at }], ct);
+            return $"{id}: drama; download pending";
         }
-        await ClassifyJobs.ApplyAsync(store, paths, name, tags, d, false, "not-drama", why, at, ct);
-        return $"{id}: not a drama; download job failed (permanent)";
+        await queue.AppendLinesAsync([ClassifyJobs.Decision(id, d, false, "not-drama", why, at)], ct);
+        return $"{id}: not a drama; download failed (permanent)";
     }
 
-    /// <summary>The rejections since <paramref name="since"/>, newest first, one line each with the reason.</summary>
-    public static async Task<List<string>> RejectedAsync(IStore store, Paths paths, DateTimeOffset since, CancellationToken ct)
+    /// <summary>The rejections since <paramref name="since"/>, newest first, one line each with the reason (from the queue's memory).</summary>
+    public static List<string> Rejected(JobQueue queue, DateTimeOffset since)
     {
         var from = Protocol.Utc(since);
-        IEnumerable<BlobEntry> found;
-        try { found = await Tags.FindFullAsync(store, Tags.StateWhere("download", "failed") + $" AND \"{Tags.Classified}\" >= '{from}'", ct); }
-        catch (ForbiddenException) { found = (await store.ListAsync(paths.JobsDir("download"), true, false, ct)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "failed"); }
-        var rows = new List<(string At, string Line)>();
-        foreach (var b in found.Where(b => b.Name.StartsWith(paths.JobsDir("download"), StringComparison.Ordinal)))
-        {
-            if (string.CompareOrdinal(b.Tags.GetValueOrDefault(Tags.Classified) ?? "", from) < 0) continue;
-            if (await store.GetAsync(b.Name, ct) is not { } c) continue;
-            var d = JobDescriptor.Parse(c.Data);
-            if (d.Reason?.StartsWith("classify:", StringComparison.Ordinal) != true) continue;
-            rows.Add((b.Tags[Tags.Classified], $"{Path.GetFileNameWithoutExtension(b.Name)}  {b.Tags[Tags.Classified]}  {d.ChannelName ?? "?"}  \"{d.Title ?? "?"}\"  {d.Reason}"));
-        }
-        return rows.OrderByDescending(r => r.At, StringComparer.Ordinal).Select(r => r.Line).ToList();
+        return queue.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue("download", out var e) && e.State == "failed" && e.Job?.Reason?.StartsWith("classify:", StringComparison.Ordinal) == true && string.CompareOrdinal(e.FinishedAt ?? "", from) >= 0)
+            .Select(s => (At: s.Entries["download"].FinishedAt ?? "", Line: $"{s.Id}  {s.Entries["download"].FinishedAt}  {s.Entries["download"].Job!.ChannelName ?? "?"}  \"{s.Entries["download"].Job!.Title ?? "?"}\"  {s.Entries["download"].Job!.Reason}")).ToList())
+            .OrderByDescending(r => r.At, StringComparer.Ordinal).Select(r => r.Line).ToList();
     }
 
-    /// <summary>Sets the pending (not leased) downloads of a source back to unclassified and makes sure the singleton exists. Returns how many.</summary>
-    public static async Task<int> RequeueSourceAsync(IStore store, Paths paths, string source, CancellationToken ct)
+    /// <summary>Sets the pending (not running) downloads of a source back to unclassified and makes sure the singleton exists. Returns how many.</summary>
+    public static async Task<int> RequeueSourceAsync(JobQueue queue, string source, CancellationToken ct)
     {
-        IEnumerable<BlobEntry> found;
-        try { found = await Tags.FindFullAsync(store, Tags.StateWhere("download", "pending"), ct); }
-        catch (ForbiddenException) { found = (await store.ListAsync(paths.JobsDir("download"), true, false, ct)).Where(b => b.Tags.GetValueOrDefault(Tags.State) == "pending"); }
-        int n = 0;
-        foreach (var b in found.Where(b => b.Name.StartsWith(paths.JobsDir("download"), StringComparison.Ordinal) && b.LeaseState != "leased"))
-        {
-            if (await store.GetAsync(b.Name, ct) is not { } c) continue;
-            var d = JobDescriptor.Parse(c.Data);
-            if (d.Source != source && d.Sources?.Contains(source) != true) continue;
-            await store.SetTagsAsync(b.Name, new Dictionary<string, string>(b.Tags) { [Tags.State] = Tags.Unclassified }, null, ct);
-            n++;
-        }
-        if (n > 0) await ClassifyJobs.EnsureSingletonAsync(store, paths, ct);
-        return n;
+        await queue.PollAsync(ct);
+        var ids = queue.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Entries.TryGetValue("download", out var e) && e.State == "pending" && (e.Job?.Source == source || e.Job?.Sources?.Contains(source) == true)).Select(s => s.Id).ToList());
+        if (ids.Count == 0) return 0;
+        await queue.AppendLinesAsync(ids.Select(id => new QLine { T = "cls", S = id, Stage = "download", State = Tags.Unclassified }).ToList(), ct);
+        await ClassifyJobs.EnsureSingletonAsync(queue, ct);
+        return ids.Count;
     }
 }

@@ -5,7 +5,19 @@ public sealed record BlobEntry(
     IReadOnlyDictionary<string, string> Tags,
     IReadOnlyDictionary<string, string> Metadata,
     string? LeaseState = null,
-    long Size = 0);
+    long Size = 0,
+    /// <summary>When the blob was created (List Blobs Creation-Time, else Last-Modified); null when the store does not say.</summary>
+    DateTimeOffset? Created = null);
+
+/// <summary>An append blob read (0.13.0 queue log): the bytes from the offset, the blob's length, whether it is sealed and how many blocks (appends) it holds.</summary>
+public sealed record AppendRead(byte[] Data, long Length, bool Sealed, int Blocks, bool NotFound = false);
+
+public enum AppendOutcome { Ok, PositionMismatch, Sealed, NotFound }
+
+/// <summary>The answer to an Append Block: Ok (Length is the new length), PositionMismatch (412: someone appended first), Sealed (409: the segment is sealed) or NotFound.</summary>
+public sealed record AppendResult(AppendOutcome Outcome, long Length = 0, int Blocks = 0);
+
+public sealed record AppendInfo(long Length, bool Sealed, int Blocks);
 
 public sealed record BlobContent(byte[] Data, string? ETag);
 
@@ -90,5 +102,25 @@ public interface IStore
         return await PutZipAsync(name, path, metadata, tags, false, ct);
     }
     Task DeleteAsync(string name, CancellationToken ct);
+    /// <summary>Replaces a block blob only while its ETag still equals <paramref name="etag"/> (If-Match); with a null etag only when it does not exist yet (If-None-Match: *). False when the condition failed (412/409/404): nothing written. The default checks with a Head first (racy); RestStore and FakeStore make it atomic.</summary>
+    async Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    {
+        if (etag == null) return await PutAsync(name, data, null, null, true, ct);
+        var h = await HeadAsync(name, ct);
+        if (h == null || h.ETag != etag) return false;
+        return await PutAsync(name, data, null, null, false, ct);
+    }
+
+    // ---- append blobs (0.13.0: the job queue log). Stores that cannot do them throw NotSupportedException.
+    /// <summary>Creates an empty append blob; false when it exists (If-None-Match: *) and <paramref name="onlyIfNew"/> is set.</summary>
+    Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
+    /// <summary>Append Block with x-ms-blob-condition-appendpos = <paramref name="appendPos"/>: written only while the blob's length still equals it.</summary>
+    Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
+    /// <summary>Bytes from <paramref name="offset"/> (at most <paramref name="maxLen"/>) of an append blob, with its length and sealed flag, in one ranged read.</summary>
+    Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
+    /// <summary>Seals an append blob (later appends fail with Sealed) only while its length equals <paramref name="appendPos"/>; false on a length mismatch, true when sealed (or already). Null: no such blob.</summary>
+    Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
+    /// <summary>Length, sealed flag and block count of an append blob; null when it does not exist.</summary>
+    Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
 }
 

@@ -32,6 +32,8 @@ public sealed class NodeConfig
     public string? ModelPath { get; set; }
     public BrowserConfig? Browser { get; set; }
     public YtDlpConfig? Ytdlp { get; set; }
+    /// <summary>0.12.0 download pre-check (config keys precheck.*): sample, duplicate lookup, AI flag. Null = defaults.</summary>
+    public PreCheckSettings? PreCheck { get; set; }
 
     /// <summary>Run limits (see LimitState). BudgetSetAt restarts the countdown when the budget is set again.</summary>
     public int? Budget { get; set; }

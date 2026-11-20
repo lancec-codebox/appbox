@@ -58,6 +58,34 @@ With `--output-local` nothing is ever written to the store: a write that would r
 
 TODO: featureless frames are not filtered out yet.
 
+## Download pre-check and AI flag (0.12.0)
+
+A download node with a search index and an SSCD model first downloads one 5-minute section (centred at 50%, <= 360p), embeds its frames and looks them up in the centers search index. A near-identical copy (share >= 0.80, similar duration) is not downloaded: the job ends in state `duplicate`. Every checked upload gets `index/videos/<id>/precheck.json` and an `ai` flag (SSCD frames probe v3); the flag never stops anything. No index or model: skipped, download as before. See PROTOCOL.md, "Download pre-check".
+
+```
+indexnode config set precheck.enabled false          # turn it off (or: indexnode run --no-precheck)
+indexnode config set precheck.tau 0.70               # frame match cosine
+indexnode config set precheck.skip-share 0.80        # share that skips the download
+indexnode config set precheck.partial-share 0.60     # share that records another cut
+indexnode config set precheck.duration-percent 0.15  # duration rule: max(15%, 600 s)
+indexnode config set precheck.duration-min 600
+indexnode config set precheck.top-centers 100
+indexnode config set precheck.window-seconds 300
+indexnode config set precheck.language-seconds 60     # seconds of audio tagged Speech with a language (~15 s chunks from the middle outwards, no VAD; music, events and nospeech dropped); 0 or all = every chunk. A non-zh call needs >= 3 chunks and 2/3 agreeing, else unclear (null = zh); under 10 s = no-speech
+indexnode config set precheck.language-min-seconds 10
+indexnode config set precheck.frames 60             # max SSCD frames per sample, evenly subsampled (a number, or 0/all); the AI thresholds are calibrated at 60
+indexnode config set precheck.video-height 360       # sample video: best stream up to this height
+indexnode config set precheck.audio-format wa        # sample audio for the language ID: lowest-bitrate audio-only (wa; a format id such as 249 also works)
+indexnode config set precheck.window-position 0.5    # centre of the window, fraction of the duration
+indexnode config set precheck.ai-flag 0.479          # ai=true at or above this score (0.529 is also recorded); calibrated at precheck.frames 60: with another frame count the record says thresholdsApply=false and a warning is logged
+indexnode config set precheck.index-recheck-minutes 10
+indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N]   # ONLY the pre-check, read-only on the store -> <dir>/<id>/precheck.json (default ./precheck-out); one line per id with the timings
+indexnode ai score [--ids <file>] [--all-frames] [--redo] [--local <dir>]   # score processed uploads from their sscd.zip -> videos/<id>/ai.json
+indexnode --version
+```
+
+`indexnode status` shows `duplicate=N` in the download queue line.
+
 ## Download (0.5.1)
 
 Each release has, per platform: `indexnode-<v>-<rid>[.exe]` (self-contained single file: no .NET install, ONNX Runtime and sherpa-onnx inside; win-x64 45.7 MiB, linux-x64 49.4 MiB) and `indexnode-<v>-<rid>-fdd[.exe]` (framework-dependent, needs the .NET 10 runtime; 25.9 MiB and 35.2 MiB). Each has a `.sha256`. On a new machine: download, run `indexnode tools install --all`, then `indexnode config set-sas <url>`.
