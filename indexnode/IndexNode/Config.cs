@@ -208,6 +208,12 @@ public sealed class YtDlpConfig
 
     /// <summary>yt-dlp's --js-runtimes value ("node", "deno:/path/to/deno"). Null: node on PATH, else deno.</summary>
     public string? JsRuntime { get; set; }
+
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5), DefaultIdle = TimeSpan.FromMinutes(2);
+    /// <summary>Wall-clock limit per yt-dlp/ffmpeg invocation in the download, comments, refresh and availability stages (default 5; 0: none). On expiry the whole process tree is killed and the job fails as transient ("timed out after N min").</summary>
+    public double? TimeoutMinutes { get; set; }
+    /// <summary>A yt-dlp/ffmpeg child that prints nothing for this long is hung: killed, transient failure (default 2; 0: none).</summary>
+    public double? IdleMinutes { get; set; }
 }
 
 public sealed class BrowserConfig

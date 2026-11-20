@@ -46,6 +46,8 @@ public sealed class EngineOptions
     public int? MaxJobs { get; init; }
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan RenewInterval { get; init; } = TimeSpan.FromSeconds(30);
+    /// <summary>How long renewals may keep failing before the job counts as lost and is cancelled (the lease itself lasts this long).</summary>
+    public TimeSpan LeaseLimit { get; init; } = TimeSpan.FromSeconds(Protocol.LeaseSeconds);
     public TimeSpan ControlInterval { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan RegistryInterval { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan BotBackoff { get; init; } = TimeSpan.FromHours(1);
@@ -703,12 +705,20 @@ public sealed partial class NodeEngine
     {
         try
         {
+            var lastOk = DateTimeOffset.UtcNow;
             while (true)
             {
                 await Wait(o.RenewInterval, token);
                 try
                 {
-                    await store.RenewLeaseAsync(claim.BlobName, claim.LeaseId, token);
+                    // a renewal that hangs (storage DNS down) must not hang the loop: it gets the rest of the lease period
+                    using (var rt = CancellationTokenSource.CreateLinkedTokenSource(token))
+                    {
+                        rt.CancelAfter(o.LeaseLimit);
+                        try { await store.RenewLeaseAsync(claim.BlobName, claim.LeaseId, rt.Token); }
+                        catch (OperationCanceledException) when (!token.IsCancellationRequested) { throw new TimeoutException($"renewal did not answer within {o.LeaseLimit.TotalSeconds:0} s"); }
+                    }
+                    lastOk = DateTimeOffset.UtcNow;
                     await Control.RefreshAsync(token, force: true);
                     if (Control.Effective(stage) == Level.Stop) { run.StopRequested = true; run.Cts.Cancel(); return; }
                     await store.SetMetadataAsync(claim.BlobName, new Dictionary<string, string>
@@ -720,7 +730,12 @@ public sealed partial class NodeEngine
                 }
                 catch (LeaseLostException) { run.LeaseLost = true; run.Cts.Cancel(); return; }
                 catch (OperationCanceledException) { throw; }
-                catch (Exception e) { Log.Info($"lease renewal for {claim.Job.JobId} failed ({e.Message}); will retry"); }
+                catch (Exception e)
+                {
+                    // 0.10.9: the lease is only ours for LeaseSeconds after the last good renewal; past that another node may hold the job, so stop it (and its child processes) now
+                    if (DateTimeOffset.UtcNow - lastOk >= o.LeaseLimit) { Log.Info($"lease on {claim.Job.JobId} not renewed for {(DateTimeOffset.UtcNow - lastOk).TotalSeconds:0} s ({e.Message}): treating it as lost, cancelling the job"); run.LeaseLost = true; run.Cts.Cancel(); return; }
+                    Log.Info($"lease renewal for {claim.Job.JobId} failed ({e.Message}); will retry");
+                }
             }
         }
         catch (OperationCanceledException) { }

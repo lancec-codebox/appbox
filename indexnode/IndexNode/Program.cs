@@ -188,6 +188,8 @@ public static class Commands
         try { var lf = RollingFile.FileFor(Environment.GetEnvironmentVariable("INDEXNODE_LOG_DIR") ?? RollingFile.DefaultDir(), nodeName); Log.UseFile(new RollingFile(lf)); Log.Info($"logging to {lf}"); } catch (Exception e) { Console.Error.WriteLine("indexnode: no log file (" + e.Message + ")"); }
 
         var tools = new Tools(http, cfg);
+        if (a.Get("child-timeout-minutes") is { } ctm) tools.Limits = tools.Limits with { Timeout = TimeSpan.FromMinutes(double.Parse(ctm, System.Globalization.CultureInfo.InvariantCulture)) };
+        if (a.Get("child-idle-minutes") is { } cim) tools.Limits = tools.Limits with { Idle = TimeSpan.FromMinutes(double.Parse(cim, System.Globalization.CultureInfo.InvariantCulture)) };
         try { await tools.CheckFfmpegAsync(stages, default); }
         catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 2; }
         var gate = new DownloadGate();

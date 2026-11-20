@@ -58,6 +58,8 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null) : ITools
         return lines;
     }
     private string? ytdlp, ffmpeg, ffprobe;
+    /// <summary>Wall-clock limit and no-output limit of every yt-dlp / ffmpeg / ffprobe child run through Tools (config ytdlp.timeoutMinutes / idleMinutes, flags --child-timeout-minutes / --child-idle-minutes; 0 turns one off). A full video download at 480p must fit in the wall-clock limit.</summary>
+    public ChildLimits Limits { get; set; } = new(config?.Ytdlp?.TimeoutMinutes is { } tm ? TimeSpan.FromMinutes(tm) : YtDlpConfig.DefaultTimeout, config?.Ytdlp?.IdleMinutes is { } im ? TimeSpan.FromMinutes(im) : YtDlpConfig.DefaultIdle);
     /// <summary>Tests: use these ffmpeg/ffprobe instead of looking them up (other tests change PATH).</summary>
     public void UseFfmpeg(string ffmpegPath, string ffprobePath) { ffmpeg = ffmpegPath; ffprobe = ffprobePath; }
     private readonly SemaphoreSlim gate = new(1, 1);
@@ -90,7 +92,7 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null) : ITools
         if (YtDlpOverride != null) return await YtDlpOverride(withJs, ct, onStdout);
         var (file, full) = YtDlpLauncher.Compose(await YtDlpCommandAsync(ct), withJs);
         ProcResult r;
-        try { r = await Proc.RunAsync(file, full, ct, onStdout, null, workDir); }
+        try { r = await Proc.RunAsync(file, full, ct, onStdout, null, workDir, Limits); }
         catch (System.ComponentModel.Win32Exception e) when (YtDlpLauncher.LooksBlocked(e.Message, e.NativeErrorCode)) { throw new InvalidOperationException(BlockedHint + " [" + e.Message + "]"); }
         catch (System.ComponentModel.Win32Exception e) when (config?.Ytdlp?.Command is null) { throw new InvalidOperationException($"yt-dlp could not start ({e.Message}). If App Control blocks it, run: indexnode tools install --ytdlp-zipapp"); }
         catch (System.ComponentModel.Win32Exception e) { throw new InvalidOperationException($"the configured ytdlp.command could not start ({e.Message}); check it, or run: indexnode tools install --ytdlp-zipapp"); }
@@ -121,8 +123,8 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null) : ITools
                 }
                 full.AddRange(args);
                 return await RunYtDlpAsync(full, ct, onStdout, dir);
-            case "ffmpeg": return await Proc.RunAsync(await FfmpegAsync(ct), args, ct, onStdout, null, dir);
-            case "ffprobe": return await Proc.RunAsync(await FfprobeAsync(ct), args, ct, onStdout, null, dir);
+            case "ffmpeg": return await Proc.RunAsync(await FfmpegAsync(ct), args, ct, onStdout, null, dir, Limits);
+            case "ffprobe": return await Proc.RunAsync(await FfprobeAsync(ct), args, ct, onStdout, null, dir, Limits);
             default: throw new ArgumentException("unknown tool " + tool);
         }
     }
