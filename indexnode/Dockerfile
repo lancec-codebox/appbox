@@ -1,4 +1,4 @@
-# IndexNode GPU node (0.6.1): CUDA 12.x + cuDNN 9, which is what Microsoft.ML.OnnxRuntime.Gpu.Linux 1.23.x is built for
+# IndexNode GPU node (0.6.1; the runtime is ASP.NET Core 10 since 0.13.0): CUDA 12.x + cuDNN 9, which is what Microsoft.ML.OnnxRuntime.Gpu.Linux 1.23.x is built for
 # (ONNX Runtime 1.23/1.24 wants CUDA 12.8 + cuDNN 9; CUDA 13 builds start with ORT 1.27, so do not move the base image to CUDA 13 without moving the package).
 #
 #   docker build -t indexnode-gpu -f indexnode/Dockerfile .      (from the repo root: IndexNode builds with IndexNode.Core and indexnode-android/Contract, which must be in the context)
@@ -25,9 +25,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl libicu74 xz-utils \
  && rm -rf /var/lib/apt/lists/*
-# the .NET 10 runtime (framework-dependent build: smaller than self-contained)
+# the ASP.NET Core 10 runtime (framework-dependent build: smaller than self-contained). 0.13.0 needs Microsoft.AspNetCore.App for `indexnode serve`;
+# the aspnetcore runtime contains Microsoft.NETCore.App too, so nothing else is installed. The CUDA base image above stays as it is.
 RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
- && bash /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --install-dir /usr/share/dotnet \
+ && bash /tmp/dotnet-install.sh --channel 10.0 --runtime aspnetcore --install-dir /usr/share/dotnet \
  && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet && rm /tmp/dotnet-install.sh
 COPY --from=build /out /app
 ENV INDEXNODE_CONFIG_DIR=/models \

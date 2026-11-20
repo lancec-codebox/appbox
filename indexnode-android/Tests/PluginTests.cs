@@ -40,11 +40,9 @@ public class PluginTests
 {
     static readonly Paths P = new("index/");
 
-    static async Task Dl(FakeStore s, string id, string added, int priority)
-    {
-        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id, 480, null); job.JobId = id; job.AddedAt = added; job.Priority = priority;
-        await s.PutAsync(P.Job("download", id), job.ToBytes(), Tags.Job("download", "pending", added, null, priority), null, true, default);
-    }
+    /// <summary>A pending download entry in the queue log (0.13.0: no job blobs).</summary>
+    static Task Dl(FakeStore s, string id, string added, int priority) => s.AddJob(P, "download", id, added, null, priority);
+    static QueueState Q(FakeStore s) => s.Replay(P.Prefix);
 
     static FakeHost Host(FakeTools t)
     {
@@ -69,8 +67,8 @@ public class PluginTests
         Assert.Equal(1, (int)res["jobsStarted"]!);
         // the priority job went first, the older priority-0 job is untouched
         Assert.Equal(["https://www.youtube.com/watch?v=highprio001"], tools.Urls.Distinct().ToList());
-        Assert.Equal("pending", s[P.Job("download", "olderzero01")].Tags["idx_state"]);
-        Assert.Equal("done", s[P.Job("download", "highprio001")].Tags["idx_state"]);
+        Assert.Equal("pending", Q(s).Entry("olderzero01", "download")!.State);
+        Assert.Equal("done", Q(s).Entry("highprio001", "download")!.State);
         var id = "highprio001";
         // video.mp4 and download.zip are blobs; the small files are members of the zip, read back through the same zip-aware store the plugin wrote with
         Assert.True(s.Exists(P.Video(id, "video.mp4"))); Assert.True(s.Exists(P.Video(id, "download.zip")));
@@ -80,9 +78,8 @@ public class PluginTests
         var marker = JsonNode.Parse(Encoding.UTF8.GetString((await rd.GetAsync(P.Video(id, "downloaded.json"), default))!.Data))!;
         Assert.Equal("android-pixel-abc123", (string)marker["nodeId"]!);
         Assert.Equal(480, (int)marker["height"]!);
-        // follow-up jobs: comments, and step jobs for processing
-        Assert.True(s.Exists(P.Job("comments", id)));
-        Assert.True(s.Exists(P.Job("frames", id)));
+        // the download only downloads and uploads: its done line adds the process follow-up (no comments or step jobs, no pre-check here)
+        Assert.Equal("pending", Q(s).Entry(id, "process")!.State); Assert.Null(Q(s).Entry(id, "comments"));
         // the network report: the node record carries the address, transport and kind
         var node = JsonNode.Parse(Encoding.UTF8.GetString(s[P.Node("android-pixel-abc123")].Data))!;
         Assert.Equal("android", (string)node["kind"]!);
@@ -98,7 +95,8 @@ public class PluginTests
         var s = new FakeStore(); var tools = new FakeTools(); var host = Host(tools);
         tools.ListingOutput = "aaaaaaaaaaa\tUCchan\tChan\t120\tpublic\tOne\nbbbbbbbbbbb\tUCchan\tChan\t60\tpublic\tTwo\n";
         var src = JobDescriptor.NewSource("playlist", "PLtest", "Test list", "once", ["videos"], false, -1, 480);   // a new source starts as a lookup
-        Assert.True(await Sources.AddAsync(s, P, src, default));
+        var q = new JobQueue(s, P, "seed", () => DateTimeOffset.UtcNow); await q.LoadAsync(default);
+        Assert.True(await Sources.AddAsync(q, src, default));
         // a download node (no stages given) runs refresh as well, like the desktop one
         var res = JsonNode.Parse(await new NodePlugin().RunWithStoreAsync(host, s, """{"maxJobs":1,"once":true}""", default))!;
         Assert.Contains("refresh", res["stages"]!.AsArray().Select(x => (string)x!));
@@ -110,11 +108,10 @@ public class PluginTests
         // every new video is a download job, unclassified (the classify job decides)
         foreach (var v in new[] { "aaaaaaaaaaa", "bbbbbbbbbbb" })
         {
-            var d = s[P.Job("download", v)];
-            Assert.Equal("unclassified", d.Tags["idx_state"]);
+            Assert.Equal("unclassified", Q(s).Entry(v, "download")!.State);
         }
         // the source job is done (schedule once)
-        Assert.Equal("done", s[P.Job("refresh", "pl-PLtest")].Tags["idx_state"]);
+        Assert.Equal("done", Q(s).Entry("pl-PLtest", "refresh")!.State);
         // noRefresh leaves the stage out
         var res2 = JsonNode.Parse(await new NodePlugin().RunWithStoreAsync(host, new FakeStore(), """{"stages":["download"],"noRefresh":true,"once":true}""", default))!;
         Assert.DoesNotContain("refresh", res2["stages"]!.AsArray().Select(x => (string)x!));
@@ -125,9 +122,9 @@ public class PluginTests
     {
         var s = new FakeStore(); var tools = new FakeTools(); var host = Host(tools);
         await Dl(s, "stoppedjob1", "2026-11-17T00:00:00Z", 0);
-        await s.PutAsync(P.Control, Encoding.UTF8.GetBytes("""{"mode":"stop"}"""), null, null, false, default);
+        await s.PutAsync(P.Control, Encoding.UTF8.GetBytes("""{"mode":"stop"}"""), null, null, false, default);   // index/jobs/control.json
         await new NodePlugin().RunWithStoreAsync(host, s, """{"stages":["download"],"once":true}""", default);
         Assert.Empty(tools.Urls);
-        Assert.Equal("pending", s[P.Job("download", "stoppedjob1")].Tags["idx_state"]);
+        Assert.Equal("pending", Q(s).Entry("stoppedjob1", "download")!.State);
     }
 }

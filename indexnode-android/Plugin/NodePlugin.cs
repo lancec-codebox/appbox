@@ -13,7 +13,7 @@ internal sealed class HostLogWriter(IHost host) : TextWriter
     public override void Write(string? value) { if (!string.IsNullOrEmpty(value)) host.Log(value.TrimEnd('\n', '\r')); }
 }
 
-/// <summary>The node loop for phones: IndexNode.Core's engine with the download stage (and, when asked, refresh and comments), over IHost and ITools only.</summary>
+/// <summary>The node loop for phones: IndexNode.Core's engine with the download stage (and, when asked, refresh and availability; comments are part of the download since 0.13.0), over IHost and ITools only.</summary>
 public sealed class NodePlugin : IPlugin
 {
     public const string Version = "0.1.1";
@@ -63,7 +63,6 @@ public sealed class NodePlugin : IPlugin
             handlers[st] = st switch
             {
                 "download" => new DownloadStage(tools, store, gate),
-                "comments" => new CommentsStage(tools, store, gate),
                 "refresh" => new RefreshStage(tools, store),
                 "availability" => new AvailabilityStage(tools, store),
                 _ => throw new ArgumentException("this node does not run stage " + st),
