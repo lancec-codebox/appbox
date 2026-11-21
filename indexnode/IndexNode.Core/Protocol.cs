@@ -103,6 +103,9 @@ public sealed class Paths(string prefix)
     public string VideoDir(string id) => $"{Prefix}videos/{id}/";
     /// <summary>0.13.9: a drama's frames file, the lookup readers' only source of its frames (never centers.zip).</summary>
     public string FramesFile(string id) => $"{Prefix}search/frames/{id}.bin";
+    /// <summary>0.13.10: a drama's retained frames (the ones no earlier drama covers), the same format as the frames file; the index is built from it when it exists.</summary>
+    public string RetainedFile(string id) => $"{Prefix}search/retained/{id}.bin";
+    public string RetainedDir => $"{Prefix}search/retained/";
     public string FramesDir => $"{Prefix}search/frames/";
     /// <summary>0.13.0: the control file lives with the queue (jobs/control.json). The old index/control.json stays mode=stop for ever (so old binaries never resume on the old store) and is never read.</summary>
     public string Control => $"{Prefix}jobs/control.json";

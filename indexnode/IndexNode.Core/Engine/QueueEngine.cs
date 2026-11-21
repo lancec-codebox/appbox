@@ -23,6 +23,7 @@ public sealed partial class NodeEngine
         {
             "process" => o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s)),
             "search-index" => handlers.ContainsKey("search-index") && (o.Stages.Contains("search-index") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.1: standard (non-AI) work of any processor node
+            "group" => handlers.ContainsKey("group") && (o.Stages.Contains("group") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.10: standard work of any process node
             "describe" or "translate" => o.AiStages,   // opt-in: only a node started with the AI stages and an endpoint
             _ => o.Stages.Contains(stage),
         };
@@ -109,7 +110,7 @@ public sealed partial class NodeEngine
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: automatic retry failed ({e.Message})"); }
     }
 
-    private static IEnumerable<string> QueueStages() => new[] { "download", "process", "describe", "translate", "refresh", "classify", "availability", "search-index" };
+    private static IEnumerable<string> QueueStages() => new[] { "download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index" };
 
     /// <summary>Claims one candidate subject (limits, per-IP cap, then the protocol's claim) and runs it. False when nothing was claimed.</summary>
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
@@ -230,6 +231,25 @@ public sealed partial class NodeEngine
             switch (stage)
             {
                 case "process": return await RunProcessAsync(lane, w, entry, job, token);
+                case "group":
+                    {
+                        // 0.13.10: sequence order. A drama waits (the entry goes back to pending, due in two minutes, nothing else written) while an earlier one is still in flight.
+                        if (queue.Read(st => st.Get(id)?.Seq) == null) await h.AssignSeqAsync(token);
+                        var blockers = await GroupSequencing.BlockersAsync(queue, store, paths, id, token);
+                        if (blockers.Count > 0)
+                        {
+                            Log.Info($"group {id}: waiting for {blockers.Count} earlier drama(s) ({string.Join(", ", blockers.Take(3))}{(blockers.Count > 3 ? ", ..." : "")})");
+                            await h.AppendAsync([new QLine { T = "done", Stage = "group", State = "pending", Due = Protocol.Utc(queue.Now + GroupSequencing.Wait) }], true, CancellationToken.None);
+                            return (Outcome.Done, null, true, null);
+                        }
+                        var gj = JobDescriptor.NewStep("group", id); gj.Priority = entry.Priority;
+                        ctx = NewContext(lane, w, "group", gj, store, [], token);
+                        await handlers["group"].RunAsync(ctx);
+                        var gl = new List<QLine> { new() { T = "done", Stage = "group" } };
+                        if (handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } gsi) gl.Add(gsi);
+                        await h.AppendAsync(gl, !WillContinue(id, "group", gl), CancellationToken.None);
+                        return (Outcome.Done, null, ClaimEnded(id), ctx);
+                    }
                 case "describe" or "translate":
                     {
                         var sj = JobDescriptor.NewStep(stage, id); sj.Priority = entry.Priority;
@@ -297,6 +317,8 @@ public sealed partial class NodeEngine
         w.Local ??= new LocalCacheStore(store, Path.Combine(Path.GetTempPath(), "indexnode", "c-" + instanceTag + "-" + id));
         // 0.13.0: the pre-check is the first step of a process claim, only for a drama with no processing done yet (a part-processed one resumes from its first unfinished step)
         bool ranPre = false;
+        // 0.13.10: the sequence number is assigned at the first pre-check line, under the claim (and so under the drama's lease)
+        if (queue.Read(s => s.Get(id)?.Seq) == null && handlers.ContainsKey("precheck")) await h.AssignSeqAsync(token);
         // 0.13.2: decided from the store only (no processing zip besides download/comments), never from the done set; the stage itself returns at once for a video.json that already has the record
         bool noProcessing = !await HasProcessingAsync(id, token);
         var vjPre = handlers.ContainsKey("precheck") && noProcessing ? (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject : null;
@@ -352,6 +374,7 @@ public sealed partial class NodeEngine
             foreach (var s1 in CheckedSteps) if (await store.HeadAsync(paths.Video(id, s1 + ".zip"), token) == null) missing.Add(s1);
             if (missing.Count > 0) throw new InvalidOperationException($"process {id}: every step is done but {string.Join(", ", missing.Select(m => m + ".zip"))} is not on the store; not finishing (the missing step runs on the next claim)");
             var lines = new List<QLine> { new() { T = "done", Stage = "process", PreCheck = pcDecision, Group = (string?)pcRec?["groupId"], GroupOffset = (double?)pcRec?["groupOffset"], MatchShare = (double?)pcRec?["matchShare"], DupShare = (double?)pcRec?["dupShare"], Mixed = (bool?)(pcRec?["group"] as System.Text.Json.Nodes.JsonObject)?["mixed"] is true ? true : null } };
+            if (handlers.ContainsKey("group") && queue.Read(st => st.Entry(id, "group")) == null) lines.Add(QLine.Add(id, "group", GroupSequencing.NewJob(id, entry.Priority), queue.NowUtc()));
             lines.Add(QLine.Add(id, "describe", NewFollow("describe", id, entry.Priority), queue.NowUtc()));
             await h.AppendAsync(lines, !WillContinue(id, "process", lines), CancellationToken.None);
             return (Outcome.Done, null, ClaimEnded(id), ctx);

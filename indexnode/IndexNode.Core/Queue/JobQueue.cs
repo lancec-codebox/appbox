@@ -75,6 +75,23 @@ public sealed class ClaimHandle
         if (!ok) throw new LeaseLostException($"{Subject}: claim epoch {Epoch} was superseded");
     }
 
+    /// <summary>0.13.10: gives this subject its sequence number if it has none, inside the fenced conditional append (the number is max + 1 of the state the append is conditional on). Returns the number.</summary>
+    public async Task<long> AssignSeqAsync(CancellationToken ct)
+    {
+        if (Lost) throw new LeaseLostException($"lease on {Subject} is lost");
+        long seq = 0;
+        var ok = await queue.AppendAsync(state =>
+        {
+            var s = state.Get(Subject);
+            if (s == null || s.Epoch != Epoch || s.ClaimBy != queue.NodeId) { MarkLost(); return null; }
+            if (s.Seq is { } have) { seq = have; return []; }
+            seq = state.NextSeq();
+            return [new QLine { T = "seq", S = Subject, Seq = seq, By = queue.NodeId, At = queue.NowUtc() }];
+        }, ct);
+        if (!ok) throw new LeaseLostException($"{Subject}: claim epoch {Epoch} was superseded");
+        return seq;
+    }
+
     /// <summary>After the final append: stops the heartbeat and deletes the active file (a crash before this leaves the work recorded as done; the lease lapses and the next node deletes the file).</summary>
     public async Task FinishAsync()
     {

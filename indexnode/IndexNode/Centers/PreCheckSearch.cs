@@ -109,7 +109,7 @@ public static class PreCheckSearch
             CentersBlob? z; List<(int Center, CentersFile.Members Members)> blocks;
             try
             {
-                z = await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct); if (z == null) continue;
+                z = await FramesReader.OpenAsync(raw, paths.RetainedFile(id), ct) ?? await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct); if (z == null) continue;   // 0.13.10: a retained file is the drama's vectors once it has one (what the index holds)
                 var h = await z.ReadHeaderAsync(ct);
                 blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
             }

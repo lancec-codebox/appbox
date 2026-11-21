@@ -35,6 +35,17 @@ public sealed class SearchData
         for (int d = 0; d < CentersFile.Dim; d++) if (center[d] - mean[d] > 0) code[d >> 3] |= (byte)(1 << (d & 7));
     }
 
+    /// <summary>0.13.10: a view of this index with only the uploads <paramref name="keep"/> accepts (the group step searches only EARLIER dramas). Rows keep their order.</summary>
+    public SearchData Restrict(Func<SearchUpload, bool> keep)
+    {
+        var map = new int[Uploads.Count]; var ups = new List<SearchUpload>();
+        for (int i = 0; i < Uploads.Count; i++) { if (keep(Uploads[i])) { map[i] = ups.Count; ups.Add(Uploads[i]); } else map[i] = -1; }
+        int kept = 0; for (int r = 0; r < Count; r++) if (map[RefUpload[r]] >= 0) kept++;
+        var nb = new byte[(long)kept * CodeBytes]; var ru = new int[kept]; var rc = new int[kept]; int w = 0;
+        for (int r = 0; r < Count; r++) { int u = map[RefUpload[r]]; if (u < 0) continue; Buffer.BlockCopy(Bits, r * CodeBytes, nb, w * CodeBytes, CodeBytes); ru[w] = u; rc[w] = RefCenter[r]; w++; }
+        return new SearchData { Version = Version, MeanVersion = MeanVersion, MeanFrames = MeanFrames, Mean = Mean, Bits = nb, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = BuiltAt };
+    }
+
     // ---------------------------------------------------------------- scan
     /// <summary>The 64 x 256 lookup table of the asymmetric score: entry [b, v] = sum over the 8 bits j of v of (+q[8b+j] if the bit is set else -q[8b+j]). The score of a code is the sum of 64 lookups.</summary>
     public static float[] Lut(ReadOnlySpan<float> q)
@@ -290,12 +301,19 @@ public static class SearchIndexBuild
     /// <summary>0.13.9: the frames file of every drama (index/search/frames/&lt;id&gt;.bin): id, ETag, size, idx_sha256. centers.zip is never listed or opened here.</summary>
     public static async Task<List<(string Id, BlobEntry Zip)>> ListCentersAsync(IStore raw, Paths paths, CancellationToken ct)
     {
+        // 0.13.10: a drama with a retained file is indexed from it (only the frames no earlier drama covers); every other from its frames file
+        var retained = new Dictionary<string, BlobEntry>(StringComparer.Ordinal);
+        foreach (var b in await raw.ListAsync(paths.RetainedDir, false, true, ct))
+        {
+            if (!b.Name.EndsWith(".bin", StringComparison.Ordinal)) continue;
+            var id = b.Name[paths.RetainedDir.Length..^".bin".Length]; if (!id.Contains('/')) retained[id] = b;
+        }
         var l = new List<(string, BlobEntry)>(); var pre = paths.FramesDir;
         foreach (var b in await raw.ListAsync(pre, false, true, ct))
         {
             if (!b.Name.EndsWith(".bin", StringComparison.Ordinal)) continue;
             var id = b.Name[pre.Length..^".bin".Length]; if (id.Contains('/')) continue;
-            l.Add((id, b));
+            l.Add((id, retained.GetValueOrDefault(id) ?? b));
         }
         return l.OrderBy(x => x.Item1, StringComparer.Ordinal).ToList();
     }
@@ -303,9 +321,10 @@ public static class SearchIndexBuild
     public sealed record Loaded(SearchUpload Up, float[] Centers, float[] Sum);
 
     /// <summary>Reads one upload's header and center vectors (a few range requests).</summary>
-    public static async Task<Loaded> LoadUploadAsync(IStore raw, Paths paths, string id, CancellationToken ct)
+    public static async Task<Loaded> LoadUploadAsync(IStore raw, Paths paths, string id, CancellationToken ct, string? blob = null)
     {
-        var z = await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct) ?? throw new FileNotFoundException(paths.FramesFile(id));
+        blob ??= paths.FramesFile(id);
+        var z = await FramesReader.OpenAsync(raw, blob, ct) ?? throw new FileNotFoundException(blob);
         int first = (int)Math.Min(z.DataLength, CentersFile.HeaderSize + 256 * CentersFile.Dim * 2);
         var buf = await z.ReadAsync(0, first, ct); var h = CentersFile.ParseHeader(buf);
         int need = CentersFile.HeaderSize + h.K * CentersFile.Dim * 2;
@@ -335,7 +354,7 @@ public static class SearchIndexBuild
             if (old != null && mean != null && old.TryGetValue(uploads[i].Id, out var ou) && ou.Sha == uploads[i].Zip.Metadata.GetValueOrDefault("idx_sha256", "?") && ou.Sha != "") reuse[i] = true;
         await Parallel.ForEachAsync(Enumerable.Range(0, uploads.Count).Where(i => !reuse[i]), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, async (i, t) =>
         {
-            loaded[i] = await LoadUploadAsync(raw, paths, uploads[i].Id, t);
+            loaded[i] = await LoadUploadAsync(raw, paths, uploads[i].Id, t, uploads[i].Zip.Name);
             int d = Interlocked.Increment(ref done); if (d % 100 == 0) say($"  read {d} uploads");
         });
         double total = 0; long frames = 0;

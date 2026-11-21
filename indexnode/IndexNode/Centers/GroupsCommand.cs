@@ -60,6 +60,15 @@ public static class GroupsCommand
     /// <summary>0.13.3: `groups build [--dry-run] [--threads N] [--check-pairs FILE]`: the one-time group table, by the SAME frame-level full check the index build runs for a new upload (each upload's own frames searched against the index, joined at &gt;= 5 distinct-frame hits, mixed and offset as in 0.13.2; the language is video.json's).</summary>
     public static async Task<int> RunAsync(Args a, IStore? remote = null)
     {
+        if (a.Positional.FirstOrDefault() == "enqueue")
+        {
+            var (_, es, ep, _) = CentersCommands.OpenStore(a, remote);
+            await JobQueue.RequireSnapshotAsync(es, ep, default);
+            var eq = new JobQueue(es, ep, "cli"); await eq.LoadAsync(default);
+            var er = await SeqCommand.EnqueueGroupsAsync(eq, a.Has("dry-run"), default);
+            Console.WriteLine($"groups enqueue{(a.Has("dry-run") ? " (dry run)" : "")}: {er.Candidates} processed dramas, {er.Existing} already have a group entry, {er.NoSeq} have no sequence number (run: indexnode seq assign), {er.Added} {(a.Has("dry-run") ? "would be " : "")}added");
+            return 0;
+        }
         if (a.Positional.FirstOrDefault() != "build") throw new ArgumentException("groups build [--dry-run] [--threads N] [--check-pairs <file>] [--top 20]");
         var (cfg, store, paths, _) = CentersCommands.OpenStore(a, remote);
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads; bool dry = a.Has("dry-run");

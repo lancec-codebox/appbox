@@ -8,7 +8,7 @@ namespace IndexNode;
 /// No center pruning: every processed upload adds all its centers.</summary>
 public static class GroupBuild
 {
-    sealed record Rec(GroupProposal? Proposal, string? At, double? Duration, bool HasPrecheck = false);
+    sealed record Rec(GroupProposal? Proposal, string? At, double? Duration, bool HasPrecheck = false, GroupProposal? Grouped = null);
 
     /// <summary>The group proposal, time and duration of an upload from its video.json (0.13.2: no precheck.json, no downloaded.json). A missing or unreadable video.json throws: the group build fails loudly and is retried.</summary>
     static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say)
@@ -17,7 +17,8 @@ public static class GroupBuild
         try { root = (await VideoJson.ReadAsync(store, paths, id, ct))?.Root ?? new JsonObject(); }   // 0.13.3: a missing or bad video.json places the upload with no hint (the catalog marks it missing), it does not fail the build
         catch (InvalidDataException) { root = new JsonObject(); }
         var pc = root["precheck"] as JsonObject;
-        return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null);
+        var gr = root["grouping"] as JsonObject;   // 0.13.10: the per-drama group step's record
+        return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null, gr == null ? null : GroupProposal.FromJson(gr["proposal"] as JsonObject));
     }
 
     public const int ChunkFrames = 30;
@@ -87,12 +88,12 @@ public static class GroupBuild
         return $"groups: checked {done} of {total} ({rate:F1}/min, ETA {(int)eta.TotalHours:D2}:{eta.Minutes:D2})";
     }
 
-    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true, bool requireGroups = false)
+    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true, bool requireGroups = false, bool foldOnly = false)
     {
         var s = settings ?? new PreCheckSettings();
         var prior = head == null ? null : await GroupStore.LoadAsync(store, paths, head.Version, ct);
         // 0.13.6: with no groups file the index job does not group (a bootstrap of every upload is hours of work: `indexnode groups build` does it once); the version is published with no groups
-        if (requireGroups && prior == null && !bootstrap)
+        if (requireGroups && !foldOnly && prior == null && !bootstrap)
         {
             say?.Invoke("groups: NO groups file yet: not grouping (catalog groupId stays null); run `indexnode groups build` first");
             return new GroupSet();
@@ -103,7 +104,7 @@ public static class GroupBuild
         foreach (var g in set.Groups) g.Members.RemoveAll(m => m.CheckedBy == "precheck" && byId.ContainsKey(m.Upload));
         set.Groups.RemoveAll(g => g.Members.Count == 0);
         var known = set.GroupOf();
-        var news = new List<NewUpload>(); int full = 0, hinted = 0;
+        var news = new List<NewUpload>(); int full = 0, hinted = 0, foldedTotal = 0, ungrouped = 0;
         // 0.13.3: the speech language of every upload is video.json's as it is NOW (not the index table's copy from when the centers were read): a group's canonical election and its reason use it
         var speech = new System.Collections.Concurrent.ConcurrentDictionary<string, (string? Lang, bool? Dub)>(StringComparer.Ordinal);
         await Parallel.ForEachAsync(next.Uploads, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (u, t) =>
@@ -113,24 +114,28 @@ public static class GroupBuild
         (string? Lang, bool? Dub) Sp(SearchUpload u) => speech.TryGetValue(u.Id, out var x) && x.Lang != null ? x : (u.SpeechLanguage, u.Dubbed);
         var unknown = next.Uploads.Where(u => !known.ContainsKey(u.Id)).ToList();
         // 0.13.6: a build full-checks at most GroupMaxNewPerBuild new uploads; the rest stay unplaced and are the next build's (a bootstrap checks them all)
-        if (!bootstrap && unknown.Count > s.GroupMaxNewPerBuild) { say?.Invoke($"groups: {unknown.Count} new uploads, checking {s.GroupMaxNewPerBuild} now (groups.max-new-per-build); the rest wait for the next build"); unknown = unknown.Take(s.GroupMaxNewPerBuild).ToList(); }
+        // 0.13.10: the index job (foldOnly) never runs the full check: a drama with a group record is folded from it, a drama without one is left out of the set (its own group in the catalog) until its group step has run
+        if (foldOnly) { var recs = new Dictionary<string, Rec>(StringComparer.Ordinal); foreach (var u in unknown) { var rr = await ReadRecAsync(store, paths, u.Id, ct, say); if (rr.Grouped != null) recs[u.Id] = rr; } ungrouped = unknown.Count(u => !recs.ContainsKey(u.Id)); unknown = unknown.Where(u => recs.ContainsKey(u.Id)).ToList(); }
+        else if (!bootstrap && unknown.Count > s.GroupMaxNewPerBuild) { say?.Invoke($"groups: {unknown.Count} new uploads, checking {s.GroupMaxNewPerBuild} now (groups.max-new-per-build); the rest wait for the next build"); unknown = unknown.Take(s.GroupMaxNewPerBuild).ToList(); }
         int done = 0, todo = unknown.Count; var clock = Stopwatch.StartNew();
         var cache = new BlockCache(s.GroupCacheMb * 1024L * 1024L);
         // 0.13.7: several uploads are checked at once (bounded by threads), each with its share of the threads for its own frames; the check only reads the index and the (still unchanged) set, the placements are applied after, in index order
         int par = Math.Max(1, Math.Min(threads, unknown.Count)), inner = Math.Max(1, threads / par);
-        var placed = new NewUpload?[unknown.Count]; int fullN = 0, hintN = 0; var cstats = new CheckStats();
+        var placed = new NewUpload?[unknown.Count]; int fullN = 0, hintN = 0, folded = 0; var cstats = new CheckStats();
         using var tick = new Timer(_ => { try { cstats.Peak(CentersBlob.InFlight); } catch { } }, null, 0, 200);
         await Parallel.ForEachAsync(Enumerable.Range(0, unknown.Count), new ParallelOptions { MaxDegreeOfParallelism = par, CancellationToken = ct }, async (k, t) =>
         {
             var u = unknown[k];
             var r = await ReadRecAsync(store, paths, u.Id, t, say);
-            var prop = await FullCheckAsync(store, paths, next, u, set, s, inner, t, cache, cstats); cstats.Done();
-            if (prop == null) { prop = r.Proposal; Interlocked.Increment(ref hintN); } else Interlocked.Increment(ref fullN);
+            // 0.13.10: a drama the group step has done is folded from its record: no frames are read or searched here
+            var prop = r.Grouped ?? (foldOnly ? null : await FullCheckAsync(store, paths, next, u, set, s, inner, t, cache, cstats)); cstats.Done();
+            if (r.Grouped != null) Interlocked.Increment(ref folded);
+            else if (prop == null) { prop = r.Proposal; Interlocked.Increment(ref hintN); } else Interlocked.Increment(ref fullN);
             var (l0, d0) = Sp(u);
             placed[k] = new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop);
             int n = Interlocked.Increment(ref done); if (n % 10 == 0 || n == todo) say?.Invoke(Progress(n, todo, clock.Elapsed) + "; " + cstats.Line() + $"; {par} uploads at once, {inner} threads each");
         });
-        news.AddRange(placed.Select(x => x!)); full += fullN; hinted += hintN;
+        news.AddRange(placed.Select(x => x!)); full += fullN; foldedTotal = folded; hinted += hintN;
         // the uploads the pre-check short-circuited (record, no centers.zip) with a proposal in it
         var shorts = new HashSet<string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/";
         foreach (var b in await store.ListAsync(pre, false, false, ct))
@@ -156,7 +161,7 @@ public static class GroupBuild
         next.Uploads = next.Uploads.Select(u => u with { Group = of.GetValueOrDefault(u.Id) }).ToList();
         if (write) await GroupStore.WriteAsync(store, paths, set, next.Version, ct);
         int moved = set.Groups.Count(g => before.TryGetValue(g.Id, out var c) && c != g.Canonical);
-        say?.Invoke($"groups: {news.Count} new uploads placed ({full} full check, {hinted} from the pre-check hint, {news.Count(n => n.ShortCircuit)} short-circuited), {set.Groups.Count} groups, {moved} canonical changed");
+        say?.Invoke($"groups: {news.Count} new uploads placed ({foldedTotal} folded from the group step, {full} full check, {ungrouped} without a group record (ungrouped until their group step runs), {hinted} from the pre-check hint, {news.Count(n => n.ShortCircuit)} short-circuited), {set.Groups.Count} groups, {moved} canonical changed");
         return set;
     }
 }

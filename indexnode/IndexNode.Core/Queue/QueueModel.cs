@@ -46,6 +46,8 @@ public sealed class QLine
     [JsonPropertyName("ais")] public double? AiScore { get; set; }
     /// <summary>done (step precheck): the pre-check record (decision, ai flag and score, every number it measured), so the log alone says why the entry was held.</summary>
     [JsonPropertyName("pre")] public System.Text.Json.Nodes.JsonNode? Pre { get; set; }
+    /// <summary>0.13.10 seq: the drama's sequence number, assigned inside the conditional append (max + 1 of the state the append is conditional on, so two nodes never get the same one and the numbers only grow). With Seq set by the caller (the bootstrap command) the line carries explicit numbers.</summary>
+    [JsonPropertyName("sq")] public long? Seq { get; set; }
 
     public string ToJson() => JsonSerializer.Serialize(this, Protocol.Json);
     public static QLine? Parse(string line) { try { return JsonSerializer.Deserialize<QLine>(line, Protocol.Json); } catch (JsonException) { return null; } }
@@ -92,6 +94,8 @@ public sealed class QSubject
     public string? LastAt { get; set; }
     /// <summary>0.13.1: when this subject's centers step last finished (the done line's time): the pre-check searches these centers by brute force until the search index has been built after that time.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CentersAt { get; set; }
+    /// <summary>0.13.10: the drama's sequence number (null until its first pre-check line, or `indexnode seq assign`).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public long? Seq { get; set; }
     [JsonIgnore] public bool Active => Entries.Values.Any(e => !e.Final);
 }
 
@@ -100,9 +104,12 @@ public sealed class QueueState
 {
     public Dictionary<string, QSubject> Subjects { get; set; } = new(StringComparer.Ordinal);
     /// <summary>The order a claim runs a subject's stages in.</summary>
-    public static readonly string[] StageOrder = ["download", "process", "describe", "translate", "refresh", "classify", "availability", "search-index"];
+    public static readonly string[] StageOrder = ["download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index"];
     public static int Rank(string stage) { var i = Array.IndexOf(StageOrder, stage); return i < 0 ? 99 : i; }
 
+    /// <summary>The highest sequence number handed out so far (kept in the snapshot, so dropping an old subject never lowers it).</summary>
+    public long MaxSeq { get; set; }
+    public long NextSeq() => MaxSeq + 1;
     public QSubject? Get(string subject) => Subjects.GetValueOrDefault(subject);
     public QEntry? Entry(string subject, string stage) => Get(subject)?.Entries.GetValueOrDefault(stage);
 
@@ -145,6 +152,12 @@ public sealed class QueueState
                     if (l.Step == "centers" && l.Stage == "process") sub.CentersAt = l.At;
                     if (l.Fin == true) EndClaim(sub, l);
                     sub.LastAt = l.At;
+                    break;
+                }
+            case "seq":   // 0.13.10: first writer wins; a repeated line (a retry after a lost race) never renumbers
+                {
+                    if (!Subjects.TryGetValue(l.S, out var sub)) Subjects[l.S] = sub = new QSubject { Id = l.S };
+                    if (sub.Seq == null && l.Seq != null) { sub.Seq = l.Seq; if (l.Seq > MaxSeq) MaxSeq = l.Seq.Value; }
                     break;
                 }
             case "deleted":   // `indexnode trash empty` removed what a skip had marked
@@ -233,6 +246,7 @@ public sealed class QueueState
         public long Off { get; set; }
         public int Blocks { get; set; }
         public string At { get; set; } = "";
+        public long MaxSeq { get; set; }
         /// <summary>The segment before Seg and its final length: a reader checks it is sealed at exactly that length before it trusts this snapshot.</summary>
         public List<QSubject> Subjects { get; set; } = [];
     }
@@ -251,16 +265,16 @@ public sealed class QueueState
             if (!allDone && s.ClaimBy == null && s.Entries.Values.All(e => e.Final) && !s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(SlimFinished(s)); continue; }   // finished, some failed for good: ids, states, priority and the reason are enough
             if (!allDone) { list.Add(s); continue; }
             if (s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(s); continue; }   // a trash mark is kept until `trash empty` has acted on it
-            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Entries = { ["download"] = d } }));
+            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, Entries = { ["download"] = d } }));
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
-        return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { Seg = seg, Off = off, Blocks = blocks, At = at, Subjects = list }, Protocol.Json);
+        return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, Subjects = list }, Protocol.Json);
     }
 
     /// <summary>A finished subject as the snapshot needs it: the stage states, priority, when it was added and finished, a cut-down error and a minimal job (id, url, reason, duplicate-of) so a retry or a duplicate check still works. Everything else (due, attempts, node, steps, network, titles, ...) is dropped.</summary>
     static QSubject SlimFinished(QSubject s)
     {
-        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt };
+        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq };
         foreach (var (k, e) in s.Entries)
         {
             var j = e.Job; var keepsJob = k is "download" or "refresh" or "classify" or "availability";
@@ -286,7 +300,7 @@ public sealed class QueueState
     {
         data = Unpack(data);
         var doc = JsonSerializer.Deserialize<SnapshotDoc>(data, Protocol.Json) ?? throw new InvalidDataException("empty queue snapshot");
-        var st = new QueueState(); foreach (var s in doc.Subjects) st.Subjects[s.Id] = s;
+        var st = new QueueState(); foreach (var s in doc.Subjects) { st.Subjects[s.Id] = s; if (s.Seq > st.MaxSeq) st.MaxSeq = s.Seq.Value; } st.MaxSeq = Math.Max(st.MaxSeq, doc.MaxSeq);
         return (st, doc);
     }
 }
