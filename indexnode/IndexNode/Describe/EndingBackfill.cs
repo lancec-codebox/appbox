@@ -19,18 +19,11 @@ public static class EndingBackfill
     /// <summary>The prompt for one batch: one block per drama, answer keyed by id.</summary>
     public static string Prompt(IEnumerable<Item> items)
     {
-        var sb = new StringBuilder();
-        sb.AppendLine("You judge whether each short-drama upload below tells its story to the end. Work only from the evidence given for each drama: the upload title, the upload description, the LAST minutes of its text track (burned-in subtitles or speech recognition, [m:ss] text) and a synopsis of the whole story written earlier. Answer with ONE JSON object and nothing else.");
-        sb.AppendLine(@"For each drama give ending: kind ""complete"" (the main conflict is resolved and the story is told to its end), ""cliffhanger"" (it stops on an unresolved turn, a 'to be continued' or a next-episode teaser) or ""truncated"" (it stops mid-scene or mid-sentence, as if the upload were cut off); signs: the evidence in a few words, English only, [] when none; nextPart: true when the text or description points to a further part, episode or season, false when it says this is the last, null when nothing says; nextPartHint: what names the next part when the title, description or last lines show it (e.g. '第二部', 'Part 2', a sequel title, 'EP 5'), copied as written, at most 80 characters, else null. Do not guess: when the evidence is too thin, answer kind null.");
-        sb.AppendLine(@"Answer: {""dramas"":[{""id"":"""",""ending"":{""kind"":""complete"",""signs"":[],""nextPart"":null,""nextPartHint"":null}}]}, one entry per drama, id copied exactly.");
+        var f = PromptFile.Load("ending"); var sb = new StringBuilder();
+        sb.AppendLine(f.Text("intro")); sb.AppendLine(f.Text("rules")); sb.AppendLine(f.Text("answer"));
         foreach (var i in items)
-        {
-            sb.AppendLine("=== drama " + i.Id);
-            sb.AppendLine("Title: " + i.Title);
-            sb.AppendLine("Description:\n" + Cut(i.Description, MaxDescription));
-            sb.AppendLine("Synopsis:\n" + Cut(i.Synopsis, MaxSynopsis));
-            sb.AppendLine($"Last {TailSeconds / 60} minutes of the text track:\n" + (i.Tail.Length == 0 ? "(no text)" : Cut(i.Tail, MaxTail, fromEnd: true)));
-        }
+            sb.AppendLine(f.Fill("drama-block", ("id", i.Id), ("title", i.Title), ("description", Cut(i.Description, MaxDescription)), ("synopsis", Cut(i.Synopsis, MaxSynopsis)), ("minutes", (TailSeconds / 60).ToString()),
+                ("tail", i.Tail.Length == 0 ? f.Text("no-text") : Cut(i.Tail, MaxTail, fromEnd: true))));
         return sb.ToString();
     }
 

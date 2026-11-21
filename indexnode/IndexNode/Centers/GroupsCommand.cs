@@ -69,6 +69,15 @@ public static class GroupsCommand
             Console.WriteLine($"groups enqueue{(a.Has("dry-run") ? " (dry run)" : "")}: {er.Candidates} dramas with frames, {er.Existing} already have a group entry, {er.NoSeq} have no sequence number (run: indexnode seq assign), {er.Added} {(a.Has("dry-run") ? "would be " : "")}added");
             return 0;
         }
+        if (a.Positional.FirstOrDefault() == "backfill-joins")
+        {
+            var (_, bs, bp, _) = CentersCommands.OpenStore(a, remote);
+            await JobQueue.RequireSnapshotAsync(bs, bp, default);
+            var bq = new JobQueue(bs, bp, "cli"); await bq.LoadAsync(default);
+            var br = await SeqCommand.BackfillJoinsAsync(bq, bs, bp, a.Has("dry-run"), default);
+            Console.WriteLine($"groups backfill-joins{(a.Has("dry-run") ? " (dry run)" : "")}: {br.Grouped} grouped dramas, {br.Missing} without a join record, {br.Read} video.json read, {br.NoRecord} with no grouping record yet, {br.Added} join line(s) {(a.Has("dry-run") ? "would be " : "")}added");
+            return 0;
+        }
         if (a.Positional.FirstOrDefault() == "rerun")
         {
             var (_, rs, rp, _) = CentersCommands.OpenStore(a, remote);

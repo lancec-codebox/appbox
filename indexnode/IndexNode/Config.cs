@@ -182,6 +182,7 @@ public sealed class AiConfig
     public string? SessionId { get; set; }
 
     public const string ApiChat = "chat", ApiResponses = "responses", ApiAuto = "auto";
+    public const string DefaultModel = "wupeter/gpt-6-luna";
     public static bool ValidApi(string? v) => v is null or ApiChat or ApiResponses or ApiAuto;
     public string EffectiveApi => string.IsNullOrWhiteSpace(Api) ? ApiAuto : Api.Trim().ToLowerInvariant();
 
@@ -195,8 +196,8 @@ public sealed class AiConfig
         {
             BaseUrl = Pick(flag("ai-base-url"), env("INDEXNODE_AI_BASE_URL"), file?.BaseUrl),
             Key = Pick(flag("ai-key"), env("INDEXNODE_AI_KEY"), file?.Key),
-            TextModel = Pick(flag("ai-text-model"), env("INDEXNODE_AI_TEXT_MODEL"), file?.TextModel),
-            VisionModel = Pick(flag("ai-vision-model"), env("INDEXNODE_AI_VISION_MODEL"), file?.VisionModel),
+            TextModel = Pick(flag("ai-text-model"), env("INDEXNODE_AI_TEXT_MODEL"), file?.TextModel, DefaultModel),
+            VisionModel = Pick(flag("ai-vision-model"), env("INDEXNODE_AI_VISION_MODEL"), file?.VisionModel, DefaultModel),
             Api = Pick(flag("ai-api"), env("INDEXNODE_AI_API"), file?.Api)?.ToLowerInvariant(),
             SessionId = Pick(flag("ai-session-id"), env("INDEXNODE_AI_SESSION_ID"), file?.SessionId),
         };

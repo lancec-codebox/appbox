@@ -51,15 +51,17 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
 
     public static string Blob(Paths paths, string id) => $"{paths.Prefix}classify/{id}.json";
 
-    public static string Prompt(string? channel, IEnumerable<ClassifyEntry> batch) => $$"""
-        You decide which uploads of a YouTube channel are worth downloading for a catalogue of Chinese short dramas (vertical micro-dramas, usually published as one long video of all episodes, 1-3 hours, or as long multi-episode parts).
-        {{(channel == null ? "Each upload names its channel." : "Channel: " + channel)}}
-        A download candidate is a whole drama, or a multi-episode part of one (at least about 20 minutes), in any language (a dubbed drama is a candidate; give its language).
-        Not candidates: trailers, previews, teasers, single short clips or highlights, recaps, reviews, commentary, reactions, behind the scenes, interviews, music, vlogs, ads, live streams, and anything that is not a scripted drama.
-        Uploads (id | {{(channel == null ? "channel | " : "")}}length | title):
-        {{string.Join("\n", batch.Select(e => $"{e.Id} | {(channel == null ? (e.ChannelName ?? "unknown channel") + " | " : "")}{(e.Duration is { } d ? $"{d / 60:F0} min" : "length unknown")} | {e.Title ?? "(no title)"}"))}}
-        Answer with ONE JSON object: {"videos":[{"id":"","candidate":true,"kind":"full|part|dub|trailer|clip|recap|other","language":"zh|en|...","reason":"a few words"}]}, one entry per upload, in the same order.
-        """;
+    public static string Prompt(string? channel, IEnumerable<ClassifyEntry> batch)
+    {
+        var f = PromptFile.Load("classify");
+        string Row(ClassifyEntry e) => f.Fill("row", ("id", e.Id), ("channelPart", channel == null ? f.Fill("row-channel-part", ("channel", e.ChannelName ?? f.Text("unknown-channel"))) : ""),
+            ("length", e.Duration is { } d ? f.Fill("length-min", ("minutes", $"{d / 60:F0}")) : f.Text("length-unknown")), ("title", e.Title ?? f.Text("no-title")));
+        return string.Join("\n", new[]
+        {
+            f.Text("intro"), channel == null ? f.Text("channel-unknown") : f.Fill("channel-known", ("channel", channel)), f.Text("criteria"),
+            f.Fill("list-header", ("channelColumn", channel == null ? f.Text("channel-column") : "")), string.Join("\n", batch.Select(Row)), f.Text("answer"),
+        }) + "\n";
+    }
 
     public static async Task SaveDecisionAsync(IStore store, Paths paths, string id, string? channelId, string? channelName, string? title, double? duration, bool candidate, string kind, string reason, string by, string? model, string at, CancellationToken ct) =>
         await store.PutAsync(Blob(paths, id), JsonSerializer.SerializeToUtf8Bytes(new { v = 1, id, channel = channelId, channelName, title, duration, candidate, kind, reason, by, model, at }), null, null, false, ct);

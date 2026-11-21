@@ -26,6 +26,41 @@ public static class SeqCommand
         return started;
     }
 
+    public sealed record BackfillReport(int Grouped, int Missing, int Read, int NoRecord, int Added);
+
+    /// <summary>
+    /// 0.13.14: `groups backfill-joins [--dry-run]`: every drama whose group step is done but whose queue subject has no join record (grouped before 0.13.14): its video.json is read ONCE and a "join" line (join, jk) is appended, in batches.
+    /// Idempotent: a drama that has a record is skipped, and the append re-checks the state, so a second run (or a racing node) adds nothing. A drama with no grouping record yet is left alone.
+    /// </summary>
+    public static async Task<BackfillReport> BackfillJoinsAsync(JobQueue q, IStore store, Paths paths, bool dry, CancellationToken ct)
+    {
+        await q.PollAsync(ct);
+        var all = q.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue("group", out var g) && g.State == "done").Select(s => (s.Id, Has: s.JoinKind != null)).ToList());
+        var missing = all.Where(x => !x.Has).Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var found = new System.Collections.Concurrent.ConcurrentDictionary<string, (string? Join, string Kind)>(StringComparer.Ordinal); int reads = 0;
+        await Parallel.ForEachAsync(missing, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, c) =>
+        {
+            Interlocked.Increment(ref reads);
+            try
+            {
+                var g = (await VideoJson.ReadAsync(store, paths, id, c))?.Root["grouping"] as System.Text.Json.Nodes.JsonObject; var pr = GroupProposal.FromJson(g?["proposal"] as System.Text.Json.Nodes.JsonObject);
+                if (g != null && pr != null) found[id] = (pr.Kind == GroupProposal.JoinKind ? pr.JoinUpload : null, pr.Kind);
+            }
+            catch (Exception e) when (e is not OperationCanceledException) { }
+        });
+        int added = 0;
+        if (!dry)
+        {
+            var at = q.NowUtc();
+            foreach (var chunk in JobQueue.Chunks(found.Keys.OrderBy(x => x, StringComparer.Ordinal).ToList(), id => id.Length * 2 + 120))
+            {
+                var ids = chunk;
+                await q.AppendLinesAsync(st => { var l = ids.Where(id => st.Get(id) is { JoinKind: null }).Select(id => new QLine { T = "join", S = id, Join = found[id].Join, JoinKind = found[id].Kind, At = at }).ToList(); Interlocked.Add(ref added, l.Count); return l; }, ct);
+            }
+        }
+        return new BackfillReport(all.Count, missing.Count, reads, missing.Count - found.Count, dry ? found.Count : added);
+    }
+
     public sealed record RerunReport(int Joins, int Added, int AlreadyPending);
 
     /// <summary>

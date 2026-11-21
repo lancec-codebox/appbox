@@ -115,6 +115,37 @@ public class AiConfigTests
     }
 
     [Fact]
+    public async Task Auto_routes_a_prefixed_gpt_model_to_responses_and_the_default_model_is_wupeter_gpt_6_luna()
+    {
+        var fake = new Fake(LunaServer);
+        var c = new AiClient(new HttpClient(fake), new AiConfig { BaseUrl = "http://gw/v1", TextModel = "wupeter/gpt-6-luna" });
+        await c.TextAsync(default);
+        Assert.Equal(["/v1/responses"], fake.Seen.Select(s => s.Path));
+        Assert.True(AiClient.IsGpt("wupeter/GPT-6-luna")); Assert.False(AiClient.IsGpt("wupeter/DeepSeek-V4"));
+        var d = AiConfig.Resolve(null, _ => null, _ => null);
+        Assert.Equal("wupeter/gpt-6-luna", d.TextModel); Assert.Equal("wupeter/gpt-6-luna", d.VisionModel);
+        var o = AiConfig.Resolve(new AiConfig { TextModel = "mine" }, _ => null, _ => null);
+        Assert.Equal("mine", o.TextModel);
+    }
+
+    [Fact]
+    public async Task Chat_sends_max_completion_tokens_for_gpt_models_and_retries_once_with_the_other_spelling_on_a_400()
+    {
+        var ok = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+        var f1 = new Fake((_, b) => (200, ok));
+        await new AiClient(new HttpClient(f1), new AiConfig { BaseUrl = "http://gw/v1", Api = "chat", TextModel = "wupeter/gpt-6-luna" }).TextAsync(default);
+        Assert.Contains("max_completion_tokens", f1.Seen[0].Body); Assert.DoesNotContain("\"max_tokens\"", f1.Seen[0].Body);
+        var f2 = new Fake((_, b) => b.Contains("\"max_tokens\"") ? (400, "{\"error\":{\"message\":\"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.\"}}") : (200, ok));
+        var c = new AiClient(new HttpClient(f2), new AiConfig { BaseUrl = "http://gw/v1", Api = "chat", TextModel = "other" });
+        Assert.Equal("ok", await c.TextAsync(default));
+        Assert.Equal(2, f2.Seen.Count); Assert.Contains("max_completion_tokens", f2.Seen[1].Body);
+        await c.TextAsync(default); Assert.Equal(3, f2.Seen.Count); // remembered
+        var f3 = new Fake((_, b) => (400, "{\"error\":{\"message\":\"bad max_tokens\"}}"));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new AiClient(new HttpClient(f3), new AiConfig { BaseUrl = "http://gw/v1", Api = "chat", TextModel = "other" }).TextAsync(default));
+        Assert.Equal(2, f3.Seen.Count);
+    }
+
+    [Fact]
     public async Task Chat_mode_does_not_fall_back_and_responses_mode_goes_straight_there()
     {
         var f1 = new Fake(LunaServer);

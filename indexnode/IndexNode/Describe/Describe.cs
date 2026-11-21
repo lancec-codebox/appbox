@@ -63,17 +63,12 @@ public sealed class DescribeInput
     public int PosterCount { get; set; }
 }
 
-/// <summary>The describe step: titles, tags, era, teaser, synopsis, cast and relations in one batched vision call, then a spoiler check with rewrite.</summary>
+/// <summary>The describe step: titles, tags, era, teaser, synopsis, cast and relations in one batched vision call, then one twist check that can correct the teaser and cast.</summary>
 public static class Describe
 {
-    public const string PromptVersion = "describe-8"; // describe-8 (2026-11-19): no aiGenerated (the AI flag comes from the SSCD frames probe now: pre-check sample or stored vectors) // describe-7 (2026-11-17): ending {kind, signs, nextPart}: is the story finished in this upload
-    // describe-6 (2026-11-16): the rewrite answer example has no concrete cluster id (a "0" in it overwrote the female lead with the male lead's text)
-    // describe-5 (2026-11-15): roleAtStart is always a short spoiler-free line about who the character is, never "not introduced" // describe-4 (2026-11-14): aiGenerated // describe-3 (2026-11-14): marks covered faces per head shot ("masked"); cast no longer scores masks
+    /// <summary>The describe prompt version, kept with the prompt text in Prompts/describe.yaml (with its history).</summary>
+    public static string PromptVersion => PromptFile.Load("describe").Version;
     public static readonly string[] Eras = ["ancient", "republic", "1950s-60s", "1970s", "1980s-90s", "modern", "futuristic"];
-    public const double CutoffFraction = 0.12;
-
-    public static double Cutoff(double duration) => Math.Round(duration * CutoffFraction, 1);
-
     /// <summary>The model's expression scores as { key: [0..10 or null] }: clamped, anything else null. Keys are cluster ids and "poster".</summary>
     /// <summary>The model's covered head shots as { cluster id: [sheet indexes] }: integers 0..99 only, anything else dropped.</summary>
     public static JsonObject CleanMasked(JsonNode? n)
@@ -109,31 +104,16 @@ public static class Describe
 
     public static AiCall BuildMain(DescribeInput d, string visionModel)
     {
-        var cut = Cutoff(d.Duration);
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine("You index a short-drama upload for a catalogue site. Work only from the evidence below. Answer with ONE JSON object and nothing else.");
-        sb.AppendLine($"Upload title (as is): {d.Title}");
-        sb.AppendLine($"Duration: {d.Duration:F0} s. Spoiler cutoff: {cut:F0} s (first {CutoffFraction:P0} of the story).");
-        sb.AppendLine($"Upload description:\n{Trunc(d.Description, 3000)}");
-        sb.AppendLine($"Text track ({d.TextSource}; burned-in subtitles where they exist, else our speech recognition), [m:ss] text:\n{TextTrack.Compress(d.Cues)}");
-        if (d.Credits.Count > 0) sb.AppendLine("Credits lines read from the video (主演/饰/领衔):\n" + string.Join('\n', d.Credits));
-        sb.AppendLine("Main face clusters (cluster id, screen seconds, first seen s): " + string.Join("; ", d.Clusters.Select(c => $"{c.Id}: {c.ScreenSeconds:F0}s, {c.FirstSeen:F0}")));
-        sb.AppendLine("Images, in order: the upload thumbnail, then one contact sheet per cluster (12 numbered candidate head shots, row by row from 0), then the poster candidate sheet (numbered frames).");
-        sb.AppendLine(@"Rules:
-- ENGLISH ONLY for teaser, synopsis, tags, descriptions and labels. Chinese appears only as content: title.zh, character.zh, character.pinyin.
-- title.en: the drama's own name if the video shows one (title card, thumbnail, description), translated; otherwise a faithful translation of the upload title with hashtags, emoji and filler like 'Full Version' removed. Never invent a title. title.zh is the Chinese name or the cleaned original title. fullTitle.en: faithful translation of the original title.
-- teaser.en: premise-style, 2-4 sentences, NO spoilers beyond the cutoff. synopsis.en: the full story with the ending.
-- tags: lowercase English words.
-- ending: is the story finished in THIS upload? Judge from the last minutes of the text track, the description and your synopsis. kind: ""complete"" (the main conflict is resolved and the story is told to its end), ""cliffhanger"" (it stops on an unresolved turn, a 'to be continued' or a next-episode teaser) or ""truncated"" (it stops mid-scene or mid-sentence, as if the upload were cut off); signs: the evidence in a few words (e.g. 'closing line ends mid-sentence', '下集预告', 'epilogue after the wedding'), [] when none; nextPart: true when the text or description points to a further part, episode or season, false when it says this is the last, null when nothing says; nextPartHint: what names the next part when the title, description or last lines show it (e.g. '第二部', 'Part 2', a sequel title, 'EP 5'), copied as written and at most 80 characters, else null.
-- era: one of ancient (dynastic costume drama), republic (1912-1949), 1950s-60s, 1970s, 1980s-90s, modern (present day), futuristic. A time-travel or rebirth story takes the era where most of it happens. fantasy: true for xianxia, xuanhuan or supernatural stories.
-- cast: one entry per cluster you can identify; exactly one 'female lead' and one 'male lead' when the story has them, others 'main' or 'supporting'. NEVER use the words villain or antagonist anywhere. Name a person only when subtitles, dialogue or credits support it; otherwise label them relative to a named character (""Gu Heng's grandmother""). actor only from the credits lines, else null. role is the final role. roleAtStart is ALWAYS a short spoiler-free line (a few words to one sentence) saying who the character is: position, standing, and how they relate to the plot as known at the start, for example 'A powerful chief minister.' or 'The princess's loyal maid.'. It must never say that the character is not introduced, not yet seen, unknown or similar, even for a character who first appears late: then say who they are without any later reveal. Descriptions and labels describe the start, never later reveals.
-- relations: every cast member linked to at least one other. since/until in seconds; spoiler is true when since is after the cutoff or the relation is itself a reveal; implied true when not stated outright.
-- masked: for each cluster, the indexes of the head shots on its sheet where the face is covered (mask, veil, helmet, face covering, the face hidden by a hand or object); [] when none. Most clusters have none.
-- picks: for each cluster, the best portrait (most flattering, in-character, well lit, expressive, no other face dominating, never a covered face) and 1-3 stills as candidate indexes of its sheet; poster: the index of the single most poster-worthy 'together' frame (charged, iconic, cinematic; NOT a twist, death, blood, identity reveal or late-story costume), or null.
-JSON shape: {""title"":{""en"":"""",""zh"":""""},""fullTitle"":{""en"":""""},""teaser"":{""en"":""""},""synopsis"":{""en"":""""},""tags"":[],""era"":"""",""fantasy"":false,""ending"":{""kind"":""complete"",""signs"":[],""nextPart"":null,""nextPartHint"":null},""cast"":[{""cluster"":0,""character"":{""zh"":"""",""pinyin"":"""",""en"":""""}|null,""role"":"""",""roleAtStart"":"""",""description"":"""",""actor"":null,""label"":{""en"":""""}}],""relations"":[{""from"":0,""to"":1,""type"":"""",""label"":{""en"":""""},""since"":0,""until"":null,""spoiler"":false,""implied"":false}],""picks"":{""0"":{""portrait"":0,""stills"":[0]}},""poster"":null,""expression"":{""0"":[0],""poster"":[0]},""masked"":{""0"":[]},""samePerson"":[[0,1]]}
-- expression: score EVERY numbered head shot of EVERY cluster sheet, and every frame of the poster candidate sheet, for how flattering the face is, an integer 0-10. 8-10: eyes open and roughly toward the camera, mouth closed or a slight smile, relaxed or composed. 5-7: acceptable but flat or slightly off. 0-2: mid-speech (open mouth), shocked or startled, crying, grimacing, blinking, eyes closed, looking far away. For a poster frame score the weaker of the two faces. Arrays are in sheet order; ""poster"" is the poster sheet.
-from/to and picks keys are cluster ids.
-- samePerson: lists of cluster ids that show the SAME person (the face matcher sometimes splits one character across clusters, e.g. in another costume or mask). Compare the contact sheets carefully; only merge when you are sure; [] when none. Do not list such a cluster separately in cast: give the group once, the first id is kept.");
+        var pf = PromptFile.Load("describe"); var sb = new System.Text.StringBuilder();
+        sb.AppendLine(pf.Text("intro"));
+        sb.AppendLine(pf.Fill("title", ("title", d.Title)));
+        sb.AppendLine(pf.Fill("duration", ("duration", d.Duration.ToString("F0"))));
+        sb.AppendLine(pf.Fill("description", ("description", Trunc(d.Description, 3000))));
+        sb.AppendLine(pf.Fill("text-track", ("textSource", d.TextSource), ("textTrack", TextTrack.Compress(d.Cues))));
+        if (d.Credits.Count > 0) sb.AppendLine(pf.Fill("credits", ("credits", string.Join('\n', d.Credits))));
+        sb.AppendLine(pf.Fill("clusters", ("clusters", string.Join("; ", d.Clusters.Select(c => $"{c.Id}: {c.ScreenSeconds:F0}s, {c.FirstSeen:F0}")))));
+        sb.AppendLine(pf.Text("images"));
+        sb.AppendLine(pf.Fill("rules", ("relationKinds", string.Join(", ", pf.List("relation-kinds"))), ("exampleTitles", "  " + string.Join(" | ", pf.List("example-titles")))));
         var imgs = new List<(string, string)>();
         if (d.Thumb != null) imgs.Add(("thumbnail", d.Thumb));
         foreach (var c in d.Clusters) if (d.Sheets.TryGetValue(c.Id, out var f)) imgs.Add(($"cluster {c.Id}", f));
@@ -216,8 +196,19 @@ from/to and picks keys are cluster ids.
         _ => null,
     };
 
-    static readonly Regex Bad = new(@"villain|antagonist", RegexOptions.IgnoreCase);
     static readonly Regex Cjk = new(@"[\u3400-\u9fff]");
+    public static bool HasCjk(string? s) => s != null && Cjk.IsMatch(s);
+
+    /// <summary>The English fields of a raw describe reply that hold Chinese characters, or null: teaser, synopsis, title.en, fullTitle.en, character.en and each cast roleAtStart, description and label.</summary>
+    public static string? CjkProblem(JsonObject r)
+    {
+        var bad = new List<string>();
+        void Chk(string name, JsonNode? n) { if (HasCjk(Txt(n))) bad.Add(name); }
+        Chk("teaser.en", r["teaser"]); Chk("synopsis.en", r["synopsis"]); Chk("title.en", (r["title"] as JsonObject)?["en"]); Chk("fullTitle.en", r["fullTitle"]);
+        foreach (var c in (r["cast"] as JsonArray) ?? [])
+            if (c is JsonObject o) { var id = o["cluster"]; Chk($"cast {id} roleAtStart", o["roleAtStart"]); Chk($"cast {id} description", o["description"]); Chk($"cast {id} label.en", o["label"]); Chk($"cast {id} character.en", (o["character"] as JsonObject)?["en"]); }
+        return bad.Count == 0 ? null : "these English fields contain Chinese characters: " + string.Join(", ", bad) + ". Translate them to English, or give a name in pinyin; Chinese only belongs in title.zh and character.zh.";
+    }
 
     /// <summary>samePerson groups to a map from each merged-in cluster to the group's kept cluster (the one with the most screen time). Unknown ids, singletons and overlaps are ignored.</summary>
     public static Dictionary<int, int> SamePerson(JsonNode? node, HashSet<int> ids, DescribeInput d)
@@ -233,6 +224,23 @@ from/to and picks keys are cluster ids.
     }
 
     public const int MaxHint = 80;
+    public static readonly string[] RelationKinds = ["parent", "grandparent", "sibling", "child", "cousin", "aunt-uncle", "spouse", "betrothed", "lover", "ex", "servant", "master", "friend", "rival", "enemy", "colleague", "other"];
+    public static string CleanKind(JsonNode? n) { var k = (Txt(n) ?? "").Trim().ToLowerInvariant().Replace('_', '-').Replace(' ', '-'); return RelationKinds.Contains(k) ? k : "other"; }
+    public static readonly string[] TitleSources = ["youtube", "translated", "written"];
+
+    /// <summary>A cast member the model calls main is demoted to supporting when its screen time is below this fraction of the lower-screen-time lead's (setting describe.main-min-screen; env INDEXNODE_DESCRIBE_MAIN_MIN_SCREEN overrides).</summary>
+    public static double MainMinScreen => double.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_DESCRIBE_MAIN_MIN_SCREEN"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0 ? v : 0.25;
+
+    public static void DemoteLowScreenMains(JsonArray cast, DescribeInput d, double? min = null)
+    {
+        var secs = d.Clusters.ToDictionary(c => c.Id, c => c.ScreenSeconds);
+        double S(JsonNode c) => secs.GetValueOrDefault(c["cluster"]!.GetValue<int>());
+        var leads = cast.Where(c => c!["role"]!.GetValue<string>() is "female lead" or "male lead").Select(c => S(c!)).ToList();
+        if (leads.Count == 0) return;
+        double floor = (min ?? MainMinScreen) * leads.Min();
+        foreach (var c in cast.OfType<JsonObject>().Where(c => c["role"]!.GetValue<string>() == "main" && S(c) < floor)) { c["role"] = "supporting"; c["demoted"] = "screen time"; }
+    }
+
     public static readonly string[] EndingKinds = ["complete", "cliffhanger", "truncated"];
 
     /// <summary>The model's ending as { kind, signs, nextPart }: kind one of <see cref="EndingKinds"/> else null (the model did not say), at most 6 short English signs, nextPart a real boolean else null, nextPartHint a non-empty string of at most <see cref="MaxHint"/> characters else null. Not an object: null.</summary>
@@ -242,7 +250,7 @@ from/to and picks keys are cluster ids.
         var kind = (Txt(e["kind"]) ?? "").Trim().ToLowerInvariant();
         var signs = new JsonArray();
         foreach (var s in (e["signs"] as JsonArray) ?? [])
-            if (signs.Count < 6 && Bad.Replace(Txt(s)?.Trim() ?? "", "").Trim() is { Length: > 0 } c) signs.Add(c.Length > 120 ? c[..120] : c);
+            if (signs.Count < 6 && (Txt(s)?.Trim() ?? "") is { Length: > 0 } c) signs.Add(c.Length > 120 ? c[..120] : c);
         return new JsonObject
         {
             ["kind"] = EndingKinds.Contains(kind) ? kind : null,
@@ -252,25 +260,26 @@ from/to and picks keys are cluster ids.
         };
     }
 
-    /// <summary>Validates and cleans a model reply into the describe result: English-only text, valid era, no villain wording, roles from the allowed set, one lead each.</summary>
+    /// <summary>Validates and cleans a model reply into the describe result: English-only text, valid era, roles from the allowed set, one lead each.</summary>
     public static JsonObject Normalize(JsonObject r, DescribeInput d)
     {
         string En(JsonNode? n) => Txt(n)?.Trim() ?? "";
-        string Clean(string s) => Bad.Replace(s, "").Replace("  ", " ").Trim();
+        string Clean(string s) => s.Trim();
         var o = new JsonObject
         {
-            ["title"] = new JsonObject { ["en"] = Clean(En(r["title"])), ["zh"] = (r["title"] as JsonObject)?["zh"] is { } tz ? Txt(tz) ?? "" : "" },
-            ["fullTitle"] = new JsonObject { ["en"] = Clean(En(r["fullTitle"])) },
+            ["title"] = new JsonObject { ["en"] = En(r["title"]), ["zh"] = (r["title"] as JsonObject)?["zh"] is { } tz ? Txt(tz) ?? "" : "" },
+            ["fullTitle"] = new JsonObject { ["en"] = En(r["fullTitle"]) },
             ["teaser"] = new JsonObject { ["en"] = Clean(En(r["teaser"])) },
             ["synopsis"] = new JsonObject { ["en"] = Clean(En(r["synopsis"])) },
         };
+        var ts = (Txt(r["titleSource"]) ?? "").Trim().ToLowerInvariant(); o["titleSource"] = TitleSources.Contains(ts) ? ts : null;
         var tags = new JsonArray();
-        foreach (var t in (r["tags"] as JsonArray) ?? []) { var s = Txt(t)?.Trim().ToLowerInvariant() ?? ""; if (s.Length > 0 && !Cjk.IsMatch(s) && !Bad.IsMatch(s) && !tags.Any(x => Txt(x) == s)) tags.Add(s); }
+        foreach (var t in (r["tags"] as JsonArray) ?? []) { var s = Txt(t)?.Trim().ToLowerInvariant() ?? ""; if (s.Length > 0 && !Cjk.IsMatch(s) && !tags.Any(x => Txt(x) == s)) tags.Add(s); }
         o["tags"] = tags;
         var era = Txt(r["era"])?.Trim().ToLowerInvariant() ?? "";
         o["era"] = Eras.Contains(era) ? era : null; o["fantasy"] = r["fantasy"] is JsonValue fv && fv.TryGetValue<bool>(out var fb) && fb;
         o["ending"] = CleanEnding(r["ending"]);
-        var ids = d.Clusters.Select(c => c.Id).ToHashSet(); var cast = new JsonArray(); bool f = false, m = false;
+        var ids = d.Clusters.Select(c => c.Id).ToHashSet(); var cast = new JsonArray();
         var canon = SamePerson(r["samePerson"], ids, d); int Cn(int id) => canon.GetValueOrDefault(id, id);
         o["samePerson"] = new JsonArray(canon.GroupBy(kv => kv.Value).Select(g => (JsonNode)new JsonArray(new[] { g.Key }.Concat(g.Select(kv => kv.Key).OrderBy(x => x)).Select(x => (JsonNode)x).ToArray())).ToArray());
         foreach (var e in (r["cast"] as JsonArray) ?? [])
@@ -279,9 +288,7 @@ from/to and picks keys are cluster ids.
             string Role(string? s)
             {
                 s = (s ?? "").Trim().ToLowerInvariant();
-                if (s == "female lead" && !f) { f = true; return s; }
-                if (s == "male lead" && !m) { m = true; return s; }
-                return s == "main" ? "main" : "supporting";
+                return s is "female lead" or "male lead" or "main" ? s : "supporting";
             }
             var ch = c["character"] as JsonObject;
             cast.Add(new JsonObject
@@ -289,18 +296,18 @@ from/to and picks keys are cluster ids.
                 ["cluster"] = cid, ["character"] = ch == null ? null : new JsonObject { ["zh"] = Txt(ch["zh"]) ?? "", ["pinyin"] = Txt(ch["pinyin"]) ?? "", ["en"] = Txt(ch["en"]) ?? "" },
                 ["role"] = Role(Txt(c["role"])), ["roleAtStart"] = Clean(Publish.NotIntroduced(Txt(c["roleAtStart"])) ? Txt(c["description"]) ?? "supporting" : Txt(c["roleAtStart"]) ?? Txt(c["role"]) ?? "supporting"),
                 ["description"] = Clean(En(c["description"])), ["actor"] = Txt(c["actor"]) is { Length: > 0 } a && d.Credits.Any(x => x.Contains(a)) ? a : null,
-                ["label"] = new JsonObject { ["en"] = Clean(En(c["label"])) },
+                ["label"] = new JsonObject { ["en"] = Clean(En(c["label"])).TrimEnd('.', ' ') },
             });
         }
+        DemoteLowScreenMains(cast, d);
         o["cast"] = cast;
-        var rels = new JsonArray(); double cut = Cutoff(d.Duration);
+        var rels = new JsonArray();
         foreach (var e in (r["relations"] as JsonArray) ?? [])
         {
             if (e is not JsonObject x || x["from"] is not JsonValue fv2 || x["to"] is not JsonValue tv || !fv2.TryGetValue<int>(out var from) || !tv.TryGetValue<int>(out var to)) continue;
             if (!ids.Contains(from) || !ids.Contains(to)) continue; from = Cn(from); to = Cn(to); if (from == to) continue;
             double since = x["since"] is JsonValue sv && sv.TryGetValue<double>(out var sd) ? sd : 0; double? until = x["until"] is JsonValue uv && uv.TryGetValue<double>(out var ud) ? ud : null;
-            bool spoiler = (x["spoiler"] is JsonValue pv && pv.TryGetValue<bool>(out var pb) && pb) || since > cut;
-            rels.Add(new JsonObject { ["from"] = from, ["to"] = to, ["type"] = Clean(Txt(x["type"]) ?? "").ToLowerInvariant(), ["label"] = new JsonObject { ["en"] = Clean(En(x["label"])) }, ["since"] = since, ["until"] = until, ["spoiler"] = spoiler, ["implied"] = x["implied"] is JsonValue iv && iv.TryGetValue<bool>(out var ib) && ib });
+            rels.Add(new JsonObject { ["from"] = from, ["to"] = to, ["kind"] = CleanKind(x["kind"]), ["type"] = Clean(Txt(x["type"]) ?? "").ToLowerInvariant(), ["label"] = new JsonObject { ["en"] = Clean(En(x["label"])) }, ["since"] = since, ["until"] = until, ["implied"] = x["implied"] is JsonValue iv && iv.TryGetValue<bool>(out var ib) && ib });
         }
         o["relations"] = rels;
         o["picks"] = r["picks"] is JsonObject p ? JsonNode.Parse(p.ToJsonString()) : new JsonObject();
@@ -310,20 +317,14 @@ from/to and picks keys are cluster ids.
         return o;
     }
 
-    public static AiCall BuildCheck(JsonObject res, double cutoff, string model) => new("spoiler-check", model, @$"You are a spoiler checker for a catalogue site. The default page shows the teaser, the cast as known at the start and the relations marked spoiler=false, to people who have not watched. Cutoff: the first {cutoff:F0} s of the story.
-Does the teaser reveal any twist, death, identity reveal or ending? Does any cast roleAtStart/description/label, or any relation with spoiler=false, give away something established after the cutoff or a hidden identity?
-Answer ONE JSON object: {{""teaserReveals"":false,""reasons"":[],""flaggedCast"":[cluster ids],""flaggedRelations"":[indexes into relations]}}.
-teaser: {res["teaser"]!["en"]}
-cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Select(c => new { cluster = c!["cluster"]!.GetValue<int>(), roleAtStart = c["roleAtStart"]!.GetValue<string>(), description = c["description"]!.GetValue<string>(), label = c["label"]!["en"]!.GetValue<string>() }))}
-relations: {JsonSerializer.Serialize(res["relations"]!.AsArray().Select((r, i) => new { i, from = r!["from"]!.GetValue<int>(), to = r["to"]!.GetValue<int>(), type = r["type"]!.GetValue<string>(), r2 = r["since"]!.GetValue<double>(), spoiler = r["spoiler"]!.GetValue<bool>() }).Where(x => !x.spoiler))}", []);
-
-    /// <summary>The flagged cast cluster ids that exist in the result, in cast order, each once.</summary>
-    public static List<int> FlaggedIdList(JsonObject res, JsonObject check)
+    /// <summary>The one twist check: given the synopsis, the teaser and the cast, does the teaser or any cast field reveal a twist (something the drama withholds and reveals later)? The same reply carries the corrected teaser and cast fields.</summary>
+    public static AiCall BuildTwistCheck(JsonObject res, string model)
     {
-        var want = ((check["flaggedCast"] as JsonArray) ?? []).Select(x => x is JsonObject o ? AsInt(o["cluster"]) : AsInt(x)).Where(x => x != null).Select(x => x!.Value).ToHashSet();
-        return res["cast"]!.AsArray().Select(c => c!["cluster"]!.GetValue<int>()).Where(want.Contains).Distinct().ToList();
+        var f = PromptFile.Load("twist-check");
+        var cast = JsonSerializer.Serialize(res["cast"]!.AsArray().Select(c => new { cluster = c!["cluster"]!.GetValue<int>(), character = c["character"]?["en"]?.GetValue<string>(), roleAtStart = c["roleAtStart"]!.GetValue<string>(), description = c["description"]!.GetValue<string>(), label = c["label"]!["en"]!.GetValue<string>() }));
+        var prompt = f.Text("instructions") + "\n" + f.Fill("evidence", ("title", Txt(res["title"]) ?? ""), ("fullTitle", Txt(res["fullTitle"]) ?? ""), ("synopsis", Txt(res["synopsis"]) ?? ""), ("teaser", Txt(res["teaser"]) ?? ""), ("cast", cast));
+        return new AiCall("twist-check", model, prompt, []);
     }
-    static JsonArray FlaggedIds(JsonObject res, JsonObject check) { var a = new JsonArray(); foreach (var i in FlaggedIdList(res, check)) a.Add(i); return a; }
 
     static string Norm(string? s) => System.Text.RegularExpressions.Regex.Replace((s ?? "").ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
 
@@ -364,65 +365,60 @@ relations: {JsonSerializer.Serialize(res["relations"]!.AsArray().Select((r, i) =
         return null;
     }
 
-    public static AiCall BuildRewrite(JsonObject res, JsonObject check, string model) => new("spoiler-rewrite", model, @$"Rewrite the flagged parts so they give nothing away: the teaser must stay a premise only (2-4 sentences, English); flagged cast descriptions and roleAtStart/label must describe only what a viewer knows in the opening. Never use the words villain or antagonist.
-Reasons: {check["reasons"]?.ToJsonString()}
-Answer ONE JSON object: {{""teaser"":""..."",""cast"":[{{""cluster"":<id>,""roleAtStart"":"""",""description"":"""",""label"":""""}}]}} with exactly one cast entry for each of these clusters, each with its own id: {FlaggedIds(res, check).ToJsonString()}. Do not answer for any other cluster. Each entry is about that one character only: keep its own name, never another character's text.
-teaser: {res["teaser"]!["en"]}
-flagged cast: {JsonSerializer.Serialize(res["cast"]!.AsArray().Where(c => (check["flaggedCast"] as JsonArray)?.Any(x => AsInt(x) == c!["cluster"]!.GetValue<int>()) == true).Select(c => c!))}", []);
-
-    /// <summary>Applies a spoiler check to the result: flagged relations become spoilers, and one rewrite call fixes the teaser and cast. Returns the number of AI calls made.</summary>
-    public static async Task<int> SpoilerCheckAsync(IChat chat, string model, JsonObject res, DescribeInput d, CancellationToken ct)
+    /// <summary>The twist check: one AI call. When it says the teaser or the cast reveals a twist, its corrected teaser and cast fields are applied (a cast entry only for an existing cluster, once, and not when it names or copies another character). Returns the number of AI calls made (1).</summary>
+    public static async Task<int> TwistCheckAsync(IChat chat, string model, JsonObject res, DescribeInput d, CancellationToken ct)
     {
-        int calls = 0;
-        for (int round = 0; round < 2; round++)
+        var check = await chat.JsonAsync(model, JsonValue.Create(BuildTwistCheck(res, model).Prompt)!, "submit_check", ct);
+        bool reveals = (check["revealsTwist"] is JsonValue rv && rv.TryGetValue<bool>(out var rb) && rb) || (check["wrongCharacter"] is JsonValue wv && wv.TryGetValue<bool>(out var wb) && wb);
+        var changed = new JsonArray(); var rejected = new JsonArray(); var ignored = new JsonArray(); bool teaserFixed = false;
+        if (reveals)
         {
-            var check = await chat.JsonAsync(model, JsonValue.Create(BuildCheck(res, Cutoff(d.Duration), model).Prompt)!, "submit_check", ct); calls++;
-            foreach (var i in (check["flaggedRelations"] as JsonArray) ?? [])
-                if (i is JsonValue v && v.TryGetValue<int>(out var ix) && ix >= 0 && ix < res["relations"]!.AsArray().Count) res["relations"]![ix]!["spoiler"] = true;
-            bool teaser = check["teaserReveals"] is JsonValue tv && tv.TryGetValue<bool>(out var tb) && tb;
-            var fc = (check["flaggedCast"] as JsonArray) ?? [];
-            if (!teaser && fc.Count == 0) { res["spoilerCheck"] = new JsonObject { ["rounds"] = round + 1, ["clean"] = true, ["log"] = res["spoilerRounds"]?.DeepClone() }; res.Remove("spoilerRounds"); return calls; }
-            var rw = await chat.JsonAsync(model, JsonValue.Create(BuildRewrite(res, check, model).Prompt)!, "submit_rewrite", ct); calls++;
-            if (teaser && Txt(rw["teaser"]) is { Length: > 0 } nt) res["teaser"] = new JsonObject { ["en"] = Bad.Replace(nt, "").Trim() };
-            // apply only what was asked: flagged ids, each once; anything else is ignored and logged; a flagged id without an answer keeps its text
-            var asked = FlaggedIdList(res, check); var came = new List<int>(); var rejected = new JsonArray(); var ignored = new JsonArray(); var seen = new HashSet<int>();
-            foreach (var e in (rw["cast"] as JsonArray) ?? [])
+            if (Txt(check["teaser"])?.Trim() is { Length: > 0 } nt && !HasCjk(nt)) { res["teaser"] = new JsonObject { ["en"] = nt }; teaserFixed = true; }
+            var seen = new HashSet<int>(); var cast = res["cast"]!.AsArray();
+            foreach (var e in (check["cast"] as JsonArray) ?? [])
             {
                 if (e is not JsonObject c || AsInt(c["cluster"]) is not { } cid) { ignored.Add(new JsonObject { ["reason"] = "no cluster id" }); continue; }
-                if (!asked.Contains(cid)) { Log.Info($"describe: rewrite answered for cluster {cid}, which was not flagged: ignored"); ignored.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "not flagged" }); continue; }
-                if (!seen.Add(cid)) { Log.Info($"describe: rewrite answered twice for cluster {cid}: the repeat is ignored"); ignored.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "duplicate" }); continue; }
-                came.Add(cid);
-                var tgt = res["cast"]!.AsArray().First(x => x!["cluster"]!.GetValue<int>() == cid)!;
-                string? r = Txt(c["roleAtStart"]) is { Length: > 0 } r0 ? Bad.Replace(r0, "").Trim() : null, ds = Txt(c["description"]) is { Length: > 0 } d0 ? Bad.Replace(d0, "").Trim() : null, lb = Txt(c["label"]) is { Length: > 0 } l0 ? Bad.Replace(l0, "").Trim() : null;
-                if (IdentityProblem(res["cast"]!.AsArray(), tgt, r, ds, lb) is { } why) { Log.Info($"describe: rewrite for cluster {cid} rejected: {why}"); rejected.Add(new JsonObject { ["cluster"] = cid, ["reason"] = why }); continue; }
+                if (cast.FirstOrDefault(x => x!["cluster"]!.GetValue<int>() == cid) is not { } tgt) { ignored.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "not in the cast" }); continue; }
+                if (!seen.Add(cid)) { ignored.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "duplicate" }); continue; }
+                string? r = Txt(c["roleAtStart"]) is { Length: > 0 } r0 ? r0.Trim() : null, ds = Txt(c["description"]) is { Length: > 0 } d0 ? d0.Trim() : null, lb = Txt(c["label"]) is { Length: > 0 } l0 ? l0.Trim() : null;
+                if (lb != null) lb = lb.TrimEnd('.', ' ');
+                if (new[] { r, ds, lb }.Any(x => x != null && HasCjk(x))) { rejected.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "Chinese characters in an English field" }); continue; }
+                if (IdentityProblem(cast, tgt, r, ds, lb) is { } why) { Log.Info($"describe: twist-check fix for cluster {cid} rejected: {why}"); rejected.Add(new JsonObject { ["cluster"] = cid, ["reason"] = why }); continue; }
+                if (lb != null && NamesOf(tgt).Where(n => !HasCjk(n)).ToList() is { Count: > 0 } own && !own.Any(n => lb.Contains(n, StringComparison.OrdinalIgnoreCase)) && Txt(tgt["label"]?["en"]) is { } oldLb && own.Any(n => oldLb.Contains(n, StringComparison.OrdinalIgnoreCase)))
+                { rejected.Add(new JsonObject { ["cluster"] = cid, ["reason"] = "label would replace the character's name" }); lb = null; }
                 if (r != null) tgt["roleAtStart"] = r;
                 if (ds != null) tgt["description"] = ds;
                 if (lb != null) tgt["label"] = new JsonObject { ["en"] = lb };
+                changed.Add(cid);
             }
-            var rounds = res["spoilerRounds"] as JsonArray ?? new JsonArray(); res["spoilerRounds"] = rounds;
-            var ja = new JsonArray(); foreach (var i in asked) ja.Add(i); var jc = new JsonArray(); foreach (var i in came) jc.Add(i);
-            rounds.Add(new JsonObject { ["round"] = round + 1, ["flagged"] = ja, ["answered"] = jc, ["rejected"] = rejected, ["ignored"] = ignored });
         }
-        res["spoilerCheck"] = new JsonObject { ["rounds"] = 2, ["clean"] = false, ["log"] = res["spoilerRounds"]?.DeepClone() }; res.Remove("spoilerRounds");
-        return calls;
+        res["twistCheck"] = new JsonObject { ["revealed"] = reveals, ["reasons"] = check["reasons"]?.DeepClone(), ["teaserFixed"] = teaserFixed, ["castFixed"] = changed, ["rejected"] = rejected, ["ignored"] = ignored };
+        return 1;
     }
 
-    /// <summary>The whole step: one batched vision call, normalisation, spoiler check and rewrite. The result is describe.json's body.</summary>
+    /// <summary>The whole step: one batched vision call, normalisation, twist check. The result is describe.json's body.</summary>
     public static async Task<JsonObject> RunAsync(IChat chat, string textModel, string visionModel, DescribeInput d, CancellationToken ct)
     {
         var main = BuildMain(d, visionModel);
-        var res = Normalize(await chat.JsonAsync(visionModel, ToContent(main), "submit_description", ct), d);
+        var content = ToContent(main);
+        var raw = await chat.JsonAsync(visionModel, content, "submit_description", ct);
         int calls = 1;
-        // the spoiler check runs on the text model; a provider content filter there (drama plots trip them) moves it to the vision model, which already read the whole drama
-        try { calls += await SpoilerCheckAsync(chat, textModel, res, d, ct); }
+        if (CjkProblem(raw) is { } cjk)
+        {
+            Log.Info($"describe {d.JobId}: {cjk} Asking again once with the error");
+            raw = await chat.JsonAsync(visionModel, AiJson.WithError(content, raw.ToJsonString(), cjk), "submit_description", ct); calls++;
+        }
+        var res = Normalize(raw, d);
+        // the twist check runs on the text model; a provider content filter there (drama plots trip them) moves it to the vision model, which already read the whole drama
+        try { calls += await TwistCheckAsync(chat, textModel, res, d, ct); }
         catch (Exception e) when (e.Message.Contains("content_filter", StringComparison.OrdinalIgnoreCase) && visionModel != textModel)
         {
-            Log.Info($"describe {d.JobId}: spoiler check refused by {textModel}'s content filter; running it on {visionModel}");
-            calls += 1 + await SpoilerCheckAsync(chat, visionModel, res, d, ct);
+            Log.Info($"describe {d.JobId}: twist check refused by {textModel}'s content filter; running it on {visionModel}");
+            calls += 1 + await TwistCheckAsync(chat, visionModel, res, d, ct);
         }
         res["v"] = 1; res["promptVersion"] = PromptVersion; res["jobId"] = d.JobId;
         res["models"] = new JsonObject { ["text"] = textModel, ["vision"] = visionModel };
-        res["aiCalls"] = calls; res["cutoffSeconds"] = Cutoff(d.Duration); res["at"] = Protocol.NowUtc();
+        res["aiCalls"] = calls; res["at"] = Protocol.NowUtc();
         return res;
     }
 }

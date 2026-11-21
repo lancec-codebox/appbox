@@ -28,6 +28,9 @@ public sealed class JobContext
     public required Action<string?, string?> Report { get; init; }
     /// <summary>Set by a handler that wants the job back as pending, due at this time (comments refresh); null: the job is done.</summary>
     public string? NextDue { get; set; }
+    /// <summary>0.13.14 (group step): the join its grouping record holds, put on the step's done line.</summary>
+    public string? GroupJoin { get; set; }
+    public string? GroupJoinKind { get; set; }
 }
 
 /// <summary>The node cannot do this job (e.g. a step it does not know): it is released without counting an attempt.</summary>

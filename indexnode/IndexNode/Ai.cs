@@ -95,12 +95,38 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
         return arr;
     }
 
+    /// <summary>True for a gpt-* model once routing prefixes ("wupeter/gpt-6-luna") are stripped.</summary>
+    public static bool IsGpt(string model)
+    {
+        var name = model.Substring(model.LastIndexOf('/') + 1);
+        return name.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private const string MaxTokens = "max_tokens", MaxCompletion = "max_completion_tokens";
+    private readonly ConcurrentDictionary<string, string> tokenParam = new();
+
+    /// <summary>Chat POST with the output budget under the spelling the model needs (gpt-* models: max_completion_tokens); one 400 naming the parameter retries with the other spelling, remembered per model.</summary>
+    private async Task<Reply> PostChatAsync(string model, JsonObject body, CancellationToken ct)
+    {
+        var first = tokenParam.GetValueOrDefault(model) ?? (IsGpt(model) ? MaxCompletion : MaxTokens);
+        body[first] = MaxOutputTokens;
+        var r = await PostAsync("/chat/completions", body, ct);
+        if (r.Status == 400 && r.Body.Contains(first, StringComparison.Ordinal))
+        {
+            var other = first == MaxTokens ? MaxCompletion : MaxTokens;
+            body.Remove(first); body[other] = MaxOutputTokens;
+            r = await PostAsync("/chat/completions", body, ct);
+            if (r.Ok) tokenParam[model] = other;
+        }
+        return r;
+    }
+
     private sealed class UnsupportedApiException : Exception;
 
     private async Task<string> ViaChatAsync(string model, JsonNode content, CancellationToken ct, bool detectUnsupported)
     {
-        var body = new JsonObject { ["model"] = model, ["max_tokens"] = MaxOutputTokens, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }) };
-        var r = await PostAsync("/chat/completions", body, ct);
+        var body = new JsonObject { ["model"] = model, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }) };
+        var r = await PostChatAsync(model, body, ct);
         if (!r.Ok || ErrorMessage(r.Body) != null) { if (detectUnsupported && IsUnsupportedApi(r.Body)) throw new UnsupportedApiException(); throw Fail(r); }
         return (JsonNode.Parse(r.Body)?["choices"]?[0]?["message"]?["content"]?.GetValue<string>() ?? "").Trim();
     }
@@ -126,7 +152,7 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     public async Task<string> ChatAsync(string model, JsonNode content, CancellationToken ct)
     {
         var mode = cfg.EffectiveApi;
-        if (mode == AiConfig.ApiAuto && !chosen.ContainsKey(model) && model.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase)) chosen[model] = AiConfig.ApiResponses; // gateway: gpt-* models answer only on /responses
+        if (mode == AiConfig.ApiAuto && !chosen.ContainsKey(model) && IsGpt(model)) chosen[model] = AiConfig.ApiResponses; // gateway: gpt-* models answer only on /responses
         if (mode == AiConfig.ApiResponses || (mode == AiConfig.ApiAuto && chosen.GetValueOrDefault(model) == AiConfig.ApiResponses)) return await ViaResponsesAsync(model, content, ct);
         if (mode == AiConfig.ApiChat) return await ViaChatAsync(model, content, ct, false);
         try
@@ -155,7 +181,7 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
     /// <summary>One forced tool call: the arguments as JSON text, or (when the model answered in text anyway) that text.</summary>
     private async Task<string> ToolCallAsync(string model, JsonNode content, string tool, CancellationToken ct)
     {
-        bool responses = cfg.EffectiveApi == AiConfig.ApiResponses || (cfg.EffectiveApi == AiConfig.ApiAuto && (chosen.GetValueOrDefault(model) == AiConfig.ApiResponses || model.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase)));
+        bool responses = cfg.EffectiveApi == AiConfig.ApiResponses || (cfg.EffectiveApi == AiConfig.ApiAuto && (chosen.GetValueOrDefault(model) == AiConfig.ApiResponses || IsGpt(model)));
         if (responses)
         {
             var body = new JsonObject
@@ -179,11 +205,11 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
         {
             var body = new JsonObject
             {
-                ["model"] = model, ["max_tokens"] = MaxOutputTokens, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }),
+                ["model"] = model, ["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() }),
                 ["tools"] = new JsonArray(new JsonObject { ["type"] = "function", ["function"] = new JsonObject { ["name"] = tool, ["description"] = ToolNote, ["parameters"] = Params() } }),
                 ["tool_choice"] = new JsonObject { ["type"] = "function", ["function"] = new JsonObject { ["name"] = tool } },
             };
-            var r = await PostAsync("/chat/completions", body, ct);
+            var r = await PostChatAsync(model, body, ct);
             if (!r.Ok || ErrorMessage(r.Body) != null) { if (ToolsRefused(r.Body) || IsUnsupportedApi(r.Body)) throw new ToolsUnsupportedException(Head(r.Body)); throw Fail(r); }
             var msg = JsonNode.Parse(r.Body)?["choices"]?[0]?["message"];
             if (msg?["tool_calls"]?[0]?["function"]?["arguments"]?.GetValue<string>() is { } a) return a;
@@ -209,9 +235,9 @@ public sealed class AiClient(HttpClient http, AiConfig cfg) : IChat
         return await AiJson.ViaTextAsync(this, model, content, ct);
     }
 
-    public Task<string> TextAsync(CancellationToken ct) => ChatAsync(cfg.TextModel!, JsonValue.Create("Reply with the single word: ok"), ct);
+    public Task<string> TextAsync(CancellationToken ct) => ChatAsync(cfg.TextModel!, JsonValue.Create(PromptFile.Load("probe").Text("text")), ct);
 
     public Task<string> VisionAsync(CancellationToken ct) => ChatAsync(cfg.VisionModel!, new JsonArray(
-        new JsonObject { ["type"] = "text", ["text"] = "What colour is the shape in this image? Answer with one word." },
+        new JsonObject { ["type"] = "text", ["text"] = PromptFile.Load("probe").Text("vision") },
         new JsonObject { ["type"] = "image_url", ["image_url"] = new JsonObject { ["url"] = "data:image/png;base64," + Convert.ToBase64String(TestPng) } }), ct);
 }

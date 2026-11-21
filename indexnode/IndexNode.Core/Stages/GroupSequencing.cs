@@ -48,15 +48,30 @@ public static class GroupSequencing
     public sealed class Gate(IStore store, Paths paths)
     {
         public static readonly TimeSpan Relist = TimeSpan.FromMinutes(2), SummaryEvery = TimeSpan.FromMinutes(5);
-        readonly HashSet<string> frames = new(StringComparer.Ordinal); DateTimeOffset listedAt = DateTimeOffset.MinValue, summaryAt = DateTimeOffset.MinValue; bool listed;
-        public int Lists { get; private set; }
+        // The published set is never mutated: a relist builds a new one and swaps it in (readers on other lanes hold Views over the old one).
+        volatile HashSet<string> frames = new(StringComparer.Ordinal); DateTimeOffset listedAt = DateTimeOffset.MinValue, summaryAt = DateTimeOffset.MinValue; bool listed;
+        readonly SemaphoreSlim refreshing = new(1, 1); volatile View? last; readonly object summaryLock = new();
+        int lists;
+        public int Lists => Volatile.Read(ref lists);
 
         public sealed record View(HashSet<string> Frames, long? L, string? LId, int Waiting, int Runnable)
         {
             public bool Runnable_(QSubject s) => Frames.Contains(s.Id) && (s.Seq is not { } sq || L is not { } l || sq < l);
         }
 
+        /// <summary>One lane refreshes at a time; a lane that finds a refresh running reuses the last View (waits only when there is none yet).</summary>
         public async Task<View> RefreshAsync(JobQueue q, DateTimeOffset now, CancellationToken ct)
+        {
+            if (!await refreshing.WaitAsync(0, ct))
+            {
+                if (last is { } lv) return lv;
+                await refreshing.WaitAsync(ct);
+            }
+            try { return last = await RefreshCoreAsync(q, now, ct); }
+            finally { refreshing.Release(); }
+        }
+
+        async Task<View> RefreshCoreAsync(JobQueue q, DateTimeOffset now, CancellationToken ct)
         {
             for (int pass = 0; pass < 2; pass++)
             {
@@ -70,11 +85,14 @@ public static class GroupSequencing
                     }
                     return (bl, gi);
                 });
+                var frames = this.frames;
                 bool missing = blockers.Any(b => !frames.Contains(b.Id)) || groupIds.Any(id => !frames.Contains(id));
                 if (!listed || (missing && pass == 0 && now - listedAt >= Relist))
                 {
-                    foreach (var id in await ListFramesAsync(store, paths, ct)) frames.Add(id);   // a present id stays present
-                    listed = true; listedAt = now; Lists++; if (pass == 0) continue;
+                    var next = new HashSet<string>(frames, StringComparer.Ordinal);   // a present id stays present
+                    foreach (var id in await ListFramesAsync(store, paths, ct)) next.Add(id);
+                    this.frames = frames = next;
+                    listed = true; listedAt = now; Interlocked.Increment(ref lists); if (pass == 0) continue;
                 }
                 var low = blockers.Where(b => !frames.Contains(b.Id)).OrderBy(b => b.Seq).Cast<(long Seq, string Id)?>().FirstOrDefault();
                 var v = new View(frames, low?.Seq, low?.Id, 0, 0);
@@ -87,8 +105,9 @@ public static class GroupSequencing
         /// <summary>"group: N waiting behind seq L (id), M runnable", at most every <see cref="SummaryEvery"/>; null in between.</summary>
         public string? Summary(View v, DateTimeOffset now)
         {
-            if (v.Waiting == 0 || now - summaryAt < SummaryEvery) return null;
-            summaryAt = now; return $"group: {v.Waiting} waiting behind seq {(v.L?.ToString() ?? "-")} ({v.LId ?? "-"}), {v.Runnable} runnable";
+            if (v.Waiting == 0) return null;
+            lock (summaryLock) { if (now - summaryAt < SummaryEvery) return null; summaryAt = now; }
+            return $"group: {v.Waiting} waiting behind seq {(v.L?.ToString() ?? "-")} ({v.LId ?? "-"}), {v.Runnable} runnable";
         }
     }
 

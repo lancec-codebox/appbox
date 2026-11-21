@@ -135,9 +135,10 @@ public static class SiteCommands
             else
             {
                 if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
-                src = new StoreJob(new RestStore(Commands.NewHttp(), cfg.Sas), new Paths(a.Get("prefix") ?? "index/"), a.Get("job")!);
+                // the store keeps a drama's files inside its step zips (download.zip, ocrsubs.zip, transcribe.zip, cast.zip ...): the wrapper serves each per-file name from the right zip and hydrates a ghosted zip
+                src = new StoreJob(StageZipStore.Wrap(new RestStore(Commands.NewHttp(), cfg.Sas)), new Paths(a.Get("prefix") ?? "index/"), a.Get("job")!);
             }
-            var d = await DescribeJob.GatherAsync(src, work, ct);
+            var d = await DescribeJob.GatherAsync(src, work, ct);   // refuses a drama without text or duration, before any AI call
             if (a.Has("dry"))
             {
                 var req = DescribeJob.Dry(d, ai); var dest = a.Get("out") ?? Path.Combine(local!, "describe.request.json");

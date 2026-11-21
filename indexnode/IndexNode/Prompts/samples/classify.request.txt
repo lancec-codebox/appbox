@@ -1,0 +1,9 @@
+=== classify call  (model: text-model)
+--- user message: text ---
+You decide which uploads of a YouTube channel are worth downloading for a catalogue of Chinese short dramas (vertical micro-dramas, usually published as one long video of all episodes, 1-3 hours, or as long multi-episode parts).
+Each upload names its channel.
+A download candidate is a whole drama, or a multi-episode part of one (at least about 20 minutes), in any language (a dubbed drama is a candidate; give its language).
+Not candidates: trailers, previews, teasers, single short clips or highlights, recaps, reviews, commentary, reactions, behind the scenes, interviews, music, vlogs, ads, live streams, and anything that is not a scripted drama.
+Uploads (id | channel | length | title):
+v1 | Drama Channel | 60 min | Reborn Bride Full
+Answer with ONE JSON object: {"videos":[{"id":"","candidate":true,"kind":"full|part|dub|trailer|clip|recap|other","language":"zh|en|...","reason":"a few words"}]}, one entry per upload, in the same order.

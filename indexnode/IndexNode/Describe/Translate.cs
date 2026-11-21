@@ -39,7 +39,8 @@ public sealed record TranslateResult(bool Skipped, string? Reason, byte[]? Vtt, 
 /// </summary>
 public static partial class Translate
 {
-    public const string PromptVersion = "translate-3";
+    /// <summary>The translate prompt version, kept with the prompt text in Prompts/translate.yaml.</summary>
+    public static string PromptVersion => PromptFile.Load("translate").Version;
     public const int BatchCues = 200, ContextCues = 10, Parallelism = 4, MaxReasks = 2;
     /// <summary>Context on each side of a batch: at least this many cues AND at least this many seconds (whichever reaches further), so an exchange split by a boundary is seen whole.</summary>
     public const double ContextSeconds = 30;
@@ -180,34 +181,11 @@ public static partial class Translate
         return string.Join('\n', res);
     }
 
-    static string GlossaryPrompt(string seed, string synopsis, string script, bool wantPlot)
+    internal static string GlossaryPrompt(string seed, string synopsis, string script, bool wantPlot)
     {
-        var plotLine = wantPlot ? "Also write \"plot\": a short PRIVATE plot summary of the whole drama, end to end, about 100 to 150 words in English, spoilers allowed: who the main characters are (use the glossary spellings), how they relate (spouse, sibling, master and servant, rank) and any hidden identity or reveal that changes how people address each other. It is only a briefing for the translators." : "";
-        var shape = wantPlot ? "{\"plot\":\"\",\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\",\"refers\":\"\"}]}" : "{\"entries\":[{\"zh\":\"\",\"en\":\"\",\"kind\":\"character\",\"refers\":\"\"}]}";
-        return $$"""
-        You are preparing the name glossary for the English subtitles of a Chinese drama. Read the whole Chinese script below and list every proper name and recurring form of address that must be rendered the same way in every line.
-
-        Include:
-        - kind "character": a character's NAME only (full name, or the name as the Chinese writes it), as ONE English spelling: pinyin without tone marks, given name then surname unless the known list below says otherwise (use the known spelling exactly when the character is listed there). Never put a form of address, a pet name or a nickname here.
-        - kind "place": places, palaces, mansions, cities, schools, sects.
-        - kind "title": official titles, ranks, noble titles and honorifics used with or instead of a name (e.g. 世子, 侯爷, 王爷, 将军).
-        - kind "address": every recurring FORM OF ADDRESS, kin term, pet name or short form of a name used to call someone (e.g. 嫂嫂, 母亲, 夫君, 师父, 昭姐姐, 阿战, 小可爱, 为善少爷). "en" is how it is SAID in English, as an address, not the person's full name: 昭姐姐 => "Sister Zhao", 阿战 => "A-Zhan" or "Zhan", 嫂嫂 => "Sister-in-law", 小可爱 => "sweetie" or "little one", 母亲 => "Mother", 世子 => "Your Highness" when said to him. "refers" is the English name of the person it usually refers to (context only; it is never substituted into the line). If one form is used differently by different speakers, give the commonest rendering.
-        - kind "other": anything else that must stay consistent (organisations, named objects, techniques).
-
-        Rules: keep names and address forms apart: a name entry maps a name to its spelling, an address entry maps an address form to how it is said. "en" is plain English letters (no Chinese, no notes, no brackets); one entry per Chinese form; give only entries that occur in the script; at most 250 entries, most frequent first.
-
-        Known drama facts (English spellings chosen for this drama; keep them):
-        Synopsis: {{(synopsis.Length > 0 ? synopsis : "(none)")}}
-        Characters:
-        {{(seed.Length > 0 ? seed : "(none)")}}
-
-        {{plotLine}}
-
-        Answer with ONE JSON object: {{shape}}
-
-        CHINESE SCRIPT (one subtitle cue per line):
-        {{script}}
-        """;
+        var f = PromptFile.Load("translate");
+        return f.Fill("glossary", ("synopsis", synopsis.Length > 0 ? synopsis : f.Text("none")), ("seed", seed.Length > 0 ? seed : f.Text("none")), ("plotLine", wantPlot ? f.Text("glossary-plot-line") : ""),
+            ("shape", f.Text(wantPlot ? "glossary-shape-with-plot" : "glossary-shape")), ("script", script));
     }
 
     public static async Task<GlossaryResult> BuildGlossaryAsync(IChat chat, string model, TranslateSource src, JsonObject? describe, CancellationToken ct)
@@ -238,39 +216,23 @@ public static partial class Translate
             ? $"{e.Zh} => {e.En} [address form{(e.Refers.Length > 0 ? $"; refers to {e.Refers}, context only" : "")}]"
             : $"{e.Zh} => {e.En} [{e.Kind}]"));
 
-    static string BatchPrompt(IReadOnlyList<ShapeCue> cues, IReadOnlyList<(int Id, bool Ask)> window, IReadOnlyDictionary<int, string> known, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string relations, string plot, string title)
+    internal static string BatchPrompt(IReadOnlyList<ShapeCue> cues, IReadOnlyList<(int Id, bool Ask)> window, IReadOnlyDictionary<int, string> known, IReadOnlyList<GlossaryEntry> glossary, string synopsis, string relations, string plot, string title)
     {
-        var sb = new StringBuilder();
-        sb.Append("""
-            You translate the Chinese subtitles of a drama into English subtitles. The cues are in time order; read them as one continuous script.
-
-            Rules:
-            - Natural, spoken English that an audience reads at a glance. Keep each speaker's register (formal court speech, family talk, slang, anger, tenderness).
-            - Use the glossary EXACTLY for names, places and titles: the English in the glossary is the only spelling to use, every time.
-            - A form of address stays a form of address: translate it as the address, in the speaker's register, using the glossary's English for that form (昭姐姐 => "Sister Zhao", 阿战 from his mother => "Zhan" or "A-Zhan", 小可爱 => "sweetie"). NEVER swap in the person's full name for an address. Use a full name only where the Chinese itself uses the name. "refers to" is context only, so you know who is meant.
-            - Fragments and scrambled OCR: the Chinese is burned-in OCR, so a cue may be cut off, partial or have swapped or wrong characters. TRANSLATE it whenever its meaning is evident from the cue and its neighbours: give the evident meaning (a cut-off line stays cut off, e.g. "...may not be able to protect the heir"; a scrambled repeat of a nearby line takes that line's meaning, in the same English). Do not drop a cue just because it looks odd.
-            - Interjections and laughs are speech: 哈哈哈 => "Hahaha", 啊啊啊 => "Aaah!", 哼 => "Hmph." Translate them.
-            - Skip ONLY (answer "en": "" and "skip": true): a lone character or fragment with no evident meaning in context (an OCR error), and on-screen text that is not dialogue (signs, wanted posters, edicts shown with no speaker). Never invent text for a skipped cue.
-            - No notes, no explanations, no brackets, no speaker labels, no quotation of the Chinese. Do not add words that are not said.
-            - One sentence may run across several cues: translate each cue's own part so that the cues read right in sequence (do not repeat the whole sentence in each cue).
-            - A cue that is only a sound effect, music or non-speech gets an empty string ("skip": true).
-            - Lines marked CONTEXT are only there to help you; do NOT translate them. Lines marked TRANSLATE are the ones to answer.
-
-            """);
-        if (title.Length > 0) sb.Append("Drama: ").Append(title).Append('\n');
-        if (synopsis.Length > 0) sb.Append("The whole story, with the ending (spoilers; a briefing only, never add words from it): ").Append(synopsis).Append("\n\n");
-        if (relations.Length > 0) sb.Append("Relations between the characters ([REVEAL] = hidden until later in the story; use it to know who is who and how they address each other, and keep the speaker's current knowledge):\n").Append(relations).Append('\n');
-        if (plot.Length > 0) sb.Append("Plot of the whole drama (a short briefing, spoilers; never add words from it): ").Append(plot).Append("\n\n");
-        sb.Append("GLOSSARY:\n").Append(GlossaryText(glossary)).Append("\n\nSCRIPT:\n");
+        var f = PromptFile.Load("translate"); var sb = new StringBuilder();
+        sb.Append(f.Text("batch-rules")).Append("\n\n");
+        if (title.Length > 0) sb.Append(f.Fill("batch-drama", ("title", title))).Append('\n');
+        if (synopsis.Length > 0) sb.Append(f.Fill("batch-synopsis", ("synopsis", synopsis))).Append("\n\n");
+        if (relations.Length > 0) sb.Append(f.Fill("batch-relations", ("relations", relations))).Append('\n');
+        if (plot.Length > 0) sb.Append(f.Fill("batch-plot", ("plot", plot))).Append("\n\n");
+        sb.Append(f.Fill("batch-script", ("glossary", GlossaryText(glossary)))).Append('\n');
         foreach (var (id, ask) in window)
         {
-            sb.Append(ask ? "TRANSLATE " : "CONTEXT ").Append('[').Append(id).Append("] ").Append(cues[id].Text);
-            if (!ask && known.TryGetValue(id, out var en)) sb.Append("   (English so far: ").Append(en).Append(')');
+            sb.Append(f.Fill(ask ? "batch-translate" : "batch-context", ("id", id.ToString()), ("text", cues[id].Text)));
+            if (!ask && known.TryGetValue(id, out var en)) sb.Append(f.Fill("batch-known", ("en", en)));
             sb.Append('\n');
         }
         var ids = window.Where(w => w.Ask).Select(w => w.Id).ToList();
-        sb.Append("\nAnswer with ONE JSON object: {\"cues\":[{\"i\":<id>,\"en\":\"<English>\"}]} (for a garbled or non-speech cue: {\"i\":<id>,\"en\":\"\",\"skip\":true}) with exactly one entry for each of the ").Append(ids.Count)
-          .Append(" TRANSLATE ids: ").Append(string.Join(',', ids)).Append(". Nothing else.");
+        sb.Append('\n').Append(f.Fill("batch-answer", ("count", ids.Count.ToString()), ("ids", string.Join(',', ids))));
         return sb.ToString();
     }
 

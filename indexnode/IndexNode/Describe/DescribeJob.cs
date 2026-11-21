@@ -30,6 +30,9 @@ public static class DescribeJob
         string? ps = null; int pn = 0;
         bool framesCast = (await J("cast/clusters.json") as JsonObject)?["source"] != null; // the frame-based cast has no two-shot posters (dropped): never pick up an older run's sheet
         if (!framesCast && await src.ReadAsync("cast/poster_sheet.jpg", ct) is { } pb) { ps = Path.Combine(work, "poster_sheet.jpg"); File.WriteAllBytes(ps, pb); pn = (await J("cast/poster_cands.json") as JsonArray)?.Count(x => x?["shortlist"]?.GetValue<bool>() ?? true) ?? 0; }
+        // nothing to describe: stop here, before the AI is asked about "duration 0 s" (0.13.14: describe --job read no files from a zip-only store, made 2 calls and wrote an empty describe.json)
+        if (cues.Count == 0) throw new InvalidOperationException($"describe {src.JobId}: no text cues found (no subtitles and no ASR lines in ocr/subs.zh.vtt or asr/{Transcribe.ModelName}.zh.vtt); not asking the AI");
+        if (dur <= 0) throw new InvalidOperationException($"describe {src.JobId}: no duration found (downloaded.json / info.json); not asking the AI");
         return new DescribeInput
         {
             JobId = src.JobId, Title = info?["title"]?.GetValue<string>() ?? "", Description = desc, Duration = dur, TextSource = ocr.Count > 0 ? "burned-in OCR" : "transcript",
@@ -52,7 +55,7 @@ public static class DescribeJob
     {
         var text = ai?.TextModel ?? "(text model)"; var vision = ai?.VisionModel ?? ai?.TextModel ?? "(vision model)";
         var main = Describe.BuildMain(d, vision);
-        var stub = new JsonObject { ["teaser"] = new JsonObject { ["en"] = "<teaser from the first call>" }, ["cast"] = new JsonArray(), ["relations"] = new JsonArray() };
-        return Describe.DryJson([main, Describe.BuildCheck(stub, Describe.Cutoff(d.Duration), text)]);
+        var stub = new JsonObject { ["teaser"] = new JsonObject { ["en"] = "<teaser from the first call>" }, ["synopsis"] = new JsonObject { ["en"] = "<synopsis from the first call>" }, ["cast"] = new JsonArray(), ["relations"] = new JsonArray() };
+        return Describe.DryJson([main, Describe.BuildTwistCheck(stub, text)]);
     }
 }

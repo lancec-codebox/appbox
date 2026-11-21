@@ -38,7 +38,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var ct = ctx.Token; var paths = ctx.Paths; var id = ctx.BlobName; var s = settings ?? new PreCheckSettings();
         long seq = ctx.Queue?.Read(st => st.Get(id)?.Seq) ?? throw new InvalidOperationException($"group {id}: no sequence number");
         ctx.Report("group", "index");
-        var clock = Stopwatch.StartNew(); double tDedup = 0, tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
+        var clock = Stopwatch.StartNew(); double tMember = 0, tDedup = 0, tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
         var head = await SearchData.LoadAsync(store, paths, null, ct);
         var q = ctx.Queue!;
         bool Earlier(string other) => other != id && (q.Read(st => st.Get(other)?.Seq) is not { } o || o < seq);
@@ -47,7 +47,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var inIndex = head?.Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal) ?? [];
         var fresh = q.Read(st => st.Subjects.Values.Where(x => x.Id != id && !inIndex.Contains(x.Id) && Earlier(x.Id) && (x.CentersAt != null || x.Entries.TryGetValue("process", out var pe) && pe.State == "done")).OrderBy(x => x.Seq ?? long.MaxValue).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList());
         tIdx = clock.Elapsed.TotalMilliseconds; int earlier = (idx?.Uploads.Count ?? 0) + fresh.Count;
-        string Split() => $"{earlier} earlier ({idx?.Uploads.Count ?? 0} indexed + {fresh.Count} fresh); index {tIdx:F0} ms, own frames {tOwn:F0} ms, search {tSearch:F0} ms (scan {tScan:F0}, read {tRead:F0}, score {tScore:F0}), fresh {tFresh:F0} ms, dedup {tDedup:F0} ms, write {tWrite:F0} ms; {searched} frames searched";
+        string Split() => $"{earlier} earlier ({idx?.Uploads.Count ?? 0} indexed + {fresh.Count} fresh); index {tIdx:F0} ms, own frames {tOwn:F0} ms, search {tSearch:F0} ms (scan {tScan:F0}, read {tRead:F0}, score {tScore:F0}), fresh {tFresh:F0} ms, membership {tMember:F0} ms, dedup {tDedup:F0} ms, write {tWrite:F0} ms; {searched} frames searched";
 
         if (idx == null && fresh.Count == 0) { await WriteAsync(ctx, id, seq, GroupProposal.None, [], null, 0, 0, 0, [], null, s, ct, null); return; }
         // own frames, from the node's local copy of the frames file
@@ -108,8 +108,10 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
             // 0.13.13: DEDUP against the group only: every earlier member of the target's group, by its FULL frames file, brute force (no global index search)
             var td = Stopwatch.StartNew();
             var earlierSeq = q.Read(st => st.Subjects.Values.Where(x => x.Id != id && (x.Seq is not { } o || o < seq)).ToDictionary(x => x.Id, x => x.Seq, StringComparer.Ordinal));
-            GroupSet? known = null; try { if (head != null) known = await GroupStore.LoadAsync(store, paths, head.Version, ct); } catch (Exception e) when (e is not OperationCanceledException) { }
-            var members = await dedup.SetAsync(paths, prop.JoinUpload, earlierSeq, known, ct);
+            var known = head != null ? await dedup.KnownAsync(paths, head.Version, ct) : null;
+            var ms = await dedup.SetAsync(paths, prop.JoinUpload, earlierSeq, jid => q.Read(st => st.Get(jid) is { JoinKind: not null } js ? (js.JoinOf, js.JoinKind) : ((string?, string?)?)null), known, ct);
+            var members = ms.Members; tMember = td.Elapsed.TotalMilliseconds;
+            Log.Info($"group {id}: membership {members.Count} of {earlierSeq.Count} earlier ({ms.FromQueue} from the queue, {ms.FromGroups} from the groups file, {ms.FromCache} cached, {ms.Reads} read from video.json) in {tMember:F0} ms");
             if (!members.Contains(prop.JoinUpload)) members.Insert(0, prop.JoinUpload);
             var (M, mem, tm, used) = await GroupDedup.LoadAsync(store, paths, members, ct);
             var dbest = GroupDedup.Best(own.Select(f => f.V).ToList(), M, mem, tm, threads, ct);
@@ -131,6 +133,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
     async Task WriteAsync(JobContext ctx, string id, long seq, GroupProposal prop, IReadOnlyList<(double T, byte[] F16)> own, int? covered, int total, int sampled, int sampleCovered, List<JsonObject> stretches, FrameBest?[]? best, PreCheckSettings s, CancellationToken ct, Func<string>? split, IReadOnlyList<string>? dedupAgainst = null, int dedupFrames = 0)
     {
         var paths = ctx.Paths; int kept = total; string? retained = null; var wsw = Stopwatch.StartNew();
+        ctx.GroupJoin = prop.Kind == GroupProposal.JoinKind ? prop.JoinUpload : null; ctx.GroupJoinKind = prop.Kind;   // the group step's done line carries the join (queue state: JoinOf)
         bool retain = s.RetainEnabled && covered != null && total > 0 && best != null && prop.Kind == GroupProposal.JoinKind && !prop.Mixed;   // 0.13.13: no retain.f gate: every join keeps only its frames unique among the group's earlier members (at least one)
         if (retain)
         {

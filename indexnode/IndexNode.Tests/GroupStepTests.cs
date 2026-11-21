@@ -297,6 +297,105 @@ public class GroupStepTests
         Assert.Equal([1L, 2L], new[] { "f1", "f2" }.Select(id => q.Read(st => st.Get(id)!.Seq!.Value)).OrderBy(x => x));
     }
 
+    // ---- 0.13.14: membership from the queue state, the groups file and a persistent cache (no per-step video.json reads)
+    static QLine[] GroupDone(string id, string? join, string kind) => [AddProcess(id), QLine.Add(id, "group", GroupSequencing.NewJob(id, 0), "2026-11-21T08:00:00Z"), new QLine { T = "done", S = id, Stage = "group", Join = join, JoinKind = kind }];
+    static Func<string, (string?, string?)?> QJ(JobQueue q) => id => q.Read(st => st.Get(id) is { JoinKind: not null } js ? (js.JoinOf, js.JoinKind) : ((string?, string?)?)null);
+    static int Gets(FakeStore s) => s.Ops.GetValueOrDefault("get") + s.Ops.GetValueOrDefault("list");
+    static Dictionary<string, long?> Earlier(params string[] ids) => ids.Select((x, i) => (x, (long?)(i + 1))).ToDictionary(x => x.x, x => x.Item2);
+
+    [Fact]
+    public async Task Membership_comes_from_the_queue_lines_alone_a_three_member_chain_and_no_store_reads()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        await q.AppendLinesAsync(GroupDone("a", null, "new").Concat(GroupDone("b", "a", "join")).Concat(GroupDone("c", "b", "join")).Concat(GroupDone("x", null, "new")).Concat(GroupDone("y", "x", "join")), default);
+        Assert.Equal("b", q.Read(st => st.Get("c")!.JoinOf)); Assert.Equal("join", q.Read(st => st.Get("c")!.JoinKind));
+        var before = Gets(s);
+        var ms = await new GroupDedup(s, Tmp()).SetAsync(P, "c", Earlier("a", "b", "c", "x", "y"), QJ(q), null, default);
+        Assert.Equal(["a", "b", "c"], ms.Members); Assert.Equal(0, ms.Reads); Assert.Equal(before, Gets(s));
+        // the join survives a snapshot rollover (a node that starts later still has it)
+        var late = await Node(s, c, "late"); Assert.Equal("b", late.Read(st => st.Get("c")!.JoinOf));
+        Assert.Equal("b", QueueState.FromSnapshot(QueueState.Unpack(q.Read(st => st.ToSnapshot(1, 0, 0, "2026-11-21T08:00:00Z", c.T)))).State.Get("c")!.JoinOf);
+    }
+
+    [Fact]
+    public async Task The_groups_file_is_read_once_and_a_restarted_node_with_the_same_cache_directory_reads_nothing()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a"); var dir = Tmp();
+        var set = new GroupSet { Groups = [new DramaGroup { Id = "g1", Members = [new GroupMember { Upload = "a" }, new GroupMember { Upload = "b", JoinedThrough = "a" }, new GroupMember { Upload = "c", JoinedThrough = "b" }] }] };
+        Assert.True(await GroupStore.WriteAsync(s, P, set, 3, default));
+        var d1 = new GroupDedup(s, dir); int g0 = Gets(s);
+        var k = await d1.KnownAsync(P, 3, default); await d1.KnownAsync(P, 3, default);
+        Assert.Equal(1, Gets(s) - g0);   // exactly one read for the version
+        var ms = await d1.SetAsync(P, "c", Earlier("a", "b", "c"), QJ(q), k, default);
+        Assert.Equal(["a", "b", "c"], ms.Members); Assert.Equal(0, ms.Reads);
+        var d2 = new GroupDedup(s, dir); int g1 = Gets(s);   // restarted node
+        var k2 = await d2.KnownAsync(P, 3, default); var ms2 = await d2.SetAsync(P, "c", Earlier("a", "b", "c"), QJ(q), k2, default);
+        Assert.Equal(["a", "b", "c"], ms2.Members); Assert.Equal(g1, Gets(s));
+    }
+
+    [Fact]
+    public async Task A_video_json_fallback_record_is_read_once_kept_for_good_and_superseded_by_a_queue_join_line()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a"); var dir = Tmp();
+        foreach (var id in new[] { "a", "b" }) await VideoJsonSeed.PutAsync(s, P, id, 300);
+        await VideoJson.UpdateAsync(s, P, "b", r => r["grouping"] = new JsonObject { ["proposal"] = new GroupProposal(GroupProposal.JoinKind, null, "a", 0, 1, 1, 1, 1, false, []).ToJson() }, default);
+        var d1 = new GroupDedup(s, dir);
+        var ms = await d1.SetAsync(P, "b", Earlier("a", "b", "n"), QJ(q), null, default);   // a has no record at all (not cached), b's is read
+        Assert.Equal(["a", "b"], ms.Members); Assert.Equal(3, ms.Reads);   // a and n have no record (not cached), b's is read
+        int g = Gets(s); var d2 = new GroupDedup(s, dir);   // restart: b's record comes from the cache directory; a (no record) is asked again
+        var ms2 = await d2.SetAsync(P, "b", Earlier("a", "b", "n"), QJ(q), null, default);
+        Assert.Equal(2, ms2.Reads); Assert.Equal(1, ms2.FromCache);
+        // a queue join line for b now says it joins n: it supersedes the cached record
+        await q.AppendLinesAsync(GroupDone("b", "n", "join"), default);
+        var ms3 = await new GroupDedup(s, dir).SetAsync(P, "b", Earlier("a", "b", "n"), QJ(q), null, default);
+        Assert.Equal(["b", "n"], ms3.Members.Order().ToList());
+    }
+
+    [Fact]
+    public async Task Backfill_joins_reads_each_grouped_drama_once_appends_the_missing_join_lines_and_is_idempotent()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        await q.AppendLinesAsync(GroupDone("a", null, "new").Concat(GroupDone("b", null, "").Select(l => { if (l.T == "done") l.JoinKind = null; return l; })).Concat(GroupDone("c", null, "x").Select(l => { if (l.T == "done") l.JoinKind = null; return l; })), default);
+        foreach (var id in new[] { "a", "b", "c" }) await VideoJsonSeed.PutAsync(s, P, id, 300);
+        await VideoJson.UpdateAsync(s, P, "b", r => r["grouping"] = new JsonObject { ["proposal"] = new GroupProposal(GroupProposal.JoinKind, null, "a", 0, 1, 1, 1, 1, false, []).ToJson() }, default);
+        var dry = await SeqCommand.BackfillJoinsAsync(q, s, P, true, default);
+        Assert.Equal(2, dry.Missing); Assert.Equal(0, s.AppendText("index/jobs/queue.log").Split('\n').Count(l => l.Contains("\"t\":\"join\"")));
+        var r1 = await SeqCommand.BackfillJoinsAsync(q, s, P, false, default);
+        Assert.Equal(1, r1.Added); Assert.Equal(1, r1.NoRecord);   // c has no grouping record yet: left alone
+        Assert.Equal("a", q.Read(st => st.Get("b")!.JoinOf)); Assert.Equal("join", q.Read(st => st.Get("b")!.JoinKind));
+        var r2 = await SeqCommand.BackfillJoinsAsync(q, s, P, false, default);
+        Assert.Equal(0, r2.Added); Assert.Equal(1, r2.Missing);   // only c still lacks one; nothing new appended
+        Assert.Equal(1, s.AppendText("index/jobs/queue.log").Split('\n').Count(l => l.Contains("\"t\":\"join\"")));
+    }
+
+    [Fact]
+    public async Task Four_lanes_refreshing_and_checking_the_gate_at_once_throw_nothing_and_agree_on_L()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        var ids = Enumerable.Range(1, 150).Select(k => "d" + k).ToArray();
+        await q.AppendLinesAsync(ids.Select(AddProcess), default);
+        await q.AppendLinesAsync(ids.Select((id, k) => new QLine { T = "seq", S = id, Seq = k + 1 }), default);
+        await PutFrames(s, "d1", Make(20, 4, 1), 20);   // d2.. get frames while the lanes run, so the shared set keeps growing (and L moves up); d5 is the first to be missing
+        var gate = new GroupSequencing.Gate(s, P); var t0 = new DateTimeOffset(c.T.UtcDateTime, TimeSpan.Zero);
+        var subs = ids.Select(id => q.Read(st => st.Get(id)!)).ToArray();
+        var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>(); var ls = new System.Collections.Concurrent.ConcurrentBag<long?>();
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(lane => Task.Run(async () =>
+        {
+            for (int i = 0; i < 2000; i++)
+                try
+                {
+                    if (lane == 0 && i is >= 1 and < 150 && i != 4) await PutFrames(s, ids[i], Make(20, 4, i), 20);
+                    var v = await gate.RefreshAsync(q, t0.AddMinutes(3 * i), default);
+                    ls.Add(v.L);
+                    foreach (var sub in subs) _ = v.Runnable_(sub);
+                }
+                catch (Exception e) { errors.Add(e); }
+        })));
+        Assert.Empty(errors);
+        Assert.All(ls, l => Assert.InRange(l!.Value, 2L, 5L));   // L climbs from 2 to 5 as frames appear; d5 never gets any
+        Assert.Equal(5L, (await gate.RefreshAsync(q, t0.AddDays(30), default)).L);
+    }
+
     [Fact]
     public async Task A_blocked_group_entry_produces_no_claim_line_and_becomes_runnable_when_the_lowest_unframed_drama_clears_and_group_entries_go_in_seq_order()
     {

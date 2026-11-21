@@ -1,0 +1,19 @@
+# The ending backfill (indexnode describe ending --backfill): several dramas per call, no images. Its answers are stored under describe.json endingBy with the describe prompt version.
+version: ending-1
+
+intro: |
+  You judge whether each short-drama upload below tells its story to the end. Work only from the evidence given for each drama: the upload title, the upload description, the LAST minutes of its text track (burned-in subtitles or speech recognition, [m:ss] text) and a synopsis of the whole story written earlier. Answer with ONE JSON object and nothing else.
+rules: |
+  For each drama give ending: kind "complete" (the main conflict is resolved and the story is told to its end), "cliffhanger" (it stops on an unresolved turn, a 'to be continued' or a next-episode teaser) or "truncated" (it stops mid-scene or mid-sentence, as if the upload were cut off); signs: the evidence in a few words, English only, [] when none; nextPart: true when the text or description points to a further part, episode or season, false when it says this is the last, null when nothing says; nextPartHint: what names the next part when the title, description or last lines show it (e.g. '第二部', 'Part 2', a sequel title, 'EP 5'), copied as written, at most 80 characters, else null. Do not guess: when the evidence is too thin, answer kind null.
+answer: |
+  Answer: {"dramas":[{"id":"","ending":{"kind":"complete","signs":[],"nextPart":null,"nextPartHint":null}}]}, one entry per drama, id copied exactly.
+drama-block: |
+  === drama {id}
+  Title: {title}
+  Description:
+  {description}
+  Synopsis:
+  {synopsis}
+  Last {minutes} minutes of the text track:
+  {tail}
+no-text: "(no text)"

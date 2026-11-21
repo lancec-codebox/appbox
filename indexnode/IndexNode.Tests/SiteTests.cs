@@ -119,48 +119,43 @@ public class DescribeTests
         var dir = Directory.CreateTempSubdirectory().FullName;
         var chat = new FakeChat(Main, """{"teaserReveals":false,"reasons":[],"flaggedCast":[],"flaggedRelations":[]}""");
         var res = await Describe.RunAsync(chat, "text-m", "vision-m", Input(dir), default);
-        Assert.Equal(2, chat.Calls.Count); // 1 batched vision call + 1 spoiler check: never one per cue
+        Assert.Equal(2, chat.Calls.Count); // 1 batched vision call + 1 twist check: never one per cue
         Assert.Equal("vision-m", chat.Calls[0].Model); Assert.Equal("text-m", chat.Calls[1].Model);
         var arr = chat.Calls[0].Content.AsArray();
         Assert.Equal(1 + 2 * 4, arr.Count); // prompt + (label, image) x (thumbnail, 2 sheets, poster sheet)
         Assert.Equal(4, arr.Count(x => x!["type"]!.GetValue<string>() == "image_url"));
         var prompt = arr[0]!["text"]!.GetValue<string>();
         Assert.Contains("新娘重生 #shorts FULL", prompt); Assert.Contains("主演：张三", prompt); Assert.Contains("第7句", prompt); Assert.Contains("ENGLISH ONLY", prompt); Assert.Contains("never invent", prompt, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal("describe-8", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
+        Assert.Equal("describe-9", (string)res["promptVersion"]!); Assert.Equal("vision-m", (string)res["models"]!["vision"]!); Assert.Equal(2, (int)res["aiCalls"]!);
     }
 
     [Fact]
-    public async Task Reply_is_normalised_no_villain_english_tags_one_lead_credits_only_actor()
+    public async Task Reply_is_normalised_villain_words_kept_english_tags_roles_credits_only_actor()
     {
         var dir = Directory.CreateTempSubdirectory().FullName;
         var res = Describe.Normalize(Describe.ParseObject(Main), Input(dir));
-        Assert.DoesNotContain("villain", res.ToJsonString(), StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(new[] { "rebirth", "revenge" }, res["tags"]!.AsArray().Select(t => (string)t!).ToArray().Where(t => t != "plot"));
+        Assert.Contains("villain", res.ToJsonString(), StringComparison.OrdinalIgnoreCase); // no word filter any more
+        Assert.Equal(new[] { "rebirth", "villain plot", "revenge" }, res["tags"]!.AsArray().Select(t => (string)t!).ToArray());
         var cast = res["cast"]!.AsArray(); Assert.Equal(2, cast.Count); // unknown cluster 9 dropped
-        Assert.Equal("female lead", (string)cast[0]!["role"]!); Assert.Equal("supporting", (string)cast[1]!["role"]!); // the second 'female lead' is demoted
+        Assert.Equal("female lead", (string)cast[0]!["role"]!); Assert.Equal("female lead", (string)cast[1]!["role"]!); // dual leads are kept
         Assert.Equal("张三", (string)cast[0]!["actor"]!); Assert.Null(cast[1]!["actor"]); // 王五 is not in the credits
         var rel = res["relations"]!.AsArray(); Assert.Equal(2, rel.Count); // the self-relation is dropped
-        Assert.True((bool)rel[0]!["spoiler"]!); // since 900 > cutoff 120
-        Assert.False((bool)rel[1]!["spoiler"]!);
+        Assert.False(((JsonObject)rel[0]!).ContainsKey("spoiler")); Assert.False(((JsonObject)rel[1]!).ContainsKey("spoiler"));
         Assert.Equal("ancient", (string)res["era"]!); Assert.False((bool)res["fantasy"]!);
         await Task.CompletedTask;
     }
 
     [Fact]
-    public async Task Spoiler_check_rewrites_flagged_teaser_and_cast_and_marks_flagged_relations()
+    public async Task Twist_check_is_one_call_and_its_rewrite_is_applied()
     {
         var dir = Directory.CreateTempSubdirectory().FullName; var d = Input(dir);
         var res = Describe.Normalize(Describe.ParseObject(Main), d);
-        var chat = new FakeChat(
-            """{"teaserReveals":true,"reasons":["teaser reveals the sister twist"],"flaggedCast":[1],"flaggedRelations":[1]}""",
-            """{"teaser":"A bride returns to her wedding day with a plan.","cast":[{"cluster":1,"roleAtStart":"a guest","description":"A guest at the wedding.","label":"Lu's guest"}]}""",
-            """{"teaserReveals":false,"reasons":[],"flaggedCast":[],"flaggedRelations":[]}""");
-        var calls = await Describe.SpoilerCheckAsync(chat, "m", res, d, default);
-        Assert.Equal(3, calls);
+        var chat = new FakeChat("""{"revealsTwist":true,"reasons":["teaser reveals the sister twist"],"teaser":"A bride returns to her wedding day with a plan.","cast":[{"cluster":1,"roleAtStart":"a guest","description":"A guest at the wedding.","label":"Lu's guest"}]}""");
+        var calls = await Describe.TwistCheckAsync(chat, "m", res, d, default);
+        Assert.Equal(1, calls); Assert.Single(chat.Calls);
         Assert.Equal("A bride returns to her wedding day with a plan.", (string)res["teaser"]!["en"]!);
         Assert.Equal("a guest", (string)res["cast"]![1]!["roleAtStart"]!); Assert.Equal("Lu's guest", (string)res["cast"]![1]!["label"]!["en"]!);
-        Assert.True((bool)res["relations"]![1]!["spoiler"]!);
-        Assert.True((bool)res["spoilerCheck"]!["clean"]!);
+        Assert.True((bool)res["twistCheck"]!["revealed"]!);
         await Task.CompletedTask;
     }
 
@@ -285,7 +280,7 @@ public class PublishTests
         // clip: 3 shots, one row each
         Assert.Equal(3, JsonDocument.Parse(File.ReadAllText(Path.Combine(p, "clipFrames.json"))).RootElement.GetArrayLength());
         Assert.Equal(3, new FileInfo(Path.Combine(p, "clip.f16")).Length / (Clip.Dim * 2));
-        var drama = File.ReadAllText(Path.Combine(p, "drama.json")); Assert.DoesNotContain("villain", drama, StringComparison.OrdinalIgnoreCase);
+        var drama = File.ReadAllText(Path.Combine(p, "drama.json")); Assert.DoesNotContain("\"villain\"", drama); Assert.DoesNotContain("spoiler\": ", System.Text.Json.Nodes.JsonNode.Parse(drama)!["relations"]!.ToJsonString()); // the villain word is kept; the cast has the flag; relations have no spoiler
         var j = JsonNode.Parse(drama)!;
         Assert.Equal("yt123", (string)j["youtubeId"]!); Assert.True((bool)j["embeddable"]!); Assert.Equal("Chan", (string)j["channel"]!); Assert.Equal(300, (double)j["durationSeconds"]!);
         Assert.Equal("原标题 #shorts", (string)j["originalTitle"]!); Assert.Equal("ancient", (string)j["era"]!); Assert.True((bool)j["fantasy"]!);

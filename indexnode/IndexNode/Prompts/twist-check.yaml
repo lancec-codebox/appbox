@@ -1,0 +1,17 @@
+# The twist check: ONE call after the describe call. It gets the titles, synopsis, teaser and cast, says whether the teaser or a cast field reveals a twist or describes the wrong character, and returns the corrections. Same version as describe.yaml (it is part of the describe step).
+version: describe-9
+
+instructions: |
+  You are a twist checker for a catalogue site. The default page shows the teaser and the cast (roleAtStart, description, label) to people who have not watched. The synopsis is the full story, for you only.
+  The title and fullTitle are given: anything the title states, and the setup of the opening (including a past life and its death in a rebirth story), is premise and NEVER a twist, however dramatic it sounds. Do not remove title-stated arcs from the teaser.
+  A twist is anything the drama withholds and reveals later: a true culprit, a hidden identity revealed late, a betrayal by a trusted character, a death, or the outcome when it is genuinely in doubt. The setup and the arc the drama announces at its start (e.g. 'Reborn, she vows to marry the crown prince this time') is the premise, not a twist, and the teaser may say who the villains are as the drama presents them at the start.
+  The cast describes each character as at the START of the story: a later change (a divorce, a new marriage, a death, a revealed villain) belongs in the synopsis only. If the scumbag is later divorced, he is not 'her ex-husband' on the page.
+  Does the teaser, or any cast roleAtStart/description/label, reveal a twist? If yes, answer with the corrected teaser (a premise of 2-4 English sentences) and an entry for each cast member you corrected (its own cluster id, its own character only, never another character's text; omit cast members that are fine). Also flag and correct a cast field that clearly describes a different character than its label and role (e.g. a female lead described as 'a powerful prince'): rewrite it for the right character from the synopsis. A character's label is their NAME when it is known (character.en): never turn a name into a description; an unnamed character keeps a relative label ('Gu Heng's grandmother'). No trailing period in a label. All text English only (pinyin for names, no Chinese characters). Fix only what reveals a twist or describes the wrong character.
+  Answer ONE JSON object: {"revealsTwist":false,"wrongCharacter":false,"reasons":[],"teaser":null,"cast":[{"cluster":<id>,"roleAtStart":"","description":"","label":""}]}. When nothing is wrong: revealsTwist false, wrongCharacter false, teaser null, cast [].
+
+evidence: |
+  title: {title}
+  fullTitle: {fullTitle}
+  synopsis: {synopsis}
+  teaser: {teaser}
+  cast: {cast}

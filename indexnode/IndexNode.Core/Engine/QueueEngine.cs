@@ -263,7 +263,7 @@ public sealed partial class NodeEngine
                         var gj = JobDescriptor.NewStep("group", id); gj.Priority = entry.Priority;
                         ctx = NewContext(lane, w, "group", gj, store, [], token);
                         await handlers["group"].RunAsync(ctx);
-                        var gl = new List<QLine> { new() { T = "done", Stage = "group" } };
+                        var gl = new List<QLine> { new() { T = "done", Stage = "group", Join = ctx.GroupJoin, JoinKind = ctx.GroupJoinKind } };
                         if (handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } gsi) gl.Add(gsi);
                         await h.AppendAsync(gl, !WillContinue(id, "group", gl), CancellationToken.None);
                         return (Outcome.Done, null, ClaimEnded(id), ctx);

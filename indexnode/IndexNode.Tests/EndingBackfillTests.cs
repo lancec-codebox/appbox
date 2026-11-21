@@ -59,7 +59,7 @@ public class EndingBackfillTests
     [Fact]
     public void The_prompt_is_describe_7_and_asks_for_the_ending()
     {
-        Assert.Equal("describe-8", Describe.PromptVersion);
+        Assert.Equal("describe-9", Describe.PromptVersion);
         var d = new DescribeInput { JobId = "j", Title = "t", Duration = 100, Clusters = [] };
         var main = Describe.BuildMain(d, "m").Prompt;
         Assert.Contains("- ending:", main); Assert.Contains("\"ending\":{\"kind\":\"complete\",\"signs\":[],\"nextPart\":null,\"nextPartHint\":null}", main);
@@ -73,7 +73,7 @@ public class EndingBackfillTests
         Assert.Equal("cliffhanger", (string)ok["kind"]!); Assert.True((bool)ok["nextPart"]!); Assert.Equal("第二部", (string)ok["nextPartHint"]!);   // trimmed
         Assert.Equal(new string('x', 80), (string)Describe.CleanEnding(JsonNode.Parse("{\"nextPartHint\":\"" + new string('x', 80) + "\"}"))!["nextPartHint"]!);
         foreach (var h in new[] { "\"" + new string('x', 81) + "\"", "\"  \"", "5", "[\"Part 2\"]", "null" }) Assert.Null(Describe.CleanEnding(JsonNode.Parse("{\"nextPartHint\":" + h + "}"))!["nextPartHint"]);   // too long (not cut), blank, not a string
-        Assert.Equal(["to be continued", "returns", "3"], ok["signs"]!.AsArray().Select(x => (string)x!).ToArray());   // blank dropped, the word villain removed
+        Assert.Equal(["to be continued", "villain returns", "3"], ok["signs"]!.AsArray().Select(x => (string)x!).ToArray());   // blank dropped, the word villain removed
 
         var bad = Describe.CleanEnding(JsonNode.Parse("""{"kind":"the end","signs":"x","nextPart":"yes"}"""))!;
         Assert.Null(bad["kind"]); Assert.Empty(bad["signs"]!.AsArray()); Assert.Null(bad["nextPart"]); Assert.Null(bad["nextPartHint"]);

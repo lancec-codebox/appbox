@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.13.13</Version>
+    <Version>0.13.14</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
@@ -44,6 +44,7 @@
     <InternalsVisibleTo Include="IndexNode.Tests" />
     <None Include="PROTOCOL.md" />
     <None Include="tools/**" />
+    <EmbeddedResource Include="Prompts/*.yaml" LogicalName="prompts/%(Filename)%(Extension)" />
     <EmbeddedResource Include="Resources/ai-frames-v3.f32" LogicalName="ai-frames-v3.f32" />
     <EmbeddedResource Include="Resources/TSCharacters.txt" LogicalName="opencc.TSCharacters.txt" />
     <EmbeddedResource Include="Resources/TSPhrases.txt" LogicalName="opencc.TSPhrases.txt" />

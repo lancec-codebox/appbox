@@ -1,0 +1,64 @@
+# Subtitle translation (Translate.cs): the glossary call, then the batched translation calls.
+version: translate-3
+
+# ---- glossary call
+glossary: |
+  You are preparing the name glossary for the English subtitles of a Chinese drama. Read the whole Chinese script below and list every proper name and recurring form of address that must be rendered the same way in every line.
+
+  Include:
+  - kind "character": a character's NAME only (full name, or the name as the Chinese writes it), as ONE English spelling: pinyin without tone marks, given name then surname unless the known list below says otherwise (use the known spelling exactly when the character is listed there). Never put a form of address, a pet name or a nickname here.
+  - kind "place": places, palaces, mansions, cities, schools, sects.
+  - kind "title": official titles, ranks, noble titles and honorifics used with or instead of a name (e.g. 世子, 侯爷, 王爷, 将军).
+  - kind "address": every recurring FORM OF ADDRESS, kin term, pet name or short form of a name used to call someone (e.g. 嫂嫂, 母亲, 夫君, 师父, 昭姐姐, 阿战, 小可爱, 为善少爷). "en" is how it is SAID in English, as an address, not the person's full name: 昭姐姐 => "Sister Zhao", 阿战 => "A-Zhan" or "Zhan", 嫂嫂 => "Sister-in-law", 小可爱 => "sweetie" or "little one", 母亲 => "Mother", 世子 => "Your Highness" when said to him. "refers" is the English name of the person it usually refers to (context only; it is never substituted into the line). If one form is used differently by different speakers, give the commonest rendering.
+  - kind "other": anything else that must stay consistent (organisations, named objects, techniques).
+
+  Rules: keep names and address forms apart: a name entry maps a name to its spelling, an address entry maps an address form to how it is said. "en" is plain English letters (no Chinese, no notes, no brackets); one entry per Chinese form; give only entries that occur in the script; at most 250 entries, most frequent first.
+
+  Known drama facts (English spellings chosen for this drama; keep them):
+  Synopsis: {synopsis}
+  Characters:
+  {seed}
+
+  {plotLine}
+
+  Answer with ONE JSON object: {shape}
+
+  CHINESE SCRIPT (one subtitle cue per line):
+  {script}
+glossary-plot-line: |
+  Also write "plot": a short PRIVATE plot summary of the whole drama, end to end, about 100 to 150 words in English, spoilers allowed: who the main characters are (use the glossary spellings), how they relate (spouse, sibling, master and servant, rank) and any hidden identity or reveal that changes how people address each other. It is only a briefing for the translators.
+glossary-shape-with-plot: '{"plot":"","entries":[{"zh":"","en":"","kind":"character","refers":""}]}'
+glossary-shape: '{"entries":[{"zh":"","en":"","kind":"character","refers":""}]}'
+none: "(none)"
+
+# ---- translation batches
+batch-rules: |
+  You translate the Chinese subtitles of a drama into English subtitles. The cues are in time order; read them as one continuous script.
+
+  Rules:
+  - Natural, spoken English that an audience reads at a glance. Keep each speaker's register (formal court speech, family talk, slang, anger, tenderness).
+  - Use the glossary EXACTLY for names, places and titles: the English in the glossary is the only spelling to use, every time.
+  - A form of address stays a form of address: translate it as the address, in the speaker's register, using the glossary's English for that form (昭姐姐 => "Sister Zhao", 阿战 from his mother => "Zhan" or "A-Zhan", 小可爱 => "sweetie"). NEVER swap in the person's full name for an address. Use a full name only where the Chinese itself uses the name. "refers to" is context only, so you know who is meant.
+  - Fragments and scrambled OCR: the Chinese is burned-in OCR, so a cue may be cut off, partial or have swapped or wrong characters. TRANSLATE it whenever its meaning is evident from the cue and its neighbours: give the evident meaning (a cut-off line stays cut off, e.g. "...may not be able to protect the heir"; a scrambled repeat of a nearby line takes that line's meaning, in the same English). Do not drop a cue just because it looks odd.
+  - Interjections and laughs are speech: 哈哈哈 => "Hahaha", 啊啊啊 => "Aaah!", 哼 => "Hmph." Translate them.
+  - Skip ONLY (answer "en": "" and "skip": true): a lone character or fragment with no evident meaning in context (an OCR error), and on-screen text that is not dialogue (signs, wanted posters, edicts shown with no speaker). Never invent text for a skipped cue.
+  - No notes, no explanations, no brackets, no speaker labels, no quotation of the Chinese. Do not add words that are not said.
+  - One sentence may run across several cues: translate each cue's own part so that the cues read right in sequence (do not repeat the whole sentence in each cue).
+  - A cue that is only a sound effect, music or non-speech gets an empty string ("skip": true).
+  - Lines marked CONTEXT are only there to help you; do NOT translate them. Lines marked TRANSLATE are the ones to answer.
+batch-drama: "Drama: {title}"
+batch-synopsis: "The whole story, with the ending (spoilers; a briefing only, never add words from it): {synopsis}"
+batch-relations: |
+  Relations between the characters ([REVEAL] = hidden until later in the story; use it to know who is who and how they address each other, and keep the speaker's current knowledge):
+  {relations}
+batch-plot: "Plot of the whole drama (a short briefing, spoilers; never add words from it): {plot}"
+batch-script: |
+  GLOSSARY:
+  {glossary}
+
+  SCRIPT:
+batch-translate: "TRANSLATE [{id}] {text}"
+batch-context: "CONTEXT [{id}] {text}"
+batch-known: "   (English so far: {en})"
+batch-answer: |
+  Answer with ONE JSON object: {"cues":[{"i":<id>,"en":"<English>"}]} (for a garbled or non-speech cue: {"i":<id>,"en":"","skip":true}) with exactly one entry for each of the {count} TRANSLATE ids: {ids}. Nothing else.

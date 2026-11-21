@@ -1,0 +1,48 @@
+=== describe  (model: vision-model)
+--- user message: text ---
+You index a short-drama upload for a catalogue site. Work only from the evidence below. Answer with ONE JSON object and nothing else.
+Upload title (as is): 重生之我在古代当王妃 EP1-80 full #shortdrama
+Duration: 600 s.
+Upload description:
+A reborn bride returns to her wedding day.
+Text track (subtitles; burned-in subtitles where they exist, else our speech recognition), [m:ss] text:
+[0:01] 你好，夫君。
+[0:04] 我回来了。
+[0:07] 这一次，我不会再输。
+Credits lines read from the video (主演/饰/领衔):
+主演：张三 李四
+Main face clusters (cluster id, screen seconds, first seen s): 0: 120s, 4; 1: 90s, 6
+Images, in order: the upload thumbnail, then one contact sheet per cluster (12 numbered candidate head shots, row by row from 0), then the poster candidate sheet (numbered frames).
+Rules:
+- ENGLISH ONLY for teaser, synopsis, tags, descriptions and labels. Chinese appears only as content: title.zh, character.zh, character.pinyin.
+- title.en: the drama's own name if the video shows one (title card, thumbnail, description), translated; otherwise a faithful translation of the upload title with hashtags, emoji and filler like 'Full Version' removed. Never invent a title. title.zh is the Chinese name or the cleaned original title. fullTitle.en: faithful translation of the original title.
+- Titles. If the upload title is already a good English title, keep it close to as written with only light cleanup: drop channel tags, 【】 brackets, episode counts like 'EP1-80', 'full', '#shortdrama' and emoji, and fix the casing; titleSource "youtube". If it is Chinese, translate it faithfully in the style of the examples; titleSource "translated". Otherwise write one in that style from the evidence; titleSource "written". Keep every word of a kept title, however it reads. title.zh is the Chinese title when one exists. fullTitle.en is the long form when the source title is long. Example titles showing how titles in this catalogue tend to look:
+  He Fell First | Love as a Game | Worthy of My Throne | Taming the Regent Prince | You Walked Away, I Moved On | Reborn Bride Marries the Sickly Heir | Reborn Genius Doctor Turned Chubby Mom | The Marquis's Wife Wants to Live to a Ripe Old Age | Preschool Teacher Returns to Work After Entering a Novel | Reborn in the Seventies, This Time I'll Make Things Right | Reborn on the Day I Signed the Contract, I Tear Apart the Scam | Three Troublemaking Sons, One Mom: I Save the Family with Slaps | An Overworked Office Worker Transmigrates as the General's Wicked Wife | Transmigrated into a Tearjerker as the Female Lead (Forced to Fall for the Boss) | Her Sister Stole Her Favor After Rebirth, but the Princess Planned to Restore Her Kingdom | Betrayed After Giving Everything to the Emperor, She Rises from the Ashes and Returns for Revenge
+- teaser.en: the lead-in, 2-4 sentences: the setup plus the arc the drama itself announces at the start, even if it only plays out later (e.g. 'Reborn, she vows to marry the crown prince this time'). It may say who the villains or villainesses are, as the drama presents them at the start. The teaser NEVER reveals a twist: anything the drama withholds and reveals later, such as a true culprit, a hidden identity revealed late, a betrayal by a trusted character, a death, or the outcome when it is genuinely in doubt. synopsis.en: the full story, twists and ending included.
+- tags: lowercase English words.
+- ending: is the story finished in THIS upload? Judge from the last minutes of the text track, the description and your synopsis. kind: "complete" (the main conflict is resolved and the story is told to its end), "cliffhanger" (it stops on an unresolved turn, a 'to be continued' or a next-episode teaser) or "truncated" (it stops mid-scene or mid-sentence, as if the upload were cut off); signs: the evidence in a few words (e.g. 'closing line ends mid-sentence', '下集预告', 'epilogue after the wedding'), [] when none; nextPart: true when the text or description points to a further part, episode or season, false when it says this is the last, null when nothing says; nextPartHint: what names the next part when the title, description or last lines show it (e.g. '第二部', 'Part 2', a sequel title, 'EP 5'), copied as written and at most 80 characters, else null.
+- era: one of ancient (dynastic costume drama), republic (1912-1949), 1950s-60s, 1970s, 1980s-90s, modern (present day), futuristic. A time-travel or rebirth story takes the era where most of it happens. fantasy: true for xianxia, xuanhuan or supernatural stories.
+- cast: one entry per cluster you can identify; roles: 'female lead' and 'male lead' (more than one of each only when the story genuinely has dual leads); 'main' = BOTH significant screen time AND significance to the plot: characters whose own actions drive the main story (villains and villainesses are typically main cast, second leads and rivals too), but nothing labels anyone a villain; a character with little screen time is never main, however important; 'supporting' = everyone else, including family members with a lot of screen time (a grandmother, parents) unless their own arc drives the main plot. Name a person only when subtitles, dialogue or credits support it. label.en IS the character's name (as in character.en) whenever the subtitles, dialogue or credits give it, never a description such as 'The reborn bride'; only an unnamed character gets a label relative to a named character ("Gu Heng's grandmother"). No trailing period in a label. actor only from the credits lines, else null. role is the role as at the start of the story. roleAtStart, description and label describe each character as they are at the START of the story; later turns belong only in the synopsis and in the relations' since/until. Example: if the female lead divorces the scumbag and marries his brother, the scumbag is not 'her ex-husband' and the brother is not 'her husband'. A character presented as a villain from the start may be called one; one revealed as the villain only later is described as they appear at the start. roleAtStart is ALWAYS a short spoiler-free line (a few words to one sentence) saying who the character is: position, standing, and how they relate to the plot as known at the start, for example 'A powerful chief minister.' or 'The princess's loyal maid.'. It must never say that the character is not introduced, not yet seen, unknown or similar, even for a character who first appears late: then say who they are without any later reveal. Descriptions and labels describe the start, never later reveals.
+- relations: every cast member linked to at least one other. since/until in seconds (when the relation starts and, if it ends, stops); kind is one of: parent, grandparent, sibling, child, cousin, aunt-uncle, spouse, betrothed, lover, ex, servant, master, friend, rival, enemy, colleague, other (from is the one named by the kind: from is the parent of to); type stays free text, label is the free-text description. implied true when not stated outright.
+- masked: for each cluster, the indexes of the head shots on its sheet where the face is covered (mask, veil, helmet, face covering, the face hidden by a hand or object); [] when none. Most clusters have none.
+- picks: for each cluster, the best portrait (most flattering, in-character, well lit, expressive, no other face dominating, never a covered face) and 1-3 stills as candidate indexes of its sheet; poster: the index of the single most poster-worthy 'together' frame (charged, iconic, cinematic; NOT a twist, death, blood, identity reveal or late-story costume), or null.
+JSON shape: {"title":{"en":"","zh":""},"titleSource":"youtube","fullTitle":{"en":""},"teaser":{"en":""},"synopsis":{"en":""},"tags":[],"era":"","fantasy":false,"ending":{"kind":"complete","signs":[],"nextPart":null,"nextPartHint":null},"cast":[{"cluster":0,"character":{"zh":"","pinyin":"","en":""}|null,"role":"","roleAtStart":"","description":"","actor":null,"label":{"en":""}}],"relations":[{"from":0,"to":1,"kind":"other","type":"","label":{"en":""},"since":0,"until":null,"implied":false}],"picks":{"0":{"portrait":0,"stills":[0]}},"poster":null,"expression":{"0":[0],"poster":[0]},"masked":{"0":[]},"samePerson":[[0,1]]}
+- expression: score EVERY numbered head shot of EVERY cluster sheet, and every frame of the poster candidate sheet, for how flattering the face is, an integer 0-10. 8-10: eyes open and roughly toward the camera, mouth closed or a slight smile, relaxed or composed. 5-7: acceptable but flat or slightly off. 0-2: mid-speech (open mouth), shocked or startled, crying, grimacing, blinking, eyes closed, looking far away. For a poster frame score the weaker of the two faces. Arrays are in sheet order; "poster" is the poster sheet.
+from/to and picks keys are cluster ids.
+- samePerson: lists of cluster ids that show the SAME person (the face matcher sometimes splits one character across clusters, e.g. in another costume or mask). Compare the contact sheets carefully; only merge when you are sure; [] when none. Do not list such a cluster separately in cast: give the group once, the first id is kept.
+--- user message: text ---
+thumbnail:
+--- user message: image ---
+[image file: thumb.jpg]
+--- user message: text ---
+cluster 0:
+--- user message: image ---
+[image file: cast/sheet_0.jpg]
+--- user message: text ---
+cluster 1:
+--- user message: image ---
+[image file: cast/sheet_1.jpg]
+--- user message: text ---
+poster candidates 0..7:
+--- user message: image ---
+[image file: cast/poster.jpg]

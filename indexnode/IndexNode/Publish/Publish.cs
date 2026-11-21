@@ -157,7 +157,7 @@ public static class Publish
     public static JsonObject BuildDrama(JsonObject describe, JsonObject? info, JsonObject? downloaded, JsonObject? clusters, JsonObject? processed, string jobId, string textSource, bool hasOcr, IReadOnlyDictionary<int, List<(string File, double T, bool Spoiler)>> stills, string by, IReadOnlyDictionary<string, JsonObject>? sources = null)
     {
         double dur = downloaded?["durationSeconds"]?.GetValue<double>() ?? info?["duration"]?.GetValue<double>() ?? 0;
-        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? Describe.Cutoff(dur);
+        double cut = describe["cutoffSeconds"]?.GetValue<double>() ?? CoverStart(dur);
         var cl = (clusters?["clusters"] as JsonArray)?.OfType<JsonObject>().ToDictionary(c => c["id"]!.GetValue<int>()) ?? [];
         var cast = new JsonArray();
         foreach (var c in (describe["cast"] as JsonArray) ?? [])
@@ -174,7 +174,8 @@ public static class Publish
         }
         var rel = new JsonArray();
         foreach (var r in (describe["relations"] as JsonArray) ?? [])
-            rel.Add(new JsonObject { ["from"] = Id(r!["from"]!.GetValue<int>()), ["to"] = Id(r["to"]!.GetValue<int>()), ["type"] = r["type"]!.DeepClone(), ["label"] = r["label"]!.DeepClone(), ["since"] = r["since"]!.DeepClone(), ["until"] = r["until"]?.DeepClone(), ["spoiler"] = r["spoiler"]!.DeepClone(), ["implied"] = r["implied"]!.DeepClone() });
+            rel.Add(new JsonObject { ["from"] = Id(r!["from"]!.GetValue<int>()), ["to"] = Id(r["to"]!.GetValue<int>()), ["kind"] = Describe.CleanKind(r["kind"]), ["type"] = r["type"]!.DeepClone(), ["label"] = r["label"]!.DeepClone(), ["since"] = r["since"]!.DeepClone(), ["until"] = r["until"]?.DeepClone(), ["implied"] = r["implied"]!.DeepClone() });
+        cast = OrderCast(cast, (describe["relations"] as JsonArray) ?? []);
         return new JsonObject
         {
             ["v"] = 0, ["packId"] = jobId, ["youtubeId"] = info?["id"]?.GetValue<string>() ?? jobId, ["embeddable"] = downloaded?["embeddable"]?.GetValue<bool>() ?? false,
@@ -186,6 +187,33 @@ public static class Publish
             ["sources"] = new JsonObject { ["text"] = textSource, ["asrModel"] = processed?["asrModel"]?.DeepClone(), ["ocr"] = hasOcr },
             ["made"] = new JsonObject { ["at"] = Protocol.NowUtc(), ["by"] = by, ["notes"] = $"describe {describe["promptVersion"]}, models {describe["models"]?.ToJsonString()}" },
         };
+    }
+
+    public static readonly string[] CloseKin = ["parent", "grandparent", "sibling", "child", "cousin", "aunt-uncle"];
+
+    /// <summary>The order of the site's cast list (no AI), and each supporting character's castGroup (the cluster id, as the cast "id", of the lead or main character they are close kin of; else null). Order: 1 the leads; 2 the main cast by screen time; 3 supporting close kin of a lead, grouped by lead; 4 supporting close kin of the other main cast, grouped the same way; 5 everyone else. Inside each part by screen time. Cast items carry id, role, villain, faceCluster, screenSeconds; relations are describe's (from/to are cluster ids, kind).</summary>
+    public static JsonArray OrderCast(JsonArray cast, JsonArray relations)
+    {
+        var items = cast.OfType<JsonObject>().ToList();
+        string Role(JsonObject c) => c["role"]?.GetValue<string>() ?? "supporting";
+        int Cl(JsonObject c) => c["faceCluster"]!.GetValue<int>();
+        double Secs(JsonObject c) => c["screenSeconds"]?.GetValue<double>() ?? 0;
+        bool Lead(JsonObject c) => Role(c) is "female lead" or "male lead";
+        var leads = items.Where(Lead).OrderBy(c => Role(c) == "female lead" ? 0 : 1).ThenByDescending(Secs).ToList();
+        var mains = items.Where(c => Role(c) == "main").OrderByDescending(Secs).ToList();
+        var rest = items.Where(c => !Lead(c) && Role(c) != "main").ToList();
+        // supporting -> the anchors (cluster ids) it is close kin of, either direction
+        IEnumerable<int> KinOf(JsonObject c) => relations.OfType<JsonObject>()
+            .Where(r => CloseKin.Contains(Describe.CleanKind(r["kind"])) && Describe.AsInt(r["from"]) is { } a && Describe.AsInt(r["to"]) is { } b && (a == Cl(c) || b == Cl(c)))
+            .Select(r => Describe.AsInt(r["from"])!.Value == Cl(c) ? Describe.AsInt(r["to"])!.Value : Describe.AsInt(r["from"])!.Value);
+        var done = new HashSet<JsonObject>(); var outList = new List<JsonObject>(); outList.AddRange(leads); outList.AddRange(mains);
+        foreach (var anchors in new[] { leads, mains.Where(m => true).ToList() })
+            foreach (var anchor in anchors)
+                foreach (var c in rest.Where(x => !done.Contains(x) && KinOf(x).Contains(Cl(anchor))).OrderByDescending(Secs))
+                { c["castGroup"] = anchor["id"]!.DeepClone(); done.Add(c); outList.Add(c); }
+        outList.AddRange(rest.Where(x => !done.Contains(x)).OrderByDescending(Secs));
+        foreach (var c in rest.Where(x => !done.Contains(x))) c["castGroup"] = null;
+        return new JsonArray(outList.Select(c => c.DeepClone()).ToArray());
     }
 
     /// <summary>The fingerprint of a pack's inputs: when it is unchanged the pack is up to date.</summary>
@@ -301,10 +329,14 @@ public static class Publish
         (describe["expression"] as JsonObject)?[key] is JsonArray a ? a.Select(x => x is JsonValue v && v.TryGetValue<int>(out var i) ? (int?)i : null).ToList() : null;
 
     /// <summary>Where cover shots may come from, in order: the start window (up to the spoiler cutoff, about the first 12%), then the first half. Never past 75% of the runtime.</summary>
+    /// <summary>The start window of cover shots and the still cutoff: the first 12% of the runtime (a picture rule of publishing, not part of describe).</summary>
+    public const double CoverStartFraction = 0.12;
+    public static double CoverStart(double duration) => Math.Round(duration * CoverStartFraction, 1);
+
     public static (string Name, double MaxT)[] CoverWindows(double cutoff, double duration)
     {
         if (duration <= 0) return [("any", double.MaxValue)];
-        var start = Math.Min(cutoff > 0 ? cutoff : duration * Describe.CutoffFraction, duration * 0.5);
+        var start = Math.Min(cutoff > 0 ? cutoff : duration * CoverStartFraction, duration * 0.5);
         return [("start", start), ("half", duration * 0.5)];
     }
 
@@ -493,7 +525,7 @@ public static class Publish
         var cast = (describe["cast"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
         var f = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "female lead"); var m = cast.FirstOrDefault(c => c["role"]?.GetValue<string>() == "male lead");
         var picks = describe["picks"] as JsonObject; var cover = new JsonObject();
-        double cutoff = describe["cutoffSeconds"]?.GetValue<double>() ?? Describe.Cutoff(dur);
+        double cutoff = describe["cutoffSeconds"]?.GetValue<double>() ?? CoverStart(dur);
         Directory.CreateDirectory(Path.Combine(tmp, "cover"));
         async Task Lead(JsonObject? c, string key)
         {

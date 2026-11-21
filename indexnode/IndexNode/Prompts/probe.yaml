@@ -1,0 +1,5 @@
+# The connection probes of 'indexnode ai test' (Ai.cs): one text call and one vision call.
+version: probe-1
+
+text: "Reply with the single word: ok"
+vision: "What colour is the shape in this image? Answer with one word."

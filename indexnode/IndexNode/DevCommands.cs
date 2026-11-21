@@ -192,16 +192,16 @@ public static class DevCommands
                 Console.WriteLine($"ocrprof: {n} frames {w}x{bh}, {lines} lines, wall {wall.Elapsed.TotalSeconds:F1}s = {n / wall.Elapsed.TotalSeconds:F1} frames/s; ms/frame: read(decode wait) {ms(tRead):F1}, det-pre {ms(eng.TPre):F1}, det {ms(eng.TDet):F1}, det-post {ms(eng.TPost):F1}, crop {ms(eng.TCrop):F1}, rec-pre {ms(eng.TRecPre):F1}, rec {ms(eng.TRec):F1}, ctc {ms(eng.TCtc):F1}");
                 break;
             }
-            case "spoilercheck":
+            case "twistcheck":
             {
-                // --describe <describe.json> --model M: one first-round spoiler check of a stored describe result; prints the verdict (or the refusal) as one JSON line
+                // --describe <describe.json> --model M: one twist check of a stored describe result; prints the verdict (or the refusal) as one JSON line
                 var res = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllBytes(a.Get("describe")!))!.AsObject(); var model = a.Get("model")!;
                 var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable); var chat = new AiClient(http, ai);
-                double cut = res["cutoffSeconds"]?.GetValue<double>() ?? 0; var t0 = sw.Elapsed.TotalSeconds;
+                var t0 = sw.Elapsed.TotalSeconds;
                 try
                 {
-                    var check = await chat.JsonAsync(model, System.Text.Json.Nodes.JsonValue.Create(Describe.BuildCheck(res, cut, model).Prompt)!, "submit_check", ct);
-                    Console.WriteLine(new System.Text.Json.Nodes.JsonObject { ["model"] = model, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds - t0, 1), ["teaserReveals"] = check["teaserReveals"]?.DeepClone(), ["flaggedCast"] = check["flaggedCast"]?.DeepClone(), ["flaggedRelations"] = check["flaggedRelations"]?.DeepClone(), ["reasons"] = check["reasons"]?.DeepClone() }.ToJsonString());
+                    var check = await chat.JsonAsync(model, System.Text.Json.Nodes.JsonValue.Create(Describe.BuildTwistCheck(res, model).Prompt)!, "submit_check", ct);
+                    Console.WriteLine(new System.Text.Json.Nodes.JsonObject { ["model"] = model, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds - t0, 1), ["revealsTwist"] = check["revealsTwist"]?.DeepClone(), ["teaser"] = check["teaser"]?.DeepClone(), ["cast"] = check["cast"]?.DeepClone(), ["reasons"] = check["reasons"]?.DeepClone() }.ToJsonString());
                 }
                 catch (Exception e) { Console.WriteLine(new System.Text.Json.Nodes.JsonObject { ["model"] = model, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds - t0, 1), ["error"] = e.Message.Contains("content_filter") ? "content_filter" : e.Message[..Math.Min(200, e.Message.Length)] }.ToJsonString()); }
                 break;
