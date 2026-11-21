@@ -268,13 +268,15 @@ public class SampleCheckTests
 
     sealed class FakeTools(Func<IReadOnlyList<string>, string, CancellationToken, Task> hook) : ITools
     {
-        public List<string> Calls = [];
+        public System.Collections.Concurrent.ConcurrentQueue<string> CallQueue = new();
+        public List<string> Calls => [.. CallQueue];
+        static string SectionStart(IReadOnlyList<string> args) { var s = args.First(x => x.StartsWith("*", StringComparison.Ordinal)); return s[1..s.IndexOf('-')]; }
         public Task<IToolWorkspace> CreateWorkspaceAsync(string name, CancellationToken ct) => Task.FromResult<IToolWorkspace>(new LocalWorkspace(name));
         public async Task<ProcResult> RunAsync(IToolWorkspace ws, string tool, IReadOnlyList<string> args, CancellationToken ct, Action<string>? onStdout = null)
         {
-            var dir = ((LocalWorkspace)ws).Dir; Calls.Add(tool + " " + string.Join(' ', args));
+            var dir = ((LocalWorkspace)ws).Dir; CallQueue.Enqueue(tool + " " + string.Join(' ', args));
             if (tool == "yt-dlp" && args.Contains("--skip-download")) { await File.WriteAllTextAsync(Path.Combine(dir, "video.info.json"), "{\"duration\":6000,\"description\":\"d\",\"title\":\"t\"}", ct); await File.WriteAllBytesAsync(Path.Combine(dir, "video.jpg"), [1], ct); }
-            else if (tool == "yt-dlp") { await hook(args, dir, ct); foreach (var st in new[] { "1650", "4050" }) await File.WriteAllBytesAsync(Path.Combine(dir, $"sec-{st}.mp4"), [1, 2, 3], ct); }
+            else if (tool == "yt-dlp") { await hook(args, dir, ct); await File.WriteAllBytesAsync(Path.Combine(dir, $"sec-{SectionStart(args)}.mp4"), [1, 2, 3], ct); }   // only this call's own section: parallel calls must not write the same file (a sharing violation on Windows)
             else if (tool == "ffmpeg") await File.WriteAllBytesAsync(Path.Combine(dir, "audio.mka"), [1], ct);
             return new ProcResult(0, "", "");
         }
@@ -290,7 +292,7 @@ public class SampleCheckTests
         {
             var tools = new FakeTools((_, _, _) => Task.CompletedTask); var w = new StringWriter();
             var rc = await SampleCommands.SampleAsync(Args.Parse(["abcdefghijk", "--output-local", Path.Combine(root, "out")]), tools, w);
-            Assert.Equal(0, rc); var o = w.ToString(); Assert.Contains("time split", o); Assert.Contains("2 segment(s) 1650-1950s, 4050-4350s", o);
+            var o = w.ToString(); Assert.True(rc == 0, $"rc {rc}; output:\n{o}\ncalls:\n{string.Join('\n', tools.Calls)}"); Assert.Contains("time split", o); Assert.Contains("2 segment(s) 1650-1950s, 4050-4350s", o);
             var yts = tools.Calls.Where(c => c.StartsWith("yt-dlp") && c.Contains("--download-sections")).ToList();
             Assert.Equal(2, yts.Count);   // one call per section, run in parallel
             Assert.Contains(yts, c => c.Contains("*1650-1950")); Assert.Contains(yts, c => c.Contains("*4050-4350"));
