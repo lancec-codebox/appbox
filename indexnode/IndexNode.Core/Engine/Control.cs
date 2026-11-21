@@ -47,6 +47,16 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         return cur;
     }
 
+    /// <summary>indexnode control storage stop|run: the kill switch (control.json "storage": "stop"). Everything else in the file stays.</summary>
+    public static async Task<ControlFile> SetStorageAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        var v = value.Trim().ToLowerInvariant(); if (v is not ("stop" or "run")) throw new ArgumentException("control storage stop|run");
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        cur.Storage = v == "stop" ? "stop" : null; cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        return cur;
+    }
+
     /// <summary>indexnode control region &lt;name&gt;|off: the store's region for the region rule (off removes it). Everything else in the file stays.</summary>
     public static async Task<ControlFile> SetRegionAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
     {

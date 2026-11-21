@@ -201,9 +201,13 @@ public sealed class CentersZip : CentersBlob
 /// <summary>0.13.9: a per-drama frames file (index/search/frames/&lt;id&gt;.bin) read by ranges. The lookup readers' only source of a drama's frames.</summary>
 public sealed class FramesReader : CentersBlob
 {
-    public static async Task<FramesReader?> OpenAsync(IStore store, string blob, CancellationToken ct)
+    /// <summary>0.13.18: size, ETag and idx_sha256 come from the node's cached frames LIST (one LIST per relist, no HEAD per file). <paramref name="fresh"/> (a stale read, or a name the listing lacks) does one HEAD and refreshes the entry.</summary>
+    public static async Task<FramesReader?> OpenAsync(IStore store, string blob, CancellationToken ct, bool fresh = false)
     {
-        var h = await store.HeadAsync(blob, ct); if (h == null || h.Size < CentersFile.HeaderSize) return null;
+        var list = FramesListing.For(store); BlobProps? h = null;
+        if (!fresh) { try { var pf = blob[..(blob.LastIndexOf('/') + 1)]; await list.EnsureAsync(store, new Paths(pf[..^"search/frames/".Length]), ct); } catch (Exception e) when (e is StorageException or NotSupportedException) { } h = list.Get(blob); }
+        if (h == null) { h = await store.HeadAsync(blob, ct); if (h != null) list.Set(blob, h); }
+        if (h == null || h.Size < CentersFile.HeaderSize) return null;
         return await LocalAsync(new FramesReader { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = 0, DataLength = h.Size }, ct);
     }
 
@@ -221,7 +225,7 @@ public sealed class FramesReader : CentersBlob
 
     /// <summary>The recorded place on the first attempt, a fresh open after a stale read (or when the version records none).</summary>
     public static async Task<FramesReader> ForAsync(IStore store, Paths paths, SearchUpload u, int attempt, CancellationToken ct) =>
-        (attempt == 0 && FromIndex(store, u) is { } fr ? await LocalAsync(fr, ct) : null) ?? await OpenAsync(store, paths.FramesFile(u.Id), ct) ?? throw new FileNotFoundException(paths.FramesFile(u.Id));
+        (attempt == 0 && FromIndex(store, u) is { } fr ? await LocalAsync(fr, ct) : null) ?? await OpenAsync(store, paths.FramesFile(u.Id), ct, fresh: attempt > 0) ?? throw new FileNotFoundException(paths.FramesFile(u.Id));
 }
 
 /// <summary>The frames file's bytes and the conversion from a centers.bin (same layout, new magic, the sequence number).</summary>
@@ -237,6 +241,7 @@ public static class FramesFile
     public static async Task<bool> WriteAsync(IStore store, Paths paths, string id, byte[] bin, long seq, bool onlyIfNew, CancellationToken ct)
     {
         var f = FromCenters(bin, seq); var name = paths.FramesFile(id);
+        FramesListing.Wrote(store, name);
         if (!await store.PutAsync(name, f, null, null, onlyIfNew, ct, "application/octet-stream")) return false;
         await store.SetMetadataAsync(name, Metadata(f), null, ct);
         return true;

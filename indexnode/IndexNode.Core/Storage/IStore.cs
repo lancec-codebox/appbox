@@ -7,7 +7,9 @@ public sealed record BlobEntry(
     string? LeaseState = null,
     long Size = 0,
     /// <summary>When the blob was created (List Blobs Creation-Time, else Last-Modified); null when the store does not say.</summary>
-    DateTimeOffset? Created = null);
+    DateTimeOffset? Created = null,
+    /// <summary>0.13.18: the blob's ETag as the listing reports it (null when the store does not say). Lets a caller use a LIST for size + ETag instead of a HEAD per blob.</summary>
+    string? ETag = null);
 
 /// <summary>An append blob read (0.13.0 queue log): the bytes from the offset, the blob's length, whether it is sealed and how many blocks (appends) it holds.</summary>
 public sealed record AppendRead(byte[] Data, long Length, bool Sealed, int Blocks, bool NotFound = false);

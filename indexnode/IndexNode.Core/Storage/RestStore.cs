@@ -16,12 +16,30 @@ public sealed class RestStore : IStore
     public Traffic Counters { get; set; } = Traffic.Current;
     /// <summary>Counts every HTTP request by kind (read, write, list) for the node's storage-ops report.</summary>
     public OpCounter Ops { get; set; } = OpCounter.Current;
-    private void Count(HttpRequestMessage req)
+    /// <summary>0.13.18: the meter and circuit breaker every request of this store passes (per call site, per op, failures apart).</summary>
+    public StoreMeter Meter { get; set; } = StoreMeter.Current;
+    /// <summary>0.13.18: names this store answered 404 for. A missing name is not asked for again within a minute, until a write, a listing or a queue line says it exists. control.json is exempt (the kill switch must be seen within one poll).</summary>
+    public NegativeCache Negative { get; set; } = new();
+    private bool KnownMissing(string name) => !name.EndsWith("jobs/control.json", StringComparison.Ordinal) && Negative.IsMissing(name);
+    private void NoteMissing(string name) { if (!name.EndsWith("jobs/control.json", StringComparison.Ordinal)) Negative.Missing(name); }
+    private (string Site, string Op, string? Name) Count(HttpRequestMessage req, string? site = null)
     {
-        var q = req.RequestUri?.Query ?? "";
-        if (req.Method == HttpMethod.Get && (q.Contains("comp=list") || q.Contains("comp=blobs"))) Ops.List();
-        else if (req.Method == HttpMethod.Get || req.Method == HttpMethod.Head) Ops.Read();
-        else Ops.Write();
+        var q = req.RequestUri?.Query ?? ""; var path = req.RequestUri?.AbsolutePath ?? "";
+        var name = Uri.UnescapeDataString(path.Length > containerPath.Length + 1 ? path[(containerPath.Length + 1)..] : "");
+        string op;
+        if (req.Method == HttpMethod.Get && (q.Contains("comp=list") || q.Contains("comp=blobs"))) { Ops.List(); op = "list"; }
+        else if (req.Method == HttpMethod.Get || req.Method == HttpMethod.Head)
+        {
+            Ops.Read();
+            op = req.Method == HttpMethod.Head ? "head" : req.Headers.Range != null ? "range" : q.Contains("comp=tags") ? "tags" : q.Contains("comp=metadata") ? "meta" : "get";
+        }
+        else
+        {
+            Ops.Write();
+            op = req.Method == HttpMethod.Delete ? "delete" : q.Contains("comp=lease") ? "lease" : q.Contains("comp=appendblock") ? "append" : q.Contains("comp=metadata") || q.Contains("comp=tags") ? "meta" : "put";
+        }
+        if (site == null) site = Meter.Before(op, name); else Meter.Before(op, name, site);
+        return (site, op, name);
     }
 
     private readonly HttpClient http;
@@ -144,14 +162,17 @@ public sealed class RestStore : IStore
 
     private async Task<HttpResponseMessage> SendAsync(Func<HttpRequestMessage> make, CancellationToken ct, int retries = 3, HttpCompletionOption opt = HttpCompletionOption.ResponseContentRead)
     {
+        string? site = null;   // 0.13.18: the call site is read once, on the way in (a retry after an await no longer has the caller on the stack)
         for (int attempt = 0; ; attempt++)
         {
             try
             {
                 var req = make();
-                Count(req);
+                var cnt = Count(req, site); site = cnt.Site;
                 var sent = req.Content?.Headers.ContentLength ?? 0;
                 var resp = await http.SendAsync(req, opt, ct);
+                if (req.Method == HttpMethod.Put && resp.IsSuccessStatusCode) Negative.Exists(cnt.Name);   // a write says the name exists now
+                if (resp.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict or HttpStatusCode.PreconditionFailed or HttpStatusCode.NotModified) Meter.Failed(cnt.Site, cnt.Op, cnt.Name, (int)resp.StatusCode);
                 Counters.Add(Traffic.StorageWrite, sent);
                 Counters.Add(Traffic.StorageRead, resp.Content.Headers.ContentLength ?? 0);
                 if ((int)resp.StatusCode >= 500 || resp.StatusCode == HttpStatusCode.TooManyRequests)
@@ -208,8 +229,9 @@ public sealed class RestStore : IStore
                 var props = b.Element("Properties");
                 long.TryParse(props?.Element("Content-Length")?.Value, out var size);
                 DateTimeOffset? created = DateTimeOffset.TryParse(props?.Element("Creation-Time")?.Value ?? props?.Element("Last-Modified")?.Value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var ct0) ? ct0 : null;
-                all.Add(new BlobEntry(b.Element("Name")!.Value, ParseTagSet(b.Element("Tags")), meta, props?.Element("LeaseState")?.Value, size, created));
+                all.Add(new BlobEntry(b.Element("Name")!.Value, ParseTagSet(b.Element("Tags")), meta, props?.Element("LeaseState")?.Value, size, created, props?.Element("Etag")?.Value is { Length: > 0 } et ? (et.StartsWith('"') ? et : "\"" + et.Trim('"') + "\"") : null));
             }
+            Negative.ExistAll(all.Select(b => b.Name));   // a listing says these exist
             marker = doc.Root?.Element("NextMarker")?.Value;
             if (string.IsNullOrEmpty(marker)) marker = null;
         } while (marker != null);
@@ -232,8 +254,9 @@ public sealed class RestStore : IStore
     public Task<BlobContent?> GetAsync(string name, CancellationToken ct) => GetAsync(name, ct, 0);
     private async Task<BlobContent?> GetAsync(string name, CancellationToken ct, int depth)
     {
+        if (KnownMissing(name)) return null;
         using var r = await SendReadAsync(name, () => Req(HttpMethod.Get, ReadUri(name)), ct);
-        if (r.StatusCode == HttpStatusCode.NotFound) return null;
+        if (r.StatusCode == HttpStatusCode.NotFound) { NoteMissing(name); return null; }
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
         var body = await r.Content.ReadAsByteArrayAsync(ct);
         if (body.Length == 0 && depth < 5 && await SettleAsync(name, ct)) return await GetAsync(name, ct, depth + 1);   // a ghost: hydrated, read again
@@ -324,8 +347,9 @@ public sealed class RestStore : IStore
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => HeadAsync(name, ct, 0);
     private async Task<BlobProps?> HeadAsync(string name, CancellationToken ct, int depth)
     {
+        if (KnownMissing(name)) return null;
         using var r = await SendReadAsync(name, () => Req(HttpMethod.Head, ReadUri(name)), ct);
-        if (r.StatusCode == HttpStatusCode.NotFound) return null;
+        if (r.StatusCode == HttpStatusCode.NotFound) { NoteMissing(name); return null; }
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Properties");
         long size = r.Content.Headers.ContentLength ?? 0;
         var meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -437,6 +461,7 @@ public sealed class RestStore : IStore
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
     {
         if (len <= 0) return new([], false);
+        if (KnownMissing(name)) return new(null, false);
         for (int attempt = 0; attempt < 8; attempt++)
         {
             var tag = ifMatch != null && etagAlias.TryGetValue(K(name, ifMatch), out var al) ? al : ifMatch;
@@ -446,7 +471,7 @@ public sealed class RestStore : IStore
                 if (tag != null && !ReadSnapshots.ContainsKey(name)) q.Headers.TryAddWithoutValidation("If-Match", tag);   // a snapshot has its own ETag: content identity is checked below instead
                 return q;
             }, ct);
-            if (r.StatusCode == HttpStatusCode.NotFound) return new(null, false);
+            if (r.StatusCode == HttpStatusCode.NotFound) { NoteMissing(name); return new(null, false); }
             if (r.StatusCode == HttpStatusCode.PreconditionFailed)
             {
                 var h = await HeadAsync(name, ct);

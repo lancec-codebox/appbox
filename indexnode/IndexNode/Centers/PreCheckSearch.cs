@@ -104,12 +104,14 @@ public static class PreCheckSearch
     {
         var used = new List<SearchUpload>(); int n = queries.Count; var q = new float[n][];
         for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
+        // 0.13.18: ONE LIST of the retained folder says which dramas have a retained file (0.13.15 GET the retained name of every fresh drama first: a 404 for nearly all of them, on every group step)
+        var haveRetained = (await raw.ListAsync(paths.RetainedDir, false, false, ct)).Select(b => b.Name).ToHashSet(StringComparer.Ordinal);
         foreach (var id in fresh)
         {
             CentersBlob? z; List<(int Center, CentersFile.Members Members)> blocks;
             try
             {
-                z = await FramesReader.OpenAsync(raw, paths.RetainedFile(id), ct) ?? await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct); if (z == null) continue;   // 0.13.10: a retained file is the drama's vectors once it has one (what the index holds)
+                z = (haveRetained.Contains(paths.RetainedFile(id)) ? await FramesReader.OpenAsync(raw, paths.RetainedFile(id), ct) : null) ?? await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct); if (z == null) continue;   // 0.13.10: a retained file is the drama's vectors once it has one (what the index holds)
                 var h = await z.ReadHeaderAsync(ct);
                 blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
             }

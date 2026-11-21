@@ -28,6 +28,9 @@ public sealed class NodeConfig
     public double? PruneLookback { get; set; }
     /// <summary>The storage account's Azure region (default westus2): reads from a node in the same region are free.</summary>
     public string? StorageRegion { get; set; }
+    public static StorageLimits TryLoadStorageLimits() { try { return Load().StorageBreaker ?? new(); } catch (Exception e) when (e is not OperationCanceledException) { return new(); } }
+    /// <summary>0.13.18 (config storage.warn-per-min, max-per-min, max-per-step, max-failures-per-min, cooldown): the storage circuit breaker; null = the defaults (3,000 / 10,000 / 20,000 / 300 / 5 min).</summary>
+    public StorageLimits? StorageBreaker { get; set; }
     public string? ModelUrl { get; set; }
     public string? ModelPath { get; set; }
     public BrowserConfig? Browser { get; set; }

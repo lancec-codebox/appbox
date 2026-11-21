@@ -139,8 +139,19 @@ public sealed partial class NodeEngine
         });
     }
 
+    private long haltLog;
+    /// <summary>0.13.18: true while this node must not claim: the storage breaker is open, or control.json has storage: stop. One log line per minute.</summary>
+    private bool StorageHalted()
+    {
+        bool why = o.Meter.Tripped, kill = Control.Current.StorageStopped;
+        if (!why && !kill) return false;
+        var m = Environment.TickCount64 / 60000; if (Interlocked.Exchange(ref haltLog, m) != m) Log.Info(kill ? "storage: control.json says storage: stop, not claiming" : "storage: the breaker is open, not claiming (" + o.Meter.TripMessage + ")");
+        return true;
+    }
+
     private async Task<bool> TryPullForwardSearchIndexAsync(int lane, CancellationToken ct)
     {
+        if (StorageHalted()) return false;
         if (!SearchIndexPullable()) return false;
         if (!TryReserve()) return false;
         ClaimHandle? h;
@@ -179,6 +190,7 @@ public sealed partial class NodeEngine
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
     {
         var id = subject.Id;
+        if (StorageHalted()) return false;   // 0.13.18: the breaker is open or control.json says storage: stop
         if (ignoreSubject.TryGetValue(id, out var until) && until > DateTimeOffset.UtcNow) return false;
         var first = runnable[0].Stage;
         if (o.Limits != null && !o.Limits.TryAcquire(first)) return false;
@@ -288,6 +300,7 @@ public sealed partial class NodeEngine
         var id = w.Id; var stage = entry.Stage; var h = w.Handle;
         var job = BodyOf(entry, id);
         JobContext? ctx = null;
+        using var budget = o.Meter.BeginStep(0, $"[{stage}#{lane}] {id}");   // 0.13.18: this step's own store budget (max-per-step) and its own site table
         try
         {
             w.Run.Info.Stage = stage; w.Run.Info.Step = null; w.Run.Info.StartedAt = Protocol.NowUtc(); RegistryChanged();
@@ -298,8 +311,8 @@ public sealed partial class NodeEngine
                     {
                         // 0.13.10: sequence order. A drama waits (the entry goes back to pending, due in two minutes, nothing else written) while an earlier one is still in flight.
                         // a group entry of a drama without frames is not runnable (the gate keeps it from being claimed; this is the race safety net): a number is given only to a drama that has frames
-                        if (queue.Read(st => st.Get(id)?.Seq) == null && await store.HeadAsync(paths.FramesFile(id), token) != null) await h.AssignSeqAsync(token);
-                        var blockers = await GroupSequencing.BlockersAsync(queue, store, paths, id, token);
+                        if (queue.Read(st => st.Get(id)?.Seq) == null && (gate?.Frames.Contains(id) == true || gate == null && await store.HeadAsync(paths.FramesFile(id), token) != null)) await h.AssignSeqAsync(token);
+                        var blockers = await GroupSequencing.BlockersAsync(queue, store, paths, id, token, gate?.Frames);
                         if (blockers.Count == 0 && queue.Read(st => st.Get(id)?.Seq) == null) blockers = [id];   // no frames, so no number: not runnable yet
                         if (blockers.Count > 0)
                         {
@@ -346,6 +359,7 @@ public sealed partial class NodeEngine
         catch (BotBlocked e) { return (Outcome.Bot, e.Message, false, ctx); }
         catch (LeaseLostException e) { return (Outcome.LeaseLost, e.Message, false, ctx); }
         catch (OperationCanceledException) { return (h.Lost ? Outcome.LeaseLost : Outcome.Released, null, false, ctx); }
+        catch (StorageBudgetExceeded e) { Log.Info($"[{stage}#{lane}] {id}: {e.Message}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, e.Message, false, ctx); }
         catch (Exception e) { Console.Error.WriteLine($"[{stage}#{lane}] {id}: {Redact.Trace(e)}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, e.Message, false, ctx); }
     }
 
@@ -366,18 +380,19 @@ public sealed partial class NodeEngine
     {
         var id = w.Id; var h = w.Handle;
         // 0.13.2: a step counts as done only if its output is on the store (the log can say done for a step that never ran: migration did); a missing output is run, not skipped
+        // 0.13.18: ONE LIST of the video's folder answers every "is this output stored" below (it was a HEAD per step, per need and per check)
+        var have = await VideoFilesAsync(id, token);
         var done = new List<string>(entry.StepsDone ?? []);
         foreach (var s0 in CheckedSteps.Where(done.Contains).ToList())
-            if (await store.HeadAsync(paths.Video(id, s0 + ".zip"), token) == null) { done.Remove(s0); Log.Info($"process {id}: {s0} is in the done list but {s0}.zip is not on the store: it runs"); }
+            if (!have.Contains(s0 + ".zip")) { done.Remove(s0); Log.Info($"process {id}: {s0} is in the done list but {s0}.zip is not on the store: it runs"); }
         var plan = PlanSteps(done);
         // the video must be downloaded: checked here, when we run, never while finding work (a HEAD never hydrates)
-        var dl = await store.HeadAsync(paths.Video(id, "download.zip"), token);
-        if (dl == null && await store.HeadAsync(paths.Video(id, "downloaded.json"), token) == null) return (Outcome.Permanent, "invalid: " + paths.Video(id, "download.zip") + " is missing (nothing was downloaded for this video)", false, null);
+        if (!have.Contains("download.zip") && !have.Contains("downloaded.json")) return (Outcome.Permanent, "invalid: " + paths.Video(id, "download.zip") + " is missing (nothing was downloaded for this video)", false, null);
         // 0.13.3: the claim holds the video's lease, so it builds a missing video.json itself (the backfill's builder), then goes on
-        if (o.EnsureVideoJson != null && await store.HeadAsync(VideoJson.Name(paths, id), token) == null)
+        if (o.EnsureVideoJson != null && !have.Contains("video.json"))
         {
             Log.Info($"process {id}: video.json is missing: building it from what is stored");
-            await o.EnsureVideoJson(store, paths, id, token);
+            await o.EnsureVideoJson(store, paths, id, token); have.Add("video.json");
         }
         w.Local ??= new LocalCacheStore(store, Path.Combine(Path.GetTempPath(), "indexnode", "c-" + instanceTag + "-" + id));
         // 0.13.0: the pre-check is the first step of a process claim, only for a drama with no processing done yet (a part-processed one resumes from its first unfinished step)
@@ -385,7 +400,7 @@ public sealed partial class NodeEngine
         // 0.13.10: the sequence number is assigned at the first pre-check line, under the claim (and so under the drama's lease)
         if (queue.Read(s => s.Get(id)?.Seq) == null && handlers.ContainsKey("precheck")) await h.AssignSeqAsync(token);
         // 0.13.2: decided from the store only (no processing zip besides download/comments), never from the done set; the stage itself returns at once for a video.json that already has the record
-        bool noProcessing = !await HasProcessingAsync(id, token);
+        bool noProcessing = !HasProcessing(have);
         var vjPre = handlers.ContainsKey("precheck") && noProcessing ? (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject : null;
         if (handlers.TryGetValue("precheck", out var pre) && noProcessing && (vjPre == null || PreCheckDecision.IsSkip((string?)vjPre["decision"])))
         {
@@ -415,8 +430,8 @@ public sealed partial class NodeEngine
             // inputs: made earlier in this claim, or already stored; a step whose producer is not ours and is not done yet is not ready for this node
             foreach (var need in Protocol.NormalizeNeeds(Protocol.NeedsOf(step)))
             {
-                if (avail.Contains(need) || done.Contains(ProducerOf(need) ?? "")) { if (!avail.Contains(need) && await store.HeadAsync(paths.Video(id, need), token) == null) return (Outcome.Permanent, $"invalid: {step} needs {need}, which is missing", false, ctx); continue; }
-                if (await store.HeadAsync(paths.Video(id, need), token) != null) { avail.Add(need); continue; }
+                if (avail.Contains(need) || done.Contains(ProducerOf(need) ?? "")) { if (!avail.Contains(need) && !have.Contains(need)) return (Outcome.Permanent, $"invalid: {step} needs {need}, which is missing", false, ctx); continue; }
+                if (have.Contains(need)) { avail.Add(need); continue; }
                 goto notReady;
             }
             w.Run.Info.Stage = step; w.Run.Info.Step = null; RegistryChanged();
@@ -436,7 +451,8 @@ public sealed partial class NodeEngine
         {
             // 0.13.2: never a final done with an output missing (one HEAD each, never a hydrate): the claim fails (transient) and the next one runs what is missing
             var missing = new List<string>();
-            foreach (var s1 in CheckedSteps) if (await store.HeadAsync(paths.Video(id, s1 + ".zip"), token) == null) missing.Add(s1);
+            var now = await VideoFilesAsync(id, token);   // one LIST, after the steps ran
+            foreach (var s1 in CheckedSteps) if (!now.Contains(s1 + ".zip")) missing.Add(s1);
             if (missing.Count > 0) throw new InvalidOperationException($"process {id}: every step is done but {string.Join(", ", missing.Select(m => m + ".zip"))} is not on the store; not finishing (the missing step runs on the next claim)");
             var lines = new List<QLine> { new() { T = "done", Stage = "process", PreCheck = pcDecision, Group = (string?)pcRec?["groupId"], GroupOffset = (double?)pcRec?["groupOffset"], MatchShare = (double?)pcRec?["matchShare"], DupShare = (double?)pcRec?["dupShare"], Mixed = (bool?)(pcRec?["group"] as System.Text.Json.Nodes.JsonObject)?["mixed"] is true ? true : null } };
             if (handlers.ContainsKey("group") && queue.Read(st => st.Entry(id, "group")) == null) lines.Add(QLine.Add(id, "group", GroupSequencing.NewJob(id, entry.Priority), queue.NowUtc()));
@@ -449,11 +465,13 @@ public sealed partial class NodeEngine
     }
 
     /// <summary>Any step output (a stage zip other than download/comments) (a recorded pre-check is handled by the pre-check itself): processing has started on this video.</summary>
-    private async Task<bool> HasProcessingAsync(string id, CancellationToken ct)
+    /// <summary>0.13.18: the file names (not paths) in the video's folder, from one LIST.</summary>
+    private async Task<HashSet<string>> VideoFilesAsync(string id, CancellationToken ct)
     {
         var list = await store.ListAsync(paths.VideoDir(id), false, false, ct);
-        return list.Any(b => { var n = b.Name[(b.Name.LastIndexOf('/') + 1)..]; return n == "processed.json" || (n.EndsWith(".zip", StringComparison.Ordinal) && n is not ("download.zip" or "comments.zip")); });
+        return list.Select(b => b.Name[(b.Name.LastIndexOf('/') + 1)..]).ToHashSet(StringComparer.Ordinal);
     }
+    private static bool HasProcessing(HashSet<string> have) => have.Any(n => n == "processed.json" || (n.EndsWith(".zip", StringComparison.Ordinal) && n is not ("download.zip" or "comments.zip")));
 
     private static string? ProducerOf(string zip) => zip.EndsWith(".zip", StringComparison.Ordinal) ? zip[..^4] : null;
 

@@ -19,12 +19,40 @@ public static class VideoJson
     public static string Name(Paths p, string id) => p.Video(id, "video.json");
 
     /// <summary>Null when there is no video.json; throws when it is there but not a JSON object (never a quiet null).</summary>
-    public static async Task<Doc?> ReadAsync(IStore store, Paths paths, string id, CancellationToken ct)
+    public static async Task<Doc?> ReadAsync(IStore store, Paths paths, string id, CancellationToken ct) => await ReadAsync(store, paths, id, ct, fresh: false);
+
+    // 0.13.18: video.json is cached on the node by ETag (a conditional GET: 304 costs one request and no bytes, and a read in the same step costs none). Docs are handed out as deep copies, so a caller's edits never leak.
+    sealed record Cached(string? ETag, byte[] Data, DateTimeOffset At);
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, System.Collections.Concurrent.ConcurrentDictionary<string, Cached>> caches = new();
+    static System.Collections.Concurrent.ConcurrentDictionary<string, Cached> CacheOf(IStore s) => caches.GetValue(StoreIdentity(s), _ => new(StringComparer.Ordinal));
+    /// <summary>The store under the wrappers that do not change what a name means (metering, recording, local cache), so a node's lanes share one cache.</summary>
+    static IStore StoreIdentity(IStore s) { for (int i = 0; i < 8; i++) s = s switch { MeteredStore m => m.Inner, RecordingStore r => r.Inner, LocalCacheStore l => l.Inner, _ => s }; return s; }
+    /// <summary>How long a cached video.json is served without asking the store again (the same step reads it many times; a step is short). A write through <see cref="UpdateAsync"/> refreshes the entry.</summary>
+    public static TimeSpan Fresh { get; set; } = TimeSpan.FromSeconds(20);
+    public static Func<DateTimeOffset> Now { get; set; } = () => DateTimeOffset.UtcNow;
+    public static void ClearCache(IStore store) => CacheOf(store).Clear();
+
+    public static async Task<Doc?> ReadAsync(IStore store, Paths paths, string id, CancellationToken ct, bool fresh)
     {
-        var c = await store.GetAsync(Name(paths, id), ct);
+        var name = Name(paths, id); var key = name; var cache = CacheOf(store);
+        if (!fresh && cache.TryGetValue(key, out var hit) && Now() - hit.At < Fresh) return Parse(name, hit.ETag, hit.Data);
+        if (cache.TryGetValue(key, out var old) && old.ETag != null)
+        {
+            var r = await store.GetIfChangedAsync(name, old.ETag, ct);
+            if (!r.Exists) { cache.TryRemove(key, out _); return null; }
+            if (!r.Changed) { cache[key] = old with { At = Now() }; return Parse(name, old.ETag, old.Data); }
+            cache[key] = new Cached(r.ETag, r.Data!, Now()); return Parse(name, r.ETag, r.Data!);
+        }
+        var c = await store.GetAsync(name, ct);
         if (c == null) return null;
-        try { return JsonNode.Parse(c.Data) is JsonObject o ? new Doc(c.ETag, o) : throw new InvalidDataException($"{Name(paths, id)} is not a JSON object"); }
-        catch (JsonException e) { throw new InvalidDataException($"{Name(paths, id)} is unreadable: {e.Message}", e); }
+        cache[key] = new Cached(c.ETag, c.Data, Now());
+        return Parse(name, c.ETag, c.Data);
+    }
+
+    static Doc Parse(string name, string? etag, byte[] data)
+    {
+        try { return JsonNode.Parse(data) is JsonObject o ? new Doc(etag, o) : throw new InvalidDataException($"{name} is not a JSON object"); }
+        catch (JsonException e) { throw new InvalidDataException($"{name} is unreadable: {e.Message}", e); }
     }
 
     public static async Task<Doc> RequireAsync(IStore store, Paths paths, string id, CancellationToken ct) => await ReadAsync(store, paths, id, ct) ?? throw new VideoJsonMissingException(id);
@@ -37,11 +65,13 @@ public static class VideoJson
     {
         for (int attempt = 0; attempt < 20; attempt++)
         {
-            var cur = await ReadAsync(store, paths, id, ct);
+            var cache = CacheOf(store);
+            var cur = await ReadAsync(store, paths, id, ct, fresh: attempt > 0);
             var root = cur?.Root ?? new JsonObject();
             root["v"] = Version; root["id"] = id;
             merge(root);
-            if (await store.PutIfMatchAsync(Name(paths, id), JsonSerializer.SerializeToUtf8Bytes(root), cur?.ETag, ct)) return root;
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(root);
+            if (await store.PutIfMatchAsync(Name(paths, id), bytes, cur?.ETag, ct)) { cache.TryRemove(Name(paths, id), out _); return root; }   // the new ETag is not known: the next read asks (once)
         }
         throw new IOException($"{id}: video.json kept changing (is another node writing it without the lease?)");
     }

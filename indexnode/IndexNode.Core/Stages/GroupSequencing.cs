@@ -10,7 +10,7 @@ public static class GroupSequencing
     /// The earlier dramas this one waits for. The group step needs only their VECTORS, not their grouping: a lower-seq drama blocks only while it has NO frames file yet AND its process entry is neither final nor held (it is still on its way to centers).
     /// A lower drama stuck in its own group step, failed, held for AI or already holding frames never blocks, so group steps of a bootstrap run in parallel and one stuck step blocks nobody.
     /// </summary>
-    public static async Task<List<string>> BlockersAsync(JobQueue q, IStore store, Paths paths, string id, CancellationToken ct)
+    public static async Task<List<string>> BlockersAsync(JobQueue q, IStore store, Paths paths, string id, CancellationToken ct, IReadOnlySet<string>? frames = null)
     {
         var cands = q.Read(st =>
         {
@@ -19,10 +19,10 @@ public static class GroupSequencing
                 if (s.Id != id && s.Seq is { } sq && sq < me && s.Entries.TryGetValue("process", out var p) && !p.Final && p.Hold == null) res.Add(s.Id);
             return res;
         });
-        var blockers = new List<string>();
-        foreach (var c in cands.OrderBy(x => x, StringComparer.Ordinal))
-            if (await store.HeadAsync(paths.FramesFile(c), ct) == null) blockers.Add(c);
-        return blockers;
+        // 0.13.18: no HEAD per candidate. The node's in-memory frames set (the gate's) decides; without one, a single LIST of the frames folder does (0.13.11 made 242 HEADs per re-claimed waiting step).
+        if (cands.Count == 0) return [];
+        frames ??= await ListFramesAsync(store, paths, ct);
+        return cands.Where(c => !frames.Contains(c)).OrderBy(x => x, StringComparer.Ordinal).ToList();
     }
 
     /// <summary>
@@ -53,6 +53,8 @@ public static class GroupSequencing
         readonly SemaphoreSlim refreshing = new(1, 1); volatile View? last; readonly object summaryLock = new();
         int lists;
         public int Lists => Volatile.Read(ref lists);
+        /// <summary>The ids known to have a frames file (the last listing, plus every id the gate saw). Never mutated.</summary>
+        public IReadOnlySet<string> Frames => frames;
 
         public sealed record View(HashSet<string> Frames, long? L, string? LId, int Waiting, int Runnable)
         {

@@ -330,7 +330,7 @@ public static class SearchIndexBuild
         int need = CentersFile.HeaderSize + h.K * CentersFile.Dim * 2;
         if (need > buf.Length) buf = await z.ReadAsync(0, need, ct);
         var centers = CentersFile.ParseCenters(buf.AsSpan(CentersFile.HeaderSize, h.K * CentersFile.Dim * 2), h.K);
-        var sha = (await raw.HeadAsync(z.Blob, ct))?.Metadata.GetValueOrDefault("idx_sha256") ?? "";
+        var sha = z.Sha ?? "";   // 0.13.18: from the frames LIST (FramesReader keeps it); 0.13.15 HEADed the file again for it
         var (sl, db) = await ReadSpeechAsync(raw, paths, id, ct);
         return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, 0, z.DataLength, h.Frames, h.K, 0, sl, db, null, z.Blob, h.TableOff), centers, h.Sum);
     }

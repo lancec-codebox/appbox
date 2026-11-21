@@ -112,7 +112,28 @@ public static class Program
             if (a.Positional.Count == 0 || a.Has("help")) { Console.WriteLine(Usage); return a.Has("help") ? 0 : 2; }
             var cmd = a.Positional[0].ToLowerInvariant();
             a.Positional.RemoveAt(0);
-            try { FramesCache.Configure(NodeConfig.Load()); } catch (Exception e) when (e is not OperationCanceledException) { }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
+            try { FramesCache.Configure(NodeConfig.Load()); } catch (Exception e) when (e is not OperationCanceledException) { }
+            StoreMeter.Current.Limits = NodeConfig.TryLoadStorageLimits();   // 0.13.18: the breaker settings (config storage.*)
+            if (a.Get("storage-max") is { } smax) { var n = int.Parse(smax); StoreMeter.Current.Limits.MaxPerStep = n; StoreMeter.Current.Limits.MaxPerMin = Math.Max(StoreMeter.Current.Limits.MaxPerMin, n); StoreMeter.Current.CliMax = n; }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
+            var rc = await Dispatch(cmd, a);
+            // 0.13.18: a write-free command (check --input-local, groups step --dry-run, whatif, region, ...) prints its per-site table at the end
+            if (cmd is not ("run" or "serve" or "precheck-serve" or "status" or "config" or "control") && StoreMeter.Current.Total > 0 && !a.Has("json")) Console.WriteLine("\n" + StoreMeter.Current.TableText());
+            return rc;
+        }
+        catch (StorageBudgetExceeded e) { Console.Error.WriteLine("error: " + e.Message); if (StoreMeter.Current.Total > 0) Console.Error.WriteLine(StoreMeter.Current.TableText()); return 1; }
+        catch (QueueNotMigratedException e) { Console.Error.WriteLine(e.Message); return 1; }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("error: " + Redact.Sas(e.Message));
+            Console.Error.WriteLine(Redact.Trace(e));
+            if (StoreMeter.Current.Total > 0 && e is StorageBudgetExceeded) Console.Error.WriteLine(StoreMeter.Current.TableText());
+            return 1;
+        }
+    }
+
+    private static async Task<int> Dispatch(string cmd, Args a)
+    {
+        {
             return cmd switch
             {
                 "run" => await Commands.RunAsync(a),
@@ -160,13 +181,6 @@ public static class Program
                 "medusa-setup" => SiteCommands.MedusaSetup(a),
                 _ => Fail($"unknown command '{cmd}'"),
             };
-        }
-        catch (QueueNotMigratedException e) { Console.Error.WriteLine(e.Message); return 1; }
-        catch (Exception e)
-        {
-            Console.Error.WriteLine("error: " + Redact.Sas(e.Message));
-            Console.Error.WriteLine(Redact.Trace(e));   // type and stack: the message alone ("'0' cannot be greater than ...") does not say where
-            return 1;
         }
     }
 
@@ -577,6 +591,13 @@ public static class Commands
             Console.WriteLine($"control: downloads per IP = {(mc.Downloads?.MaxPerIp is > 0 ? mc.Downloads.MaxPerIp.ToString() : "no cap")}");
             if (level == null) return 0;
         }
+        if (level == "storage")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control storage stop|run");
+            var sc = await ControlWatcher.SetStorageAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: storage = {(sc.StorageStopped ? "stop (no node claims; running steps finish)" : "run")}");
+            return 0;
+        }
         if (level == "region")
         {
             var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control region <name like westus2>|off");
@@ -631,7 +652,8 @@ public static class Commands
         if (nodes.Count == 0) Console.WriteLine("  (none)");
         foreach (var n in nodes.OrderBy(n => n.NodeId))
         {
-            Console.WriteLine($"  {n.NodeId,-24} {n.Kind,-8} stages={string.Join('+', n.Stages)} lanes={n.Workers} threads={n.Threads} state={n.EffectiveState(now)} control={n.Control} lastSeen={n.LastSeen}{(n.Ops != null ? "  storage ops: " + n.Ops : "")}");
+            Console.WriteLine($"  {n.NodeId,-24} {n.Kind,-8} stages={string.Join('+', n.Stages)} lanes={n.Workers} threads={n.Threads} state={n.EffectiveState(now)} control={n.Control} lastSeen={n.LastSeen}{(n.Ops != null ? "  storage ops: " + n.Ops + (n.Ops.Failed > 0 ? $", {n.Ops.Failed} failed" : "") + (n.Ops.Tripped ? ", BREAKER OPEN" : "") + (!a.Has("ops") && n.Ops.TopSites is { Count: > 0 } ts0 ? "; top: " + string.Join("; ", ts0.Take(5)) : "") : "")}");
+            if (a.Has("ops") && n.Ops?.TopSites is { } ts) { foreach (var s in ts) Console.WriteLine("      ops  " + s); }
             foreach (var r in n.Running)
                 Console.WriteLine($"      lane {r.Worker}: {r.Stage}/{r.JobId} {r.Step} {r.Progress}");
         }
@@ -824,6 +846,11 @@ public static class Commands
                 case "prune.lookback": file.PruneLookback = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
 
                 case "storage.region": file.StorageRegion = val.Trim(); break;
+                case "storage.warn-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.warn-per-min must be 1 or more"); (file.StorageBreaker ??= new()).WarnPerMin = n; break; }
+                case "storage.max-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-min must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerMin = n; break; }
+                case "storage.max-per-step": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-step must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerStep = n; break; }
+                case "storage.max-failures-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-failures-per-min must be 1 or more"); (file.StorageBreaker ??= new()).MaxFailuresPerMin = n; break; }
+                case "storage.cooldown": { var d = RefreshStage.ParseEvery(val); if (d <= TimeSpan.Zero) throw new ArgumentException("storage.cooldown must be a positive duration like 5m"); (file.StorageBreaker ??= new()).Cooldown = d; break; }
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
                 case "search.keep-versions": case "search.keepversions": { var kv = int.Parse(val); if (kv < 0) throw new ArgumentException("search.keep-versions must be 0 or more"); (file.Search ??= new()).KeepVersions = kv; break; }

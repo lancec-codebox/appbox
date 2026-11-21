@@ -380,6 +380,9 @@ public sealed class ControlFile
     public string? AiDramas { get; set; }
     /// <summary>0.13.17: the store's Azure region (e.g. "westus2"). Nodes with a region-only stage (RegionGate.OnlyStages) must run in it. Absent: no rule. Older nodes ignore the field.</summary>
     public string? Region { get; set; }
+    /// <summary>0.13.18: "stop" is the global kill switch for storage use: every node stops claiming within one poll (running steps finish or fail on their own budget). Absent / "run": normal.</summary>
+    public string? Storage { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore] public bool StorageStopped => string.Equals(Storage, "stop", StringComparison.OrdinalIgnoreCase);
     [System.Text.Json.Serialization.JsonIgnore] public bool AiDramasOn => string.Equals(AiDramas, "on", StringComparison.OrdinalIgnoreCase);
 
     public static Level ParseLevel(string? s) => s?.ToLowerInvariant() switch

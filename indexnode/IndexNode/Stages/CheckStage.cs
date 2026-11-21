@@ -14,13 +14,15 @@ public sealed class CheckStage(PreCheckStage pre) : IStageHandler
     {
         var ct = ctx.Token; var store = ctx.Store; var paths = ctx.Paths; var id = ctx.Job.JobId;
         var vj = await VideoJson.ReadAsync(store, paths, id, ct);
+        // 0.13.18: one LIST of the video's folder answers every "is it stored" below (sample.json, video.mp4, downloaded.json, download.zip were a HEAD each)
+        var have = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Select(b => b.Name[(b.Name.LastIndexOf('/') + 1)..]).ToHashSet(StringComparer.Ordinal);
         JsonObject? rec = vj?.Root["precheck"] as JsonObject;
         if (rec == null)
         {
             PreCheckStage.Run? run = null;
-            bool sample = await store.HeadAsync(paths.Video(id, SampleStage.Dir + "sample.json"), ct) != null;
+            bool sample = await Exists(store, paths, id, have, SampleStage.Dir + "sample.json", ct);
             if (sample) run = await pre.AnalyzeSampleAsync(ctx, null, ct, strict: true);
-            else if (await store.HeadAsync(paths.Video(id, "video.mp4"), ct) != null)
+            else if (have.Contains("video.mp4"))
             {
                 if (vj == null) throw new VideoJsonMissingException(id);
                 run = await pre.AnalyzeAsync(ctx, null, ct, strict: true);
@@ -31,7 +33,7 @@ public sealed class CheckStage(PreCheckStage pre) : IStageHandler
         }
         if (PreCheckDecision.IsSkip((string?)rec["decision"])) throw Duplicate(ctx, rec);
         // not a copy: the full download follows (a stored video goes straight to its process entry)
-        bool stored = await store.HeadAsync(paths.Video(id, "downloaded.json"), ct) != null || await store.HeadAsync(paths.Video(id, "download.zip"), ct) != null;
+        bool stored = have.Contains("downloaded.json") || have.Contains("download.zip");
         if (!stored)
         {
             var d = new JobDescriptor { Stage = "download", JobId = id, Url = ctx.Job.Url ?? "https://www.youtube.com/watch?v=" + id, MaxHeight = ctx.Job.MaxHeight, Format = ctx.Job.Format, Subs = ctx.Job.Subs, MaxComments = ctx.Job.MaxComments, Priority = ctx.Job.Priority, AddedAt = Protocol.NowUtc() };
@@ -40,6 +42,10 @@ public sealed class CheckStage(PreCheckStage pre) : IStageHandler
         }
         Log.Info($"check {id}: {(string?)rec["decision"]}; {(stored ? "the stored video goes on to process" : "the full download is queued")}");
     }
+
+    /// <summary>A file of the video's folder (the sample folder is a sub-folder: one HEAD for it, only when the listing does not show it).</summary>
+    static async Task<bool> Exists(IStore store, Paths paths, string id, HashSet<string> have, string rel, CancellationToken ct) =>
+        have.Contains(rel[(rel.LastIndexOf('/') + 1)..]) || rel.Contains('/') && await store.HeadAsync(paths.Video(id, rel), ct) != null;
 
     static DuplicateFound Duplicate(JobContext ctx, JsonObject rec)
     {

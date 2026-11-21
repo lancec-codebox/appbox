@@ -95,6 +95,8 @@ public sealed class EngineOptions
     public JobQueue? Queue { get; init; }
     /// <summary>The storage operations this node counts (reads, writes, lists); default: the process-wide counter.</summary>
     public OpCounter? Ops { get; init; }
+    /// <summary>0.13.18: the store meter and breaker (default: the process-wide one).</summary>
+    public StoreMeter Meter { get; init; } = StoreMeter.Current;
     // ---- accepted and ignored since 0.13.0 (old callers and tests set them)
     [Obsolete("0.13.0: a node runs one claim per lane; there are no per-stage job counts")] public Dictionary<string, int>? Jobs { get; init; }
     [Obsolete("0.13.0: batches are gone; --lanes is the number of concurrent claims")] public int Lanes { get => Workers; init => Workers = value; }
@@ -144,6 +146,9 @@ public sealed partial class NodeEngine
         private void Close() { if (current != null) { done.Add((current, sw.Elapsed)); current = null; } }
         public string Line(string device) { lock (done) { Close(); return done.Count == 0 ? "" : string.Join(", ", done.GroupBy(d => d.Step).Select(g => $"{g.Key} {g.Sum(x => x.Time.TotalSeconds):F1}s")) + $" [{device}]"; } }
     }
+
+    private OpsReport WithTop(OpsReport r) { var m = o_Meter; r.TopSites = m.Table().Take(30).Select(x => $"{x.Site} {x.Op} x{x.Count}" + (x.Failed > 0 ? $" ({x.Failed} failed)" : "")).ToList(); r.Failed = m.TotalFailed; r.Tripped = m.Tripped; return r; }
+    private StoreMeter o_Meter => o.Meter;
 
     private readonly IStore store;
     private readonly Paths paths;
@@ -200,7 +205,7 @@ public sealed partial class NodeEngine
         State = state ?? NodeState(),
         Control = Control.Current.Mode,
         Running = running.Keys.Select(r => new RunningJob { JobId = r.Info.JobId, Stage = r.Info.Stage, Step = r.Info.Step, Progress = r.Info.Progress, Worker = r.Info.Worker, StartedAt = r.Info.StartedAt }).ToList(),
-        Traffic = traffic.Snapshot(), Ops = ops.Snapshot(startedAt), Placement = placement, Network = network, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
+        Traffic = traffic.Snapshot(), Ops = WithTop(ops.Snapshot(startedAt)), Placement = placement, Network = network, FirstSeen = firstSeen ?? Protocol.Utc(startedAt), Instance = instance, Instances = peers.Count == 0 ? null : new(peers),
         LastSeen = Protocol.NowUtc(), StartedAt = Protocol.Utc(startedAt),
     };
 
