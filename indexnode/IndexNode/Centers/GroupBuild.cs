@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json.Nodes;
 
 namespace IndexNode;
@@ -19,8 +20,14 @@ public static class GroupBuild
         return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null);
     }
 
+    public const int ChunkFrames = 30;
+
+    /// <summary>The frames to search: the pre-check's own selection (<see cref="PreCheck.SubsampleIndices"/>, one sampler for both callers), here spread over the whole upload (the pre-check's window is 5 minutes around 50% of the video), so mixed cuts and the offset see its full length.</summary>
+    public static List<(float T, float[] V)> Sample(List<(float T, float[] V)> frames, int max) =>
+        max <= 0 || frames.Count <= max ? frames : PreCheck.SubsampleIndices(frames.Count, max).Select(i => frames[i]).ToList();
+
     /// <summary>The full check of one processed upload: every frame vector of its centers.zip (time order) against <paramref name="next"/> without itself. Null when its centers cannot be read (the caller falls back to the pre-check's hint).</summary>
-    public static async Task<GroupProposal?> FullCheckAsync(IStore store, Paths paths, SearchData next, SearchUpload u, GroupSet set, PreCheckSettings s, int threads, CancellationToken ct)
+    public static async Task<GroupProposal?> FullCheckAsync(IStore store, Paths paths, SearchData next, SearchUpload u, GroupSet set, PreCheckSettings s, int threads, CancellationToken ct, BlockCache? cache = null)
     {
         List<(float T, float[] V)> frames = [];
         try
@@ -33,8 +40,17 @@ public static class GroupBuild
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"groups: centers of {u.Id} not read ({e.Message})"); return null; }
         if (frames.Count == 0) return GroupProposal.None;
         frames.Sort((a, b) => a.T.CompareTo(b.T));
+        // 0.13.6: at most GroupCheckFrames frames, evenly spaced over the upload (the pre-check lookup on each); join, mixed and offset come from these samples
+        frames = Sample(frames, s.GroupCheckFrames);
         int ex = next.Uploads.FindIndex(x => x.Id == u.Id);
-        var (best, _) = await PreCheckSearch.BestPerFrameAsync(store, paths, next, frames.Select(f => f.V).ToList(), s.TopCenters, threads, ct, ex);
+        // in chunks, so one call never holds every block its frames touch; the shared LRU cache keeps what the next chunk needs
+        var best = new FrameBest?[frames.Count];
+        for (int at = 0; at < frames.Count; at += ChunkFrames)
+        {
+            var part = frames.Skip(at).Take(ChunkFrames).Select(f => f.V).ToList();
+            var (b, _) = await PreCheckSearch.BestPerFrameAsync(store, paths, next, part, s.TopCenters, threads, ct, ex, cache);
+            Array.Copy(b, 0, best, at, b.Length);
+        }
         var hits = new List<FrameHit>();
         for (int i = 0; i < best.Length; i++) if (best[i] is { } b && b.Cosine >= s.Tau && b.Upload >= 0 && b.Upload < next.Uploads.Count) hits.Add(new FrameHit(i, next.Uploads[b.Upload].Id, b.Time, b.Cosine));
         var of = set.GroupOf();
@@ -44,10 +60,24 @@ public static class GroupBuild
         return DramaGroups.Propose(a, 0, 0, s, i => frames[i].T);
     }
 
-    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true)
+    /// <summary>"groups: checked N of M (r/min, ETA hh:mm)".</summary>
+    public static string Progress(int done, int total, TimeSpan elapsed)
+    {
+        double rate = elapsed.TotalMinutes > 0 ? done / elapsed.TotalMinutes : 0;
+        var eta = rate > 0 ? TimeSpan.FromMinutes((total - done) / rate) : TimeSpan.Zero;
+        return $"groups: checked {done} of {total} ({rate:F1}/min, ETA {(int)eta.TotalHours:D2}:{eta.Minutes:D2})";
+    }
+
+    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true, bool requireGroups = false)
     {
         var s = settings ?? new PreCheckSettings();
         var prior = head == null ? null : await GroupStore.LoadAsync(store, paths, head.Version, ct);
+        // 0.13.6: with no groups file the index job does not group (a bootstrap of every upload is hours of work: `indexnode groups build` does it once); the version is published with no groups
+        if (requireGroups && prior == null && !bootstrap)
+        {
+            say?.Invoke("groups: NO groups file yet: not grouping (catalog groupId stays null); run `indexnode groups build` first");
+            return new GroupSet();
+        }
         var set = prior ?? new GroupSet();
         var byId = next.Uploads.ToDictionary(u => u.Id, StringComparer.Ordinal);
         // a short-circuited placement of an upload that is now processed is replaced by the full check
@@ -62,15 +92,19 @@ public static class GroupBuild
             try { speech[u.Id] = await SearchIndexBuild.ReadSpeechAsync(store, paths, u.Id, t); } catch (Exception e) when (e is not OperationCanceledException) { }
         });
         (string? Lang, bool? Dub) Sp(SearchUpload u) => speech.TryGetValue(u.Id, out var x) && x.Lang != null ? x : (u.SpeechLanguage, u.Dubbed);
-        int done = 0, todo = next.Uploads.Count(u => !known.ContainsKey(u.Id));
-        foreach (var u in next.Uploads.Where(u => !known.ContainsKey(u.Id)))
+        var unknown = next.Uploads.Where(u => !known.ContainsKey(u.Id)).ToList();
+        // 0.13.6: a build full-checks at most GroupMaxNewPerBuild new uploads; the rest stay unplaced and are the next build's (a bootstrap checks them all)
+        if (!bootstrap && unknown.Count > s.GroupMaxNewPerBuild) { say?.Invoke($"groups: {unknown.Count} new uploads, checking {s.GroupMaxNewPerBuild} now (groups.max-new-per-build); the rest wait for the next build"); unknown = unknown.Take(s.GroupMaxNewPerBuild).ToList(); }
+        int done = 0, todo = unknown.Count; var clock = Stopwatch.StartNew();
+        var cache = new BlockCache(s.GroupCacheMb * 1024L * 1024L);
+        foreach (var u in unknown)
         {
             var r = await ReadRecAsync(store, paths, u.Id, ct, say);
-            var prop = await FullCheckAsync(store, paths, next, u, set, s, threads, ct);
+            var prop = await FullCheckAsync(store, paths, next, u, set, s, threads, ct, cache);
             if (prop == null) { prop = r.Proposal; hinted++; } else full++;
             var (l0, d0) = Sp(u);
             news.Add(new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop));
-            if (bootstrap && ++done % 50 == 0) say?.Invoke($"groups: checked {done} of {todo}");
+            if (++done % 10 == 0 || done == todo) say?.Invoke(Progress(done, todo, clock.Elapsed));
         }
         // the uploads the pre-check short-circuited (record, no centers.zip) with a proposal in it
         var shorts = new HashSet<string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/";

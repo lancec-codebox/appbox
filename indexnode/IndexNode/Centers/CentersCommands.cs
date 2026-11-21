@@ -165,7 +165,7 @@ public static class CentersCommands
             if (!newMean) next.MeanFrames = head!.MeanFrames;
         }
         next.BuiltAt = startedAt;
-        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, cts.Token, Console.WriteLine, threads);
+        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, cts.Token, Console.WriteLine, threads, cfg.PreCheck);
         next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, Console.WriteLine, cts.Token);
         Console.WriteLine($"catalog: {next.Catalog.Uploads.Count} uploads, {next.Catalog.ToGzip().Length / 1024.0:F1} KB gzipped");
         next.Catalog.ApplyGroups(groups);

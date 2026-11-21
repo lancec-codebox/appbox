@@ -6,7 +6,7 @@ namespace IndexNode;
 /// 0.13.1: the "search-index" queue stage: builds index/search/vN+1/ from every centers.zip (reusing unchanged uploads of the head, the same builder as `search-index update`) and moves head.yaml with If-Match
 /// (a lost race leaves the winner's head and fails this run, which then retries). Versions older than head - search.keepVersions (default 3) are deleted after head.yaml moves (derived data). When more centers finished while it ran, the entry goes pending again, due in 15 minutes.
 /// </summary>
-public sealed class SearchIndexStage(IStore store, int keepVersions = 3) : IStageHandler
+public sealed class SearchIndexStage(IStore store, int keepVersions = 3, PreCheckSettings? settings = null) : IStageHandler
 {
     public async Task RunAsync(JobContext ctx)
     {
@@ -21,7 +21,7 @@ public sealed class SearchIndexStage(IStore store, int keepVersions = 3) : IStag
         else next = await SearchIndexBuild.BuildAsync(store, paths, ups, head.Mean, head, head.Version + 1, head.MeanVersion, threads, m => Log.Info("search-index: " + m), ct);
         next.BuiltAt = started;   // centers that finish after this are not in it: the pre-check looks at them by brute force
         ctx.Report("search-index", "groups");
-        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, ct, m => Log.Info("search-index: " + m));
+        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, ct, m => Log.Info("search-index: " + m), threads, settings, requireGroups: true);
         ctx.Report("search-index", "catalog");
         next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, m => Log.Info("search-index: " + m), ct);
         next.Catalog.ApplyGroups(groups);

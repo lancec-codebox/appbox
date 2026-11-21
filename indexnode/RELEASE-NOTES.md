@@ -1,3 +1,14 @@
+## 0.13.6
+
+Live fix: `groups build` took ~14 h and 14 GB RSS on 1,083 uploads, and the first search-index build would have done the same inline.
+
+- **The full check samples.** Each upload's check searches at most `groups.check-frames` (default 240; 0 = all) of its frames, evenly spaced over the WHOLE upload, by the pre-check's own sampler (`PreCheck.SubsampleIndices`) and lookup (`PreCheckSearch.BestPerFrameAsync`). The pre-check samples a window around 50% of the video; the group check spreads over the full length so mixed cuts and the offset see all of it. The join rule is unchanged (>= 5 distinct-frame hits); shares (match, dup, hit share), the contiguity span and the median offset are computed over the sampled frames (the denominator is the sample count, the offset uses each sample's own time).
+- **Bounded memory.** The checks share one LRU block cache capped at `groups.cache-mb` (default 2048); an evicted block is read again. Frames are searched in chunks of 30 so a call never holds every block its frames touch.
+- **Progress.** `groups: checked N of M (r/min, ETA hh:mm)` every 10 uploads (and at the end).
+- **No inline bootstrap.** With no groups file the queued search-index job publishes the version with no groups (catalog groupId null) and logs that `indexnode groups build` must run first. With a groups file it full-checks only the uploads new in this build, at most `groups.max-new-per-build` (default 100); the rest wait for the next build. The manual `indexnode search-index build/update` keeps grouping (capped the same way).
+- New config keys: `groups.check-frames`, `groups.cache-mb`, `groups.max-new-per-build`.
+- Tests: `GroupSampleTests` (sampler, sampled duplicate join + mixed cut, cache cap in bytes, index job without/with a groups file and the cap, progress line).
+
 ## 0.13.5
 
 Two read paths still failed on Nexis ghosts after 0.13.4.

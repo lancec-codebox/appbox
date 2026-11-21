@@ -221,7 +221,7 @@ public static class Commands
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
             ["refresh"] = new RefreshStage(tools, store),
             ["availability"] = new AvailabilityStage(tools, store),
-            ["search-index"] = new SearchIndexStage(store, cfg.Search?.KeepVersions ?? 3),
+            ["search-index"] = new SearchIndexStage(store, cfg.Search?.KeepVersions ?? 3, cfg.PreCheck),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
@@ -802,6 +802,9 @@ public static class Commands
                 case "precheck.audio-format": (file.PreCheck ??= new()).AudioFormat = val.Trim(); break;
                 case "precheck.window-position": (file.PreCheck ??= new()).WindowPosition = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.ai-flag": (file.PreCheck ??= new()).AiFlag = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "groups.check-frames": (file.PreCheck ??= new()).GroupCheckFrames = PreCheckSettings.ParseFrames(val); break;
+                case "groups.cache-mb": (file.PreCheck ??= new()).GroupCacheMb = Math.Max(16, int.Parse(val)); break;
+                case "groups.max-new-per-build": (file.PreCheck ??= new()).GroupMaxNewPerBuild = Math.Max(0, int.Parse(val)); break;
                 case "precheck.group-min-hits": (file.PreCheck ??= new()).GroupMinHits = int.Parse(val); break;
                 case "precheck.index-recheck-minutes": (file.PreCheck ??= new()).IndexRecheckMinutes = int.Parse(val); break;
                 case "node-name": file.NodeName = NodeConfig.SanitizeName(val); break;

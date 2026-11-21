@@ -70,7 +70,7 @@ public static class GroupsCommand
         if (!dry && await store.GetAsync(GroupStore.File(paths, idx.Version), cts.Token) != null) throw new InvalidOperationException($"{GroupStore.File(paths, idx.Version)} exists: the groups are written once (the search-index job maintains them from here)");
         Console.WriteLine($"groups build: {idx.Uploads.Count} indexed uploads (index v{idx.Version}), frame-level full check per upload{(dry ? ", dry run" : "")}");
         // an empty group set with no head: every upload of the index is "new" and goes through the full check (bootstrap: join cycles are broken, the earliest processed owns the group)
-        var set = await GroupBuild.ApplyAsync(store, paths, null, idx, cts.Token, m => Console.WriteLine("  " + m), threads, null, bootstrap: true, write: false);
+        var set = await GroupBuild.ApplyAsync(store, paths, null, idx, cts.Token, m => Console.WriteLine("  " + m), threads, cfg.PreCheck, bootstrap: true, write: false);
         set.IndexVersion = idx.Version;
         int multi = set.Groups.Count(g => g.Members.Count > 1), single = set.Groups.Count - multi;
         Console.WriteLine($"groups: {set.Groups.Count} groups ({multi} with 2+ uploads, {single} single), {idx.Uploads.Count} uploads, {sw.Elapsed.TotalSeconds:F1}s (join at >= {new PreCheckSettings().GroupMinHits} distinct-frame hits at cosine {new PreCheckSettings().Tau:0.00}; mixed and offset as in the index build)");

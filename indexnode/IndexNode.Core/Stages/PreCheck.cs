@@ -50,6 +50,12 @@ public sealed class PreCheckSettings
     public int IndexRecheckMinutes { get; set; } = 10;
     /// <summary>0.13.2 drama groups. Join the group with the most matched frames at >= this many distinct-frame hits (config precheck.group-min-hits).</summary>
     public int GroupMinHits { get; set; } = 5;
+    /// <summary>0.13.6 (config groups.check-frames): the full check of an upload searches at most this many of its frames, evenly spaced over the upload; 0 = all.</summary>
+    public int GroupCheckFrames { get; set; } = 240;
+    /// <summary>0.13.6 (config groups.cache-mb): byte cap of the member-block cache the groups checks share (LRU; a dropped block is read again).</summary>
+    public int GroupCacheMb { get; set; } = 2048;
+    /// <summary>0.13.6 (config groups.max-new-per-build): at most this many new uploads are full-checked per search-index build; the rest wait for the next one.</summary>
+    public int GroupMaxNewPerBuild { get; set; } = 100;
     /// <summary>MIXED needs the hits under this share of the samples ...</summary>
     public double MixedMaxShare { get; set; } = 0.60;
     /// <summary>... at a consistent time offset (hits within this many seconds of the median offset, 80% of them) ...</summary>
