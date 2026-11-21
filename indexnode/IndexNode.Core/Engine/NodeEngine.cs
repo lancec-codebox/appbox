@@ -51,6 +51,8 @@ public sealed class EngineOptions
 {
     /// <summary>0.13.1: at start, add the singleton search-index entry when none is pending (catch-up; tests of the follow-up turn it off).</summary>
     public bool SearchIndexCatchUp { get; init; } = true;
+    /// <summary>0.13.17: the head's build time (null: no published index). When set, the start-up catch-up adds a build only if the index is behind the queue; null function = always add (old behaviour).</summary>
+    public Func<CancellationToken, Task<DateTimeOffset?>>? HeadBuiltAt { get; init; }
     public required string NodeId { get; init; }
     public string Name { get; init; } = "node";
     public string Kind { get; init; } = "desktop";
@@ -394,6 +396,7 @@ public sealed partial class NodeEngine
             {
                 await Task.Delay(o.IdleCheck, token);
                 if (!running.IsEmpty || Volatile.Read(ref busyClaims) > 0) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); continue; }
+                if (SearchIndexPullable()) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); continue; }
                 if (DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastBusyTicks), DateTimeKind.Utc) >= window)
                 {
                     Log.Info($"idle for {window.TotalMinutes:F1} min: exiting (--exit-when-idle)");

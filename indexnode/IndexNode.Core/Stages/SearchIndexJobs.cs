@@ -18,6 +18,15 @@ public static class SearchIndexJobs
         return q.Read(st => st.Subjects.Values.Where(s => s.CentersAt != null && string.CompareOrdinal(s.CentersAt, cut) > 0).OrderBy(s => s.CentersAt, StringComparer.Ordinal).Select(s => s.Id).ToList());
     }
 
+    /// <summary>0.13.17: is the published index behind the queue? True when some finished process (centers) or group record is newer than the head's build time. builtAt null (no head) is behind.</summary>
+    public static bool IndexBehind(QueueState st, DateTimeOffset? builtAt)
+    {
+        if (builtAt == null) return true;
+        var cut = Protocol.Utc(builtAt.Value);
+        return st.Subjects.Values.Any(s => (s.CentersAt != null && string.CompareOrdinal(s.CentersAt, cut) > 0)
+            || (s.Entries.TryGetValue("group", out var g) && g.State is "done" or "duplicate" && g.FinishedAt != null && string.CompareOrdinal(g.FinishedAt, cut) > 0));
+    }
+
     /// <summary>The add line for the current state, or null when one is pending (or being built): a pending entry is never added twice. A finished or failed one is added again (force).</summary>
     public static QLine? AddLine(QueueState st, DateTimeOffset now, TimeSpan delay)
     {

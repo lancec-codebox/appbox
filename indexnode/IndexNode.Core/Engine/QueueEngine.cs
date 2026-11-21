@@ -97,6 +97,7 @@ public sealed partial class NodeEngine
                 if (!worked)
                 {
                     await RetryFailedSearchIndexAsync(ct);
+                    if (await TryPullForwardSearchIndexAsync(lane, ct)) continue;
                     RegistryChanged();
                     if (o.Once) return;
                     await Wait(o.PollInterval < o.ControlInterval ? o.PollInterval : o.ControlInterval, ct);
@@ -110,8 +111,51 @@ public sealed partial class NodeEngine
     private async Task EnsureSearchIndexAsync(CancellationToken ct)
     {
         if (!o.SearchIndexCatchUp || !handlers.ContainsKey("search-index") || !StageEnabled("search-index")) return;
-        try { await queue.AppendLinesAsync(st => SearchIndexJobs.AddLine(st, NowUtc, TimeSpan.Zero) is { } l ? [l] : null, ct); }
+        try
+        {
+            if (o.HeadBuiltAt != null)
+            {
+                var builtAt = await o.HeadBuiltAt(ct);
+                if (!queue.Read(st => SearchIndexJobs.IndexBehind(st, builtAt))) { Log.Info("search-index: the published index is up to date, no catch-up build"); return; }
+            }
+            await queue.AppendLinesAsync(st => SearchIndexJobs.AddLine(st, NowUtc, TimeSpan.Zero) is { } l ? [l] : null, ct);
+        }
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: catch-up add failed ({e.Message})"); }
+    }
+
+    /// <summary>0.13.17: true when the only work this node could ever run is a search-index entry still waiting out its debounce: it is enabled here, pending, not due, and the queue holds no claim by any node and no runnable entry of a stage this node runs.</summary>
+    internal bool SearchIndexPullableForTest() => SearchIndexPullable();
+    internal bool SearchIndexPullable()
+    {
+        if (!handlers.ContainsKey("search-index") || !StageEnabled("search-index")) return false;
+        return queue.Read(st =>
+        {
+            var e = st.Entry(SearchIndexJobs.Subject, SearchIndexJobs.Stage);
+            if (e is not { State: "pending" }) return false;
+            var now = Protocol.Utc(NowUtc);
+            if (e.Runnable(now)) return false;   // already runnable: the normal path takes it
+            if (st.Subjects.Values.Any(s => s.ClaimBy != null)) return false;
+            return st.Candidates(now, StageEnabled, CanRunEntry).Count == 0;
+        });
+    }
+
+    private async Task<bool> TryPullForwardSearchIndexAsync(int lane, CancellationToken ct)
+    {
+        if (!SearchIndexPullable()) return false;
+        if (!TryReserve()) return false;
+        ClaimHandle? h;
+        Interlocked.Increment(ref busyClaims);
+        try
+        {
+            try { h = await queue.TryClaimAsync(SearchIndexJobs.Subject, s => s.ClaimBy == null && s.Entries.TryGetValue(SearchIndexJobs.Stage, out var e) && e.State == "pending" ? [SearchIndexJobs.Stage] : null, ct); }
+            catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); throw; }
+            catch (Exception e) { Log.Info($"[search-index#{lane}] claim failed ({e.Message})"); h = null; }
+            if (h == null) { Interlocked.Decrement(ref reserved); return false; }
+            Log.Info("search-index: nothing else to run, building now (not waiting for the debounce)");
+            await RunClaimAsync(lane, h, ct, pulled: true);
+            return true;
+        }
+        finally { Interlocked.Decrement(ref busyClaims); }
     }
 
     private DateTimeOffset nextSearchIndexRetry;
@@ -175,7 +219,7 @@ public sealed partial class NodeEngine
         public LocalCacheStore? Local;
     }
 
-    private async Task<bool> RunClaimAsync(int lane, ClaimHandle h, CancellationToken ct)
+    private async Task<bool> RunClaimAsync(int lane, ClaimHandle h, CancellationToken ct, bool pulled = false)
     {
         var id = h.Subject; var watch = System.Diagnostics.Stopwatch.StartNew();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct, h.Token);
@@ -190,7 +234,7 @@ public sealed partial class NodeEngine
             // the stages of the subject this node runs, in order; follow-ups the stages add (process -> describe) join the same claim when this node runs them
             for (int guard = 0; guard < 16 && !cts.IsCancellationRequested; guard++)
             {
-                var entry = queue.Read(s => s.Get(id)?.Entries.Values.Where(e => e.Runnable(Protocol.Utc(NowUtc)) && StageEnabled(e.Stage) && CanRunEntry(s.Get(id)!, e)).OrderBy(e => QueueState.Rank(e.Stage)).FirstOrDefault());
+                var entry = queue.Read(s => s.Get(id)?.Entries.Values.Where(e => (e.Runnable(Protocol.Utc(NowUtc)) || (pulled && e.Stage == SearchIndexJobs.Stage && e.State == "pending")) && StageEnabled(e.Stage) && CanRunEntry(s.Get(id)!, e)).OrderBy(e => QueueState.Rank(e.Stage)).FirstOrDefault());
                 if (entry == null) break;
                 var (outcome, error, last, ctx) = await RunStageAsync(lane, work, entry, cts.Token);
                 if (outcome == Outcome.Done) { anyDone = true; if (last) break; continue; }

@@ -41,7 +41,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode sources add <url> [--every 1d|6h|daily@03:00] [--backfill N] [--follow-channels] [--tabs videos|videos,shorts (default videos)] [--max-height 480] [--priority N]
         indexnode sources migrate-seen [--dry-run]   (0.13.2: seen.json ids become members of members.json, then seen.json goes; a refresh does it for its own source on first touch)
@@ -94,6 +94,8 @@ public static class Program
         indexnode control run|drain|stop [--stage download|process|comments] [--message M] [--max-per-ip N|off] [gpu-hold <30m|off>]
         indexnode control gpu-hold <duration like 30m>|off
         indexnode control ai-dramas on|off
+        indexnode region [--stages a,b]   (0.13.17: read-only: what this machine detects (IMDS, placement, env), control.json's region, and whether a node here could run the region-only stages)
+        indexnode control region <name like westus2>|off   (0.13.17: check, process and its steps, group and search-index run only on nodes in this Azure region; run --allow-out-of-region for a one-item test)
         indexnode control --max-per-ip N|off
         indexnode --version
         indexnode config set-sas <url>
@@ -119,6 +121,7 @@ public static class Program
                 "precheck" => await PreCheckCommand.RunAsync(a),
                 "sample" => await SampleCommands.SampleAsync(a),
                 "check" => await SampleCommands.CheckAsync(a),
+                "region" => await RegionCommand.RunAsync(a),   // 0.13.17: read-only diagnostic of the region rule
                 "serve" or "precheck-serve" => await ServeCommand.RunAsync(a),   // precheck-serve: the old name, a hidden alias
                 "unprocessed" => await Commands.UnprocessedAsync(a),
                 "seeds" => await Commands.SeedsAsync(a),
@@ -208,6 +211,16 @@ public static class Commands
             stages = GpuRouting.GpuNodeStages(stages);
             if (stages.Length == 0) throw new ArgumentException("--gpu runs only sscd, clip, cast and ocrsubs; --stages names none of them");
         }
+        // 0.13.17: the region rule, before anything is claimed (the write-free check/groups-step/whatif commands never come through here)
+        if (stages.Any(s => RegionGate.OnlyStages.Contains(s)))
+        {
+            var ctlRegion = ControlFile.Parse((await store.GetAsync(paths.Control, default))?.Data).Region;
+            var own = await RegionGate.DetectAsync(null, Environment.GetEnvironmentVariable("INDEXNODE_REGION"), null, cfg.StorageRegion ?? "westus2", default);
+            Console.Error.WriteLine($"indexnode: region {own.Region ?? "(none)"} (source: {own.Source}), control region {ctlRegion ?? "(none)"}");
+            var rv = RegionGate.Evaluate(stages, ctlRegion, own, a.Has("allow-out-of-region"));
+            if (rv.Warning != null) Console.Error.WriteLine("indexnode: " + rv.Warning);
+            if (!rv.Run) { Console.Error.WriteLine(rv.Error); return 4; }
+        }
         TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? RefreshStage.ParseEvery(ew) : null;
         foreach (var old in new[] { "jobs", "max-heavy", "workers", "batch", "batch-hours" }) if (a.Get(old) != null) Console.Error.WriteLine($"indexnode: --{old} is ignored since 0.13.0 (one video per claim; --lanes N runs more claims at once)");
         int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 1;
@@ -254,6 +267,7 @@ public static class Commands
             Steps = ProcessStage.SupportedSteps(cfg),
             Stages = stages, Workers = workers, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
+            HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
@@ -562,6 +576,13 @@ public static class Commands
             var mc = await ControlWatcher.SetMaxPerIpAsync(store, paths, mpi, cfg.NodeName ?? Environment.UserName, default);
             Console.WriteLine($"control: downloads per IP = {(mc.Downloads?.MaxPerIp is > 0 ? mc.Downloads.MaxPerIp.ToString() : "no cap")}");
             if (level == null) return 0;
+        }
+        if (level == "region")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control region <name like westus2>|off");
+            var rc = await ControlWatcher.SetRegionAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: region = {rc.Region ?? "off (no region rule)"} (region-only stages: {string.Join(",", RegionGate.OnlyStages)})");
+            return 0;
         }
         if (level == "ai-dramas")
         {

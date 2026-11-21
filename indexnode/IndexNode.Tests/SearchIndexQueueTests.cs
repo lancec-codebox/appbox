@@ -32,15 +32,105 @@ public class SearchIndexQueueTests : IDisposable
     static async Task Process(FakeStore s, string id) { await s.AddJob(P, "process", id, Protocol.Utc(T0.AddMinutes(-10))); await s.PutAsync(P.Video(id, "download.zip"), [1, 2, 3], null, null, false, default); }
     static int SearchAdds(FakeStore s) => s.AppendText("index/jobs/queue.log").Split('\n', StringSplitOptions.RemoveEmptyEntries).Count(l => l.Contains("\"t\":\"add\"") && l.Contains("\"s\":\"search-index\""));
 
+    // ---------------------------------------------------------------- 0.13.17: the debounce is pulled forward when nothing else is left
+
+    static async Task Debounced(FakeStore s) { var q = new JobQueue(s, P, "t", () => T0); await q.LoadAsync(default); await q.AppendLinesAsync([SearchIndexJobs.AddLine(q.Read(st => st), T0, SearchIndexJobs.Delay)!], default); }
+    static async Task Lines(FakeStore s, params QLine[] l) { var q = new JobQueue(s, P, "t", () => T0); await q.LoadAsync(default); await q.AppendLinesAsync(l, default); }
+
+    [Fact]
+    public async Task Only_a_not_yet_due_search_index_entry_is_built_now_and_exit_when_idle_0m_ends_with_a_fresh_index()
+    {
+        var s = new FakeStore(); await Debounced(s); var built = new List<string>();
+        var e = Engine(s, false, built);
+        await Run(e);
+        Assert.Single(built);
+        Assert.Equal("done", s.Replay(P.Prefix).Entry("search-index", "search-index")!.State);
+
+        var s2 = new FakeStore(); await Debounced(s2); var built2 = new List<string>();
+        var h = new Dictionary<string, IStageHandler> { ["search-index"] = new Fn(ctx => { built2.Add(ctx.Job.JobId); return Task.CompletedTask; }) };
+        var o = new EngineOptions
+        {
+            NodeId = "n1", Name = "n1", Stages = ["search-index"], Workers = 1, Threads = 2, ExitWhenIdle = TimeSpan.Zero, IdleCheck = TimeSpan.FromMilliseconds(30), Now = () => T0,
+            PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
+            TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter(),
+        };
+        var ne = new NodeEngine(s2, P, o, h);
+        await Run(ne);
+        Assert.Single(built2); Assert.True(ne.ExitedIdle);
+    }
+
+    [Fact]
+    public async Task Another_nodes_running_claim_keeps_the_debounce()
+    {
+        var s = new FakeStore(); await Debounced(s); await Process(s, "v1"); var built = new List<string>();
+        var other = new JobQueue(s, P, "other", () => T0); await other.LoadAsync(default);
+        var held = await other.TryClaimAsync("v1", st => ["process"], default);   // a live claim: its active file is leased
+        Assert.NotNull(held);
+        var e = Engine(s, false, built);
+        await Run(e);
+        Assert.Empty(built);   // v1 is under another node's claim: the debounce stays
+    }
+
+    [Fact]
+    public async Task Runnable_work_of_a_stage_this_node_runs_keeps_the_debounce_until_it_is_done()
+    {
+        var s = new FakeStore(); await Debounced(s); await Process(s, "v1");
+        var order = new List<string>();
+        var h = new Dictionary<string, IStageHandler>();
+        foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
+        foreach (var st in Protocol.StepStages) h[st] = new Fn(_ => { if (!order.Contains("process")) order.Add("process"); return Task.CompletedTask; });
+        h["process"] = h["frames"];
+        h["search-index"] = new Fn(_ => { order.Add("search-index"); return Task.CompletedTask; });
+        var o = new EngineOptions { NodeId = "n1", Name = "n1", Stages = ["process"], Workers = 1, Threads = 4, Once = true, Now = () => T0, PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40), TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter() };
+        await Run(new NodeEngine(s, P, o, h));
+        Assert.Equal("process", order[0]);   // the runnable drama goes first; the build is pulled forward only after it
+        Assert.Equal("search-index", order[^1]);
+    }
+
+    // ---------------------------------------------------------------- 0.13.17: the start-up catch-up only when the index is behind
+
+    static async Task GroupDone(FakeStore s, string id, DateTimeOffset at)
+    {
+        await s.AddJob(P, "group", id, Protocol.Utc(at.AddMinutes(-5)));
+        var q = new JobQueue(s, P, "t", () => at); await q.LoadAsync(default);
+        await q.AppendLinesAsync([new QLine { T = "claim", S = id, Stages = ["group"], By = "x", Epoch = 1, At = Protocol.Utc(at) }, new QLine { T = "done", S = id, Stage = "group", Fin = true, At = Protocol.Utc(at), Epoch = 1 }], default);
+    }
+    static NodeEngine CatchUpEngine(FakeStore s, DateTimeOffset? headBuiltAt, List<string> built)
+    {
+        var h = new Dictionary<string, IStageHandler> { ["search-index"] = new Fn(ctx => { built.Add("b"); return Task.CompletedTask; }) };
+        var o = new EngineOptions
+        {
+            NodeId = "n1", Name = "n1", Stages = ["search-index"], Workers = 1, Threads = 2, Once = true, SearchIndexCatchUp = true, HeadBuiltAt = _ => Task.FromResult(headBuiltAt), Now = () => T0,
+            PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
+            TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter(),
+        };
+        return new NodeEngine(s, P, o, h);
+    }
+
+    [Fact]
+    public async Task A_start_with_an_up_to_date_head_adds_no_catch_up_entry()
+    {
+        var s = new FakeStore(); await GroupDone(s, "g1", T0.AddMinutes(-30)); var built = new List<string>();
+        await Run(CatchUpEngine(s, T0.AddMinutes(-10), built));   // the head was built after the last finished group record
+        Assert.Equal(0, SearchAdds(s)); Assert.Empty(built);
+    }
+
+    [Fact]
+    public async Task A_start_with_one_newer_group_record_adds_one_catch_up_entry()
+    {
+        var s = new FakeStore(); await GroupDone(s, "g1", T0.AddMinutes(-30)); await GroupDone(s, "g2", T0.AddMinutes(-5)); var built = new List<string>();
+        await Run(CatchUpEngine(s, T0.AddMinutes(-10), built));
+        Assert.Equal(1, SearchAdds(s)); Assert.Single(built);
+    }
+
     [Fact]
     public async Task A_process_done_that_wrote_centers_adds_search_index_due_in_15_minutes_and_another_add_while_pending_is_a_no_op()
     {
         var s = new FakeStore(); await Process(s, "v1"); await Process(s, "v2"); var built = new List<string>();
         await Run(Engine(s, false, built));
         var q = s.Replay(P.Prefix); var e = q.Entry("search-index", "search-index")!;
-        Assert.Equal("pending", e.State); Assert.Equal(Protocol.Utc(T0.AddMinutes(15)), e.Due);
         Assert.Equal(1, SearchAdds(s));                 // two dramas finished their centers: ONE add (the second found it pending)
-        Assert.Empty(built);                             // not due yet
+        Assert.Single(built);                            // 0.13.17: nothing else is left, so the debounce is pulled forward
         Assert.Equal(Protocol.Utc(T0), q.Get("v1")!.CentersAt);
     }
 

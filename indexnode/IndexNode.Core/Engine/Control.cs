@@ -47,6 +47,17 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         return cur;
     }
 
+    /// <summary>indexnode control region &lt;name&gt;|off: the store's region for the region rule (off removes it). Everything else in the file stays.</summary>
+    public static async Task<ControlFile> SetRegionAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        if (string.IsNullOrWhiteSpace(value)) throw new ArgumentException("control region <name like westus2>|off");
+        cur.Region = value.Equals("off", StringComparison.OrdinalIgnoreCase) ? null : Placement.NormRegion(value);
+        cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        return cur;
+    }
+
     /// <summary>indexnode control ai-dramas on|off: whether nodes may claim a drama the pre-check held as AI.</summary>
     public static async Task<ControlFile> SetAiDramasAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
     {

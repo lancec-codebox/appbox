@@ -378,6 +378,8 @@ public sealed class ControlFile
     public DownloadsControl? Downloads { get; set; }
     /// <summary>0.13.1: "on" lets nodes claim an AI-held drama (the pre-check flagged it AI); "off" or absent: they stay pending. Default off.</summary>
     public string? AiDramas { get; set; }
+    /// <summary>0.13.17: the store's Azure region (e.g. "westus2"). Nodes with a region-only stage (RegionGate.OnlyStages) must run in it. Absent: no rule. Older nodes ignore the field.</summary>
+    public string? Region { get; set; }
     [System.Text.Json.Serialization.JsonIgnore] public bool AiDramasOn => string.Equals(AiDramas, "on", StringComparison.OrdinalIgnoreCase);
 
     public static Level ParseLevel(string? s) => s?.ToLowerInvariant() switch
