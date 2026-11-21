@@ -55,21 +55,6 @@ public class Backfill0133Tests
         Assert.Null(VideoJson.Duration(r)); Assert.Null(r["youtube"]!["durationSeconds"]); Assert.Equal("unknown", (string?)r["youtube"]!["durationSource"]);
     }
 
-    [Fact(Skip = "2026-11-20: needs ffmpeg on PATH, which CI runners do not have; follow-up Victor29")]
-    public async Task The_stored_video_header_is_probed_with_ffprobe_as_the_last_resort()
-    {
-        var dir = Path.Combine(Path.GetTempPath(), "bf0133-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir); var mp4 = Path.Combine(dir, "v.mp4");
-        var psi = new System.Diagnostics.ProcessStartInfo("ffmpeg") { RedirectStandardError = true, RedirectStandardOutput = true };
-        foreach (var x in new[] { "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=3", "-movflags", "+faststart", "-pix_fmt", "yuv420p", mp4 }) psi.ArgumentList.Add(x);
-        using (var p = System.Diagnostics.Process.Start(psi)!) { await p.WaitForExitAsync(); Assert.Equal(0, p.ExitCode); }
-        var s = new FakeStore(); await s.PutAsync(P.Video("probe000001", "video.mp4"), await File.ReadAllBytesAsync(mp4), null, null, false, default);
-        var rep = await VideosBackfill.BackfillAsync(s, P, false, 0.5, 1, null, default);
-        Assert.Empty(rep.Failed);
-        var r = JsonNode.Parse((await s.GetAsync(VideoJson.Name(P, "probe000001"), default))!.Data)!.AsObject();
-        Assert.InRange(VideoJson.Duration(r) ?? 0, 2.9, 3.2); Assert.Equal("ffprobe", (string?)r["youtube"]!["durationSource"]);
-        Directory.Delete(dir, true);
-    }
-
     [Fact]
     public async Task EnsureAsync_builds_a_missing_video_json_and_leaves_an_existing_one()
     {
@@ -107,5 +92,21 @@ public class Backfill0133ProbeTests
 {
     static readonly Paths P = new("index-test/");
 
+    static bool OnPath(string name) => (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries).Any(d => File.Exists(Path.Combine(d, OperatingSystem.IsWindows() ? name + ".exe" : name)));
 
+    [Fact]
+    public async Task The_stored_video_header_is_probed_with_ffprobe_as_the_last_resort()
+    {
+        if (!OnPath("ffmpeg") || !OnPath("ffprobe")) return;   // CI runners may have no ffmpeg/ffprobe: nothing to probe with, as in the other ffmpeg tests
+        var dir = Path.Combine(Path.GetTempPath(), "bf0133-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir); var mp4 = Path.Combine(dir, "v.mp4");
+        var psi = new System.Diagnostics.ProcessStartInfo("ffmpeg") { RedirectStandardError = true, RedirectStandardOutput = true };
+        foreach (var x in new[] { "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=3", "-movflags", "+faststart", "-pix_fmt", "yuv420p", mp4 }) psi.ArgumentList.Add(x);
+        using (var p = System.Diagnostics.Process.Start(psi)!) { await p.WaitForExitAsync(); Assert.Equal(0, p.ExitCode); }
+        var s = new FakeStore(); await s.PutAsync(P.Video("probe000001", "video.mp4"), await File.ReadAllBytesAsync(mp4), null, null, false, default);
+        var rep = await VideosBackfill.BackfillAsync(s, P, false, 0.5, 1, null, default);
+        Assert.Empty(rep.Failed);
+        var r = JsonNode.Parse((await s.GetAsync(VideoJson.Name(P, "probe000001"), default))!.Data)!.AsObject();
+        Assert.InRange(VideoJson.Duration(r) ?? 0, 2.9, 3.2); Assert.Equal("ffprobe", (string?)r["youtube"]!["durationSource"]);
+        Directory.Delete(dir, true);
+    }
 }

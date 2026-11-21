@@ -130,7 +130,7 @@ public static class VideosBackfill
         try
         {
             var blob = paths.Video(id, "video.mp4"); var h = await store.HeadAsync(blob, ct); if (h == null || h.Size == 0) return null;
-            var r = await store.GetRangeAsync(blob, 0, (int)Math.Min(h.Size, 32 * 1024 * 1024), h.ETag, ct); if (r.Data == null) return null;
+            var r = await GhostSafeRead.RangeAsync(store, new BlobPin(blob, h.ETag, h.Size), 0, (int)Math.Min(h.Size, 32 * 1024 * 1024), ct); if (r.Data == null) return null;
             tmp = Path.Combine(Path.GetTempPath(), "indexnode-probe-" + Guid.NewGuid().ToString("N") + ".mp4"); await File.WriteAllBytesAsync(tmp, r.Data, ct);
             var psi = new System.Diagnostics.ProcessStartInfo("ffprobe") { RedirectStandardOutput = true, RedirectStandardError = true };
             foreach (var x in new[] { "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", tmp }) psi.ArgumentList.Add(x);

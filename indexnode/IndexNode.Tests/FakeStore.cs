@@ -8,6 +8,7 @@ public sealed class FakeStore : IStore
     public sealed class Blob
     {
         public byte[] Data = [];
+        public byte[]? GhostData;   // set while the blob is a dehydrated Nexis ghost (Data is then empty)
         public Dictionary<string, string> Tags = new();
         public Dictionary<string, string> Meta = new();
         public string? Lease;
@@ -147,8 +148,11 @@ public sealed class FakeStore : IStore
 
     public Task<BlobContent?> GetAsync(string name, CancellationToken ct)
     {
-        lock (gate) { Op("get"); return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"") : null); }
+        lock (gate) { Op("get"); if (Blobs.TryGetValue(name, out var g) && g.GhostData != null) { g.Data = g.GhostData; g.GhostData = null; g.Version++; } return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"") : null); }
     }
+
+    /// <summary>Nexis dehydrates the blob: 0 bytes committed and a new ETag, the content kept aside until a whole read hydrates it (same bytes, another ETag).</summary>
+    public void Dehydrate(string name) { lock (gate) { var b = Blobs[name]; b.GhostData = b.Data; b.Data = []; b.Version++; } }
 
     public Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct)
     {

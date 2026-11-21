@@ -97,7 +97,9 @@ public sealed class CentersZip
 {
     public required IStore Store { get; init; }
     public required string Blob { get; init; }
-    public required string? ETag { get; init; }
+    public required string? ETag { get; set; }
+    /// <summary>idx_sha256 of the content opened (empty when unknown): a changed ETag with the same length and sha is a ghost transition, not a rewrite.</summary>
+    public string? Sha { get; init; }
     public required long ZipSize { get; init; }
     /// <summary>Where centers/centers.bin starts inside the zip (past its local header).</summary>
     public required long DataStart { get; init; }
@@ -109,18 +111,17 @@ public sealed class CentersZip
         // a Nexis ghost HEADs as 0 bytes (the data sits in uncommitted blocks): a whole read hydrates it (RestStore), then HEAD again. A zip of 0 bytes used to reach the range read as "bytes=0--1" (ArgumentOutOfRange 'to' = -1)
         if (h.Size < 22) { await store.GetAsync(blob, ct); h = await store.HeadAsync(blob, ct) ?? throw new FileNotFoundException(blob); }
         if (h.Size < 22) throw new InvalidDataException($"{blob} is {h.Size} bytes: not a zip (a ghost that could not be hydrated?)");
-        var src = new BlobZipSource
-(store, blob, h.Size, h.ETag);
+        var src = new BlobZipSource(store, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
         var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
         var e = es.FirstOrDefault(x => x.Name == CentersFile.Member) ?? throw new InvalidDataException($"{blob} has no {CentersFile.Member}");
         if (e.Method != 0) throw new NotSupportedException("centers.bin must be stored, not deflated");
         var lh = await src.ReadAsync(e.LocalOffset, 30 + 256, ct);
         if (lh.Length < 30 || BitConverter.ToUInt32(lh, 0) != 0x04034b50) throw new InvalidDataException("bad local header");
-        return new CentersZip { Store = store, Blob = blob, ETag = h.ETag, ZipSize = h.Size, DataStart = e.LocalOffset + 30 + BitConverter.ToUInt16(lh, 26) + BitConverter.ToUInt16(lh, 28), DataLength = e.Size };
+        return new CentersZip { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = e.LocalOffset + 30 + BitConverter.ToUInt16(lh, 26) + BitConverter.ToUInt16(lh, 28), DataLength = e.Size };
     }
 
     /// <summary>A zip whose place is already known (the search index records ETag, size and where centers.bin starts): no HEAD, no directory read.</summary>
-    public static CentersZip FromIndex(IStore store, string blob, SearchUpload u) => new() { Store = store, Blob = blob, ETag = u.ETag.Length == 0 ? null : u.ETag, ZipSize = u.ZipSize, DataStart = u.DataStart, DataLength = u.DataLength };
+    public static CentersZip FromIndex(IStore store, string blob, SearchUpload u) => new() { Store = store, Blob = blob, ETag = u.ETag.Length == 0 ? null : u.ETag, Sha = u.Sha, ZipSize = u.ZipSize, DataStart = u.DataStart, DataLength = u.DataLength };
 
     public int Requests; public long BytesRead;
 
@@ -150,7 +151,7 @@ public sealed class CentersZip
     public async Task<byte[]> ReadAsync(long off, int len, CancellationToken ct)
     {
         Interlocked.Increment(ref Requests); Interlocked.Add(ref BytesRead, len);
-        var r = await Store.GetRangeAsync(Blob, DataStart + off, len, ETag, ct);
+        var pin = new BlobPin(Blob, ETag, ZipSize, Sha); var r = await GhostSafeRead.RangeAsync(Store, pin, DataStart + off, len, ct); ETag = pin.ETag;
         if (r.Mismatch) throw new StaleZipException(Blob);
         var d = r.Data ?? throw new FileNotFoundException(Blob + " is gone");
         if (d.Length != len) throw new InvalidDataException($"{Blob}: asked for {len} bytes at {off}, got {d.Length}");

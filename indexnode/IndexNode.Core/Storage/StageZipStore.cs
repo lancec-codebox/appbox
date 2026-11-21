@@ -20,12 +20,13 @@ public interface IStageStore
 public sealed class StaleZipException(string name) : IOException($"{name} changed while it was being read");
 
 /// <summary>Reads a zip blob by ranges, each pinned to the ETag the directory was read at.</summary>
-public sealed class BlobZipSource(IStore store, string name, long length, string? etag) : IZipSource
+public sealed class BlobZipSource(IStore store, string name, long length, string? etag, string? sha = null) : IZipSource
 {
+    readonly BlobPin pin = new(name, etag, length, sha);
     public long Length => length;
     public async Task<byte[]> ReadAsync(long off, int len, CancellationToken ct)
     {
-        var r = await store.GetRangeAsync(name, off, len, etag, ct);
+        var r = await GhostSafeRead.RangeAsync(store, pin, off, len, ct);
         if (r.Mismatch) throw new StaleZipException(name);
         return r.Data ?? throw new FileNotFoundException(name + " is gone");
     }
@@ -89,7 +90,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
             if (!File.Exists(local)) { Directory.CreateDirectory(Path.GetDirectoryName(local)!); var tmp = local + "." + Guid.NewGuid().ToString("N")[..6]; await inner.DownloadToFileAsync(blob, tmp, ct); File.Move(tmp, local, true); }
             src = new FileZipSource(local);
         }
-        else src = new BlobZipSource(inner, blob, h.Size, h.ETag);
+        else src = new BlobZipSource(inner, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
         var entries = (await ZipFormat.ReadDirectoryAsync(src, ct)).Where(e => !e.IsDirectory).ToDictionary(e => e.Name, StringComparer.Ordinal);
         return views[blob] = new View { Blob = blob, ETag = h.ETag, Src = src, Entries = entries, Meta = h.Metadata };
     }

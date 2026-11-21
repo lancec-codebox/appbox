@@ -1,3 +1,10 @@
+## 0.13.4
+
+Live fix: pre-checks failed with "centers.zip is gone" after Nexis dehydrated a centers.zip.
+
+- **A Nexis ghost transition never fails a read.** Dehydrating or hydrating a blob changes its ETag, not its bytes, but a reader holding the old ETag got a 412 and called the file gone. One helper (`GhostSafeRead`, used by `CentersZip` for the pre-check search, the search-index cache and the catalog/groups builders, by `BlobZipSource` for every stage-zip range read, and by the backfill's video header probe) now treats a 412 or "gone" on a blob that still exists as: hydrate if it is a ghost, HEAD again, check that the length (and idx_sha256 when both sides have one) are unchanged, then read on with the new ETag. Only a real 404 or changed content is an error.
+- The ffprobe backfill test returns early when ffmpeg/ffprobe are not on PATH (CI runners), with no Skip.
+
 ## 0.13.3
 
 Four fixes from the live 0.13.2 run.
