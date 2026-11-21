@@ -109,8 +109,8 @@ public static class VideosBackfill
     {
         try
         {
-            var blob = paths.Video(id, "download.zip"); var h = await store.HeadAsync(blob, ct); if (h == null || h.Size < 22) return (null, null);
-            var src = new BlobZipSource(store, blob, h.Size, h.ETag);
+            var blob = paths.Video(id, "download.zip"); var h = await ZipOpen.HeadReadableAsync(store, blob, ct, mustBeZip: false); if (h == null || h.Size < ZipOpen.MinZip) return (null, null);   // 0.13.5: a ghost is hydrated first
+            var src = new BlobZipSource(store, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
             var es = await ZipFormat.ReadDirectoryAsync(src, ct, 4096);
             foreach (var (name, key) in new[] { ("downloaded.json", "durationSeconds"), ("info.json", "duration") })
             {
@@ -156,8 +156,8 @@ public static class VideosBackfill
     /// <summary>The one remaining reader of transcribe.zip (backfill only): the upload's language and dubbed from its asr member, by a few range reads. Null/null when there is no transcript.</summary>
     public static async Task<(string? Language, bool? Dubbed)> LegacySpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct)
     {
-        var blob = paths.Video(id, "transcribe.zip"); var h = await raw.HeadAsync(blob, ct); if (h == null) return (null, null);
-        var src = new BlobZipSource(raw, blob, h.Size, h.ETag);
+        var blob = paths.Video(id, "transcribe.zip"); var h = await ZipOpen.HeadReadableAsync(raw, blob, ct, mustBeZip: false); if (h == null || h.Size < ZipOpen.MinZip) return (null, null);
+        var src = new BlobZipSource(raw, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
         var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
         var e = es.FirstOrDefault(x => x.Name == "asr/" + Transcribe.ModelName + ".zh.json"); if (e == null) return (null, null);
         var lh = await src.ReadAsync(e.LocalOffset, 30, ct); if (lh.Length < 30 || BitConverter.ToUInt32(lh, 0) != 0x04034b50) return (null, null);

@@ -78,9 +78,9 @@ public static class EndingBackfill
     /// <summary>Reads a drama's describe.zip whole (one ETag-pinned view: the directory and every member come from that one version). Null when it is gone, unreadable, or already has an "ending" key.</summary>
     static async Task<Loaded?> LoadAsync(IStore raw, string blob, string id, CancellationToken ct)
     {
-        var head = await raw.HeadAsync(blob, ct);
-        if (head?.ETag == null) return null;
-        IZipSource src = new BlobZipSource(raw, blob, head.Size, head.ETag);
+        var head = await ZipOpen.HeadReadableAsync(raw, blob, ct, mustBeZip: false);
+        if (head?.ETag == null || head.Size < ZipOpen.MinZip) return null;
+        IZipSource src = new BlobZipSource(raw, blob, head.Size, head.ETag, head.Metadata.GetValueOrDefault("idx_sha256"));
         try
         {
             var entries = (await ZipFormat.ReadDirectoryAsync(src, ct)).Where(e => !e.IsDirectory).ToList();

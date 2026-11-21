@@ -72,6 +72,33 @@ public sealed class RestStore : IStore
         return read.Repaired || read.Snapshot != null || (await blob.ReadAsync(ct))?.Length > 0;
     }
 
+    /// <summary>
+    /// 0.13.5: a read that went to a Nexis snapshot (the blob was caught mid-dehydrate) and got 404: Nexis deletes that ephemeral snapshot a few minutes after the transition, so a missing snapshot is not a missing blob.
+    /// Back to the base blob: wait for the transition to finish (look again with the store's retry backoff, about 2 minutes in all), hydrate when it is a ghost, then read on (from a fresh snapshot when it is still transitioning).
+    /// Only a base blob that 404s is gone (the repeated read answers that).
+    /// </summary>
+    private async Task<HttpResponseMessage> SendReadAsync(string name, Func<HttpRequestMessage> make, CancellationToken ct, HttpCompletionOption opt = HttpCompletionOption.ResponseContentRead)
+    {
+        bool viaSnapshot = ReadSnapshots.ContainsKey(name);
+        var r = await SendAsync(make, ct, opt: opt);
+        if (r.StatusCode != HttpStatusCode.NotFound || !viaSnapshot) return r;
+        r.Dispose();
+        Log.Info($"nexis: the snapshot of {name} is gone: back to the blob, waiting for the transition to finish");
+        ReadSnapshots.TryRemove(name, out _);
+        var blob = GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(this, name);
+        for (int i = 1; ; i++)
+        {
+            try
+            {
+                var read = await NexisAccess.EnsureReadableAsync(blob, ct, failOnEmptyNonGhost: false);
+                if (read.Snapshot != null) ReadSnapshots[name] = read.Snapshot;
+                break;
+            }
+            catch (PermanentFailure e) when (i < 6) { Log.Info($"nexis: {name} is still changing state ({e.Message}), looking again"); await Task.Delay(RetryDelay(i), ct); }
+        }
+        return await SendAsync(make, ct, opt: opt);
+    }
+
     private Uri ReadUri(string name) => BlobUri(name, ReadSnapshots.TryGetValue(name, out var snap) ? "snapshot=" + Uri.EscapeDataString(snap) : null);
 
     public Uri BlobUri(string name, string? extra = null)
@@ -183,7 +210,7 @@ public sealed class RestStore : IStore
 
     public async Task<BlobContent?> GetAsync(string name, CancellationToken ct)
     {
-        using var r = await SendAsync(() => Req(HttpMethod.Get, ReadUri(name)), ct);
+        using var r = await SendReadAsync(name, () => Req(HttpMethod.Get, ReadUri(name)), ct);
         if (r.StatusCode == HttpStatusCode.NotFound) return null;
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
         var body = await r.Content.ReadAsByteArrayAsync(ct);
@@ -196,7 +223,7 @@ public sealed class RestStore : IStore
     {
         if (len <= 0) return [];   // no HTTP form for an empty range: off+len-1 < 0 made RangeHeaderValue throw "to ('-1') must be non-negative"
         if (!ReadSnapshots.ContainsKey(name)) await HydrateGhostAsync(name, ct);
-        using var r = await SendAsync(() => { var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1); return q; }, ct);
+        using var r = await SendReadAsync(name, () => { var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1); return q; }, ct);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (range)");
         return await r.Content.ReadAsByteArrayAsync(ct);
     }
@@ -272,7 +299,7 @@ public sealed class RestStore : IStore
     /// <summary>Size, ETag and metadata. 0.13.0: this never hydrates a ghost (a metadata check must not make Nexis bring 1 GB back); only reading the contents does. A ghost's size is what is committed (0) and its ETag and metadata are the blob's own.</summary>
     public async Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
     {
-        using var r = await SendAsync(() => Req(HttpMethod.Head, ReadUri(name)), ct);
+        using var r = await SendReadAsync(name, () => Req(HttpMethod.Head, ReadUri(name)), ct);
         if (r.StatusCode == HttpStatusCode.NotFound) return null;
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Properties");
         long size = r.Content.Headers.ContentLength ?? 0;
@@ -368,7 +395,7 @@ public sealed class RestStore : IStore
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
     {
         if (len <= 0) return new([], false);
-        using var r = await SendAsync(() =>
+        using var r = await SendReadAsync(name, () =>
         {
             var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1);
             if (ifMatch != null) q.Headers.TryAddWithoutValidation("If-Match", ifMatch);
@@ -453,7 +480,7 @@ public sealed class RestStore : IStore
 
     public async Task DownloadToFileAsync(string name, string path, CancellationToken ct)
     {
-        using var r = await SendAsync(() => Req(HttpMethod.Get, ReadUri(name)), ct, opt: HttpCompletionOption.ResponseHeadersRead);
+        using var r = await SendReadAsync(name, () => Req(HttpMethod.Get, ReadUri(name)), ct, HttpCompletionOption.ResponseHeadersRead);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
         if (r.Content.Headers.ContentLength == 0 && !ReadSnapshots.ContainsKey(name) && await HydrateGhostAsync(name, ct)) { await DownloadToFileAsync(name, path, ct); return; }
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);

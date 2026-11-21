@@ -107,10 +107,8 @@ public sealed class CentersZip
 
     public static async Task<CentersZip?> OpenAsync(IStore store, string blob, CancellationToken ct)
     {
-        var h = await store.HeadAsync(blob, ct); if (h == null) return null;
-        // a Nexis ghost HEADs as 0 bytes (the data sits in uncommitted blocks): a whole read hydrates it (RestStore), then HEAD again. A zip of 0 bytes used to reach the range read as "bytes=0--1" (ArgumentOutOfRange 'to' = -1)
-        if (h.Size < 22) { await store.GetAsync(blob, ct); h = await store.HeadAsync(blob, ct) ?? throw new FileNotFoundException(blob); }
-        if (h.Size < 22) throw new InvalidDataException($"{blob} is {h.Size} bytes: not a zip (a ghost that could not be hydrated?)");
+        // a Nexis ghost HEADs as 0 bytes (the data sits in uncommitted blocks): ZipOpen hydrates it and HEADs again; a 0-byte blob that is no ghost is "not a zip"
+        var h = await ZipOpen.HeadReadableAsync(store, blob, ct); if (h == null) return null;
         var src = new BlobZipSource(store, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
         var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
         var e = es.FirstOrDefault(x => x.Name == CentersFile.Member) ?? throw new InvalidDataException($"{blob} has no {CentersFile.Member}");

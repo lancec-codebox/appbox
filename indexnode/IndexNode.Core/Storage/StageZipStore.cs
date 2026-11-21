@@ -81,7 +81,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
         if (!fresh && views.TryGetValue(blob, out var v)) return v;
         views.TryRemove(blob, out _);
         if (LocalCacheStore.Unwrap(inner) is RestStore rest && !fresh) { try { await NexisAccess.PrepareAsync(rest, blob, ct); } catch (OperationCanceledException) { throw; } catch (Exception e) { Log.Info($"zip {blob}: touch failed ({e.Message})"); } }   // a ghosted zip is restored first
-        var h = await inner.HeadAsync(blob, ct);
+        var h = await ZipOpen.HeadReadableAsync(inner, blob, ct, mustBeZip: false);
         if (h == null) return null;
         IZipSource src;
         if (h.Size <= WholeZipLimit)

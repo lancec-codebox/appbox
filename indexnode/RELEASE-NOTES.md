@@ -1,3 +1,10 @@
+## 0.13.5
+
+Two read paths still failed on Nexis ghosts after 0.13.4.
+
+- **A vanished snapshot is not a missing blob.** A read that went to a Nexis snapshot (the blob was caught mid-dehydrate) and got a 404 used to end as "centers.zip is gone": Nexis deletes that ephemeral snapshot a few minutes after the transition. `RestStore` now goes back to the base blob, waits for the transition to finish (about 2 minutes, with its retry backoff), hydrates when it is a ghost, and reads on (`GetAsync`, ranged reads including the If-Match one, `HeadAsync`, downloads). Only a base blob that 404s is gone.
+- **Every zip open hydrates a ghost first.** The backfill's `download.zip` (duration) and `transcribe.zip` reads, the `describe.zip` ending backfill and the stage-zip view took the length from a HEAD (0 for a ghost) and failed with "not a zip: the blob is 0 bytes". They now all go through `ZipOpen.HeadReadableAsync`, like `CentersZip`: a 0-byte blob tagged `ghostd_state=ghost` (or with `ghostd_size` > 0) is hydrated and HEADed again; a 0-byte blob with no ghost tags is still "not a zip".
+
 ## 0.13.4
 
 Live fix: pre-checks failed with "centers.zip is gone" after Nexis dehydrated a centers.zip.
