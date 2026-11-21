@@ -222,6 +222,7 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
         if (QueueProcessing)
         {
             var p = JobDescriptor.NewProcess(id); p.Priority = ctx.Job.Priority; p.Steps = null;
+            await PubTime.StampAsync(ctx.Store, ctx.Paths, id, ctx.Job, p, ctx.Token);
             if (!ctx.FollowUps.Any(l => l.T == "add" && l.Stage == "process")) ctx.FollowUps.Add(QLine.Add(id, "process", p, Protocol.NowUtc()));
             Log.Info($"download {id}: process entry added to the queue");
         }

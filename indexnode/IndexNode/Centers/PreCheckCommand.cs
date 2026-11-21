@@ -62,6 +62,6 @@ public static class PreCheckCommand
         string speech = r.Analysis.Speech is { } sp ? (sp.Unavailable == null ? "  speech " + (sp.Language ?? "-") + (sp.Dubbed ? " DUB" : "") : "  speech: metadata fallback") : "";
         string member = d.MatchedMember != null ? $"  member {d.MatchedMember} ({d.Checked.Count} checked)" : d.Checked.Count > 0 ? $"  ({d.Checked.Count} members checked, none passed)" : "";
         string sp2 = r.Analysis.Speech == null ? "  speech: skipped (not needed)" : speech;
-        return $"{id}: {d.Decision}  {top}{member}  {ai}  threads={threads}\n    time split: cut {Sec("cut")}s, frames {Sec("frames")}s, sscd {Sec("sscd")}s, lookup {Sec("lookup")}s ({Sec("lookupRequests")} requests, {(s.TryGetValue("lookupBytes", out var by) ? by / 1048576 : 0):0.0} MB), members {Sec("members")}s ({Sec("membersDirect")} of {Sec("membersChecked")} scored directly), ai {Sec("ai")}s{sp2}, total {Sec("total")}s (the section download is timed apart)";
+        return $"{id}: {d.Decision}  {top}{member}  {ai}  threads={threads}\n    time split: cut {Sec("cut")}s, frames {Sec("frames")}s, sscd {Sec("sscd")}s, lookup {Sec("lookup")}s (cache {Sec("cacheHits")} hits, {Sec("cacheRanged")} read by range, {Sec("fillsQueued")} fills queued; {Sec("lookupRequests")} ranged requests, {(s.TryGetValue("lookupBytes", out var by) ? by / 1048576 : 0):0.0} MB), members {Sec("members")}s ({Sec("membersDirect")} of {Sec("membersChecked")} scored directly), ai {Sec("ai")}s{sp2}, total {Sec("total")}s (the section download is timed apart)";
     }
 }

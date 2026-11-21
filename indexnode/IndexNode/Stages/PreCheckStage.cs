@@ -84,35 +84,86 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
                 }
                 segs.Add(new SampleSegment(clip, ws, we, wp));
             }
-            double cutSeconds = tcut.Elapsed.TotalSeconds;
-            var (start, end) = (segs[0].Start, segs[^1].End);
-            if (keepSample != null) { Directory.CreateDirectory(keepSample); for (int k = 0; k < segs.Count; k++) File.Copy(segs[k].Path, Path.Combine(keepSample, segs.Count == 1 ? "sample.mp4" : $"sample{k}.mp4"), true); }
-            PreCheckAnalysis analysis;
-            try { analysis = await analyzer.AnalyzeSegmentsAsync(segs, s, Math.Max(1, ctx.ThreadShare()), p => ctx.Report("precheck", p), ct); }
-            catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"process {id}: pre-check skipped (analysis failed: {e.Message})"); return Skip("analysis failed: " + e.Message); }
-            if (analysis.SkippedReason != null) { Log.Info($"process {id}: pre-check skipped ({analysis.SkippedReason})"); return Skip(analysis.SkippedReason); }
-            analysis = analysis with { Group = ProposeGroup(analysis, segs, s) };
-            var decision = PreCheck.Decide(analysis, duration, _ => null, s);
-            // the language ID runs only when it can change the decision: an authoritative skip whose group copies are all dubs (the canonical exception); the audio is the first segment's
-            if (PreCheck.SpeechNeeded(analysis, decision))
-            {
-                var sw2 = System.Diagnostics.Stopwatch.StartNew();
-                var speech = await analyzer.SpeechAsync(segs[0].Path, s, Math.Max(1, ctx.ThreadShare()), ct);
-                var sec = new Dictionary<string, double>(analysis.Seconds) { ["speech"] = sw2.Elapsed.TotalSeconds };
-                analysis = analysis with { Speech = speech, Seconds = sec };
-                decision = PreCheck.Decide(analysis, duration, _ => null, s);
-            }
-            { var sd = new Dictionary<string, double>(analysis.Seconds) { ["cut"] = cutSeconds }; if (!sd.ContainsKey("speech")) sd["speechSkipped"] = 1; analysis = analysis with { Seconds = sd }; }
-            bool ai = analysis.AiScore >= s.AiFlag;
-            if (PreCheckSettings.AiThresholdWarning(s, analysis.Frames) is { } warn) Log.Info($"process {id}: WARNING {warn}");
-            var rec = PreCheck.Record(id, decision, analysis, info, DownloadedFormats.FromInfo(info), (start, end), duration, s, ctx.NodeId, version, ai, 0, !PreCheckDecision.IsSkip(decision.Decision));
-            rec["youtube"] = new JsonObject { ["id"] = id, ["url"] = ctx.Job.Url ?? (string?)info["webpage_url"] ?? "https://www.youtube.com/watch?v=" + id };
-            rec["seconds"]!["total"] = Math.Round(sw.Elapsed.TotalSeconds, 2); rec["threads"] = Math.Max(1, ctx.ThreadShare()); rec["source"] = "stored-video";
-            Log.Info($"process {id}: pre-check {decision.Decision} ({string.Join("; ", decision.Reasons)}), ai score {analysis.AiScore:0.000}{(ai ? " (flag)" : "")}, {sw.Elapsed.TotalSeconds:0.0}s");
-            analysis = analysis with { Seconds = new Dictionary<string, double>(analysis.Seconds) { ["total"] = Math.Round(sw.Elapsed.TotalSeconds, 2) } };
-            return new Run(decision, rec, PreCheck.Summary(decision, analysis, ai, s), analysis, ai);
+            return await FinishAsync(ctx, segs, duration, info, keepSample, tcut.Elapsed.TotalSeconds, sw, "stored-video", strict);
         }
         finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+
+
+    /// <summary>0.13.16: the check on the stage's sample files (index/videos/&lt;id&gt;/sample/: sample0/1.mp4, audio, info.json, sample.json), the same two-segment decision as the stored-video one. No write of any kind. Null when the pre-check cannot run and strict is off.</summary>
+    public async Task<Run?> AnalyzeSampleAsync(JobContext ctx, string? keepSample, CancellationToken ct, bool strict = false)
+    {
+        var store = ctx.Store; var paths = ctx.Paths; var id = ctx.Job.JobId; var s = settings; var sw = System.Diagnostics.Stopwatch.StartNew();
+        if (await analyzer.UnavailableAsync(s, ct) is { } unavailable) { Log.Info($"check {id}: skipped ({unavailable})"); return SkipOf(ctx, strict, unavailable); }
+        var mk = await store.GetAsync(paths.Video(id, SampleStage.Dir + "sample.json"), ct);
+        if (mk == null) return SkipOf(ctx, strict, "no sample.json (the sample is not complete)");
+        var m = JsonNode.Parse(mk.Data)!.AsObject();
+        var infoBlob = await store.GetAsync(paths.Video(id, SampleStage.Dir + "info.json"), ct);
+        var info = infoBlob == null ? new JsonObject() : JsonNode.Parse(infoBlob.Data) as JsonObject ?? new JsonObject();
+        var work = Path.Combine(Path.GetTempPath(), "indexnode", "ck-" + id + "-" + Guid.NewGuid().ToString("N")[..6]);
+        Directory.CreateDirectory(work);
+        try
+        {
+            ctx.Report("check", "fetch");
+            var segs = new List<SampleSegment>();
+            foreach (var sg in (m["segments"] as JsonArray)?.OfType<JsonObject>() ?? [])
+            {
+                var f = Path.Combine(work, (string)sg["file"]!);
+                await store.DownloadToFileAsync(paths.Video(id, SampleStage.Dir + (string)sg["file"]!), f, ct);
+                segs.Add(new SampleSegment(f, (double)sg["start"]!, (double)sg["end"]!, (double?)sg["position"] ?? 0.5));
+            }
+            if (segs.Count == 0) return SkipOf(ctx, strict, "sample.json names no segment");
+            string? audio = null;
+            if ((string?)m["audio"] is { Length: > 0 } an) { audio = Path.Combine(work, an); await store.DownloadToFileAsync(paths.Video(id, SampleStage.Dir + an), audio, ct); }
+            return await FinishAsync(ctx, segs, (double)m["duration"]!, info, keepSample, 0, sw, "sample", strict, audio);
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    /// <summary>The same on local sample files (`indexnode check --input-local`): a folder with sample.json and the files it names. Reads and writes no store.</summary>
+    public async Task<Run?> AnalyzeLocalSampleAsync(JobContext ctx, string dir, string? keepSample, CancellationToken ct)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var m = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(dir, "sample.json"), ct))!.AsObject();
+        var info = File.Exists(Path.Combine(dir, "info.json")) ? JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(dir, "info.json"), ct)) as JsonObject ?? new JsonObject() : new JsonObject();
+        var segs = (m["segments"] as JsonArray)!.OfType<JsonObject>().Select(sg => new SampleSegment(Path.Combine(dir, (string)sg["file"]!), (double)sg["start"]!, (double)sg["end"]!, (double?)sg["position"] ?? 0.5)).ToList();
+        string? audio = (string?)m["audio"] is { Length: > 0 } a && File.Exists(Path.Combine(dir, a)) ? Path.Combine(dir, a) : null;
+        return await FinishAsync(ctx, segs, (double)m["duration"]!, info, keepSample, 0, sw, "sample-local", false, audio);
+    }
+
+    private static Run? SkipOf(JobContext ctx, bool strict, string why) => strict ? throw new InvalidOperationException($"pre-check could not run for {ctx.Job.JobId}: {why}") : null;
+
+    /// <summary>The analysis of cut or downloaded segments (shared by the stored-video check and the sample check): frames, one SSCD batch, lookup, every member, the language ID only when needed. No write of any kind.</summary>
+    private async Task<Run?> FinishAsync(JobContext ctx, List<SampleSegment> segs, double duration, JsonObject info, string? keepSample, double cutSeconds, System.Diagnostics.Stopwatch sw, string source, bool strict, string? audio = null)
+    {
+        var s = settings; var id = ctx.Job.JobId; var ct = ctx.Token;
+        var (start, end) = (segs[0].Start, segs[^1].End);
+        if (keepSample != null) { Directory.CreateDirectory(keepSample); for (int k = 0; k < segs.Count; k++) File.Copy(segs[k].Path, Path.Combine(keepSample, segs.Count == 1 ? "sample.mp4" : $"sample{k}.mp4"), true); }
+        PreCheckAnalysis analysis;
+        try { analysis = await analyzer.AnalyzeSegmentsAsync(segs, s, Math.Max(1, ctx.ThreadShare()), p => ctx.Report("precheck", p), ct); }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"process {id}: pre-check skipped (analysis failed: {e.Message})"); return SkipOf(ctx, strict, "analysis failed: " + e.Message); }
+        if (analysis.SkippedReason != null) { Log.Info($"process {id}: pre-check skipped ({analysis.SkippedReason})"); return SkipOf(ctx, strict, analysis.SkippedReason); }
+        analysis = analysis with { Group = ProposeGroup(analysis, segs, s) };
+        var decision = PreCheck.Decide(analysis, duration, _ => null, s);
+        // the language ID runs only when it can change the decision: an authoritative skip whose group copies are all dubs (the canonical exception); the audio is the first segment's
+        if (PreCheck.SpeechNeeded(analysis, decision))
+        {
+            var sw2 = System.Diagnostics.Stopwatch.StartNew();
+            var speech = await analyzer.SpeechAsync(audio ?? segs[0].Path, s, Math.Max(1, ctx.ThreadShare()), ct);
+            var sec = new Dictionary<string, double>(analysis.Seconds) { ["speech"] = sw2.Elapsed.TotalSeconds };
+            analysis = analysis with { Speech = speech, Seconds = sec };
+            decision = PreCheck.Decide(analysis, duration, _ => null, s);
+        }
+        { var sd = new Dictionary<string, double>(analysis.Seconds) { ["cut"] = cutSeconds }; if (!sd.ContainsKey("speech")) sd["speechSkipped"] = 1; analysis = analysis with { Seconds = sd }; }
+        bool ai = analysis.AiScore >= s.AiFlag;
+        if (PreCheckSettings.AiThresholdWarning(s, analysis.Frames) is { } warn) Log.Info($"process {id}: WARNING {warn}");
+        var rec = PreCheck.Record(id, decision, analysis, info, DownloadedFormats.FromInfo(info), (start, end), duration, s, ctx.NodeId, version, ai, 0, !PreCheckDecision.IsSkip(decision.Decision));
+        rec["youtube"] = new JsonObject { ["id"] = id, ["url"] = ctx.Job.Url ?? (string?)info["webpage_url"] ?? "https://www.youtube.com/watch?v=" + id };
+        rec["seconds"]!["total"] = Math.Round(sw.Elapsed.TotalSeconds, 2); rec["threads"] = Math.Max(1, ctx.ThreadShare()); rec["source"] = source;
+        Log.Info($"process {id}: pre-check {decision.Decision} ({string.Join("; ", decision.Reasons)}), ai score {analysis.AiScore:0.000}{(ai ? " (flag)" : "")}, {sw.Elapsed.TotalSeconds:0.0}s");
+        analysis = analysis with { Seconds = new Dictionary<string, double>(analysis.Seconds) { ["total"] = Math.Round(sw.Elapsed.TotalSeconds, 2) } };
+        return new Run(decision, rec, PreCheck.Summary(decision, analysis, ai, s), analysis, ai);
     }
 
     /// <summary>0.13.15: the group proposal over the two segments: the frame index runs through the segments in order; each frame's own time is its place in its segment.</summary>

@@ -44,6 +44,15 @@ public static class JobsCommand
                 Console.WriteLine($"{lines.Count} job(s) moved back to pending");
                 return 0;
             }
+            case "sample-first":
+            {
+                bool dry = a.Has("dry-run");
+                var q = await Load(store, paths);
+                var rep = await SampleFirst.RunAsync(q, dry, default, store, paths);
+                Console.WriteLine($"{rep.Downloads} pending download(s) {(dry ? "would become" : "became")} sample entries (priority and due kept), {rep.Checks} pending process entr(ies) {(dry ? "would get" : "got")} a check entry ahead of the process step, {rep.AlreadyDone} already sample-first, {rep.Claimed} under a claim left alone, {rep.Pubs} publish time(s) {(dry ? "would be" : "were")} filled in (info.json, else the source's members.json){(dry ? " (dry run: nothing written)" : $", {rep.Batches} batched append(s)")}");
+                if (!dry) Console.WriteLine("lift the process hold with: indexnode control run --stage process");
+                return 0;
+            }
             case "repair-steps":
             {
                 // 0.13.2: steps listed as done whose output is not on the store come out of the done list; a finished subject that lacks an output is re-opened with only the missing steps

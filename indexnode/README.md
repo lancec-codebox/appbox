@@ -70,6 +70,10 @@ indexnode config set precheck.partial-share 0.60     # share that records anothe
 indexnode config set precheck.duration-percent 0.15  # duration rule: max(15%, 600 s)
 indexnode config set precheck.duration-min 600
 indexnode config set precheck.top-centers 100
+indexnode sample <id> --output-local <dir> --timebox 120   # 0.13.16: the sample download only, writes no store or queue (lancecl1); wrap it: timeout -k 10 130 indexnode sample ...
+indexnode check <id> --input-local <dir> --timebox 120    # 0.13.16: the check on those files, write-free (the host); wrap it: pwsh -NoProfile -File Q:\src\workspace\drama-index\scripts\timebox.ps1 130 indexnode.exe check ...
+indexnode jobs sample-first --dry-run                     # 0.13.16: pending downloads -> sample, pending process -> check; then: indexnode control run --stage process
+indexnode config set sample-budget 200                    # 0.13.16: the sample stage's own budget (default unlimited)
 indexnode config set precheck.window-seconds 300      # 0.13.15: two segments of this length
 indexnode config set precheck.window-positions 0.30,0.70   # 0.13.15: centres of the two segments (30 frames each at precheck.frames 60)
 indexnode config set precheck.order-tolerance-seconds 120  # 0.13.15: a member passes when gap_M >= gap_N - this

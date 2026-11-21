@@ -96,8 +96,8 @@ public class PreCheckTests : IDisposable
         Assert.False((bool)ai["thresholdsApply"]!); Assert.Equal(60, (int)ai["thresholdFrames"]!); Assert.Equal(300, (int)ai["framesScored"]!); Assert.NotNull((string?)ai["warning"]); Assert.Equal(360, d.VideoHeight); Assert.Equal("wa", d.AudioFormat);
         Assert.Equal(0, PreCheckSettings.ParseFrames("all")); Assert.Equal(40, PreCheckSettings.ParseFrames("40"));
         var a = PreCheck.SampleArgs(new PreCheckSettings { VideoHeight = 240, AudioFormat = "249" }, 10, 20, "u");
-        Assert.Equal("res:240", a[1]); Assert.Equal("bv*+249/b", a[3]); Assert.Equal("*10-20", a[5]);
-        Assert.Equal("bv*+wa/b", PreCheck.SampleArgs(d, 0, 5, "u")[3]);
+        Assert.Equal("18/b[height<=240][vcodec!=none][acodec!=none]/bv*[height<=240]+249/b", a[1]); Assert.Equal("*10-20", a[3]);
+        Assert.Equal("18/b[height<=360][vcodec!=none][acodec!=none]/bv*[height<=360]+ba/b", PreCheck.SampleArgs(new PreCheckSettings(), 0, 5, "u")[1]);   // the default audio (wa) becomes ba
         Assert.Equal(Enumerable.Range(0, 7), PreCheck.SubsampleIndices(7, 0)); Assert.Equal(Enumerable.Range(0, 7), PreCheck.SubsampleIndices(7, 50));
         var sub = PreCheck.SubsampleIndices(100, 4); Assert.Equal([12, 37, 62, 87], sub);
     }
@@ -960,6 +960,7 @@ public class PreCheckTests : IDisposable
             var info = new List<PreCheckAnalyzer.SegInfo> { new(0.30, 540, 840, 30), new(0.70, 1260, 1560, 30) };
             var s = new PreCheckSettings();
             await an.AnalyzeFramesAsync(root, 60, BarCrop.None, null, s, 4, _ => { }, new Dictionary<string, double>(), null, default, info);   // 1st run: fills the frames cache (a GET per file)
+            await FramesCache.Current.WaitFillsAsync();
             Assert.True(FramesCache.Current.Downloads > 0);
             int downloads = FramesCache.Current.Downloads; counting.Reset();
             var secs = new Dictionary<string, double>(); var sw = System.Diagnostics.Stopwatch.StartNew();

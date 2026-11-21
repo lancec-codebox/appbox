@@ -14,10 +14,10 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     public const int SeenCap = 500;
     private readonly Func<DateTimeOffset> now = clock ?? (() => DateTimeOffset.UtcNow);
 
-    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null, string? Availability = null, string? UploadDate = null);
+    public sealed record Entry(string Id, string? ChannelId, string? ChannelName, double? Duration = null, string? Title = null, string? Availability = null, string? UploadDate = null, long? Timestamp = null);
 
     /// <summary>The yt-dlp --print template of a listing line (see <see cref="ParseLine"/>).</summary>
-    public const string ListPrint = "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(availability)s\t%(upload_date)s\t%(title)s";
+    public const string ListPrint = "%(id)s\t%(channel_id)s\t%(channel)s\t%(duration)s\t%(availability)s\t%(upload_date)s\t%(timestamp)s\t%(title)s";
     /// <summary>A channel's first poll looks this far back: its back catalogue goes to classification too.</summary>
     public const int ChannelFirstList = 100;
 
@@ -47,7 +47,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         if (!Regex.IsMatch(id, @"^[A-Za-z0-9_-]{11}$")) return null;
         string? Field(int i) => p.Length > i && p[i].Trim() is { Length: > 0 } v && v != "NA" ? v : null;
         double? dur = Field(3) is { } d && double.TryParse(d, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var dv) ? dv : null;
-        return new Entry(id, Field(1), Field(2), dur, p.Length > 6 && string.Join(' ', p[6..]).Trim() is { Length: > 0 } title && title != "NA" ? title : null, Field(4), Field(5));
+        return new Entry(id, Field(1), Field(2), dur, p.Length > 7 && string.Join(' ', p[7..]).Trim() is { Length: > 0 } title && title != "NA" ? title : null, Field(4), Field(5), Field(6) is { } ts && long.TryParse(ts, out var tv) ? tv : null);
     }
 
     public async Task<List<Entry>> ListAsync(JobDescriptor j, int end, CancellationToken ct)
@@ -94,6 +94,15 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         }
     }
 
+    /// <summary>0.13.16: every listed upload's publish time: its own (listing timestamp or upload_date), else an estimate that keeps the listing order (newest first).</summary>
+    public static Dictionary<string, (string Pub, string Source)> PubsOf(IReadOnlyList<Entry> listed, DateTimeOffset anchor)
+    {
+        var filled = PubTime.Fill(listed.Select(e => PubTime.FromListing(e.Timestamp, e.UploadDate) is { } p ? ((string?)p, (string?)PubTime.Listing) : (null, null)).ToList(), anchor);
+        var res = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
+        for (int i = 0; i < listed.Count; i++) res[listed[i].Id] = filled[i];
+        return res;
+    }
+
     private async Task<bool> KnownAsync(JobQueue queue, Paths paths, string id, CancellationToken ct) =>
         queue.Read(s => s.Entry(id, "download") != null) || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0;
 
@@ -129,6 +138,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
 
         // every unknown video becomes an unclassified download job (0.9.1); the singleton classify job decides it. A lookup of a playlist honours its backfill limit (none = every video)
         int limit = lookup && job.Kind == "playlist" && job.Backfill != null ? backfill : int.MaxValue;
+        var pubs = PubsOf(listed, now());
         var batch = new List<JobDescriptor>();   // decided and appended together below: one append for the whole lookup, not one per video
         foreach (var e in fresh)
         {
@@ -137,6 +147,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={e.Id}", job.MaxHeight ?? 480, null);
             d.Source = job.JobId; d.Sources = [job.JobId]; d.AddedAt = addedAt; d.Priority = job.Priority;
             d.Title = e.Title; d.Duration = e.Duration; d.Availability = e.Availability;
+            if (pubs.TryGetValue(e.Id, out var pb)) { d.Pub = pb.Pub; d.PubSource = pb.Source; }
             d.ChannelId = e.ChannelId ?? (job.Kind == "channel" ? job.Id : null); d.ChannelName = e.ChannelName ?? (job.Kind == "channel" ? job.Name : null);
             batch.Add(d);
         }
@@ -202,6 +213,9 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     }
 
     /// <summary>index/sources/&lt;id&gt;/members.json (for the catalog and for "is this new?"): written by the refresh claim, conditional on its ETag. A playlist is rewritten in full; a channel's listing is only its newest uploads, so it is merged into what is there (newest first).</summary>
-    private async Task WriteMembersAsync(Paths paths, JobDescriptor job, List<Entry> listed, bool lookup, string at, CancellationToken ct) =>
-        job.Members = await SourceMembers.MergeAsync(store, paths, job, listed.Select(e => new SourceMember(e.Id, e.Title, e.Duration, e.ChannelId, e.ChannelName, e.Availability)).ToList(), lookup, at, ct);
+    private async Task WriteMembersAsync(Paths paths, JobDescriptor job, List<Entry> listed, bool lookup, string at, CancellationToken ct)
+    {
+        var pubs = PubsOf(listed, now());
+        job.Members = await SourceMembers.MergeAsync(store, paths, job, listed.Select(e => new SourceMember(e.Id, e.Title, e.Duration, e.ChannelId, e.ChannelName, e.Availability, null, pubs[e.Id].Pub, pubs[e.Id].Source)).ToList(), lookup, at, ct);
+    }
 }

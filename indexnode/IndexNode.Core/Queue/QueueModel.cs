@@ -51,6 +51,9 @@ public sealed class QLine
     /// <summary>0.13.14 done (group) and join (backfill): the upload the drama's grouping record joins (null: it joins none) and its kind (join | mixed | new). The queue state keeps them (QSubject.JoinOf / JoinKind), so group membership needs no video.json reads.</summary>
     [JsonPropertyName("join")] public string? Join { get; set; }
     [JsonPropertyName("jk")] public string? JoinKind { get; set; }
+    /// <summary>0.13.16 "pub" line: sets the subject's publish time (backfill by `jobs sample-first`), and where it came from.</summary>
+    [JsonPropertyName("pub")] public string? PubTime { get; set; }
+    [JsonPropertyName("pubsrc")] public string? PubSrc { get; set; }
 
     public string ToJson() => JsonSerializer.Serialize(this, Protocol.Json);
     public static QLine? Parse(string line) { try { return JsonSerializer.Deserialize<QLine>(line, Protocol.Json); } catch (JsonException) { return null; } }
@@ -102,6 +105,8 @@ public sealed class QSubject
     /// <summary>0.13.14: what the group step's done line (or a backfill "join" line) recorded: the upload this drama's grouping record joins, and the kind (join | mixed | new; null = not recorded yet).</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? JoinOf { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? JoinKind { get; set; }
+    /// <summary>0.13.16: the upload's publish time (the last add that carried one): the claim order within a priority, newest first, for sample, check, download and process.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Pub { get; set; }
     [JsonIgnore] public bool Active => Entries.Values.Any(e => !e.Final);
 }
 
@@ -110,7 +115,7 @@ public sealed class QueueState
 {
     public Dictionary<string, QSubject> Subjects { get; set; } = new(StringComparer.Ordinal);
     /// <summary>The order a claim runs a subject's stages in.</summary>
-    public static readonly string[] StageOrder = ["download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index"];
+    public static readonly string[] StageOrder = ["sample", "check", "download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index"];
     public static int Rank(string stage) { var i = Array.IndexOf(StageOrder, stage); return i < 0 ? 99 : i; }
 
     /// <summary>The highest sequence number handed out so far (kept in the snapshot, so dropping an old subject never lowers it).</summary>
@@ -132,8 +137,12 @@ public sealed class QueueState
                     var at = l.At ?? "";
                     sub.Entries[stage] = new QEntry { Stage = stage, State = l.State ?? "pending", Priority = l.Pri ?? l.Job?.Priority ?? 0, Added = old != null && l.Force == true && old.Added.Length > 0 ? old.Added : at, Due = l.Due ?? at, Job = l.Job };
                     sub.LastAt = at;
+                    if (l.Job?.Pub is { Length: > 0 } pub) sub.Pub = pub;
                     break;
                 }
+            case "pub":
+                if (Get(l.S) is { } pubSub && l.PubTime != null) pubSub.Pub = l.PubTime;
+                break;
             case "claim":
                 {
                     if (!Subjects.TryGetValue(l.S, out var sub)) Subjects[l.S] = sub = new QSubject { Id = l.S };
@@ -231,7 +240,7 @@ public sealed class QueueState
     private static void EndClaim(QSubject sub, QLine l) { if (l.Epoch == null || l.Epoch == sub.Epoch) { sub.ClaimBy = null; sub.ClaimStages = null; } }
 
     /// <summary>A finished entry keeps no body in the state (the snapshot stays small): the fields a status line or the site needs survive.</summary>
-    private static JobDescriptor? Slim(JobDescriptor? j) => j == null ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Priority = j.Priority, Title = j.Title, ChannelName = j.ChannelName, Duration = j.Duration, Source = j.Source, Name = j.Name, Kind = j.Kind, Id = j.Id, Network = j.Network, ElapsedSeconds = j.ElapsedSeconds };
+    private static JobDescriptor? Slim(JobDescriptor? j) => j == null ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Priority = j.Priority, Title = j.Title, ChannelName = j.ChannelName, Duration = j.Duration, Source = j.Source, Name = j.Name, Kind = j.Kind, Id = j.Id, Network = j.Network, ElapsedSeconds = j.ElapsedSeconds, Pub = j.Pub, PubSource = j.PubSource };
 
     /// <summary>The subjects with something this node can run now, best first: highest priority, then the oldest added entry, then the id. <paramref name="skip"/> leaves out subjects another node holds.</summary>
     public List<(QSubject Subject, List<QEntry> Runnable)> Candidates(string nowUtc, Func<string, bool> stageOk, Func<QSubject, QEntry, bool>? canRun = null, Func<string, bool>? skip = null)
@@ -246,8 +255,12 @@ public sealed class QueueState
         // 0.13.2: a due search-index entry goes before any drama work (a singleton added today must not wait behind a backlog of older priority-0 entries); then priority, added, id as before
         // 0.13.11: a due group entry goes right behind search-index and before process work: group steps are short, and a group entry added today must not wait behind a backlog of older priority-0 process entries
         return res.OrderByDescending(x => x.Item2.Any(e => e.Stage == "search-index") ? 2 : x.Item2.Any(e => e.Stage == "group") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage == "group") && !x.Item2.Any(e => e.Stage == "search-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.12: group entries lowest sequence number first
-            .ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
+            .ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenByDescending(x => PubKey(x.Item1, x.Item2), StringComparer.Ordinal).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
     }
+
+    /// <summary>0.13.16: the publish time that orders a candidate within its priority (newest first); "" (last) when the subject has none or has no sample, check, download or process entry to run.</summary>
+    static string PubKey(QSubject s, List<QEntry> runnable) =>
+        runnable.Any(e => e.Stage is "sample" or "check" or "download" or "process") ? s.Pub ?? runnable.Where(e => e.Stage is "sample" or "check" or "download" or "process").Select(e => e.Job?.Pub).Where(p => !string.IsNullOrEmpty(p)).DefaultIfEmpty("").Max()! : "";
 
     public Dictionary<string, int> PendingByStage(string nowUtc) =>
         Subjects.Values.SelectMany(s => s.Entries.Values).Where(e => e.State == "pending").GroupBy(e => e.Stage).ToDictionary(g => g.Key, g => g.Count());
@@ -279,7 +292,8 @@ public sealed class QueueState
             if (!allDone && s.ClaimBy == null && s.Entries.Values.All(e => e.Final) && !s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(SlimFinished(s)); continue; }   // finished, some failed for good: ids, states, priority and the reason are enough
             if (!allDone) { list.Add(s); continue; }
             if (s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(s); continue; }   // a trash mark is kept until `trash empty` has acted on it
-            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Entries = { ["download"] = d } }));
+            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Entries = { ["download"] = d } }));
+            else if (s.Entries.TryGetValue("check", out var ck)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Entries = { ["check"] = ck } }));   // 0.13.16: a sample-first duplicate has no download entry
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
         return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, Subjects = list }, Protocol.Json);
@@ -288,10 +302,10 @@ public sealed class QueueState
     /// <summary>A finished subject as the snapshot needs it: the stage states, priority, when it was added and finished, a cut-down error and a minimal job (id, url, reason, duplicate-of) so a retry or a duplicate check still works. Everything else (due, attempts, node, steps, network, titles, ...) is dropped.</summary>
     static QSubject SlimFinished(QSubject s)
     {
-        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind };
+        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub };
         foreach (var (k, e) in s.Entries)
         {
-            var j = e.Job; var keepsJob = k is "download" or "refresh" or "classify" or "availability";
+            var j = e.Job; var keepsJob = k is "download" or "sample" or "check" or "refresh" or "classify" or "availability";
             o.Entries[k] = new QEntry
             {
                 Stage = e.Stage, State = e.State, Priority = e.Priority, Added = e.Added, FinishedAt = e.FinishedAt, Permanent = e.Permanent,

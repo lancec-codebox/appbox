@@ -154,12 +154,13 @@ public abstract class CentersBlob
     {
         if (LocalPath != null)
         {
-            Interlocked.Increment(ref LocalReads);
+            Interlocked.Increment(ref LocalReads); FramesCache.Current?.NoteLookup();
             using var fh = File.OpenHandle(LocalPath); var lb = new byte[len]; int got = 0;
             while (got < len) { int n = RandomAccess.Read(fh, lb.AsSpan(got), off + got); if (n <= 0) break; got += n; }
             if (got != len) throw new InvalidDataException($"{Blob}: asked for {len} bytes at {off}, the local copy has {got}");
             return lb;
         }
+        FramesCache.Current?.NoteLookup();
         Interlocked.Increment(ref Requests); Interlocked.Add(ref BytesRead, len);
         await InFlightGate.WaitAsync(ct); int now = Interlocked.Increment(ref inFlight); int pk; while (now > (pk = peakInFlight)) Interlocked.CompareExchange(ref peakInFlight, now, pk);
         RangeRead r; var pin = new BlobPin(Blob, ETag, ZipSize, Sha);
@@ -210,7 +211,9 @@ public sealed class FramesReader : CentersBlob
     /// <summary>With the node's frames cache on, the whole file is fetched once (one GET) and kept; every later read is from disk.</summary>
     static async Task<FramesReader> LocalAsync(FramesReader r, CancellationToken ct)
     {
-        if (FramesCache.Current is { } c) r.LocalPath = await c.EnsureAsync(r.Store, r.Blob, r.Sha, r.ZipSize, ct);
+        // 0.13.16: never wait for a whole-file download: a hit reads the local copy, a miss reads by range and queues the file for a background fill
+        if (FramesCache.Current is { } c) r.LocalPath = c.TryLocalOrQueue(r.Store, r.Blob, r.Sha, r.ZipSize);
+        await Task.CompletedTask;
         return r;
     }
 

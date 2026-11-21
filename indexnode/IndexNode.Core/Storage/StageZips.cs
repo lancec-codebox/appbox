@@ -15,7 +15,7 @@ public static class StageLayout
     public const string CropsDir = "cast/crops/";
 
     public static string ZipName(string stage) => stage + ".zip";
-    public static bool IsRaw(string member) => member is "video.mp4" or "compact.mp4";
+    public static bool IsRaw(string member) => member is "video.mp4" or "compact.mp4" || member.StartsWith("sample/", StringComparison.Ordinal);   // 0.13.16: the sample download's files are loose blobs, never members of download.zip (whose existence means the full download is complete)
     /// <summary>Retired (the dino step): never repacked, deleted by the repack.</summary>
     public static bool IsRetired(string member) => member.StartsWith("dino/", StringComparison.Ordinal);
     /// <summary>The opt-in clip step (dropped 2026-11-14) keeps its loose files: not packed, not counted as loose.</summary>

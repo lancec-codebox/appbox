@@ -60,6 +60,9 @@ public static class Program
         indexnode tools install --ytdlp-zipapp
         indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
         indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--order-tolerance-seconds 120] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
+        indexnode sample <id|url> --output-local <dir> [--timebox 120]   (0.13.16: ONLY the sample download (two 5-minute segments at 0.30/0.70, 360p, the first segment's audio, info, description, thumbnail) into <dir>/<id>/; writes no store or queue; prints the time split; run it on lancecl1, never the hexad host)
+        indexnode check <id|url> --input-local <dir> [--exclude-self] [--output-local <dir>] [--timebox 120] [--threads N]   (0.13.16: ONLY the check on those local sample files (the search index is read from the store, read-only): record and time split; writes no store or queue; run it on the hexad host)
+        indexnode jobs sample-first [--dry-run]   (0.13.16: pending downloads become sample entries, pending process entries get a check entry; priority and due kept; batched, idempotent; prints the counts)
         indexnode seq assign [--dry-run]   (0.13.10: give every existing drama its sequence number, by first pre-check)
         indexnode groups step <id> [--dry-run] [--threads N]   (0.13.15: the group step of ONE drama exactly as the node runs it (queue state, FramesCache, dedup set); --dry-run writes nothing to the store or the queue and prints the record it would write and the time split: membership with join-source counts, search, dedup, write-free total)
         indexnode precheck whatif [--ids <file>] [--limit N] [--threads N]   (0.13.15: the two-segment pre-check on each drama's stored frames (itself excluded) against the old single window: decisions, possible false skips, AI flag changes, run time; works with --limit 1)
@@ -94,7 +97,7 @@ public static class Program
         indexnode control --max-per-ip N|off
         indexnode --version
         indexnode config set-sas <url>
-        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port|precheck.enabled|precheck.tau|precheck.skip-share|precheck.partial-share|precheck.duration-percent|precheck.duration-min|precheck.top-centers|precheck.window-seconds|precheck.language-seconds|precheck.language-min-seconds|precheck.window-position|precheck.ai-flag> <value>
+        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port|precheck.enabled|precheck.tau|precheck.skip-share|precheck.partial-share|precheck.duration-percent|precheck.duration-min|precheck.top-centers|precheck.window-seconds|precheck.language-seconds|precheck.language-min-seconds|precheck.window-position|precheck.ai-flag|sample-budget> <value>
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
         """;
 
@@ -114,6 +117,8 @@ public static class Program
                 "enqueue" => await Commands.EnqueueAsync(a),
                 "download" => await Commands.DownloadAsync(a),
                 "precheck" => await PreCheckCommand.RunAsync(a),
+                "sample" => await SampleCommands.SampleAsync(a),
+                "check" => await SampleCommands.CheckAsync(a),
                 "serve" or "precheck-serve" => await ServeCommand.RunAsync(a),   // precheck-serve: the old name, a hidden alias
                 "unprocessed" => await Commands.UnprocessedAsync(a),
                 "seeds" => await Commands.SeedsAsync(a),
@@ -222,10 +227,13 @@ public static class Commands
         NodeEngine? engineRef = null;
         bool aiStages = a.Has("ai-stages");
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
+        var preStage = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths, b => FreshFromQueue(engineRef, b)), NoPre(a, cfg.PreCheck), Commands.VersionString);
         var handlers = new Dictionary<string, IStageHandler>
         {
             ["download"] = new DownloadStage(tools, store, gate),
-            ["precheck"] = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths, b => FreshFromQueue(engineRef, b)), NoPre(a, cfg.PreCheck), Commands.VersionString),
+            ["precheck"] = preStage,
+            ["sample"] = new SampleStage(tools, store, gate, cfg.PreCheck ?? new()),
+            ["check"] = new CheckStage(preStage),
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
             ["refresh"] = new RefreshStage(tools, store),
             ["availability"] = new AvailabilityStage(tools, store),
@@ -289,12 +297,13 @@ public static class Commands
         var local = new NodeLimits
         {
             Budget = a.Get("budget") is { } b ? int.Parse(b) : cfg.Budget,
+            SampleBudget = a.Get("sample-budget") is { } sbf ? int.Parse(sbf) : cfg.SampleBudget,
             Schedule = a.Get("schedule") ?? cfg.Schedule,
             Window = a.Get("window") ?? cfg.Window,
         };
         if (local.Schedule != null) CronExpr.Parse(local.Schedule);
         if (local.Window != null) RefreshStage.ParseEvery(local.Window);
-        var stamp = a.Has("budget") ? "flag" : cfg.BudgetSetAt ?? "";
+        var stamp = a.Has("budget") || a.Has("sample-budget") ? "flag" : cfg.BudgetSetAt ?? "";
         return new LimitState(nodeId, local, stamp, Path.Combine(NodeConfig.ConfigDir(), "state.json"));
     }
 
@@ -770,6 +779,7 @@ public static class Commands
             switch (key)
             {
                 case "budget": file.Budget = int.Parse(val); file.BudgetSetAt = Protocol.NowUtc(); break;
+                case "sample-budget": file.SampleBudget = val.Equals("off", StringComparison.OrdinalIgnoreCase) || val.Equals("unlimited", StringComparison.OrdinalIgnoreCase) ? null : int.Parse(val); file.BudgetSetAt = Protocol.NowUtc(); break;
                 case "schedule": CronExpr.Parse(val); file.Schedule = val; break;
                 case "window": RefreshStage.ParseEvery(val); file.Window = val; break;
                 case "ai.base-url": (file.Ai ??= new()).BaseUrl = val; break;

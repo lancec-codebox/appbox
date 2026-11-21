@@ -24,6 +24,8 @@ public sealed partial class NodeEngine
             "process" => o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s)),
             "search-index" => handlers.ContainsKey("search-index") && (o.Stages.Contains("search-index") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.1: standard (non-AI) work of any processor node
             "group" => handlers.ContainsKey("group") && (o.Stages.Contains("group") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.10: standard work of any process node
+            "sample" => handlers.ContainsKey("sample") && (o.Stages.Contains("sample") || o.Stages.Contains("download")),   // 0.13.16: downloader nodes only (it needs YouTube)
+            "check" => handlers.ContainsKey("check") && (o.Stages.Contains("check") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.16: any processor, no YouTube
             "describe" or "translate" => o.AiStages,   // opt-in: only a node started with the AI stages and an endpoint
             _ => o.Stages.Contains(stage),
         };
@@ -48,7 +50,8 @@ public sealed partial class NodeEngine
     private GroupSequencing.Gate? gate; private volatile GroupSequencing.Gate.View? gateView;
 
     private bool CanRunEntry(QSubject s, QEntry e) =>
-        e.Stage == "group" ? gateView is not { } gv || gv.Runnable_(s)   // a blocked group step is never claimed and nothing is appended for it (the claim-time BlockersAsync stays as the race safety net)
+        e.Stage == "process" && s.Entries.TryGetValue("check", out var ck0) && !ck0.Final ? false   // 0.13.16: the check comes first (a process entry never runs the pre-check itself while a check is pending)
+        : e.Stage == "group" ? gateView is not { } gv || gv.Runnable_(s)   // a blocked group step is never claimed and nothing is appended for it (the claim-time BlockersAsync stays as the race safety net)
         : e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
    // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
 
@@ -126,7 +129,7 @@ public sealed partial class NodeEngine
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: automatic retry failed ({e.Message})"); }
     }
 
-    private static IEnumerable<string> QueueStages() => new[] { "download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index" };
+    private static IEnumerable<string> QueueStages() => new[] { "sample", "check", "download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index" };
 
     /// <summary>Claims one candidate subject (limits, per-IP cap, then the protocol's claim) and runs it. False when nothing was claimed.</summary>
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
@@ -135,7 +138,7 @@ public sealed partial class NodeEngine
         if (ignoreSubject.TryGetValue(id, out var until) && until > DateTimeOffset.UtcNow) return false;
         var first = runnable[0].Stage;
         if (o.Limits != null && !o.Limits.TryAcquire(first)) return false;
-        if (runnable.Any(e => e.Stage == "download"))
+        if (runnable.Any(e => e.Stage is "download" or "sample"))
         {
             bool allowed;
             try { await EnsureFreshNetworkAsync(ct); allowed = await UnderIpCapAsync(ct); }
@@ -280,7 +283,7 @@ public sealed partial class NodeEngine
                     }
                 default:
                     {
-                        if (stage == "download") job.Network = JobNetwork.From(network);
+                        if (stage is "download" or "sample") job.Network = JobNetwork.From(network);
                         ctx = NewContext(lane, w, stage, job, store, [], token);
                         await handlers[stage].RunAsync(ctx);
                         var lines = new List<QLine>();
@@ -417,7 +420,7 @@ public sealed partial class NodeEngine
         var id = w.Id; var h = w.Handle; var stage = entry.Stage; var none = CancellationToken.None;
         var job = BodyOf(entry, id);
         if (ctx?.Job != null && stage is not ("process" or "describe" or "translate")) job = ctx.Job;
-        if (stage == "download") job.Network ??= JobNetwork.From(network);
+        if (stage is "download" or "sample") job.Network ??= JobNetwork.From(network);
         var steps = queue.Read(s => s.Entry(id, stage)?.StepsDone)?.ToArray();
         var at = queue.NowUtc();
         QLine L(string state) => new() { T = "failed", Stage = stage, State = state, Error = Redact.Sas(error), Attempt = entry.Attempts, Done = steps, Step = ctx?.Stage is { } cs && stage == "process" ? cs : null };
@@ -430,7 +433,11 @@ public sealed partial class NodeEngine
                         var d = w.Run.Duplicate;
                         job.FinishedAt = Protocol.NowUtc(); job.NodeId = o.NodeId; job.DuplicateOf = d is { Ai: true } ? null : d?.Upload; job.DuplicateShare = d is { Ai: true } ? null : d?.Share; job.LastError = null;
                         job.DuplicateSpeechLanguage = d?.SpeechLanguage; job.DuplicateDubbed = d?.Dubbed; job.DuplicateLanguageSource = d?.LanguageSource; job.DuplicateMetadataLanguage = d?.MetadataLanguage; job.DuplicateUrl = d?.Url;
-                        await h.AppendAsync([new QLine { T = "done", Stage = stage, State = "duplicate", Job = job, Trash = "download.zip/video", Why = d?.Why, Group = d?.Group, GroupOffset = d?.GroupOffset, MatchShare = d?.MatchShare, DupShare = d?.DupShare, Mixed = d?.Mixed }], true, none);   // the pre-check skipped it (process entry ends in 'duplicate': metadata only, no frames or later artifacts, no describe)
+                        // 0.13.16: a check on a sample marks nothing (no video stored); a check on a stored video marks it as a process skip does, and ends the waiting process entry the same way
+                        bool stored = stage != "check" || await store.HeadAsync(paths.Video(id, "video.mp4"), none) != null;
+                        var dl = new List<QLine> { new QLine { T = "done", Stage = stage, State = "duplicate", Job = job, Trash = stored ? "download.zip/video" : null, Why = d?.Why, Group = d?.Group, GroupOffset = d?.GroupOffset, MatchShare = d?.MatchShare, DupShare = d?.DupShare, Mixed = d?.Mixed } };
+                        if (stage == "check" && queue.Read(st => st.Entry(id, "process") is { Final: false })) dl.Add(new QLine { T = "done", Stage = "process", State = "duplicate", Job = BodyOf(queue.Read(st => st.Entry(id, "process"))!, id), Why = d?.Why, Group = d?.Group, GroupOffset = d?.GroupOffset, MatchShare = d?.MatchShare, DupShare = d?.DupShare, Mixed = d?.Mixed });
+                        await h.AppendAsync(dl, true, none);   // the pre-check skipped it (process entry ends in 'duplicate': metadata only, no frames or later artifacts, no describe)
                         break;
                     }
                 case Outcome.Permanent:
@@ -446,7 +453,7 @@ public sealed partial class NodeEngine
                 case Outcome.Bot:
                     {
                         var l = L("pending"); l.Job = job; job.NodeId = o.NodeId; await h.AppendAsync([l], true, none);   // no attempt counted; the error and the network stay on the job
-                        stageBackoff[stage] = DateTimeOffset.UtcNow + o.BotBackoff;
+                        stageBackoff[stage] = DateTimeOffset.UtcNow + o.BotBackoff; if (stage == "sample") stageBackoff["download"] = stageBackoff[stage];
                         Log.Info($"[{stage}] bot block / rate limit: backing off {o.BotBackoff.TotalMinutes:F0} min");
                         break;
                     }

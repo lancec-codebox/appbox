@@ -172,10 +172,13 @@ public static class PreCheck
         return positions.Select(p => { var w = Window(duration, length, p); return (w.Start, w.End, p); }).ToList();
     }
 
+    /// <summary>0.13.16: the selector of every sample download: the progressive 360p mp4 (format 18, h264+aac: the section is a plain ranged read, no re-encode), else any progressive stream up to 360p, split streams only as the last resort (split HLS formats are fetched segment by segment by ffmpeg and are far slower).</summary>
+    public static string SampleFormat(PreCheckSettings s) => $"18/b[height<={s.VideoHeight}][vcodec!=none][acodec!=none]/bv*[height<={s.VideoHeight}]+{(string.IsNullOrWhiteSpace(s.AudioFormat) || s.AudioFormat.Trim() == "wa" ? "ba" : s.AudioFormat.Trim())}/b";
+
     /// <summary>0.13.15: one yt-dlp call fetching every segment: a --download-sections per range.</summary>
     public static List<string> SampleArgs(PreCheckSettings s, IReadOnlyList<(double Start, double End)> ranges, string url)
     {
-        var a = new List<string> { "-S", $"res:{s.VideoHeight}", "-f", $"bv*+{(string.IsNullOrWhiteSpace(s.AudioFormat) ? "wa" : s.AudioFormat.Trim())}/b" };
+        var a = new List<string> { "-f", SampleFormat(s) };
         foreach (var r in ranges) { a.Add("--download-sections"); a.Add(SectionArg(r.Start, r.End)); }
         a.AddRange(["--merge-output-format", "mp4", "-o", "sample.%(ext)s", url]);
         return a;
@@ -183,7 +186,7 @@ public static class PreCheck
 
     /// <summary>The yt-dlp arguments of the one sample download (host-independent: the desktop node and an Android host with Medusa's yt-dlp build the same call).</summary>
     public static List<string> SampleArgs(PreCheckSettings s, double start, double end, string url) =>
-        ["-S", $"res:{s.VideoHeight}", "-f", $"bv*+{(string.IsNullOrWhiteSpace(s.AudioFormat) ? "wa" : s.AudioFormat.Trim())}/b", "--download-sections", SectionArg(start, end), "--merge-output-format", "mp4", "-o", "sample.%(ext)s", url];
+        ["-f", SampleFormat(s), "--download-sections", SectionArg(start, end), "--merge-output-format", "mp4", "-o", "sample.%(ext)s", url];
 
     /// <summary>Indexes of <paramref name="max"/> frames spread evenly over <paramref name="n"/> (all of them when max &lt;= 0 or max &gt;= n).</summary>
     public static int[] SubsampleIndices(int n, int max)

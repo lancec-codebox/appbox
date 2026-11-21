@@ -270,8 +270,11 @@ public sealed class FakeStore : IStore
     public Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct) =>
         PutAsync(name, File.ReadAllBytes(path), null, null, false, ct, contentType);
 
+    /// <summary>0.13.16: whole-file downloads (DownloadToFileAsync) so far.</summary>
+    public int WholeGets;
     public Task DownloadToFileAsync(string name, string path, CancellationToken ct)
     {
+        Interlocked.Increment(ref WholeGets);
         lock (gate) File.WriteAllBytes(path, Blobs[name].Data);
         return Task.CompletedTask;
     }

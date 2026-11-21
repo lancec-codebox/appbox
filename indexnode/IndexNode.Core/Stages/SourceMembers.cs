@@ -4,7 +4,7 @@ using System.Text.Json.Nodes;
 namespace IndexNode;
 
 /// <summary>One member of a source: what the listing said, and when refresh first listed it.</summary>
-public sealed record SourceMember(string Id, string? Title = null, double? Duration = null, string? ChannelId = null, string? ChannelName = null, string? Availability = null, string? FirstSeen = null);
+public sealed record SourceMember(string Id, string? Title = null, double? Duration = null, string? ChannelId = null, string? ChannelName = null, string? Availability = null, string? FirstSeen = null, string? Pub = null, string? PubSource = null);
 
 /// <summary>
 /// 0.13.2: index/sources/&lt;id&gt;/members.json is the one file of a source (seen.json is gone): the ids the source has listed, newest first, each with a firstSeen. Written only by the holder of the source's lease (the refresh claim),
@@ -32,7 +32,7 @@ public static class SourceMembers
         {
             var cur = await ReadAsync(store, paths, job.JobId, ct);
             var old = cur.Members.GroupBy(m => m.Id, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
-            var members = listed.Select(m => m with { FirstSeen = old.GetValueOrDefault(m.Id)?.FirstSeen ?? m.FirstSeen ?? at }).ToList();
+            var members = listed.Select(m => m with { FirstSeen = old.GetValueOrDefault(m.Id)?.FirstSeen ?? m.FirstSeen ?? at, Pub = m.PubSource == PubTime.Estimate && old.GetValueOrDefault(m.Id)?.Pub != null ? old[m.Id].Pub : m.Pub, PubSource = m.PubSource == PubTime.Estimate && old.GetValueOrDefault(m.Id)?.Pub != null ? old[m.Id].PubSource : m.PubSource }).ToList();
             if (job.Kind == "channel") members.AddRange(cur.Members.Where(h => members.All(m => m.Id != h.Id)));
             var doc = new { v = 2, sourceId = job.JobId, kind = job.Kind, id = job.Id, name = job.Name, updatedAt = at, lookedUpAt = lookup ? at : cur.LookedUpAt ?? at, members };
             if (await store.PutIfMatchAsync(paths.SourceMembers(job.JobId), JsonSerializer.SerializeToUtf8Bytes(doc, Protocol.Json), cur.Etag, ct)) return members.Count;

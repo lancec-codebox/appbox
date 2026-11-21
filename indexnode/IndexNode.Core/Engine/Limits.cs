@@ -105,6 +105,7 @@ public sealed class LimitState
     private string? key;
     private int? budget;
     private int remaining, inflight;
+    private int? sBudget; private int sRemaining, sInflight; private string? sKey;   // 0.13.16: the sample stage's own budget (null = unlimited)
     private CronExpr? cron;
     private TimeSpan window = TimeSpan.FromHours(1);
 
@@ -117,6 +118,8 @@ public sealed class LimitState
 
     public int? Budget { get { lock (gate) return budget; } }
     public int Remaining { get { lock (gate) return remaining; } }
+    public int? SampleBudget { get { lock (gate) return sBudget; } }
+    public int SampleRemaining { get { lock (gate) return sRemaining; } }
 
     /// <summary>Resolves the effective limits (an override in control.json wins per field) and restarts the countdown when its key changed.</summary>
     public void Apply(ControlFile? control)
@@ -125,6 +128,14 @@ public sealed class LimitState
         {
             NodeLimits? o = null;
             control?.Nodes?.TryGetValue(nodeId, out o);
+            int? sb = o?.SampleBudget ?? local.SampleBudget;
+            var sk = sb == null ? null : o?.SampleBudget != null ? $"control|{sb}|{control?.ChangedAt}" : $"local|{sb}|{localStamp}";
+            if (sk != sKey || sBudget != sb)
+            {
+                sBudget = sb; sKey = sk;
+                if (sb == null) sRemaining = 0;
+                else { var ss = LoadSample(); sRemaining = ss is { } x && x.Key == sk ? Math.Min(x.Remaining, sb.Value) : sb.Value; Save(); }
+            }
             int? b = o?.Budget ?? local.Budget;
             var newKey = b == null ? null : o?.Budget != null ? $"control|{b}|{control?.ChangedAt}" : $"local|{b}|{localStamp}";
             var sched = o?.Schedule ?? local.Schedule;
@@ -151,13 +162,24 @@ public sealed class LimitState
         catch { return null; }
     }
 
+    private (string Key, int Remaining)? LoadSample()
+    {
+        try
+        {
+            if (statePath == null || !File.Exists(statePath)) return null;
+            var d = JsonDocument.Parse(File.ReadAllText(statePath)).RootElement;
+            return d.TryGetProperty("sampleKey", out var k) && d.TryGetProperty("sampleRemaining", out var r) ? (k.GetString() ?? "", r.GetInt32()) : null;
+        }
+        catch { return null; }
+    }
+
     private void Save()
     {
         if (statePath == null) return;
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
-            File.WriteAllText(statePath, JsonSerializer.Serialize(new { budgetKey = key, budgetRemaining = remaining }));
+            File.WriteAllText(statePath, JsonSerializer.Serialize(new { budgetKey = key, budgetRemaining = remaining, sampleKey = sKey, sampleRemaining = sRemaining }));
         }
         catch (Exception e) { Log.Info("limits: could not save the budget state (" + e.Message + ")"); }
     }
@@ -178,7 +200,13 @@ public sealed class LimitState
         lock (gate)
         {
             if (!InWindow(out _)) return false;
-            if (stage == "refresh" || budget == null) return true;
+            if (stage == "sample")
+            {   // 0.13.16: a sample counts only against the sample budget (default unlimited), never the full-download budget
+                if (sBudget == null) return true;
+                if (sRemaining - sInflight <= 0) return false;
+                sInflight++; return true;
+            }
+            if (stage is "refresh" or "check" || budget == null) return true;
             if (remaining - inflight <= 0) return false;
             inflight++;
             return true;
@@ -190,7 +218,14 @@ public sealed class LimitState
     {
         lock (gate)
         {
-            if (stage == "refresh" || budget == null) return;
+            if (stage == "sample")
+            {
+                if (sBudget == null) return;
+                if (sInflight > 0) sInflight--;
+                if (finished && sRemaining > 0) { sRemaining--; Save(); }
+                return;
+            }
+            if (stage is "refresh" or "check" || budget == null) return;
             if (inflight > 0) inflight--;
             if (finished && remaining > 0) { remaining--; Save(); }
         }

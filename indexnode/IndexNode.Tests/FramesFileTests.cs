@@ -138,6 +138,7 @@ public class FramesFileTests
             try
             {
                 var local = await Query(fs, q); Assert.Equal(remote, local);
+                await FramesCache.Current.WaitFillsAsync();
                 Assert.Equal(3, FramesCache.Current.Downloads);   // one GET per file, however many reads follow
                 var again = await Query(fs, q); Assert.Equal(remote, again);
                 Assert.Equal(3, FramesCache.Current.Downloads);   // warm: nothing more fetched
@@ -147,6 +148,61 @@ public class FramesFileTests
                 var trace = new List<string>(); foreach (var id in new[] { "l0", "l1", "l2" }) { await small.EnsureAsync(fs, P.FramesFile(id), null, size, default); trace.Add(string.Join('|', Directory.GetFiles(small.Dir).Select(Path.GetFileName))); }
                 var sizes = string.Join(',', Directory.GetFiles(small.Dir, "*.bin").Select(f => new FileInfo(f).Length)); Assert.True(Directory.GetFiles(small.Dir, "*.bin").Length == 2, $"{string.Join(';', trace)} max {small.MaxBytes}"); Assert.False(File.Exists(small.PathOf(P.FramesFile("l0"), null, size)));
                 Directory.Delete(small.Dir, true);
+            }
+            finally { FramesCache.Current = null; }
+        }
+        finally { foreach (var d in Directory.GetDirectories(Path.GetTempPath(), "ff-*")) try { Directory.Delete(d, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task A_cold_lookup_reads_by_range_with_no_whole_file_GET_then_the_background_fill_makes_the_next_lookup_all_hits()
+    {
+        var cache = Tmp(); var dir = Tmp();
+        try
+        {
+            var fs = new FakeStore(); StageZipStore? wr = null; var all = new List<float[]>();
+            for (int i = 0; i < 6; i++) { var x = Make(300, 12, 200 + i); all.Add(x); (fs, wr) = await Drama("k" + i, F16(x), 300, cache + i, fs); await Centers(wr, "k" + i); }
+            var ups = await SearchIndexBuild.ListCentersAsync(fs, P, default); var idx = await SearchIndexBuild.BuildAsync(fs, P, ups, null, null, 1, 1, 4, _ => { }, default);
+            var qs = Enumerable.Range(0, 20).Select(i => all[5].AsSpan(i * 10 * D, D).ToArray()).ToList();
+            FramesCache.Current = new FramesCache(dir, 1L << 30) { PauseMs = 100 };
+            try
+            {
+                int gets0 = fs.WholeGets;
+                var (b1, st1) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, -1);
+                Assert.Equal(gets0, fs.WholeGets);   // the lookup returned with no whole-file GET
+                Assert.True(st1.Requests > 0); Assert.True(FramesCache.Current.RangedMisses > 0); Assert.True(FramesCache.Current.FillsQueued > 0);
+                await FramesCache.Current.WaitFillsAsync();
+                Assert.Equal(FramesCache.Current.FillsQueued, FramesCache.Current.Downloads);
+                int hits0 = FramesCache.Current.Hits, miss0 = FramesCache.Current.RangedMisses;
+                var (b2, st2) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, -1);
+                Assert.Equal(0, st2.Requests); Assert.Equal(miss0, FramesCache.Current.RangedMisses); Assert.True(FramesCache.Current.Hits > hits0);
+                Assert.Equal(b1.Length, b2.Length);
+            }
+            finally { FramesCache.Current = null; }
+        }
+        finally { foreach (var d in Directory.GetDirectories(Path.GetTempPath(), "ff-*")) try { Directory.Delete(d, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task A_cold_lookup_across_300_uncached_uploads_takes_under_5_seconds()
+    {
+        var cache = Tmp(); var dir = Tmp();
+        try
+        {
+            var fs = new FakeStore(); StageZipStore? wr = null; var all = new List<float[]>();
+            for (int i = 0; i < 300; i++) { var x = Make(30, 4, 500 + i); all.Add(x); (fs, wr) = await Drama("m" + i, F16(x), 30, cache + i, fs); await Centers(wr, "m" + i); }
+            var ups = await SearchIndexBuild.ListCentersAsync(fs, P, default); var idx = await SearchIndexBuild.BuildAsync(fs, P, ups, null, null, 1, 1, 4, _ => { }, default);
+            var qs = Enumerable.Range(0, 60).Select(i => all[i * 5].AsSpan((i % 30) * D, D).ToArray()).ToList();
+            fs.RangeLatency = TimeSpan.FromMilliseconds(2);
+            FramesCache.Current = new FramesCache(dir, 1L << 30);
+            try
+            {
+                int g0 = fs.WholeGets; var sw = System.Diagnostics.Stopwatch.StartNew();
+                await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 64, 4, default, -1);
+                Assert.Equal(g0, fs.WholeGets);
+                var t = sw.Elapsed.TotalSeconds; Console.WriteLine($"BENCH cold lookup, 300 uncached uploads: {t:F2}s, {FramesCache.Current.RangedMisses} ranged misses, {FramesCache.Current.FillsQueued} fills queued");
+                Assert.True(t < 5, $"{t:F2}s");
+                Assert.True(FramesCache.Current.RangedMisses >= 100);
             }
             finally { FramesCache.Current = null; }
         }
@@ -166,7 +222,7 @@ public class FramesFileTests
             FramesCache.Current = new FramesCache(dir, 1L << 30);
             try
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew(); await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var cold = sw.Elapsed.TotalSeconds;
+                var sw = System.Diagnostics.Stopwatch.StartNew(); await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var cold = sw.Elapsed.TotalSeconds; await FramesCache.Current.WaitFillsAsync();
                 sw.Restart(); var (best, st) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var warm = sw.Elapsed.TotalSeconds;
                 Console.WriteLine($"BENCH frames-cache: 12 dramas x 1500 frames, 60-frame group check: cold {cold:F2}s ({FramesCache.Current.Downloads} GETs, {FramesCache.Current.DownloadedBytes / 1024} KB), warm {warm:F3}s, {st.Requests} range requests");
                 Assert.Equal(0, st.Requests); Assert.True(warm < 10);

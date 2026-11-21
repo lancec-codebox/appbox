@@ -16,7 +16,7 @@ public static partial class Protocol
     /// <summary>The step jobs an upload gets by default (download, enqueue, sources): every step stage except the opt-in ones (dino: owner 2026-11-16, not part of ingest; clip: dropped 2026-11-14), which run only when asked for (process --job --steps).</summary>
     public static readonly string[] IngestStepStages = StepStages.Where(s => s is not ("dino" or "clip")).ToArray();
     /// <summary>"process" is the legacy all-in-one stage: its jobs fan out into step jobs.</summary>
-    public static readonly string[] Stages = ["download", "process", .. StepStages, "refresh", "classify", "availability", "search-index"];
+    public static readonly string[] Stages = ["sample", "check", "download", "process", .. StepStages, "refresh", "classify", "availability", "search-index"];
     /// <summary>Stages that decode or run models and so share the thread budget.</summary>
     public static readonly string[] HeavyStages = ["process", "frames", "sscd", "centers", "dino", "thumbs", "clip", "transcribe", "ocrsubs", "cast"];
     public static bool IsStep(string stage) => StepStages.Contains(stage);
@@ -244,6 +244,9 @@ public sealed class JobDescriptor
     public string? DuplicateUrl { get; set; }
     public string? NodeId { get; set; }
     public double? ElapsedSeconds { get; set; }
+    /// <summary>0.13.16: the upload's publish time (UTC) and where it came from (info | listing | estimate). The sample, check, download and process stages are claimed newest first within a priority.</summary>
+    public string? Pub { get; set; }
+    public string? PubSource { get; set; }
 
     // ---- watch (a followed source) and the download jobs it creates
     /// <summary>"playlist" or "channel".</summary>
@@ -388,6 +391,8 @@ public sealed class ControlFile
         var g = ParseLevel(Mode);
         var s = Stages != null && Stages.TryGetValue(stage, out var v) ? ParseLevel(v)
             : stage == "refresh" && Stages != null && Stages.TryGetValue("watch", out var wv) ? ParseLevel(wv) // the control file's pre-0.10.3 "watch" key is the refresh stage
+            : stage == "sample" && Stages != null && Stages.TryGetValue("download", out var sv) ? ParseLevel(sv) // 0.13.16: the sample stage follows "download" unless set itself
+            : stage == "check" && Stages != null && Stages.TryGetValue("process", out var kv) ? ParseLevel(kv) // and the check follows "process"
             : Protocol.IsStep(stage) && Stages != null && Stages.TryGetValue("process", out var pv) ? ParseLevel(pv) : Level.Run; // a step follows "process" unless set itself
         return (Level)Math.Max((int)g, (int)s);
     }
@@ -411,6 +416,8 @@ public sealed class GpuControl
 public sealed class NodeLimits
 {
     public int? Budget { get; set; }
+    /// <summary>0.13.16: the budget of the `sample` stage alone (samples never count against <see cref="Budget"/>); null = unlimited.</summary>
+    public int? SampleBudget { get; set; }
     public string? Schedule { get; set; }
     public string? Window { get; set; }
 }

@@ -43,6 +43,8 @@ public sealed class NodeConfig
     /// <summary>Run limits (see LimitState). BudgetSetAt restarts the countdown when the budget is set again.</summary>
     public int? Budget { get; set; }
     public string? BudgetSetAt { get; set; }
+    /// <summary>0.13.16: the sample stage's own budget (config key sample-budget); null = unlimited.</summary>
+    public int? SampleBudget { get; set; }
     public string? Schedule { get; set; }
     public string? Window { get; set; }
 

@@ -132,6 +132,7 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         progress("lookup");
         int ex = excludeId == null ? -1 : idx.Uploads.FindIndex(u => u.Id == excludeId);
         int excluded = ex < 0 ? 0 : idx.RefUpload.Count(u => u == ex);
+        var fc0 = FramesCache.Current is { } fcA ? (fcA.Hits, fcA.RangedMisses, fcA.FillsQueued) : (0, 0, 0);
         var (best, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, rows, s.TopCenters, threads, ct, ex, Blocks);
         var fresh = new List<string>();
         if (FreshUploads != null)
@@ -161,7 +162,9 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         var ofGroup = gs?.GroupOf() ?? new Dictionary<string, string>(StringComparer.Ordinal);
         var ug = hits.Select(h => h.Upload).Distinct(StringComparer.Ordinal).ToDictionary(u => u, u => ofGroup.GetValueOrDefault(u), StringComparer.Ordinal);
         var gm = (gs?.Groups ?? []).Where(g => ug.Values.Contains(g.Id)).ToDictionary(g => g.Id, g => (IReadOnlyList<GroupCopy>)g.Members.Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration)).ToList(), StringComparer.Ordinal);
-        secs["lookup"] = sw.Elapsed.TotalSeconds; secs["lookupScan"] = st.ScanMs / 1000; secs["lookupRead"] = st.ReadMs / 1000; secs["lookupScore"] = st.ScoreMs / 1000; secs["lookupRequests"] = st.Requests; secs["lookupBytes"] = st.Bytes; sw.Restart();
+        secs["lookup"] = sw.Elapsed.TotalSeconds; secs["lookupScan"] = st.ScanMs / 1000; secs["lookupRead"] = st.ReadMs / 1000; secs["lookupScore"] = st.ScoreMs / 1000; secs["lookupRequests"] = st.Requests; secs["lookupBytes"] = st.Bytes;
+        if (FramesCache.Current is { } fc1) { secs["cacheHits"] = fc1.Hits - fc0.Item1; secs["cacheRanged"] = fc1.RangedMisses - fc0.Item2; secs["fillsQueued"] = fc1.FillsQueued - fc0.Item3; }
+        sw.Restart();
         double ai = AiProbe.Default.Score(rows);
         secs["ai"] = sw.Elapsed.TotalSeconds; sw.Restart();
         SpeechResult? speech = null;
