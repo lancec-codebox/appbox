@@ -32,9 +32,14 @@ public sealed partial class NodeEngine
     }
 
     /// <summary>The steps of a process entry this node would run, in order: standard steps, listed for the node (or all of them for a node with no step list), supported, and not done yet.</summary>
-    internal string[] PlanSteps(QEntry e)
+    internal string[] PlanSteps(QEntry e) => PlanSteps(e.StepsDone ?? []);
+
+    /// <summary>0.13.2: the steps whose output zip is not on the store (one HEAD each, never a hydrate). sync is not checked: it has no output when a video has no transcript or no text lines.</summary>
+    internal static readonly string[] CheckedSteps = StandardSteps.Where(s => s != "sync").ToArray();
+
+    internal string[] PlanSteps(IEnumerable<string> doneSteps)
     {
-        var done = e.StepsDone ?? [];
+        var done = doneSteps.ToList();
         return StandardSteps.Where(s => !done.Contains(s) && (o.Stages.Contains("process") || o.Stages.Contains(s)) && (o.Steps == null || o.Steps.Contains(s)) && Control.Effective(s) == Level.Run).ToArray();
     }
 
@@ -259,15 +264,21 @@ public sealed partial class NodeEngine
     private async Task<(Outcome, string?, bool, JobContext?)> RunProcessAsync(int lane, ClaimWork w, QEntry entry, JobDescriptor job, CancellationToken token)
     {
         var id = w.Id; var h = w.Handle;
-        var plan = PlanSteps(entry);
+        // 0.13.2: a step counts as done only if its output is on the store (the log can say done for a step that never ran: migration did); a missing output is run, not skipped
         var done = new List<string>(entry.StepsDone ?? []);
+        foreach (var s0 in CheckedSteps.Where(done.Contains).ToList())
+            if (await store.HeadAsync(paths.Video(id, s0 + ".zip"), token) == null) { done.Remove(s0); Log.Info($"process {id}: {s0} is in the done list but {s0}.zip is not on the store: it runs"); }
+        var plan = PlanSteps(done);
         // the video must be downloaded: checked here, when we run, never while finding work (a HEAD never hydrates)
         var dl = await store.HeadAsync(paths.Video(id, "download.zip"), token);
         if (dl == null && await store.HeadAsync(paths.Video(id, "downloaded.json"), token) == null) return (Outcome.Permanent, "invalid: " + paths.Video(id, "download.zip") + " is missing (nothing was downloaded for this video)", false, null);
         w.Local ??= new LocalCacheStore(store, Path.Combine(Path.GetTempPath(), "indexnode", "c-" + instanceTag + "-" + id));
         // 0.13.0: the pre-check is the first step of a process claim, only for a drama with no processing done yet (a part-processed one resumes from its first unfinished step)
         bool ranPre = false;
-        if (handlers.TryGetValue("precheck", out var pre) && done.Count == 0 && !await HasProcessingAsync(id, token))
+        // 0.13.2: decided from the store only (no processing zip besides download/comments), never from the done set; the stage itself returns at once for a video.json that already has the record
+        bool noProcessing = !await HasProcessingAsync(id, token);
+        var vjPre = handlers.ContainsKey("precheck") && noProcessing ? (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject : null;
+        if (handlers.TryGetValue("precheck", out var pre) && noProcessing && (vjPre == null || (string?)vjPre["decision"] == PreCheckDecision.Duplicate))
         {
             ranPre = true;
             w.Run.Info.Stage = "precheck"; w.Run.Info.Step = null; RegistryChanged();
@@ -276,13 +287,14 @@ public sealed partial class NodeEngine
             await pre.RunAsync(pctx);   // throws DuplicateFound for a skip (nothing was deleted or rewritten: the done line marks the video for `indexnode trash empty`)
         }
         // the pre-check's decision (PASS included) goes on the final done line, read from the record the stage wrote
-        string? pcDecision = null; bool pcAi = false; double pcScore = 0; System.Text.Json.Nodes.JsonNode? pcNode = null;
-        if (handlers.ContainsKey("precheck") && await store.GetAsync(paths.Video(id, "precheck.json"), token) is { } pcj) try { var pn = System.Text.Json.Nodes.JsonNode.Parse(pcj.Data); pcNode = pn; pcDecision = (string?)pn?["decision"]; pcAi = (bool?)pn?["ai"]?["flag"] == true; pcScore = (double?)pn?["ai"]?["score"] ?? 0; } catch (System.Text.Json.JsonException) { }
+        string? pcDecision = null; System.Text.Json.Nodes.JsonObject? pcRec = null;
+        if (handlers.ContainsKey("precheck")) { pcRec = (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject; pcDecision = (string?)pcRec?["decision"]; }   // 0.13.2: video.json holds the record; unreadable or missing fails the claim (retried), never a quiet null
+        bool pcAi = (bool?)pcRec?["ai"]?["flag"] == true; double pcScore = (double?)pcRec?["ai"]?["score"] ?? 0;
         // 0.13.1: an AI-flagged drama that is not a duplicate (that was decided first) is held, not skipped: the pre-check's done step goes on the log and the claim is released; with aiDramas on it just goes on
-        if (ranPre && pcAi && pcDecision != "duplicate" && !Control.Current.AiDramasOn)
+        if (noProcessing && pcAi && pcDecision != "duplicate" && !Control.Current.AiDramasOn)
         {
             Log.Info($"process {id}: pre-check says AI (score {pcScore:0.000}): held, aiDramas is off");
-            await h.AppendAsync([new QLine { T = "done", Stage = "process", Step = "precheck", PreCheck = pcDecision, Hold = "ai", AiScore = pcScore, Why = $"ai: score {pcScore:0.000}", Pre = pcNode }], true, CancellationToken.None);
+            await h.AppendAsync([new QLine { T = "done", Stage = "process", Step = "precheck", PreCheck = pcDecision, Hold = "ai", AiScore = pcScore, Why = $"ai: score {pcScore:0.000}", Pre = pcRec }], true, CancellationToken.None);
             return (Outcome.Done, null, ClaimEnded(id), null);
         }
         var avail = new HashSet<string>(StringComparer.Ordinal);
@@ -313,7 +325,11 @@ public sealed partial class NodeEngine
         bool complete = StandardSteps.All(done.Contains);
         if (complete)
         {
-            var lines = new List<QLine> { new() { T = "done", Stage = "process", PreCheck = pcDecision } };
+            // 0.13.2: never a final done with an output missing (one HEAD each, never a hydrate): the claim fails (transient) and the next one runs what is missing
+            var missing = new List<string>();
+            foreach (var s1 in CheckedSteps) if (await store.HeadAsync(paths.Video(id, s1 + ".zip"), token) == null) missing.Add(s1);
+            if (missing.Count > 0) throw new InvalidOperationException($"process {id}: every step is done but {string.Join(", ", missing.Select(m => m + ".zip"))} is not on the store; not finishing (the missing step runs on the next claim)");
+            var lines = new List<QLine> { new() { T = "done", Stage = "process", PreCheck = pcDecision, Group = (string?)pcRec?["groupId"], GroupOffset = (double?)pcRec?["groupOffset"], MatchShare = (double?)pcRec?["matchShare"], DupShare = (double?)pcRec?["dupShare"], Mixed = (bool?)(pcRec?["group"] as System.Text.Json.Nodes.JsonObject)?["mixed"] is true ? true : null } };
             lines.Add(QLine.Add(id, "describe", NewFollow("describe", id, entry.Priority), queue.NowUtc()));
             await h.AppendAsync(lines, !WillContinue(id, "process", lines), CancellationToken.None);
             return (Outcome.Done, null, ClaimEnded(id), ctx);
@@ -351,7 +367,7 @@ public sealed partial class NodeEngine
                         var d = w.Run.Duplicate;
                         job.FinishedAt = Protocol.NowUtc(); job.NodeId = o.NodeId; job.DuplicateOf = d is { Ai: true } ? null : d?.Upload; job.DuplicateShare = d is { Ai: true } ? null : d?.Share; job.LastError = null;
                         job.DuplicateSpeechLanguage = d?.SpeechLanguage; job.DuplicateDubbed = d?.Dubbed; job.DuplicateLanguageSource = d?.LanguageSource; job.DuplicateMetadataLanguage = d?.MetadataLanguage; job.DuplicateUrl = d?.Url;
-                        await h.AppendAsync([new QLine { T = "done", Stage = stage, State = "duplicate", Job = job, Trash = "download.zip/video", Why = d?.Why }], true, none);   // the pre-check skipped it (process entry ends in 'duplicate': metadata only, no frames or later artifacts, no describe)
+                        await h.AppendAsync([new QLine { T = "done", Stage = stage, State = "duplicate", Job = job, Trash = "download.zip/video", Why = d?.Why, Group = d?.Group, GroupOffset = d?.GroupOffset, MatchShare = d?.MatchShare, DupShare = d?.DupShare, Mixed = d?.Mixed }], true, none);   // the pre-check skipped it (process entry ends in 'duplicate': metadata only, no frames or later artifacts, no describe)
                         break;
                     }
                 case Outcome.Permanent:

@@ -20,8 +20,11 @@ public sealed class SearchIndexStage(IStore store, int keepVersions = 3) : IStag
         if (head == null) next = await SearchIndexBuild.BuildAsync(store, paths, ups, null, null, 1, 1, threads, m => Log.Info("search-index: " + m), ct);
         else next = await SearchIndexBuild.BuildAsync(store, paths, ups, head.Mean, head, head.Version + 1, head.MeanVersion, threads, m => Log.Info("search-index: " + m), ct);
         next.BuiltAt = started;   // centers that finish after this are not in it: the pre-check looks at them by brute force
+        ctx.Report("search-index", "groups");
+        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, ct, m => Log.Info("search-index: " + m));
         ctx.Report("search-index", "catalog");
         next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, m => Log.Info("search-index: " + m), ct);
+        next.Catalog.ApplyGroups(groups);
         ctx.Report("search-index", $"publishing v{next.Version}");
         await next.PublishAsync(store, paths, ct);
         try { var gone = await SearchData.PruneAsync(store, paths, keepVersions, ct); if (gone.Count > 0) Log.Info($"search-index: removed old versions {string.Join(", ", gone.Select(g => "v" + g))} (keeping {keepVersions} back)"); }

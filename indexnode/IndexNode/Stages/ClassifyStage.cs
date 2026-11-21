@@ -96,13 +96,19 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
                 if (c) { yes.Add(e.Id); aiYes++; }
             }
         }
-        int made = 0;
+        var adds = new List<JobDescriptor>();
         foreach (var id in yes)
         {
             if (ctx.Queue!.Read(s => s.Entry(id, "download") != null) || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0) continue;
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", job.MaxHeight ?? 480, null);
             d.Source = job.Source; d.Sources = job.Source == null ? null : [job.Source]; d.AddedAt = at; d.Priority = job.Priority;
-            if (await ctx.Queue!.AppendLinesAsync(st => st.Entry(id, "download") != null ? null : [QLine.Add(id, "download", d, at, d.Priority)], ct) && ctx.Queue.Read(s => s.Entry(id, "download")?.Job?.AddedAt == at)) made++;
+            adds.Add(d);
+        }
+        int made = 0;   // one append per chunk of the candidates, decided against the state
+        foreach (var chunk in JobQueue.Chunks(adds, d => d.ToBytes().Length))
+        {
+            if (await ctx.Queue!.AppendLinesAsync(st => { var l = chunk.Where(d => st.Entry(d.JobId, "download") == null).Select(d => QLine.Add(d.JobId, "download", d, at, d.Priority)).ToList(); return l.Count == 0 ? null : l; }, ct))
+                made += chunk.Count(d => ctx.Queue.Read(s => s.Entry(d.JobId, "download")?.Job?.AddedAt == at));
         }
         Log.Info($"classify {job.JobId}: {entries.Count} uploads: {stored} already decided, {rule} too short, {ask.Count} by AI ({aiYes} candidates); {made} download job(s) created");
     }
@@ -129,7 +135,7 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         {
             if (save) await SaveDecisionAsync(store, paths, id, d.ChannelId, d.ChannelName, d.Title, d.Duration, candidate, kind, reason, by, model, at, ct);
             cls.Add(ClassifyJobs.Decision(id, d, candidate, kind, reason, at));
-            if (cls.Count >= 40) await Flush();
+            if (cls.Count >= 500) await Flush();
             if (candidate) yes++; else no++;
             job.Classified = (job.Classified ?? 0) + 1; if (!candidate) job.Rejected = (job.Rejected ?? 0) + 1;
         }

@@ -43,7 +43,9 @@ public static class Program
     public const string Usage = """
         indexnode run [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
-        indexnode sources add <url> [--every 1d|6h|daily@03:00] [--backfill N] [--follow-channels] [--tabs videos,shorts] [--max-height 480] [--priority N]
+        indexnode sources add <url> [--every 1d|6h|daily@03:00] [--backfill N] [--follow-channels] [--tabs videos|videos,shorts (default videos)] [--max-height 480] [--priority N]
+        indexnode sources migrate-seen [--dry-run]   (0.13.2: seen.json ids become members of members.json, then seen.json goes; a refresh does it for its own source on first touch)
+        indexnode sources set-tabs videos|videos,shorts --all [--dry-run]   (0.13.2: the tabs of every followed source; the default is videos only)
         indexnode sources list | remove <id> | import <channels.json> [--every 1d] [--tabs videos,shorts] [--priority N]
         indexnode sources schedule <id> dynamic|off|once|1d|6h|daily@03:00   (dynamic: the next check follows the age of the newest upload; new sources are "once" unless --every says otherwise)
         indexnode sources lookup <id>   (full listing again: every member recorded, every unknown video queued)
@@ -59,13 +61,16 @@ public static class Program
         indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
         indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
         indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
+        indexnode groups build [--dry-run] [--threads N] [--link 0.75]   (the one-time drama groups from center-level shares; then the search-index job keeps them)
         indexnode search-index build [--new-mean] | update [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (the global search table under index/search/vN/)
         indexnode search --vector <f32|f16 file of 512> | --image <file> [--trim] [--top-centers 300] [--top 20] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (screenshot search over the centers; "search <text> --job <id>" is the clip text search)
         indexnode ai score [--ids <file>] [--all-frames] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (0.12.0: the AI-drama probe on processed uploads' stored sscd.zip -> videos/<id>/ai.json)
         indexnode status [--json]
         indexnode jobs migrate --to log [--dry-run]   (0.13.0: builds the first queue snapshot from today's job blobs; refuses while a job is running)
+        indexnode jobs repair-steps [--dry-run]   (0.13.2: steps in a done list whose output is not on the store are taken out; a finished subject missing an output is re-opened with only the missing steps)
         indexnode jobs list [--stage S] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>   (the queue)
         indexnode video <id>   (what the queue knows about one video)
+        indexnode videos backfill [--dry-run] [--threads N]   (0.13.2: create index/videos/<id>/video.json for every upload that has none, from idx_summary, info.json, precheck.json, transcribe.zip and the AI probe; create-only; a video under an active claim is skipped and reported. Run once, from a westus2 node, before the search-index job relies on it)
         (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
         indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel <cores>]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
         indexnode process --job <id> [--steps cast,describe] [--threads N] [--ai-...]   (redo steps of one processed job in the store: real-data run; then 'publish --job <id>')
@@ -113,10 +118,12 @@ public static class Program
                 "jobs" => await JobsCommand.RunAsync(a),
                 "trash" => await JobsCommand.TrashAsync(a),
                 "video" => await JobsCommand.VideoAsync(a),
+                "videos" => await VideosBackfill.RunAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
                 "search" => a.Has("vector") || a.Has("image") ? await CentersCommands.SearchAsync(a) : await Commands.SearchAsync(a),
                 "centers" => await CentersCommands.CentersAsync(a),
                 "search-index" => await CentersCommands.SearchIndexAsync(a),
+                "groups" => await GroupsCommand.RunAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await JobsCommand.RunAsync(Args.Parse(["retry", .. (a.Get("stage") is { } rs ? new[] { "--stage", rs } : [])])),
                 "classify" => await ClassifyCommand.RunAsync(a),
@@ -243,7 +250,7 @@ public static class Commands
 
         var budgetText = limits.Budget is { } bd ? $" budget={limits.Remaining}/{bd}" : "";
         var schedText = (a.Get("schedule") ?? cfg.Schedule) is { } sc ? " schedule=" + sc.Replace(' ', '_') + " window=" + (a.Get("window") ?? cfg.Window ?? "1h") : "";
-        Log.Info($"node {nodeId}: stages={string.Join(',', stages)}lanes={lanes} ai-stages={(aiStages && ai.Configured ? "on" : "off")} threads={threads} worker-threads={opts.ThreadsPerWorker} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
+        Log.Info($"node {nodeId}: stages={string.Join(',', stages)} lanes={lanes} ai-stages={(aiStages && ai.Configured ? "on" : "off")} threads={threads} worker-threads={opts.ThreadsPerWorker} prefix={paths.Prefix}{budgetText}{schedText} ai=[{ai.Describe()}]");
         Task? statusLoop = null;
         if (a.Get("status-out") is { } statusOut)
         {
@@ -306,6 +313,26 @@ public static class Commands
                 job.Priority = priority;
                 var created = await Sources.AddAsync(queue, job, default);
                 Console.WriteLine($"{(created ? "added " : "exists")} {job.JobId}  {job.Kind}  {job.Name}  schedule={Schedule.Of(job).Describe()} backfill={(job.Backfill?.ToString() ?? "all")} followChannels={job.FollowChannels}{(created ? "  lookup due now (priority " + Protocol.RefreshNowPriority + ")" : "")}");
+                return 0;
+            }
+            case "migrate-seen":
+            {
+                bool dry = a.Has("dry-run"); int srcs = 0, ids = 0, files = 0; var at = Protocol.NowUtc();
+                foreach (var j in Sources.List(queue))
+                {
+                    if (await SourceMembers.MigrateSeenAsync(store, paths, j.JobId, j.Seen, at, default, dry) is not { } n) continue;
+                    if (n > 0 || await store.HeadAsync(paths.SourceSeen(j.JobId), default) != null) { srcs++; ids += n; }
+                    if (dry && await store.HeadAsync(paths.SourceSeen(j.JobId), default) != null) files++;
+                }
+                Console.WriteLine($"{(dry ? "would migrate" : "migrated")} {srcs} source(s): {ids} id(s) {(dry ? "would become" : "became")} members{(dry ? $", {files} seen.json file(s) would be deleted (dry run: nothing written)" : "; seen.json deleted")}");
+                return 0;
+            }
+            case "set-tabs":
+            {
+                var tabs = Sources.ParseTabs(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("sources set-tabs videos|videos,shorts --all [--dry-run]"));
+                if (!a.Has("all")) throw new ArgumentException("sources set-tabs <tabs> --all [--dry-run] (every followed source)");
+                bool dry = a.Has("dry-run"); int n = await Sources.SetTabsAsync(queue, tabs, dry, default);
+                Console.WriteLine($"{(dry ? "would set" : "set")} tabs={string.Join(',', tabs)} on {n} source(s){(dry ? " (dry run: nothing written)" : "")}");
                 return 0;
             }
             case "list":
@@ -774,6 +801,7 @@ public static class Commands
                 case "precheck.audio-format": (file.PreCheck ??= new()).AudioFormat = val.Trim(); break;
                 case "precheck.window-position": (file.PreCheck ??= new()).WindowPosition = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.ai-flag": (file.PreCheck ??= new()).AiFlag = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.group-min-hits": (file.PreCheck ??= new()).GroupMinHits = int.Parse(val); break;
                 case "precheck.index-recheck-minutes": (file.PreCheck ??= new()).IndexRecheckMinutes = int.Parse(val); break;
                 case "node-name": file.NodeName = NodeConfig.SanitizeName(val); break;
                 case "ytdlp.command": file.Ytdlp = new YtDlpConfig { Command = ParseCommand(val) }; break;

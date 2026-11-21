@@ -18,20 +18,29 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
         var ct = ctx.Token; var store = ctx.Store; var paths = ctx.Paths; var id = ctx.Job.JobId; var s = settings;
         if (!s.Enabled) return;
         var videoBlob = paths.Video(id, "video.mp4");
-        if (await store.GetAsync(paths.Video(id, "precheck.json"), ct) is { } prior)
+        var vj = await VideoJson.RequireAsync(store, paths, id, ct);   // 0.13.2: the record lives in video.json (precheck.json is not written any more); a missing descriptor fails the claim, loudly
+        if (vj.Root["precheck"] is JsonObject pr)
         {   // a repeat (the claim was interrupted after the record): a duplicate is finished again, anything else just goes on
-            var pr = JsonNode.Parse(prior.Data) as JsonObject;
-            if ((string?)pr?["decision"] == PreCheckDecision.Duplicate) { await FinishDuplicateAsync(ctx, pr!, null, ct); }
+            if ((string?)pr["decision"] == PreCheckDecision.Duplicate) { await FinishDuplicateAsync(ctx, pr, null, ct); }
             return;
         }
 
         var run = await AnalyzeAsync(ctx, null, ct, strict: true);
         if (run == null) return;
-        await store.PutAsync(paths.Video(id, "precheck.json"), Encoding.UTF8.GetBytes(run.Record.ToJsonString(new JsonSerializerOptions { WriteIndented = true })), null, null, false, ct);
+        await RecordAsync(store, paths, id, run.Record, ct);
         if (run.Decision.Decision == PreCheckDecision.Duplicate) { await FinishDuplicateAsync(ctx, run.Record, run.Summary, ct); return; }
         // an AI-flagged upload is not skipped (0.13.1): the engine holds it until control aiDramas is on (the record says ai.flag)
         // anything else: the summary is kept in downloaded.json's cache copy only when the zip is re-committed by a later stage; download.zip itself is not touched
     }
+
+    /// <summary>Writes the pre-check record, and the speech and AI facts it measured, into video.json (this claim holds the video's lease; conditional on the ETag read, a 412 reads and merges again).</summary>
+    public static Task RecordAsync(IStore store, Paths paths, string id, JsonObject rec, CancellationToken ct) => VideoJson.UpdateAsync(store, paths, id, root =>
+    {
+        root["precheck"] = JsonNode.Parse(rec.ToJsonString());
+        var sp = rec["speech"] as JsonObject; var ai = rec["ai"] as JsonObject;
+        if ((string?)sp?["speechLanguage"] is { Length: > 0 } lang) VideoJson.SetSpeech(root, lang, (bool?)sp?["dubbed"], "precheck");
+        if ((double?)ai?["score"] is { } score) VideoJson.SetAi(root, score, (bool?)ai?["flag"], "precheck");
+    }, ct);
 
     /// <summary>What one pre-check found (no store write).</summary>
     public sealed record Run(PreCheckDecision Decision, JsonObject Record, JsonObject Summary, PreCheckAnalysis Analysis, bool Ai);
@@ -47,7 +56,8 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
         if (await analyzer.UnavailableAsync(s, ct) is { } unavailable) { Log.Info($"process {id}: pre-check skipped ({unavailable})"); return Skip(unavailable); }
         var infoBlob = await store.GetAsync(paths.Video(id, "info.json"), ct);
         var info = infoBlob == null ? new JsonObject() : JsonNode.Parse(infoBlob.Data) as JsonObject ?? new JsonObject();
-        var downloaded = await store.GetAsync(paths.Video(id, "downloaded.json"), ct) is { } d0 ? JsonNode.Parse(d0.Data) as JsonObject ?? new JsonObject() : new JsonObject();
+        var vroot = (await VideoJson.RequireAsync(store, paths, id, ct)).Root;   // 0.13.2: the download facts are video.json's
+        var downloaded = vroot["download"] as JsonObject ?? new JsonObject();
         var work = Path.Combine(Path.GetTempPath(), "indexnode", "pc-" + id + "-" + Guid.NewGuid().ToString("N")[..6]);
         Directory.CreateDirectory(work);
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -56,7 +66,7 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
             ctx.Report("precheck", "fetch");
             var video = Path.Combine(work, "video.mp4");
             await store.DownloadToFileAsync(videoBlob, video, ct);
-            double duration = (double?)downloaded["durationSeconds"] ?? (double?)info["duration"] ?? 0;
+            double duration = VideoJson.Duration(vroot) ?? (double?)info["duration"] ?? 0;
             if (duration <= 0) duration = await Frames.DurationAsync(tools, video, ct);
             if (duration <= 0) { Log.Info($"process {id}: pre-check skipped (no duration)"); return Skip("no duration"); }
             var (start, end, whole) = PreCheck.Window(duration, s.WindowSeconds, s.WindowPosition);
@@ -73,6 +83,7 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
             try { analysis = await analyzer.AnalyzeAsync(sample, s, Math.Max(1, ctx.ThreadShare()), p => ctx.Report("precheck", p), ct); }
             catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"process {id}: pre-check skipped (analysis failed: {e.Message})"); return Skip("analysis failed: " + e.Message); }
             if (analysis.SkippedReason != null) { Log.Info($"process {id}: pre-check skipped ({analysis.SkippedReason})"); return Skip(analysis.SkippedReason); }
+            analysis = analysis with { Group = DramaGroups.Propose(analysis, start, end - start, s) };
             var decision = PreCheck.Decide(analysis, duration, _ => null, s);
             bool ai = analysis.AiScore >= s.AiFlag;
             if (PreCheckSettings.AiThresholdWarning(s, analysis.Frames) is { } warn) Log.Info($"process {id}: WARNING {warn}");
@@ -93,6 +104,6 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
         var sp = rec["speech"] as JsonObject;
         var why = string.Join("; ", (rec["reasons"] as JsonArray)?.Select(r => r?.ToString()) ?? []);
         Log.Info($"process {ctx.Job.JobId}: pre-check skip (duplicate of {upload}): download.zip and the video are left as they are, marked for 'indexnode trash empty'");
-        throw new DuplicateFound(upload, share, (string?)sp?["speechLanguage"], (bool?)sp?["dubbed"], (string?)sp?["languageSource"], (string?)sp?["metadataLanguage"], ctx.Job.Url) { Why = why, AiScore = (double?)(rec["ai"] as JsonObject)?["score"] };
+        throw new DuplicateFound(upload, share, (string?)sp?["speechLanguage"], (bool?)sp?["dubbed"], (string?)sp?["languageSource"], (string?)sp?["metadataLanguage"], ctx.Job.Url) { Why = why, Group = (string?)rec["groupId"], GroupOffset = (double?)rec["groupOffset"], MatchShare = (double?)rec["matchShare"], DupShare = (double?)rec["dupShare"], Mixed = (bool?)(rec["group"] as JsonObject)?["mixed"] is true ? true : null, AiScore = (double?)(rec["ai"] as JsonObject)?["score"] };
     }
 }

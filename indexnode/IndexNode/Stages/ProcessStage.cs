@@ -94,9 +94,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
         bool Has(string file) => !Redo && listing.ContainsKey(paths.Video(id, file));
         bool HasAny(string file) => listing.ContainsKey(paths.Video(id, file));
         if (Has("processed.json") && !Redo && !stepJob) return;
-        var downloaded = await store.GetAsync(paths.Video(id, "downloaded.json"), ct)
-            ?? throw new InvalidOperationException($"{id} has no downloaded.json yet");
-        double duration = StoredJson.Doc(downloaded.Data, $"{id}/downloaded.json").RootElement.TryGetProperty("durationSeconds", out var dEl) ? dEl.GetDouble() : 0;
+        // 0.13.2: the duration is video.json's (no downloaded.json / idx_summary read); a missing descriptor fails the claim and is retried after `indexnode videos backfill`
+        double duration = VideoJson.Duration((await VideoJson.RequireAsync(store, paths, id, ct)).Root) ?? 0;
 
         // centers: also due again when sscd.zip changed since centers.zip was built (its idx_inputs no longer matches)
         bool centersStale = steps.Contains("centers") && !Redo && Has("centers/manifest.json") && await CentersStep.StaleAsync(store, paths, id, ct);
@@ -179,6 +178,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 ctx.Report("centers", null);
                 Log.Info($"process {id}: centers {await CentersStep.RunAsync(wst, paths, id, Math.Max(1, ctx.ThreadShare()), m => ctx.Report("centers", m), ct)}");
                 await Commit("centers");
+                if ((await VideoJson.ReadAsync(store, paths, id, ct))?.Root["ai"] is null && await CatalogBuild.AiScoreAsync(store, paths, id, ct) is { } cs)   // no pre-check score: the centers' frame vectors give it
+                    await VideoJson.UpdateAsync(store, paths, id, root => { if (root["ai"] is null) VideoJson.SetAi(root, cs, cs >= new PreCheckSettings().AiFlag, "centers"); }, ct);
             }
             if (need["dino"])
             {   // after sscd: DINOv2-small vectors from the stored frames (opt-in step)
@@ -209,6 +210,12 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 ctx.Report("transcribe", null);
                 Log.Info($"process {id}: transcribe {await StageSteps.TranscribeAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("transcribe", p), ct)}");
                 await Commit("transcribe");
+                if (await store.GetAsync(paths.Video(id, "asr/" + Transcribe.ModelName + ".zh.json"), ct) is { } asrNow)
+                {   // 0.13.2: the measured speech language goes into video.json (this claim holds the lease)
+                    var ar = StoredJson.Doc(asrNow.Data, $"{id}/asr/" + Transcribe.ModelName + ".zh.json").RootElement;
+                    string? lg = ar.TryGetProperty("language", out var lgEl) ? lgEl.GetString() : null; bool? db = ar.TryGetProperty("dubbed", out var dbEl) ? dbEl.ValueKind == JsonValueKind.True : null;
+                    await VideoJson.UpdateAsync(store, paths, id, root => VideoJson.SetSpeech(root, lg, db, "transcribe"), ct);
+                }
             }
             if (need["ocrsubs"])
             {

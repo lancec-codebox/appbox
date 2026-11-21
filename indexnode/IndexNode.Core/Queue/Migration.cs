@@ -62,7 +62,14 @@ public static class Migration
             if (Protocol.IsStep(stage) || stage == "process") { if (!byDrama.TryGetValue(id, out var g)) byDrama[id] = g = new(); g[stage] = b; continue; }
             await OneAsync(store, state, rep, stage, id, b, at, paths, ct);
         }
-        foreach (var (id, steps) in byDrama) AddDrama(state, rep, id, steps, at);
+        foreach (var (id, steps) in byDrama)
+        {
+            // 0.13.2: a step is done only if its old job was done or its output zip is on the store (a step with no old job at all is NOT done: centers jobs were only ever made after sscd)
+            var have = new HashSet<string>(StringComparer.Ordinal);
+            bool open = NodeEngine.StandardSteps.Any(x => steps.TryGetValue(x, out var sb) && St(sb) != "done") || steps.TryGetValue("process", out var lp) && St(lp) == "pending";
+            if (open) foreach (var x in NodeEngine.StandardSteps) if (!steps.ContainsKey(x) && await store.HeadAsync(paths.Video(id, x + ".zip"), ct) != null) have.Add(x);
+            AddDrama(state, rep, id, steps, at, have);
+        }
         rep.Subjects = state.Subjects.Count;
         return (state, rep);
     }
@@ -100,7 +107,7 @@ public static class Migration
         rep.Count(stage, s);
     }
 
-    private static void AddDrama(QueueState state, MigrationReport rep, string id, Dictionary<string, BlobEntry> jobs, string at)
+    private static void AddDrama(QueueState state, MigrationReport rep, string id, Dictionary<string, BlobEntry> jobs, string at, HashSet<string> haveZips)
     {
         if (!state.Subjects.TryGetValue(id, out var sub)) state.Subjects[id] = sub = new QSubject { Id = id, LastAt = at };
         var std = NodeEngine.StandardSteps;
@@ -112,7 +119,7 @@ public static class Migration
         if (pending.Count > 0 || failed.Count > 0)
         {
             var all = pending.Select(x => jobs[x]).Concat(failed.Select(x => jobs[x])).ToList();
-            var done = std.Where(x => !pending.Contains(x) && !failed.Contains(x)).ToList();
+            var done = std.Where(x => !pending.Contains(x) && !failed.Contains(x) && (stdJobs.Contains(x) || haveZips.Contains(x))).ToList();   // done: its old job was done (not pending, not failed), or no job at all but its zip is there
             var added = all.Select(b => b.Tags.GetValueOrDefault(Tags.Added) ?? at).OrderBy(x => x, StringComparer.Ordinal).First();
             var due = pending.Count > 0 ? pending.Select(x => Tags.DueOf(jobs[x].Tags)).Where(x => x.Length > 0).DefaultIfEmpty(added).Min()! : added;
             int pri = all.Max(b => Tags.PriorityOf(b.Tags));
@@ -148,7 +155,7 @@ public static class Migration
         foreach (var s in state.Subjects.Values)
             if (s.Entries.TryGetValue("refresh", out var e) && e.Job?.Seen is { Count: > 0 } seen)
             {
-                await store.PutAsync(paths.SourceSeen(s.Id), JsonSerializer.SerializeToUtf8Bytes(seen, Protocol.Json), null, null, false, ct); rep.SeenFiles++;
+                await SourceMembers.AddIdsAsync(store, paths, s.Id, seen, at, ct); rep.SeenFiles++;   // 0.13.2: the old seen list goes straight into members.json
                 e.Job.Seen = [];   // the snapshot, like a log line, does not carry the list
             }
         await store.CreateAppendBlobAsync(paths.QueueSegment(1), true, ct);

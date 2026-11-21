@@ -35,7 +35,7 @@ public sealed class JobSkipped(string message) : Exception(message);
 
 /// <summary>0.12.0/0.13.0: thrown by the pre-check (the first step of a process claim) when the upload is a copy / AI / a non-canonical dub of an upload we already have; the job ends in state "duplicate".</summary>
 public sealed class DuplicateFound(string upload, double share, string? speechLanguage = null, bool? dubbed = null, string? languageSource = null, string? metadataLanguage = null, string? url = null) : Exception($"duplicate of {upload} (share {share:0.00})")
-{ public string Upload { get; } = upload; public double Share { get; } = share; public string? SpeechLanguage { get; } = speechLanguage; public bool? Dubbed { get; } = dubbed; public string? LanguageSource { get; } = languageSource; public string? MetadataLanguage { get; } = metadataLanguage; public string? Url { get; } = url; public string? Why { get; init; } public double? AiScore { get; init; } public bool Ai { get; init; } }
+{ public string Upload { get; } = upload; public double Share { get; } = share; public string? SpeechLanguage { get; } = speechLanguage; public bool? Dubbed { get; } = dubbed; public string? LanguageSource { get; } = languageSource; public string? MetadataLanguage { get; } = metadataLanguage; public string? Url { get; } = url; public string? Why { get; init; } public double? AiScore { get; init; } public string? Group { get; init; } public double? GroupOffset { get; init; } public double? MatchShare { get; init; } public double? DupShare { get; init; } public bool? Mixed { get; init; } public bool Ai { get; init; } }
 
 public interface IStageHandler
 {

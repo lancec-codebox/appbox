@@ -179,6 +179,7 @@ public class CentersTests
         await wr.PutAsync(P.Video(id, "sscd/0000.f16"), f16, null, null, false, default);
         await wr.PutAsync(P.Video(id, "sscd/manifest.json"), Encoding.UTF8.GetBytes($"{{\"v\":1,\"step\":\"sscd\",\"chunks\":[{{\"chunk\":\"0000\",\"start\":0,\"rows\":{n}}}]}}"), null, null, false, default);
         foreach (var st in new[] { "frames", "sscd" }) Assert.True(await StageZipStore.Stage(wr)!.CommitStageAsync(id, st, "n1", false, false, default));
+        await VideoJsonSeed.PutAsync(fs, P, id, 300);   // 0.13.2: the descriptor the download wrote
         return (fs, wr);
     }
 
@@ -223,6 +224,7 @@ public class CentersTests
             var planted = new float[D];
             foreach (var (id, seed) in new[] { ("a1", 41), ("b2", 42), ("c3", 43) })
             {
+                await VideoJsonSeed.PutAsync(local, P, id, 300);
                 var x = Make(300, 20, seed, 0.5); if (id == "b2") planted = x.AsSpan(77 * D, D).ToArray();
                 var n = 300; var f16 = F16(x);
                 var frames = Enumerable.Range(0, n).Select(i => new ChunkFrame(i, i * 1.0, i * 1.0, [], null, i, 1)).ToList();
@@ -344,7 +346,7 @@ public class CentersTests
             await fs.PutAsync(P.Video("up9", "download.zip"), [1], null, null, false, default);
             var wr0 = (StageZipStore)StageZipStore.Wrap(fs, cache + "d"); await wr0.PutAsync(P.Video("up9", "downloaded.json"), Encoding.UTF8.GetBytes("{\"durationSeconds\":300}"), null, null, false, default);
             await wr0.PutAsync(P.Video("up9", "info.json"), Encoding.UTF8.GetBytes("{}"), null, null, false, default); Assert.True(await StageZipStore.Stage(wr0)!.CommitStageAsync("up9", "download", "n", false, false, default));
-            Assert.DoesNotContain(fs.Names("index/videos/up9/"), n => n.EndsWith(".json"));
+            Assert.DoesNotContain(fs.Names("index/videos/up9/"), n => n.EndsWith(".json") && !n.EndsWith("/video.json", StringComparison.Ordinal));   // 0.13.2: video.json is the one loose descriptor
             var store = SiteCommands.ProcessStore(fs); ProcessStage.Ai = new AiConfig();
             for (int round = 0; round < 2; round++)
             {

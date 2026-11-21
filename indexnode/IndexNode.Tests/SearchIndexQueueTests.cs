@@ -124,6 +124,7 @@ public class SearchIndexQueueTests : IDisposable
         await wr.PutAsync(P.Video(id, "sscd/0000.f16"), F16(x), null, null, false, default);
         await wr.PutAsync(P.Video(id, "sscd/manifest.json"), Encoding.UTF8.GetBytes($"{{\"v\":1,\"step\":\"sscd\",\"chunks\":[{{\"chunk\":\"0000\",\"start\":0,\"rows\":{n}}}]}}"), null, null, false, default);
         foreach (var st in new[] { "frames", "sscd" }) Assert.True(await StageZipStore.Stage(wr)!.CommitStageAsync(id, st, "n1", false, false, default));
+        await VideoJsonSeed.PutAsync(wr, P, id, 1800);   // 0.13.2: the descriptor the download wrote
     }
 
     [Fact]

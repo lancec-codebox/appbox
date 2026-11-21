@@ -35,7 +35,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     public static string[] ListingUrls(JobDescriptor j)
     {
         if (j.Kind == "playlist") return [$"https://www.youtube.com/playlist?list={j.Id}"];
-        var tabs = j.Tabs is { Length: > 0 } t ? t : ["videos", "shorts"];
+        var tabs = j.Tabs is { Length: > 0 } t ? t : ["videos"];   // 0.13.2: videos only (a channel's Shorts are never dramas; classify's length rule dropped them all anyway)
         return tabs.Select(tab => $"https://www.youtube.com/channel/{j.Id}/{tab}").ToArray();
     }
 
@@ -58,11 +58,12 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         foreach (var url in urls)
         {
             var r = await tools.RunYtDlpAsync(end > 0 ? ["--flat-playlist", "--no-warnings", "--playlist-end", end.ToString(), "--print", ListPrint, url] : ["--flat-playlist", "--no-warnings", "--print", ListPrint, url], ct);
+            if (r.ExitCode != 0 && (r.Stderr ?? "").Contains("does not have a", StringComparison.OrdinalIgnoreCase) && r.Stderr!.Contains(" tab", StringComparison.OrdinalIgnoreCase)) continue;   // 0.13.2: a missing tab (a channel with no Shorts tab) is an empty listing, not a failure
             if (r.ExitCode != 0) { failed++; lastError = r.Stderr; continue; }
             foreach (var line in r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 if (ParseLine(line) is { } e && all.All(x => x.Id != e.Id)) all.Add(e);
         }
-        if (failed == urls.Length) YtDlp.Throw(lastError ?? "");
+        if (failed > 0 && failed == urls.Length) YtDlp.Throw(lastError ?? "");
         return all;
     }
 
@@ -115,9 +116,9 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
 
         // lookup: the whole source (a playlist in full, a channel's newest ChannelFirstList or backfill); refresh: a channel's newest uploads until known ones are reached, a playlist in full
         int end = lookup ? (job.Kind == "playlist" ? 0 : Math.Max(ChannelFirstList, backfill)) : job.Kind == "playlist" ? 0 : ListSize;
-        var seenBlob = await store.GetAsync(paths.SourceSeen(job.JobId), ct);   // up to 500 ids: kept out of the log lines
-        job.Seen = seenBlob == null ? job.Seen : System.Text.Json.JsonSerializer.Deserialize<List<string>>(seenBlob.Data, Protocol.Json);
-        var seen = new HashSet<string>(job.Seen ?? []);
+        // 0.13.2: members.json is the source's one file; an old seen.json (and any ids the job body still carries) become members on first touch
+        if (await SourceMembers.MigrateSeenAsync(store, paths, job.JobId, job.Seen, Protocol.Utc(now()), ct) is { } migrated && migrated > 0) Log.Info($"{job.JobId}: {migrated} id(s) of the old seen list became members");
+        var seen = (await SourceMembers.ReadAsync(store, paths, job.JobId, ct)).Members.Select(m => m.Id).ToHashSet(StringComparer.Ordinal);
         bool firstPoll = job.LastPolled == null;
         var listed = await ListAsync(job, end, ct);
         while (!lookup && job.Kind == "channel" && end < 500 && listed.Count >= end && listed.All(e => !seen.Contains(e.Id))) { end *= 4; listed = await ListAsync(job, end, ct); } // every one new: go further back until a known one turns up
@@ -128,20 +129,22 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
 
         // every unknown video becomes an unclassified download job (0.9.1); the singleton classify job decides it. A lookup of a playlist honours its backfill limit (none = every video)
         int limit = lookup && job.Kind == "playlist" && job.Backfill != null ? backfill : int.MaxValue;
+        var batch = new List<JobDescriptor>();   // decided and appended together below: one append for the whole lookup, not one per video
         foreach (var e in fresh)
         {
             if (await KnownAsync(queue, paths, e.Id, ct)) { skipped++; continue; }
-            if (made >= limit) break;
+            if (batch.Count >= limit) break;
             var d = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={e.Id}", job.MaxHeight ?? 480, null);
             d.Source = job.JobId; d.Sources = [job.JobId]; d.AddedAt = addedAt; d.Priority = job.Priority;
             d.Title = e.Title; d.Duration = e.Duration; d.Availability = e.Availability;
             d.ChannelId = e.ChannelId ?? (job.Kind == "channel" ? job.Id : null); d.ChannelName = e.ChannelName ?? (job.Kind == "channel" ? job.Name : null);
-            if (await ClassifyJobs.CreateUnclassifiedAsync(queue, d, ct)) made++; else skipped++;
+            batch.Add(d);
         }
+        made = (await ClassifyJobs.CreateUnclassifiedBatchAsync(queue, batch, ct)).Count; skipped += batch.Count - made;
 
         if (job.FollowChannels == true)
         {
-            var done = new HashSet<string>();
+            var done = new HashSet<string>(); var follow = new List<JobDescriptor>();
             foreach (var e in fresh)
             {
                 var cid = e.ChannelId;
@@ -155,15 +158,14 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
                 if (cid == null || !done.Add(cid)) continue;
                 var ch = JobDescriptor.NewSource("channel", cid, cname ?? cid, "once", ["videos"], false, 0, job.MaxHeight ?? 480); // Shorts are never dramas
                 ch.Source = job.JobId; ch.AddedAt = addedAt; ch.Priority = job.Priority;
-                if (await Sources.AddAsync(queue, ch, ct)) Log.Info($"{run} {job.JobId}: now following channel {ch.Name} ({cid})");
+                follow.Add(ch);
             }
+            foreach (var ch in await Sources.AddBatchAsync(queue, follow, ct)) Log.Info($"{run} {job.JobId}: now following channel {ch.Name} ({ch.Id})");
         }
 
         await WriteMembersAsync(paths, job, listed, lookup, addedAt, ct);
 
-        job.Seen = fresh.Select(e => e.Id).Concat(job.Seen ?? []).Distinct().Take(SeenCap).ToList();
-        await store.PutAsync(paths.SourceSeen(job.JobId), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(job.Seen, Protocol.Json), null, null, false, ct);
-        job.Seen = [];   // the log line carries the job without its list (see seen.json); an empty list marks a source that has been looked at
+        job.Seen = [];   // an empty list marks a source that has been looked at (KindOf); the ids live in members.json
         job.Found = (job.Found ?? 0) + made;
         job.LastPolled = addedAt; job.LastRun = run;
         if (lookup) job.LastLookup = addedAt; else job.LastRefresh = addedAt;
@@ -199,23 +201,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         Log.Info($"{run} {job.JobId}: {listed.Count} listed, {fresh.Count} {(lookup ? "looked at" : "new")}, {made} download job(s) created, {skipped} already known; schedule {schedule.Describe()}{tierText}{(next != null ? ", next " + job.NextRefresh : "")}");
     }
 
-    public sealed record Member(string Id, string? Title, double? Duration, string? ChannelId, string? ChannelName, string? Availability);
-
-    /// <summary>index/sources/&lt;id&gt;/members.json (for the catalog): the member list of the last look. A playlist is rewritten in full; a channel's listing is only its newest uploads, so it is merged into what is there (newest first).</summary>
-    private async Task WriteMembersAsync(Paths paths, JobDescriptor job, List<Entry> listed, bool lookup, string at, CancellationToken ct)
-    {
-        var members = listed.Select(e => new Member(e.Id, e.Title, e.Duration, e.ChannelId, e.ChannelName, e.Availability)).ToList();
-        string? looked = at;
-        if (await store.GetAsync(paths.SourceMembers(job.JobId), ct) is { } old)
-            try
-            {
-                var o = JsonNode.Parse(old.Data) as JsonObject;
-                if (job.Kind == "channel") members = members.Concat((o?["members"]?.Deserialize<List<Member>>(Protocol.Json) ?? []).Where(h => members.All(m => m.Id != h.Id))).ToList();
-                if (!lookup) looked = o?["lookedUpAt"]?.ToString() ?? looked;
-            }
-            catch (JsonException) { }
-        job.Members = members.Count;
-        var doc = new { v = 1, sourceId = job.JobId, kind = job.Kind, id = job.Id, name = job.Name, updatedAt = at, lookedUpAt = lookup ? at : looked, members };
-        await store.PutAsync(paths.SourceMembers(job.JobId), JsonSerializer.SerializeToUtf8Bytes(doc, Protocol.Json), null, null, false, ct, "application/json");
-    }
+    /// <summary>index/sources/&lt;id&gt;/members.json (for the catalog and for "is this new?"): written by the refresh claim, conditional on its ETag. A playlist is rewritten in full; a channel's listing is only its newest uploads, so it is merged into what is there (newest first).</summary>
+    private async Task WriteMembersAsync(Paths paths, JobDescriptor job, List<Entry> listed, bool lookup, string at, CancellationToken ct) =>
+        job.Members = await SourceMembers.MergeAsync(store, paths, job, listed.Select(e => new SourceMember(e.Id, e.Title, e.Duration, e.ChannelId, e.ChannelName, e.Availability)).ToList(), lookup, at, ct);
 }

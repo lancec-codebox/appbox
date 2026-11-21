@@ -28,7 +28,7 @@ public static class Trash
         await queue.PollAsync(ct);
         var cut = Protocol.Utc(queue.Now - olderThan);
         var due = queue.Read(List).Where(i => i.DeletedAt == null && string.CompareOrdinal(i.MarkedAt ?? "", cut) <= 0).ToList();
-        var res = new List<(Item, string[])>();
+        var res = new List<(Item, string[])>(); var lines = new List<QLine>();
         foreach (var it in due)
         {
             var found = new List<string>();
@@ -36,8 +36,10 @@ public static class Trash
             res.Add((it, found.ToArray()));
             if (dryRun) continue;
             foreach (var b in found) await store.DeleteAsync(b, ct);
-            await queue.AppendLinesAsync([new QLine { T = "deleted", S = it.Subject, Stage = it.Stage, Trash = it.Mark }], ct);
+            lines.Add(new QLine { T = "deleted", S = it.Subject, Stage = it.Stage, Trash = it.Mark });
+            if (lines.Count >= JobQueue.BatchChunk) { await queue.AppendLinesAsync(lines.ToList(), ct); lines.Clear(); }   // the blobs are gone; the marks are recorded in chunks, not one append each
         }
+        if (lines.Count > 0) await queue.AppendLinesAsync(lines, ct);
         return res;
     }
 }

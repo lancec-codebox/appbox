@@ -10,7 +10,7 @@ public static partial class Sources
     [GeneratedRegex(@"youtube\.com/channel/(UC[A-Za-z0-9_-]{22})")] private static partial Regex ChannelPath();
 
     public static string[] ParseTabs(string? s) =>
-        string.IsNullOrWhiteSpace(s) ? ["videos", "shorts"] : s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(t =>
+        string.IsNullOrWhiteSpace(s) ? ["videos"] : s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(t =>
             t is "videos" or "shorts" ? t : throw new ArgumentException($"unknown tab '{t}' (videos, shorts)")).ToArray();
 
     /// <summary>(kind, id) when the URL names one outright; null when yt-dlp has to resolve it (a @handle).</summary>
@@ -60,6 +60,40 @@ public static partial class Sources
             return [QLine.Add(job.JobId, "refresh", job, job.AddedAt, Protocol.RefreshNowPriority, job.AddedAt)];
         }, ct);
         return made;
+    }
+
+    /// <summary>The batch of <see cref="AddAsync"/>: one append per <see cref="JobQueue.BatchChunk"/> sources, decided against the state; returns the sources that were made.</summary>
+    public static async Task<List<JobDescriptor>> AddBatchAsync(JobQueue queue, IReadOnlyList<JobDescriptor> jobs, CancellationToken ct)
+    {
+        foreach (var j in jobs) { j.Run = "lookup"; j.Stage = "refresh"; }
+        var madeAll = new List<JobDescriptor>();
+        foreach (var chunk in JobQueue.Chunks(jobs, j => j.ToBytes().Length))
+        {
+            var made = new List<JobDescriptor>();
+            await queue.AppendLinesAsync(st =>
+            {
+                made.Clear(); var lines = new List<QLine>(); var seen = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var j in chunk)
+                {
+                    if (st.Entry(j.JobId, "refresh") != null || !seen.Add(j.JobId)) continue;
+                    made.Add(j); lines.Add(QLine.Add(j.JobId, "refresh", j, j.AddedAt, Protocol.RefreshNowPriority, j.AddedAt));
+                }
+                return lines.Count == 0 ? null : lines;
+            }, ct);
+            madeAll.AddRange(made);
+        }
+        return madeAll;
+    }
+
+    /// <summary>0.13.2: sets the tabs of every followed source (`sources set-tabs videos --all`) as batched upd lines (one append per batch). Returns how many sources changed.</summary>
+    public static async Task<int> SetTabsAsync(JobQueue queue, string[] tabs, bool dryRun, CancellationToken ct)
+    {
+        await queue.PollAsync(ct);
+        var jobs = queue.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("refresh") && s.Entries["refresh"].Job is { } j && !(j.Tabs is { } t && t.SequenceEqual(tabs))).Select(s => (s.Id, Job: s.Entries["refresh"].Job!)).ToList());
+        if (dryRun) return jobs.Count;
+        var lines = jobs.Select(x => { var j = Clone(x.Job); j.Tabs = tabs; return new QLine { T = "upd", S = x.Id, Stage = "refresh", Job = j }; }).ToList();
+        foreach (var chunk in JobQueue.Chunks(lines, l => l.ToJson().Length)) await queue.AppendLinesAsync(chunk, ct);
+        return jobs.Count;
     }
 
     private static JobDescriptor WithSeen(JobDescriptor j) => j;

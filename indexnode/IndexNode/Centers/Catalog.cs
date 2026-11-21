@@ -17,7 +17,7 @@ public sealed record CatalogUpload(string Id, double? DurationSeconds, string? T
     string? Data = null);
 
 /// <summary>Per-group section: empty in 0.13.1.</summary>
-public sealed record CatalogGroup(string Id);
+public sealed record CatalogGroup(string Id, string? Canonical, IReadOnlyList<string> Members);
 
 /// <summary>What the pre-check needs about every upload without opening it: duration, language, AI. Published next to the index version it was built for.</summary>
 public sealed class Catalog
@@ -29,6 +29,16 @@ public sealed class Catalog
     public List<CatalogGroup> Groups { get; set; } = [];
     Dictionary<string, CatalogUpload>? by;
     public CatalogUpload? Find(string id) => (by ??= Uploads.GroupBy(u => u.Id).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal)).GetValueOrDefault(id);
+
+    /// <summary>0.13.2: fills groupId / canonical / mixed / groupOffset of every entry and the groups section from the group set of the same version.</summary>
+    public void ApplyGroups(GroupSet set)
+    {
+        var m = new Dictionary<string, (string G, GroupMember M, DramaGroup D)>(StringComparer.Ordinal);
+        foreach (var g in set.Groups) foreach (var x in g.Members) m[x.Upload] = (g.Id, x, g);
+        Uploads = Uploads.Select(u => m.TryGetValue(u.Id, out var e) ? u with { GroupId = e.G, Canonical = e.D.Canonical == u.Id, Mixed = e.M.Mixed, GroupOffset = e.M.Offset } : u).ToList();
+        Groups = set.Groups.Select(g => new CatalogGroup(g.Id, g.Canonical, g.Members.Select(x => x.Upload).ToList())).ToList();
+        by = null;
+    }
 
     public byte[] ToGzip()
     {
@@ -48,25 +58,21 @@ public sealed class Catalog
 
 public static class CatalogBuild
 {
-    /// <summary>What an upload's precheck.json says (0.12.0+); everything null when there is none.</summary>
+    /// <summary>What an upload's video.json says (0.13.2); the pre-check fields are null when it has no precheck section.</summary>
     public sealed record Pre(bool Exists, string? Language, bool? Dubbed, double? AiScore, bool? AiFlag, string? Title, string? Channel, double? Duration, string? Decision = null, string? MatchUpload = null, double? MatchShare = null, double? MatchOffset = null, double? MatchCosine = null);
 
+    /// <summary>The facts of one upload from its video.json. A missing or unreadable video.json THROWS (the entry fails and is retried at the next build): never a quiet null.</summary>
     public static async Task<Pre> ReadPrecheckAsync(IStore store, Paths paths, string id, CancellationToken ct)
     {
-        try
-        {
-            if (await store.GetAsync(paths.Video(id, "precheck.json"), ct) is not { } c || JsonNode.Parse(c.Data) is not JsonObject o) return new Pre(false, null, null, null, null, null, null, null);
-            var sp = o["speech"] as JsonObject; var ai = o["ai"] as JsonObject; var v = o["video"] as JsonObject;
-            double? dur = (double?)v?["duration"]; if (dur is not > 0) dur = null;
-            var top = (o["top"] as JsonArray)?.OfType<JsonObject>().ToList() ?? []; var mu = (string?)o["matchUpload"];
-            var m = (mu == null ? null : top.FirstOrDefault(x => (string?)x["upload"] == mu)) ?? top.FirstOrDefault();
-            return new Pre(true, (string?)sp?["speechLanguage"], (bool?)sp?["dubbed"], (double?)ai?["score"], (bool?)ai?["flag"], (string?)v?["title"], (string?)v?["channel"], dur, (string?)o["decision"], mu ?? (string?)m?["upload"], (double?)m?["share"], (double?)m?["bestTime"], (double?)m?["bestCosine"]);
-        }
-        catch (Exception e) when (e is not OperationCanceledException) { return new Pre(false, null, null, null, null, null, null, null); }
+        var root = (await VideoJson.RequireAsync(store, paths, id, ct)).Root;
+        var sp = root["speech"] as JsonObject; var ai = root["ai"] as JsonObject; var yt = root["youtube"] as JsonObject; var pc = root["precheck"] as JsonObject;
+        var top = (pc?["top"] as JsonArray)?.OfType<JsonObject>().ToList() ?? []; var mu = (string?)pc?["matchUpload"];
+        var m = (mu == null ? null : top.FirstOrDefault(x => (string?)x["upload"] == mu)) ?? top.FirstOrDefault();
+        return new Pre(pc != null, (string?)sp?["language"], (bool?)sp?["dubbed"], (double?)ai?["score"], (bool?)ai?["flag"], (string?)yt?["title"], (string?)yt?["channel"], VideoJson.Duration(root), (string?)pc?["decision"], mu ?? (string?)m?["upload"], (double?)m?["share"], (double?)m?["bestTime"], (double?)m?["bestCosine"]);
     }
 
-    /// <summary>download.zip's idx_summary durationSeconds by HEAD (never a hydrate), else the old downloaded.json, else precheck.json's measured duration.</summary>
-    public static async Task<double?> DurationAsync(IStore store, Paths paths, string id, Pre? pre, CancellationToken ct) => await MatchedDuration.ReadAsync(store, paths, id, ct) ?? pre?.Duration;
+    /// <summary>The upload's duration from video.json (youtube, else download); null only when the descriptor says none.</summary>
+    public static async Task<double?> DurationAsync(IStore store, Paths paths, string id, Pre? pre, CancellationToken ct) => pre?.Duration ?? (await ReadPrecheckAsync(store, paths, id, ct)).Duration;
 
     /// <summary>AI score from the frame vectors of the upload's centers.zip (every member vector, evenly subsampled to the calibrated frame count). Null when the file is unreadable.</summary>
     public static async Task<double?> AiScoreAsync(IStore store, Paths paths, string id, CancellationToken ct)
@@ -92,29 +98,33 @@ public static class CatalogBuild
         var have = processed.Select(u => u.Id).ToHashSet(StringComparer.Ordinal); var metaOnly = new List<string>(); var pre = paths.Prefix + "videos/";
         foreach (var b in await store.ListAsync(pre, false, false, ct))
         {
-            if (!b.Name.EndsWith("/precheck.json", StringComparison.Ordinal)) continue;
-            var id = b.Name[pre.Length..^"/precheck.json".Length]; if (!id.Contains('/') && !have.Contains(id)) metaOnly.Add(id);
+            if (!b.Name.EndsWith("/video.json", StringComparison.Ordinal)) continue;
+            var id = b.Name[pre.Length..^"/video.json".Length]; if (id.Contains('/') || have.Contains(id)) continue;
+            if (b.Size > 0) metaOnly.Add(id);   // an upload with no centers.zip (the index holds only processed ones): the pre-check's short circuit, read below
         }
         metaOnly.Sort(StringComparer.Ordinal);
         var work = processed.Select(u => (u.Id, u.SpeechLanguage, u.Dubbed, Catalog.Processed)).Concat(metaOnly.Select(i => (i, (string?)null, (bool?)null, Catalog.MetadataOnly))).ToList();
-        var res = new CatalogUpload?[work.Count]; int done = 0;
+        var res = new CatalogUpload?[work.Count]; int done = 0; var failed = new List<string>();
         await Parallel.ForEachAsync(Enumerable.Range(0, work.Count), new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (i, t) =>
         {
             var (id, lang0, dub0, state) = work[i];
             if (prev?.Find(id) is { } old && old.CheckedBy != null && old.Data != null && old.State == state && old.DurationSeconds != null && (old.Ai?.Score != null || state == Catalog.MetadataOnly) && (old.SpeechLanguage != null || lang0 == null)) { res[i] = old with { GroupId = null, Canonical = false, Mixed = false, GroupOffset = null }; return; }
-            var pc = await ReadPrecheckAsync(store, paths, id, t); string? held = null;
+            Pre pc;
+            try { pc = await ReadPrecheckAsync(store, paths, id, t); }
+            catch (Exception e) when (e is not OperationCanceledException) { lock (failed) failed.Add($"{id}: {e.Message}"); return; }   // loud, below: the build fails and the entry is retried at the next build
+            if (state == Catalog.MetadataOnly && !pc.Exists) return;   // downloaded, not pre-checked yet (and not indexed): not in the catalog
+            string? held = null;
             if (state == Catalog.MetadataOnly && pc.AiFlag == true && pc.Decision != PreCheckDecision.Duplicate) held = Catalog.HeldAi;   // the AI hold: short-circuited, not processed (yet); state stays metadata-only
-            var dur = await DurationAsync(store, paths, id, pc, t);
+            var dur = pc.Duration;
             string? lang = pc.Language ?? lang0; bool? dub = pc.Language != null ? pc.Dubbed : dub0;
-            if (lang == null && state == Catalog.MetadataOnly) (lang, dub) = await SearchIndexBuild.ReadSpeechAsync(store, paths, id, t);
             double? score = pc.AiScore; bool? flag = pc.AiFlag;
-            if (score == null && state == Catalog.Processed) { score = await AiScoreAsync(store, paths, id, t); flag = score == null ? null : score >= aiFlag; }
             res[i] = new CatalogUpload(id, dur, pc.Title, pc.Channel, lang, dub, score == null ? null : new CatalogAi(Math.Round(score.Value, 4), flag), null, false, false, null, state,
                 state == Catalog.Processed ? Catalog.ByIndex : Catalog.ByPrecheck, held,
                 state == Catalog.Processed ? null : pc.Decision, state == Catalog.Processed ? null : pc.MatchUpload, state == Catalog.Processed ? null : pc.MatchShare, state == Catalog.Processed ? null : pc.MatchOffset, state == Catalog.Processed ? null : pc.MatchCosine,
                 state == Catalog.Processed ? Catalog.DataFull : Catalog.DataPrecheck);
             int d = Interlocked.Increment(ref done); if (d % 100 == 0) say?.Invoke($"  catalog: {d} uploads");
         });
-        return new Catalog { Version = version, Uploads = res.Select(r => r!).ToList() };
+        if (failed.Count > 0) throw new InvalidOperationException($"catalog: {failed.Count} upload(s) have no readable video.json (run: indexnode videos backfill): {string.Join("; ", failed.Order().Take(5))}{(failed.Count > 5 ? "; ..." : "")}");
+        return new Catalog { Version = version, Uploads = res.Where(r => r != null).Select(r => r!).ToList() };
     }
 }

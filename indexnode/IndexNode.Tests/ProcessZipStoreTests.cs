@@ -55,10 +55,11 @@ public class ProcessZipStoreTests
             await build.PutAsync(P.Video("vid", "frames/0000.json"), FrameChunks.JpegIndexJson("0000", 0, 360, 640, 85, frames), null, null, false, default);
             await build.PutAsync(P.Video("vid", "frames/manifest.json"), FrameChunks.ManifestJson("frames", 360, 640, 0, 4, meta, null, "mjpeg", "jpeg"), null, null, false, default);
             await build.PutAsync(P.Video("vid", "downloaded.json"), Encoding.UTF8.GetBytes("{\"durationSeconds\":4}"), null, null, false, default);
+            await VideoJsonSeed.PutAsync(build, P, "vid", 4);
             await build.PutAsync(P.Video("vid", "info.json"), Encoding.UTF8.GetBytes("{\"id\":\"vid\"}"), null, null, false, default);
             await build.PutAsync(P.Video("vid", "sscd/manifest.json"), Encoding.UTF8.GetBytes("{\"old\":true}"), null, null, false, default);
             foreach (var st in new[] { "frames", "download", "sscd" }) Assert.True(await StageZipStore.Stage(build)!.CommitStageAsync("vid", st, "n1", false, false, default), st);
-            Assert.DoesNotContain(fs.Names("index/videos/vid/"), n => n.EndsWith(".json"));   // only stage zips are in the store, like the real one
+            Assert.DoesNotContain(fs.Names("index/videos/vid/"), n => n.EndsWith(".json") && !n.EndsWith("/video.json", StringComparison.Ordinal));   // only stage zips are in the store, like the real one
             var oldSscd = fs[P.Video("vid", "sscd.zip")].Data.ToArray(); Assert.NotEmpty(oldSscd);
 
             var model = Path.Combine(dir, "tiny.onnx"); File.WriteAllBytes(model, TinyModel());
@@ -78,7 +79,7 @@ public class ProcessZipStoreTests
             // and the raw, unwrapped store is what failed before 0.10.8
             var raw = new JobContext { Job = ctx.Job, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = fs, Paths = P, NodeId = "t", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
             var e = await Assert.ThrowsAsync<InvalidOperationException>(() => new ProcessStage(tools, fs, new NodeConfig { ModelPath = model }, new HttpClient()) { Redo = true }.RunAsync(raw));
-            Assert.Contains("no downloaded.json", e.Message);
+            Assert.Contains("no frames/ chunks", e.Message);   // 0.13.2: the duration is video.json's (loose, found on the raw store); what the raw store still cannot do is read the stage zips' members
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

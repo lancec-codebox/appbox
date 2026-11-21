@@ -55,6 +55,16 @@ public static class JobsCommand
                 Console.WriteLine($"{lines.Count} job(s) moved back to pending");
                 return 0;
             }
+            case "repair-steps":
+            {
+                // 0.13.2: steps listed as done whose output is not on the store come out of the done list; a finished subject that lacks an output is re-opened with only the missing steps
+                bool dry = a.Has("dry-run");
+                var q = await Load(store, paths);
+                var rep = await RepairSteps.RunAsync(q, store, paths, dry, default);
+                Console.WriteLine($"{rep.Subjects} process subject(s): {rep.Fixed} {(dry ? "would be fixed" : "fixed")}, {rep.StepsRemoved} step(s) {(dry ? "would be removed" : "removed")} from done lists, {rep.Reopened} finished subject(s) {(dry ? "would be re-opened" : "re-opened")}{(rep.Claimed > 0 ? $", {rep.Claimed} under a claim left alone" : "")}{(dry ? " (dry run: nothing written)" : "")}");
+                foreach (var (s, n) in rep.PerStep) Console.WriteLine($"  {s}: {n}");
+                return 0;
+            }
             case "release":
             {
                 // frees a subject whose worker is gone without waiting for its lease: deletes the active file when its lease has lapsed, else says who holds it
@@ -67,7 +77,7 @@ public static class JobsCommand
                 Console.WriteLine($"{id}: released (the next claim starts from the first unfinished step)");
                 return 0;
             }
-            default: throw new ArgumentException("jobs migrate --to log [--dry-run] | list [--stage S] [--held ai] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>");
+            default: throw new ArgumentException("jobs migrate --to log [--dry-run] | repair-steps [--dry-run] | list [--stage S] [--held ai] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>");
         }
     }
 

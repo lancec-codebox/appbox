@@ -165,8 +165,10 @@ public static class CentersCommands
             if (!newMean) next.MeanFrames = head!.MeanFrames;
         }
         next.BuiltAt = startedAt;
+        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, cts.Token, Console.WriteLine, threads);
         next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, Console.WriteLine, cts.Token);
         Console.WriteLine($"catalog: {next.Catalog.Uploads.Count} uploads, {next.Catalog.ToGzip().Length / 1024.0:F1} KB gzipped");
+        next.Catalog.ApplyGroups(groups);
         await next.PublishAsync(store, paths, cts.Token);
         var pruned = await SearchData.PruneAsync(store, paths, cfg.Search?.KeepVersions ?? 3, cts.Token);
         if (pruned.Count > 0) Console.WriteLine($"search-index: removed old versions {string.Join(", ", pruned.Select(g => "v" + g))}");

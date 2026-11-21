@@ -20,3 +20,12 @@ A skip (duplicate, AI, non-canonical dub) changes nothing: the `done` line carri
 
 ## Rollback limits
 Before step 4 nothing has changed. After it the old blobs are untouched but stale: going back means old binaries on a store whose queue moved on (work done by 0.13.0 is unknown to them), and `index/control.json` is mode=stop, so you must set it to run yourself. Treat the migration as one way.
+
+## 0.13.2: video.json and members.json
+
+Before a 0.13.2 search-index job runs (it reads video.json for every upload, and fails loudly where there is none):
+
+1. `indexnode videos backfill --dry-run` from a westus2 node: counts the uploads that have no video.json, the ones under an active claim (skipped: their claim writes it) and any with no duration anywhere (FAILED; fix or retire them).
+2. `indexnode videos backfill`: creates the missing ones (create-only; run it again for the claimed ones once their claims end).
+3. `indexnode sources migrate-seen --dry-run`, then without `--dry-run`: seen.json ids become members of `index/sources/<id>/members.json` and seen.json is deleted (a refresh also does it for its own source on first touch).
+4. **0.13.1 live repair**: `indexnode jobs repair-steps --dry-run`, then `indexnode jobs repair-steps` (corrects the wrongly done steps, re-opens the finished dramas without centers.zip), then `indexnode sources set-tabs videos --all --dry-run` and without `--dry-run`.

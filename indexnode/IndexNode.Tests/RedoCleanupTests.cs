@@ -30,6 +30,7 @@ public class RedoCleanupTests
         async Task Put(string n, string? c = null) => await s.PutAsync(V + n, Encoding.UTF8.GetBytes(c ?? (n.EndsWith(".json") ? """{"segments":[]}""" : "x")), null, null, false, default);
         foreach (var n in Source.Concat(Others)) await Put(n);
         await Put("downloaded.json", """{"durationSeconds":60}""");
+        await VideoJsonSeed.PutAsync(s, new Paths("index-test/"), "vid", 60);
         var vtt = "WEBVTT\n\n" + string.Concat(Enumerable.Range(0, 8).Select(i => $"00:00:{i * 2 + 1:00}.000 --> 00:00:{i * 2 + 2:00}.000\n你好{i}\n\n"));
         await Put("ocr/subs.zh-Hans.vtt", vtt); await Put("ocr/subs.zh.vtt", vtt);
         await Put("subs/ai/en.vtt", "OLD"); await Put("subs/ai/en.json", "OLD"); await Put("subs/ai/en.old-run.vtt", "OLD");

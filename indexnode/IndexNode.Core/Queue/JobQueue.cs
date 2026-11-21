@@ -103,6 +103,23 @@ public sealed class JobQueue
     /// <summary>... or this many bytes (kept well under 2 MB so a node that starts reads at most this much after the snapshot).</summary>
     public const long RolloverBytes = 1L << 20;
     public const int MaxLineBytes = 16 * 1024;
+    /// <summary>One AppendBlock holds at most 4 MiB (Azure); a batch of lines is one block, so callers split a bigger batch (<see cref="BatchChunk"/>).</summary>
+    public const int MaxAppendBytes = 4 * 1024 * 1024;
+    /// <summary>Entries per append for the bulk adds (a lookup of a whole channel is a few hundred; 1000 lines of ~600 bytes stay far under <see cref="MaxAppendBytes"/>).</summary>
+    public const int BatchChunk = 1000;
+    /// <summary>Splits a batch into chunks of at most <see cref="BatchChunk"/> items AND about 3 MiB of serialized size (<paramref name="size"/> = bytes of one item), so one chunk is one append block under <see cref="MaxAppendBytes"/>.</summary>
+    public static List<List<T>> Chunks<T>(IReadOnlyList<T> items, Func<T, int> size)
+    {
+        var res = new List<List<T>>(); var cur = new List<T>(); long bytes = 0;
+        foreach (var it in items)
+        {
+            int s = size(it) + 400;
+            if (cur.Count > 0 && (cur.Count >= BatchChunk || bytes + s > 3L * 1024 * 1024)) { res.Add(cur); cur = new(); bytes = 0; }
+            cur.Add(it); bytes += s;
+        }
+        if (cur.Count > 0) res.Add(cur);
+        return res;
+    }
     /// <summary>A just-created active file has no lease for a moment; without a lease it only counts as abandoned once it is this old.</summary>
     public static readonly TimeSpan NewActiveGrace = TimeSpan.FromMinutes(2);
     private const int ReadChunk = 1 << 20;
@@ -229,6 +246,7 @@ public sealed class JobQueue
                     sb.Append(j).Append('\n');
                 }
                 var bytes = Encoding.UTF8.GetBytes(sb.ToString());
+                if (bytes.Length > MaxAppendBytes) throw new InvalidOperationException($"queue: {lines.Count} lines are {bytes.Length} bytes: over the {MaxAppendBytes}-byte append block limit (split the batch)");
                 var res = await store.AppendBlockAsync(paths.QueueSegment(seg), bytes, off, ct);
                 switch (res.Outcome)
                 {

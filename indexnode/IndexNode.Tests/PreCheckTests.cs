@@ -149,8 +149,11 @@ public class PreCheckTests : IDisposable
             Directory.CreateDirectory(dir); var zip = Path.Combine(dir, "t.zip");
             using (var fs = File.Create(zip)) using (var za = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Create)) { var e = za.CreateEntry("asr/" + Transcribe.ModelName + ".zh.json"); using var s = e.Open(); s.Write(json); }
             await store.PutAsync(paths.Video("a", "transcribe.zip"), File.ReadAllBytes(zip), null, null, false, default, "application/zip");
+            Assert.Equal(("en", (bool?)true), await VideosBackfill.LegacySpeechAsync(store, paths, "a", default));   // transcribe.zip is read by the backfill only
+            Assert.Equal((null, null), await VideosBackfill.LegacySpeechAsync(store, paths, "none", default));
+            await store.PutAsync(paths.Video("a", "video.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"id\":\"a\",\"speech\":{\"language\":\"en\",\"dubbed\":true,\"source\":\"transcribe\"}}"), null, null, false, default);
             Assert.Equal(("en", (bool?)true), await SearchIndexBuild.ReadSpeechAsync(store, paths, "a", default));
-            Assert.Equal((null, null), await SearchIndexBuild.ReadSpeechAsync(store, paths, "none", default));
+            await Assert.ThrowsAsync<VideoJsonMissingException>(() => SearchIndexBuild.ReadSpeechAsync(store, paths, "none", default));
             var y = new SearchData { Mean = new float[512], Bits = [], RefUpload = [], RefCenter = [], Uploads = [new SearchUpload("a", "s", "e", 1, 0, 1, 1, 1, 0, "en", true), new SearchUpload("b", "s", "e", 1, 0, 1, 1, 1, 0)] }.UploadsYaml();
             var (_, _, _, ups) = SearchData.ParseUploadsYaml(y);
             Assert.Equal("en", ups[0].SpeechLanguage); Assert.True(ups[0].Dubbed); Assert.Null(ups[1].SpeechLanguage); Assert.Null(ups[1].Dubbed);
@@ -278,6 +281,7 @@ public class PreCheckTests : IDisposable
             await wr.PutAsync(P.Video(id, "sscd/0000.f16"), F16(x), null, null, false, default);
             await wr.PutAsync(P.Video(id, "sscd/manifest.json"), Encoding.UTF8.GetBytes($"{{\"v\":1,\"step\":\"sscd\",\"chunks\":[{{\"chunk\":\"0000\",\"start\":0,\"rows\":{n}}}]}}"), null, null, false, default);
             foreach (var st in new[] { "frames", "sscd" }) Assert.True(await StageZipStore.Stage(wr)!.CommitStageAsync(id, st, "n1", false, false, default));
+            await VideoJsonSeed.PutAsync(local, P, id, 1800);
         }
         var old = Console.Out; Console.SetOut(new StringWriter());
         try
@@ -369,9 +373,12 @@ public class PreCheckTests : IDisposable
         };
         await rig.Fs.PutAsync(P.Video(id, "video.mp4"), await File.ReadAllBytesAsync(video), null, null, false, default);   // 0.13.0: the pre-check reads the stored video
         await rig.Fs.PutAsync(P.Video(id, "info.json"), Encoding.UTF8.GetBytes(info), null, null, false, default);
+        await VideoJsonSeed.PutAsync(rig.Fs, P, id, infoDuration);   // 0.13.2: the descriptor the download wrote
+        await VideoJsonSeed.PutAsync(rig.Fs, P, "b2", 1800);
         // the downloaded.json of b2: 1800 s
         await rig.Fs.PutAsync(P.Video("b2", "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1800}"), null, null, false, default);
         IStore index = withIndex ? OpenLocal() : new FakeStore();
+        if (withIndex) await VideoJsonSeed.PutAsync(index, P, "b2", 1800);
         if (withIndex) await index.PutAsync(P.Video("b2", "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1800}"), null, null, false, default);   // the analyzer reads the matched duration from the index store
         var an = new PreCheckAnalyzer(rig.Tools, cfg, new HttpClient(), index, P, new SearchIndexCache(Path.Combine(root, "cache-" + id), TimeSpan.FromMinutes(10)))
         {
@@ -390,7 +397,12 @@ public class PreCheckTests : IDisposable
     };
 
     static byte[] Take(float[] x, int from, int n) => F16(x.AsSpan(from * D, n * D).ToArray());
-    static JsonElement Json(FakeStore s, string name) => JsonDocument.Parse(s[name].Data).RootElement.Clone();
+    /// <summary>0.13.2: the pre-check record is video.json's "precheck" section (precheck.json is never written): asking for index/videos/&lt;id&gt;/precheck.json returns that section.</summary>
+    static JsonElement Json(FakeStore s, string name)
+    {
+        if (name.EndsWith("/precheck.json", StringComparison.Ordinal)) { Assert.False(s.Exists(name), name + " must not be written"); var vj = JsonDocument.Parse(s[name[..^"precheck.json".Length] + "video.json"].Data).RootElement; return vj.GetProperty("precheck").Clone(); }
+        return JsonDocument.Parse(s[name].Data).RootElement.Clone();
+    }
 
     static (string? L, bool D, string S) Lang(string json) { var info = JsonNode.Parse(json)!.AsObject(); return PreCheck.LanguageFromInfo(info, DownloadedFormats.FromInfo(info)); }
     const string Vid = "{\"vcodec\":\"avc1\",\"acodec\":\"none\"}";
@@ -754,8 +766,8 @@ public class PreCheckTests : IDisposable
         DuplicateFound? ex = null;
         try { await stage.RunAsync(Ctx(rig.Fs, job)); } catch (DuplicateFound d) { ex = d; }
         Assert.NotNull(ex); Assert.Equal("b2", ex!.Upload); Assert.False(string.IsNullOrEmpty(ex.Why));
-        foreach (var kv in before) Assert.Equal(kv.Value, rig.Fs[kv.Key].Data);   // nothing changed, nothing deleted
-        Assert.Equal(before.Count + 1, rig.Fs.Blobs.Count); Assert.True(rig.Fs.Exists(P.Video(id, "precheck.json")));
+        foreach (var kv in before.Where(k => !k.Key.EndsWith("/video.json", StringComparison.Ordinal))) Assert.Equal(kv.Value, rig.Fs[kv.Key].Data);   // nothing changed, nothing deleted (video.json gains the record)
+        Assert.Equal(before.Count, rig.Fs.Blobs.Count); Assert.False(rig.Fs.Exists(P.Video(id, "precheck.json"))); Assert.NotNull(Json(rig.Fs, P.Video(id, "precheck.json")));   // 0.13.2: video.json (already there) gains the record; no new blob
         Assert.Empty(rig.Calls);   // no yt-dlp: the window came from the stored video
     }
 
@@ -793,15 +805,16 @@ public class PreCheckTests : IDisposable
     }
 
     [Fact]
-    public async Task The_matched_duration_comes_from_download_zips_idx_summary_then_downloaded_json_never_a_get_of_the_zip()
+    public async Task The_matched_duration_comes_from_video_json_and_a_missing_one_fails_loudly()
     {
-        var fs = new FakeStore(); await Repack(fs, "new1", 1800);
-        Assert.Equal(1800, await MatchedDuration.ReadAsync(fs, P, "new1", default));
-        await fs.PutAsync(P.Video("old1", "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1234}"), null, null, false, default);   // an old layout
-        Assert.Equal(1234, await MatchedDuration.ReadAsync(fs, P, "old1", default));
-        Assert.Null(await MatchedDuration.ReadAsync(fs, P, "none", default));
-        await fs.PutAsync(P.Video("empty", "download.zip"), [1], null, null, false, default); await fs.SetMetadataAsync(P.Video("empty", "download.zip"), new Dictionary<string, string> { ["idx_summary"] = "{}" }, null, default);
-        Assert.Null(await MatchedDuration.ReadAsync(fs, P, "empty", default));
+        var fs = new FakeStore();
+        await fs.PutAsync(P.Video("new1", "video.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"id\":\"new1\",\"youtube\":{\"durationSeconds\":1800}}"), null, null, false, default);
+        Assert.Equal(1800, (await CatalogBuild.ReadPrecheckAsync(fs, P, "new1", default)).Duration);
+        await fs.PutAsync(P.Video("old1", "video.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"id\":\"old1\",\"download\":{\"durationSeconds\":1234}}"), null, null, false, default);
+        Assert.Equal(1234, (await CatalogBuild.ReadPrecheckAsync(fs, P, "old1", default)).Duration);
+        await Assert.ThrowsAsync<VideoJsonMissingException>(() => CatalogBuild.ReadPrecheckAsync(fs, P, "none", default));   // never a quiet null
+        await fs.PutAsync(P.Video("bad", "video.json"), Encoding.UTF8.GetBytes("{not json"), null, null, false, default);
+        await Assert.ThrowsAsync<InvalidDataException>(() => CatalogBuild.ReadPrecheckAsync(fs, P, "bad", default));
     }
 
     [Fact]
@@ -824,7 +837,7 @@ public class PreCheckTests : IDisposable
         // a repeat of a claim interrupted after the record: the stored record says ai (this part needs no ffmpeg)
         var fs = new FakeStore();
         var rec = new JsonObject { ["decision"] = "new", ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.61, ["threshold"] = 0.479 }, ["speech"] = new JsonObject { ["speechLanguage"] = "zh", ["dubbed"] = false } };
-        await fs.PutAsync(P.Video("aiaiaiai001", "precheck.json"), Encoding.UTF8.GetBytes(rec.ToJsonString()), null, null, false, default);
+        await VideoJsonSeed.PutAsync(fs, P, "aiaiaiai001", 1800, precheck: rec);
         await fs.PutAsync(P.Video("aiaiaiai001", "download.zip"), [9, 9], null, null, false, default);
         var an = new PreCheckAnalyzer(new Tools(new HttpClient(), new NodeConfig()), new NodeConfig(), new HttpClient(), fs, P, new SearchIndexCache(Path.Combine(root, "cache-ai0"), TimeSpan.FromMinutes(10)));
         var stage = new PreCheckStage(new Tools(new HttpClient(), new NodeConfig()), an, new PreCheckSettings(), "t");
@@ -853,13 +866,12 @@ public class PreCheckTests : IDisposable
     async Task<(IStore Store, Dictionary<string, float[]> V)> CatalogRigAsync()
     {
         var v = await BuildIndexAsync(); var st = OpenLocal();
-        foreach (var (id, d) in new[] { ("a1", 900), ("c3", 600) }) await st.PutAsync(P.Video(id, "precheck.json"), Encoding.UTF8.GetBytes(new JsonObject { ["video"] = new JsonObject { ["duration"] = d } }.ToJsonString()), null, null, false, default);   // no download.zip metadata in this fixture: the catalog falls back to the measured duration
-        var rec = new JsonObject { ["speech"] = new JsonObject { ["speechLanguage"] = "en", ["dubbed"] = true }, ["ai"] = new JsonObject { ["flag"] = false, ["score"] = 0.12 }, ["video"] = new JsonObject { ["duration"] = 1800, ["title"] = "B two", ["channel"] = "Chan" } };
-        await st.PutAsync(P.Video("b2", "precheck.json"), Encoding.UTF8.GetBytes(rec.ToJsonString()), null, null, false, default);
-        var skipped = new JsonObject { ["speech"] = new JsonObject { ["speechLanguage"] = "zh", ["dubbed"] = false }, ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.7 }, ["video"] = new JsonObject { ["duration"] = 300, ["title"] = "skipped" } };
-        await st.PutAsync(P.Video("m9", "precheck.json"), Encoding.UTF8.GetBytes(skipped.ToJsonString()), null, null, false, default);
-        var dupRec = new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "b2", ["top"] = new JsonArray(new JsonObject { ["upload"] = "b2", ["share"] = 0.93, ["bestCosine"] = 0.88, ["bestTime"] = 12.5 }), ["speech"] = new JsonObject { ["speechLanguage"] = "en", ["dubbed"] = false }, ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.66 }, ["video"] = new JsonObject { ["duration"] = 1795, ["title"] = "dup of b2", ["channel"] = "Chan2" } };
-        await st.PutAsync(P.Video("d8", "precheck.json"), Encoding.UTF8.GetBytes(dupRec.ToJsonString()), null, null, false, default);   // a duplicate that is also AI-flagged: a duplicate skip, not a hold
+        // 0.13.2: every fact is video.json's (the catalog reads nothing else); a1 and c3 are processed (their AI score was measured on their centers), b2 is processed with a pre-check speech/AI record
+        await VideoJsonSeed.PutAsync(st, P, "a1", 900, aiScore: 0.2, aiFlag: false); await VideoJsonSeed.PutAsync(st, P, "c3", 600, aiScore: 0.1, aiFlag: false);
+        await VideoJsonSeed.PutAsync(st, P, "b2", 1800, "en", true, title: "B two", channel: "Chan", aiScore: 0.12, aiFlag: false);
+        await VideoJsonSeed.PutAsync(st, P, "m9", 300, "zh", false, new JsonObject { ["at"] = "2026-11-01T00:00:00Z" }, title: "skipped", aiScore: 0.7, aiFlag: true);   // AI-held: short-circuited, not processed
+        var dupRec = new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "b2", ["top"] = new JsonArray(new JsonObject { ["upload"] = "b2", ["share"] = 0.93, ["bestCosine"] = 0.88, ["bestTime"] = 12.5 }) };
+        await VideoJsonSeed.PutAsync(st, P, "d8", 1795, "en", false, dupRec, title: "dup of b2", channel: "Chan2", aiScore: 0.66, aiFlag: true);   // a duplicate that is also AI-flagged: a duplicate skip, not a hold
         var old = Console.Out; Console.SetOut(new StringWriter());
         try { Assert.Equal(0, await CentersCommands.SearchIndexAsync(Args.Parse(["build", "--local", root, "--threads", "2"]))); } finally { Console.SetOut(old); }
         return (st, v);
@@ -871,10 +883,10 @@ public class PreCheckTests : IDisposable
         var (st, _) = await CatalogRigAsync();
         var idx = (await new SearchIndexCache(Path.Combine(root, "cat1"), TimeSpan.FromMinutes(10)).GetAsync(st, P, default))!;
         Assert.Equal(2, idx.Version); Assert.True(File.Exists(Path.Combine(root, "index", "search", "v2", "catalog.json.gz")) || await st.HeadAsync(Catalog.Name(P, 2), default) != null);
-        var c = idx.Catalog!; Assert.NotNull(c); Assert.Equal(2, c.Version); Assert.Empty(c.Groups);
+        var c = idx.Catalog!; Assert.NotNull(c); Assert.Equal(2, c.Version); Assert.Equal(3, c.Groups.Count); Assert.Null(c.Find("m9")!.GroupId);   // 0.13.2: the group section is filled for the indexed uploads; a metadata-only one is in no group
         Assert.Equal(["a1", "b2", "c3", "d8", "m9"], c.Uploads.Select(u => u.Id).OrderBy(x => x, StringComparer.Ordinal));
         var a1 = c.Find("a1")!; Assert.Equal(900, a1.DurationSeconds); Assert.Equal("processed", a1.State); Assert.NotNull(a1.Ai?.Score);   // scored from its centers (no precheck.json)
-        Assert.Null(a1.GroupId); Assert.False(a1.Canonical); Assert.False(a1.Mixed); Assert.Null(a1.GroupOffset);
+        Assert.Equal("g-a1", a1.GroupId); Assert.True(a1.Canonical); Assert.False(a1.Mixed); Assert.Equal(c.Groups.Single(g => g.Id == "g-a1").Canonical, "a1");
         var b2 = c.Find("b2")!; Assert.Equal(1800, b2.DurationSeconds); Assert.Equal("en", b2.SpeechLanguage); Assert.True(b2.Dubbed); Assert.Equal(0.12, b2.Ai!.Score); Assert.Equal("B two", b2.Title); Assert.Equal("Chan", b2.Channel);
         Assert.Equal("index", a1.CheckedBy); Assert.Equal("index", b2.CheckedBy); Assert.Equal("full", a1.Data); Assert.Equal("full", b2.Data); Assert.Equal("full", c.Find("c3")!.Data);
         var m9 = c.Find("m9")!; Assert.Equal("metadata-only", m9.State); Assert.Equal("ai", m9.Held); Assert.Equal("precheck", m9.CheckedBy); Assert.Equal("precheck", m9.Data); Assert.Equal(300, m9.DurationSeconds); Assert.True(m9.Ai!.Flag); Assert.Equal(0.7, m9.Ai.Score); Assert.Equal("zh", m9.SpeechLanguage); Assert.Equal("skipped", m9.Title);
@@ -926,4 +938,22 @@ public class PreCheckTests : IDisposable
     }
     sealed class Nop : IAsyncDisposable { public ValueTask DisposeAsync() => ValueTask.CompletedTask; }
 
+    [Fact]
+    public async Task The_index_build_runs_the_full_check_for_an_upload_without_a_precheck_and_prunes_no_centers()
+    {
+        var v = await BuildIndexAsync(); var st = OpenLocal();
+        var zip = await st.GetAsync(P.Video("a1", "centers.zip"), default);
+        await VideoJsonSeed.PutAsync(st, P, "a1copy", 900);   // a processed copy of a1: its descriptor has no precheck section (an upload from before the pre-check)
+        await st.PutAsync(P.Video("a1copy", "centers.zip"), zip!.Data, null, null, false, default);   // a processed copy of a1: no precheck.json at all (an upload from before the pre-check)
+        Assert.Equal(0, await CentersCommands.SearchIndexAsync(Args.Parse(["update", "--local", root, "--threads", "2"])));   // (its output goes to the console: no Console.SetOut here, other classes capture it in parallel)
+        var idx = (await new SearchIndexCache(Path.Combine(root, "cfull"), TimeSpan.FromMinutes(10)).GetAsync(st, P, default))!;
+        var g = (await GroupStore.LoadAsync(st, P, idx.Version, default))!; var of = g.GroupOf();
+        Assert.Equal(of["a1"], of["a1copy"]);   // joined by the build's own check
+        var m = g.Groups.Single(x => x.Id == of["a1"]).Members.Single(x => x.Upload == "a1copy");
+        Assert.Equal("index", m.CheckedBy); Assert.True(m.MatchShare > 0.9, m.MatchShare.ToString()); Assert.Equal(0, m.Offset!.Value, 1);
+        Assert.NotEqual(of["a1"], of["b2"]);
+        Assert.Equal("index", idx.Catalog!.Find("a1copy")!.CheckedBy); Assert.Equal(of["a1"], idx.Catalog.Find("a1copy")!.GroupId);
+        // no center pruning: the table holds every center of every processed upload
+        Assert.Equal(idx.Uploads.Sum(u => u.K), idx.Count);
+    }
 }

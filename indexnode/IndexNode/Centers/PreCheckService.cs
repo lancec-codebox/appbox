@@ -77,6 +77,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             await IndexAsync(ct);
             var a = await analyzer.AnalyzeFramesAsync(fdir, frames.Count, null, ap, settings, threads, _ => { }, secs, excludeSelf ? id : null, ct);
             if (a.IndexVersion > 0) NoteVersion(a.IndexVersion);
+            a = a with { Group = DramaGroups.Propose(a, window.Item1, window.Item2 - window.Item1, settings) };
             var decision = PreCheck.Decide(a, duration, _ => null, settings);
             bool ai = a.AiScore >= settings.AiFlag;
             var rec = PreCheck.Record(id, decision, a, info, DownloadedFormats.FromInfo(info), window, duration, settings, "precheck-service", version, ai, (double?)meta["sampleDownloadSeconds"] ?? 0, decision.Decision != PreCheckDecision.Duplicate);

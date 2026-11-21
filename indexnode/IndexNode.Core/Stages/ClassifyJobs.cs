@@ -40,6 +40,35 @@ public static class ClassifyJobs
         return made;
     }
 
+    /// <summary>
+    /// The batch of <see cref="CreateUnclassifiedAsync"/>: every descriptor not on the queue yet becomes an unclassified download entry, and the singleton is ensured, in ONE append per <see cref="JobQueue.BatchChunk"/> descriptors
+    /// (decided against the state as it is; a 412 re-decides the whole chunk). Returns the ids that were made (the rest were already there).
+    /// </summary>
+    public static async Task<List<string>> CreateUnclassifiedBatchAsync(JobQueue queue, IReadOnlyList<JobDescriptor> ds, CancellationToken ct = default)
+    {
+        var madeAll = new List<string>();
+        foreach (var chunk in JobQueue.Chunks(ds, d => d.ToBytes().Length))
+        {
+            var made = new List<string>();
+            await queue.AppendLinesAsync(st =>
+            {
+                made.Clear(); var lines = new List<QLine>(); var seen = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var d in chunk)
+                {
+                    if (st.Entry(d.JobId, "download") != null || !seen.Add(d.JobId)) continue;
+                    made.Add(d.JobId); lines.Add(QLine.Add(d.JobId, "download", d, d.AddedAt, d.Priority, null, Tags.Unclassified));
+                }
+                if (lines.Count == 0) return null;
+                var c = st.Entry(Subject, "classify"); var at = chunk[0].AddedAt;
+                if (c == null) lines.Add(QLine.Add(Subject, "classify", new JobDescriptor { Stage = "classify", JobId = SingletonId, Name = "classify all", AddedAt = at }, at));
+                else if (c.State is "failed" or "done" && st.Get(Subject)?.ClaimBy == null) lines.Add(new QLine { T = "retry", S = Subject, Stage = "classify", Due = at, At = at });
+                return lines;
+            }, ct);
+            madeAll.AddRange(made);
+        }
+        return madeAll;
+    }
+
     /// <summary>The unclassified download entries, oldest first (added, then id): read from the queue's memory, no listing.</summary>
     public static List<(string Id, QEntry Entry)> ListUnclassified(JobQueue queue) =>
         queue.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue("download", out var e) && e.State == Tags.Unclassified).Select(s => (Id: s.Id, Entry: s.Entries["download"])).ToList())

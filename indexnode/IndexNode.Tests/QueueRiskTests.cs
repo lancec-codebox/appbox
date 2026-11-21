@@ -136,6 +136,22 @@ public class QueueRiskTests : IDisposable
     }
 
     [Fact]
+    public async Task A_download_creates_video_json_with_the_youtube_and_download_facts_and_writes_no_precheck_json()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var (fake, zs, stage, dir) = Rig(); var id = "abcdefghij3";
+        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id, 480, null);
+        await stage.RunAsync(CommentsTests.Ctx(zs, job, "download"));
+        var root = (await VideoJson.RequireAsync(fake, P, id, default)).Root;   // loose, never zipped
+        Assert.Equal(1, (int)root["v"]!); Assert.Equal(id, (string)root["id"]!);
+        Assert.Equal(12.5, (double)root["youtube"]!["durationSeconds"]!); Assert.Equal(12.5, VideoJson.Duration(root));
+        Assert.Equal(12.5, (double)root["download"]!["durationSeconds"]!); Assert.Equal(480, (int)root["download"]!["height"]!);
+        Assert.False(fake.Exists(P.Video(id, "precheck.json")));
+        Assert.True(fake.Exists(P.Video(id, "download.zip")));   // download.zip (and its idx_summary) is still written for Medusa
+        Assert.Null(root["precheck"]); Assert.Null(root["speech"]);
+    }
+
+    [Fact]
     public async Task A_video_that_is_already_downloaded_but_has_no_comments_gets_them_on_its_next_download_claim_as_a_duplicates_metadata_entry_does()
     {
         if (OperatingSystem.IsWindows()) return;

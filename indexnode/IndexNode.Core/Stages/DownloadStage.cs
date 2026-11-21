@@ -120,12 +120,12 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
             const string videoName = "video.mp4", infoName = "video.info.json", descriptionName = "description.txt";
             if (!await work.ExistsAsync(videoName, ct)) throw new InvalidOperationException("yt-dlp finished but video.mp4 was not produced");
             int height = 0; double duration = 0;
-            DownloadedFormats? fmt = null;
+            DownloadedFormats? fmt = null; JsonObject? infoNode = null;
             if (await work.ExistsAsync(infoName, ct))
             {
                 var node = JsonNode.Parse(await work.ReadTextAsync(infoName, ct))!.AsObject();
                 await work.WriteTextAsync(descriptionName, (string?)node["description"] ?? "", ct);
-                node.Remove("comments");
+                node.Remove("comments"); infoNode = JsonNode.Parse(node.ToJsonString())!.AsObject();   // video.json's youtube section reads it
                 fmt = DownloadedFormats.FromInfo(node); // before the size trim below drops "formats"
                 var json = node.ToJsonString();
                 height = (int?)node["height"] ?? 0; duration = (double?)node["duration"] ?? 0;
@@ -165,6 +165,9 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
                 network = ctx.Job.Network == null ? null : new { ipv4 = ctx.Job.Network.Ipv4, ipv6Prefix = ctx.Job.Network.Ipv6Prefix, vpn = ctx.Job.Network.Vpn, transport = ctx.Job.Network.Transport },
             }, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
             await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);   // download.zip's summary
+            // 0.13.2: the per-video descriptor, written by the holder of the video's lease (this claim): created here, updated by the process claim
+            var markerNode = JsonNode.Parse(marker)!.AsObject();
+            await VideoJson.UpdateAsync(ctx.Store, paths, id, root => { root["youtube"] = VideoJson.YoutubeFrom(infoNode, id, job.Url, duration); root["download"] = markerNode.DeepClone(); }, ct);
             await StageCommit.CommitAsync(ctx.Store, id, "download", ctx.NodeId, false, ct);   // video.mp4 is already up: the zip, last, marks the download complete
             await EnsureFollowUpJobs(ctx);
         }

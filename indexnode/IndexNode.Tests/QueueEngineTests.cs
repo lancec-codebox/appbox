@@ -20,7 +20,7 @@ public class QueueEngineTests
     {
         var h = new Dictionary<string, IStageHandler>();
         foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(stage ?? (_ => Task.CompletedTask));
-        foreach (var st in Protocol.StepStages) h[st] = new Fn(st is "describe" or "translate" ? (ai ?? step ?? (_ => Task.CompletedTask)) : step ?? (_ => Task.CompletedTask));
+        foreach (var st in Protocol.StepStages) { var inner = st is "describe" or "translate" ? (ai ?? step ?? (_ => Task.CompletedTask)) : step ?? (_ => Task.CompletedTask); h[st] = new Fn(async ctx => { await inner(ctx); if (st is not ("describe" or "translate" or "sync") && await ctx.Store.HeadAsync(P.Video(ctx.Job.JobId, st + ".zip"), default) == null) await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, st + ".zip"), [1], null, null, false, default); }); }   // a real step leaves its zip: the process claim checks it
         h["process"] = h["frames"];
         return new NodeEngine(s, P, o, h);
     }
@@ -28,7 +28,7 @@ public class QueueEngineTests
     static Task Run(NodeEngine e, int seconds = 15) => e.RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(seconds));
 
     /// <summary>A downloaded video: its download.zip is there, so a process claim finds its input.</summary>
-    static Task Downloaded(FakeStore s, string id) => s.PutAsync(P.Video(id, "download.zip"), [1, 2, 3], null, null, false, default);
+    static async Task Downloaded(FakeStore s, string id) { await s.PutAsync(P.Video(id, "download.zip"), [1, 2, 3], null, null, false, default); await VideoJsonSeed.PutAsync(s, P, id, 600); }   // 0.13.2: the download also wrote the descriptor
 
     static async Task Within(Func<bool> cond, int ms = 5000) { var until = DateTime.UtcNow.AddMilliseconds(ms); while (!cond()) { if (DateTime.UtcNow > until) throw new TimeoutException("condition not met"); await Task.Delay(10); } }
 
@@ -270,9 +270,9 @@ public class QueueEngineTests
         var order = new List<string>();
         var h = new Dictionary<string, IStageHandler>();
         foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
-        foreach (var st in Protocol.StepStages) h[st] = new Fn(ctx => { order.Add(ctx.Stage); return Task.CompletedTask; });
+        foreach (var st in Protocol.StepStages) h[st] = new Fn(async ctx => { order.Add(ctx.Stage); if (st is not ("describe" or "translate" or "sync") && await ctx.Store.HeadAsync(P.Video(ctx.Job.JobId, st + ".zip"), default) == null) await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, st + ".zip"), [1], null, null, false, default); });
         h["process"] = h["frames"];
-        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, "precheck.json"), System.Text.Encoding.UTF8.GetBytes("{\"decision\":\"new\"}"), null, null, false, default); });
+        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await PreCheckStage.RecordAsync(ctx.Store, P, ctx.Job.JobId, System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"new\"}")!.AsObject(), default); });
         await Run(new NodeEngine(s, P, Opts(["process"]), h));
         Assert.Equal("precheck", order[0]);
         Assert.Contains("\"pc\":\"new\"", s.AppendText("index-test/jobs/queue.log"));
@@ -283,9 +283,9 @@ public class QueueEngineTests
     {
         var h = new Dictionary<string, IStageHandler>();
         foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
-        foreach (var st in Protocol.StepStages) h[st] = new Fn(ctx => { order.Add(ctx.Stage); return Task.CompletedTask; });
+        foreach (var st in Protocol.StepStages) h[st] = new Fn(async ctx => { order.Add(ctx.Stage); if (st is not ("describe" or "translate" or "sync") && await ctx.Store.HeadAsync(P.Video(ctx.Job.JobId, st + ".zip"), default) == null) await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, st + ".zip"), [1], null, null, false, default); });
         h["process"] = h["frames"];
-        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, "precheck.json"), System.Text.Encoding.UTF8.GetBytes("{\"decision\":\"" + decision + "\",\"ai\":{\"flag\":true,\"score\":0.61,\"threshold\":0.479},\"share\":0.12}"), null, null, false, default); });
+        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await PreCheckStage.RecordAsync(ctx.Store, P, ctx.Job.JobId, System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"" + decision + "\",\"ai\":{\"flag\":true,\"score\":0.61,\"threshold\":0.479},\"share\":0.12}")!.AsObject(), default); });
         return h;
     }
     static Task SetAi(FakeStore s, string v) => s.PutAsync(P.Control, new ControlFile { AiDramas = v }.ToBytes(), null, null, false, default);

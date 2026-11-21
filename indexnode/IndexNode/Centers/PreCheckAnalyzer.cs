@@ -154,12 +154,19 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
                 matches[i] = m with { Duration = await CatalogBuild.DurationAsync(store, paths, m.Upload, p, ct), SpeechLanguage = p.Language ?? m.SpeechLanguage, Dubbed = p.Language != null ? p.Dubbed : m.Dubbed };
             }
         }
+        var gs = await GroupStore.LoadAsync(store, paths, idx.Version, ct);
+        var upIds = idx.Uploads.Select(u => u.Id).Concat(used.Select(u => u.Id)).ToList();
+        var hits = new List<FrameHit>();
+        for (int i = 0; i < best.Length; i++) if (best[i] is { } b && b.Cosine >= s.Tau && b.Upload >= 0 && b.Upload < upIds.Count) hits.Add(new FrameHit(i, upIds[b.Upload], b.Time, b.Cosine));
+        var ofGroup = gs?.GroupOf() ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        var ug = hits.Select(h => h.Upload).Distinct(StringComparer.Ordinal).ToDictionary(u => u, u => ofGroup.GetValueOrDefault(u), StringComparer.Ordinal);
+        var gm = (gs?.Groups ?? []).Where(g => ug.Values.Contains(g.Id)).ToDictionary(g => g.Id, g => (IReadOnlyList<GroupCopy>)g.Members.Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed)).ToList(), StringComparer.Ordinal);
         secs["lookup"] = sw.Elapsed.TotalSeconds; secs["lookupScan"] = st.ScanMs / 1000; secs["lookupRead"] = st.ReadMs / 1000; secs["lookupScore"] = st.ScoreMs / 1000; secs["lookupRequests"] = st.Requests; secs["lookupBytes"] = st.Bytes; sw.Restart();
         double ai = AiProbe.Default.Score(rows);
         secs["ai"] = sw.Elapsed.TotalSeconds; sw.Restart();
         SpeechResult? speech = null;
         if (audioPath != null) { progress("language"); speech = await SpeechAsync(audioPath, threads, s.LanguageSeconds, s.LanguageMinSeconds, ct); secs["speech"] = sw.Elapsed.TotalSeconds; }
-        return new PreCheckAnalysis(null, idx.Version, rows.Length, noHit, matches, ai, secs) { Speech = speech, Excluded = excluded };
+        return new PreCheckAnalysis(null, idx.Version, rows.Length, noHit, matches, ai, secs) { Speech = speech, Excluded = excluded, Hits = hits, UploadGroups = ug, GroupMembers = gm };
     }
 
     /// <summary>The bar box from the frames themselves (a service that only received JPEGs): up to 24 evenly spaced frames, the frames step's rule.</summary>

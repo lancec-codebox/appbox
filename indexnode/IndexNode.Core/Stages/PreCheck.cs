@@ -48,6 +48,17 @@ public sealed class PreCheckSettings
     }
     /// <summary>How long a node trusts its cached search index before it re-checks head.yaml.</summary>
     public int IndexRecheckMinutes { get; set; } = 10;
+    /// <summary>0.13.2 drama groups. Join the group with the most matched frames at >= this many distinct-frame hits (config precheck.group-min-hits).</summary>
+    public int GroupMinHits { get; set; } = 5;
+    /// <summary>MIXED needs the hits under this share of the samples ...</summary>
+    public double MixedMaxShare { get; set; } = 0.60;
+    /// <summary>... at a consistent time offset (hits within this many seconds of the median offset, 80% of them) ...</summary>
+    public double OffsetTolerance { get; set; } = 30;
+    /// <summary>... covering one contiguous part: the hits fill at least this fraction of the frames from the first to the last hit.</summary>
+    public double ContiguousFill { get; set; } = 0.7;
+    /// <summary>Match share = frames with cosine >= this in the group; duplicate share = >= DupCosine (recorded, not decisive).</summary>
+    public double MatchCosine { get; set; } = 0.75;
+    public double DupCosine { get; set; } = 0.85;
 }
 
 /// <summary>One candidate upload: the share of sample frames whose best match is in it with cosine &gt;= tau.</summary>
@@ -72,6 +83,11 @@ public sealed record SpeechResult(string? Language, bool Dubbed, int Segments, d
 public sealed record PreCheckAnalysis(string? SkippedReason, int IndexVersion, int Frames, int NoHit, IReadOnlyList<PreCheckMatch> Top, double AiScore, IReadOnlyDictionary<string, double> Seconds)
 {
     public SpeechResult? Speech { get; init; }
+    /// <summary>0.13.2: the frames that matched (cosine >= tau), the group of every upload they hit (null = none yet) and each hit group's known copies; the proposal is made from them by <see cref="DramaGroups.Propose"/>.</summary>
+    public IReadOnlyList<FrameHit> Hits { get; init; } = [];
+    public IReadOnlyDictionary<string, string?> UploadGroups { get; init; } = new Dictionary<string, string?>();
+    public IReadOnlyDictionary<string, IReadOnlyList<GroupCopy>> GroupMembers { get; init; } = new Dictionary<string, IReadOnlyList<GroupCopy>>();
+    public GroupProposal? Group { get; init; }
     /// <summary>Centers of the excluded upload that the lookup left out (--exclude-self).</summary>
     public int Excluded { get; init; }
     public static PreCheckAnalysis Skipped(string reason) => new(reason, 0, 0, 0, [], 0, new Dictionary<string, double>());
@@ -155,7 +171,7 @@ public static class PreCheck
         var decision = new PreCheckDecision((string?)rec["decision"] ?? PreCheckDecision.Skipped, reasons, up == null ? null : top.FirstOrDefault(m => m.Upload == up));
         var ai = rec["ai"] as JsonObject; var secs = new Dictionary<string, double>();
         foreach (var kv in (rec["seconds"] as JsonObject) ?? []) if (kv.Value is JsonValue v && v.TryGetValue<double>(out var d)) secs[kv.Key] = d;
-        var a = new PreCheckAnalysis(null, (int?)rec["indexVersion"] ?? 0, (int?)rec["frames"] ?? 0, (int?)rec["noHit"] ?? 0, top, (double?)ai?["score"] ?? 0, secs);
+        var a = new PreCheckAnalysis(null, (int?)rec["indexVersion"] ?? 0, (int?)rec["frames"] ?? 0, (int?)rec["noHit"] ?? 0, top, (double?)ai?["score"] ?? 0, secs) { Group = GroupProposal.FromJson(rec["group"] as JsonObject) };
         return (decision, a, (bool?)ai?["flag"] ?? false);
     }
 
@@ -179,11 +195,13 @@ public static class PreCheck
             if (DurationClose(duration, md.Value, s))
             {
                 // canonical = Chinese audio only. A visual duplicate keeps only its metadata, EXCEPT an original-language upload (zh/yue, measured on the audio) of a drama whose known copies are all dubs: that one is processed fully
-                // and becomes the canonical copy. The drama's copies are the matched upload (per upload today; no group index). A copy with no recorded language counts as zh.
+                // and becomes the canonical copy. The drama's copies are the members of the group the pre-check proposed to join (0.13.2; the matched upload alone when there is none). A copy with no recorded language counts as zh.
                 var mine = a.Speech is { Unavailable: null } sp ? NormLang(sp.Language) ?? "zh" : null;   // no speech found: null counts as zh
-                var theirs = NormLang(top.SpeechLanguage) ?? "zh";
+                // the group's copies when the pre-check proposed a join (every known copy must be a dub), else the matched upload alone
+                var copies = a.Group is { Kind: GroupProposal.JoinKind, Copies.Count: > 0 } gp ? gp.Copies.Select(c => (Up: c.Upload, Lang: NormLang(c.SpeechLanguage) ?? "zh")).ToList() : [(top.Upload, NormLang(top.SpeechLanguage) ?? "zh")];
+                var theirs = copies.All(c => c.Lang != "zh") ? copies[0].Lang : "zh";
                 var dup = new[] { $"top share {top.Share:0.00} >= {s.SkipShare:0.00}", $"duration {duration:0}s within max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s) of {top.Upload} ({md.Value:0}s)" };
-                if (mine == "zh" && theirs != "zh") return new(PreCheckDecision.Canonical, [dup[0], dup[1], $"the new upload is original-language (zh) and {top.Upload} is a {theirs} dub: processed as the canonical copy"], top);
+                if (mine == "zh" && theirs != "zh") return new(PreCheckDecision.Canonical, [dup[0], dup[1], copies.Count > 1 ? $"the new upload is original-language (zh) and all {copies.Count} known copies in the group are dubs ({string.Join(", ", copies.Select(c => c.Up + ":" + c.Lang))}): processed as the canonical copy" : $"the new upload is original-language (zh) and {top.Upload} is a {theirs} dub: processed as the canonical copy"], top);
                 return new(PreCheckDecision.Duplicate, dup, top);
             }
             return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} >= {s.SkipShare:0.00} but duration {duration:0}s differs from {top.Upload} ({md.Value:0}s) by more than max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s)"], top);
@@ -249,6 +267,7 @@ public static class PreCheck
             ["seconds"] = new JsonObject(a.Seconds.Select(kv => KeyValuePair.Create(kv.Key, (JsonNode?)Math.Round(kv.Value, 3)))) { ["sampleDownload"] = Math.Round(sampleDownloadSeconds, 2) },
             ["node"] = nodeId, ["version"] = version,
         };
+        if (a.Group is { } g) { o["group"] = g.ToJson(); o["groupId"] = g.Group; o["groupOffset"] = Math.Round(g.Offset, 2); o["matchShare"] = Math.Round(g.MatchShare, 4); o["dupShare"] = Math.Round(g.DupShare, 4); }
         return o;
     }
 
@@ -260,6 +279,7 @@ public static class PreCheck
         if (d.Match is { } m) { o["match"] = m.Upload; if (d.Decision == PreCheckDecision.Canonical) o["duplicateOf"] = m.Upload; o["share"] = Math.Round(m.Share, 3); o["cosine"] = Math.Round(m.BestCosine, 3); }
         if (a != null) { o["indexVersion"] = a.IndexVersion; o["aiScore"] = Math.Round(a.AiScore, 3); }
         if (ai != null) o["ai"] = ai;
+        if (a?.Group is { } g) { o["group"] = g.Group; o["groupKind"] = g.Kind; o["groupOffset"] = Math.Round(g.Offset, 2); o["matchShare"] = Math.Round(g.MatchShare, 3); o["dupShare"] = Math.Round(g.DupShare, 3); if (g.Mixed) o["mixed"] = true; }
         return o;
     }
 }

@@ -223,8 +223,12 @@ public sealed class FakeStore : IStore
         }
     }
 
+    /// <summary>Set to change the named blob (a concurrent writer) right before the next PutIfMatchAsync is checked (single use; runs outside the lock).</summary>
+    public Action<string>? BeforePutIfMatch;
     public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct)
     {
+        Action<string>? hook; lock (gate) { hook = BeforePutIfMatch; BeforePutIfMatch = null; }
+        hook?.Invoke(name);
         lock (gate)
         {
             if (!Blobs.TryGetValue(name, out var b))

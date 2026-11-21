@@ -35,6 +35,12 @@ public sealed class QLine
     [JsonPropertyName("why")] public string? Why { get; set; }
     /// <summary>done (process): the pre-check's decision for this claim (new, partial, canonical, duplicate), also when it let the video through.</summary>
     [JsonPropertyName("pc")] public string? PreCheck { get; set; }
+    /// <summary>0.13.2 done (process / duplicate): the pre-check's PROPOSED group (null = new), time offset (s), match share (cosine >= 0.75) and duplicate share (>= 0.85); mixed = flagged as one part of a longer cut. The search-index job is the only group writer.</summary>
+    [JsonPropertyName("grp")] public string? Group { get; set; }
+    [JsonPropertyName("goff")] public double? GroupOffset { get; set; }
+    [JsonPropertyName("gms")] public double? MatchShare { get; set; }
+    [JsonPropertyName("gds")] public double? DupShare { get; set; }
+    [JsonPropertyName("gmix")] public bool? Mixed { get; set; }
     /// <summary>done (step precheck, final): the claim is released and the entry is held for this reason ("ai"): not claimable while control.json aiDramas is off.</summary>
     [JsonPropertyName("hold")] public string? Hold { get; set; }
     [JsonPropertyName("ais")] public double? AiScore { get; set; }
@@ -171,6 +177,14 @@ public sealed class QueueState
             case "retry":
                 if (l.Stage != null && Entry(l.S, l.Stage) is { } re) { re.State = "pending"; re.Attempts = 0; re.LastError = null; re.Permanent = null; re.Due = l.Due ?? l.At ?? re.Due; if (l.Job != null) re.Job = l.Job; if (l.Step != null && re.StepsDone != null) re.StepsDone.Remove(l.Step); }
                 break;
+            case "fixsteps":   // 0.13.2 jobs repair-steps: the entry's done list is corrected to what is on the store (Done = the whole list); state pending re-opens a finished entry
+                if (l.Stage != null && Entry(l.S, l.Stage) is { } fe)
+                {
+                    fe.StepsDone = l.Done?.ToList();
+                    if (l.State == "pending") { fe.State = "pending"; fe.Attempts = 0; fe.LastError = null; fe.Permanent = null; fe.FinishedAt = null; fe.Due = l.Due ?? l.At ?? fe.Due; }
+                    if (Get(l.S) is { } fs) fs.LastAt = l.At ?? fs.LastAt;
+                }
+                break;
             case "upd":
                 if (l.Stage != null && Entry(l.S, l.Stage) is { } ue) { if (l.Job != null) ue.Job = l.Job; if (l.Pri != null) ue.Priority = l.Pri.Value; if (l.Due != null) ue.Due = l.Due; }
                 break;
@@ -204,7 +218,8 @@ public sealed class QueueState
             var r = s.Entries.Values.Where(e => e.Runnable(nowUtc) && stageOk(e.Stage) && (canRun == null || canRun(s, e))).OrderBy(e => Rank(e.Stage)).ToList();
             if (r.Count > 0) res.Add((s, r));
         }
-        return res.OrderByDescending(x => x.Item2.Max(e => e.Priority)).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
+        // 0.13.2: a due search-index entry goes before any drama work (a singleton added today must not wait behind a backlog of older priority-0 entries); then priority, added, id as before
+        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage == "search-index") ? 1 : 0).ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
     }
 
     public Dictionary<string, int> PendingByStage(string nowUtc) =>

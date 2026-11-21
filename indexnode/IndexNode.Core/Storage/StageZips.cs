@@ -19,7 +19,7 @@ public static class StageLayout
     /// <summary>Retired (the dino step): never repacked, deleted by the repack.</summary>
     public static bool IsRetired(string member) => member.StartsWith("dino/", StringComparison.Ordinal);
     /// <summary>The opt-in clip step (dropped 2026-11-14) keeps its loose files: not packed, not counted as loose.</summary>
-    public static bool IsPassThrough(string member) => member.StartsWith("clip/", StringComparison.Ordinal) || member is "precheck.json" or "ai.json";   // 0.12.0: the pre-check record and the AI score stay loose (a duplicate has no download.zip)
+    public static bool IsPassThrough(string member) => member.StartsWith("clip/", StringComparison.Ordinal) || member is "precheck.json" or "ai.json" or "video.json";   // 0.13.2: video.json (the per-video descriptor) is loose and never in a zip; 0.12.0: the pre-check record and the AI score stay loose (a duplicate has no download.zip)
     /// <summary>The marker files 0.10.0 no longer writes: downloaded.json is download.zip's summary, processed.json is not needed.</summary>
     public static bool IsLegacyMarker(string member) => member is "downloaded.json" or "processed.json";
 
