@@ -179,20 +179,59 @@ public class PreCheckTests : IDisposable
     {
         var d = PreCheck.Decide(A(("up1", 0.80, 0.99)), 1800, _ => 1800, S);
         Assert.Equal("duplicate", d.Decision); Assert.Equal("up1", d.Match!.Upload);
-        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 599, _ => 1800, S).Decision);   // within max(15%, 10 min): 10 min wins on a short upload
-        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 10000 - 1400, _ => 10000, S).Decision); // 15% of 10000 s = 1500 s
+        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 59, _ => 1800, S).Decision);   // 0.13.13: longer by at most max(2%, 60 s) of L
+        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 10000 - 1400, _ => 10000, S).Decision); // shorter by up to 15% of L (1500 s)
     }
 
     [Fact]
     public void A_duration_far_from_the_match_or_unknown_never_skips()
     {
         var far = PreCheck.Decide(A(("up1", 0.95, 0.99)), 1800 + 601, _ => 1800, S);
-        Assert.Equal("partial", far.Decision); Assert.Contains("differs", far.Reasons[0]);
+        Assert.Equal("partial", far.Decision); Assert.Contains("longer than the group's longest copy", far.Reasons[0]);
         Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.95, 0.99)), 1800, _ => null, S).Decision);
+    }
+
+    // ---- 0.13.13: the asymmetric duplicate rule
+    static PreCheckAnalysis AG(double share, string up, string group, params (string Id, double Dur)[] members) => A((up, share, 0.99)) with
+    {
+        UploadGroups = new Dictionary<string, string?> { [up] = group },
+        GroupMembers = new Dictionary<string, IReadOnlyList<GroupCopy>> { [group] = members.Select(m => new GroupCopy(m.Id, "zh", false, m.Dur)).ToList() },
+    };
+
+    [Fact]
+    public void Asymmetric_rule_longer_by_ten_minutes_is_partial_equal_is_duplicate_shorter_by_5_percent_is_duplicate_shorter_by_30_percent_is_partial()
+    {
+        var longer = PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 600, _ => 1800, S);
+        Assert.Equal("partial", longer.Decision); Assert.Contains("longer than the group's longest copy (2400 s vs 1800 s", longer.Reasons[0]); Assert.Contains("processed", longer.Reasons[0]);
+        Assert.Equal(("up1", 1800.0), longer.MatchedLongest);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800, _ => 1800, S).Decision);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 * 0.95, _ => 1800, S).Decision);
+        var shorter = PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 * 0.70, _ => 1800, S);
+        Assert.Equal("partial", shorter.Decision); Assert.Contains("shorter than the group's longest copy", shorter.Reasons[0]);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 60, _ => 1800, S).Decision);       // the slack: max(2% = 36 s, 60 s)
+        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 61, _ => 1800, S).Decision);
+        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800, _ => null, S).Decision);              // L unknown: processed
+    }
+
+    [Fact]
+    public void A_group_whose_longest_member_is_longer_than_the_matched_upload_is_the_reference_and_the_record_says_so()
+    {
+        var a = AG(0.97, "short1", "g1", ("short1", 1500), ("long1", 2400), ("mid1", 2000));
+        var d = PreCheck.Decide(a, 2400, _ => null, S);                                   // matched duration comes from the top match
+        a = a with { Top = [a.Top[0] with { Duration = 1500 }] };
+        d = PreCheck.Decide(a, 2400, _ => null, S);
+        Assert.Equal("duplicate", d.Decision); Assert.Equal(("long1", 2400.0), d.MatchedLongest);                         // longer than the matched upload (1500) but equal to L
+        Assert.Equal("partial", PreCheck.Decide(a, 2400 + 600, _ => null, S).Decision);                                  // longer than L + slack
+        var rec = PreCheck.Record("new1", d, a, new System.Text.Json.Nodes.JsonObject(), null, (0, 300), 2400, S, "n", "v", false, 0, false);
+        Assert.Equal("long1", (string)rec["matchedLongest"]!["id"]!); Assert.Equal(2400.0, (double)rec["matchedLongest"]!["duration"]!);
+        Assert.Equal(0.02, (double)rec["settings"]!["durationSlackPercent"]!); Assert.Equal(60.0, (double)rec["settings"]!["durationSlackSeconds"]!);
+        // the legacy (symmetric) rule, for what-if comparisons: 2400 is far from the matched 1500 by more than 15% and 10 min
+        Assert.Equal("partial", PreCheck.Decide(a, 2400, _ => null, S, legacy: true).Decision);
     }
 
     [Fact]
     public void Share_in_060_to_080_is_partial_and_below_060_is_new()
+
     {
         Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.79, 0.9)), 1800, _ => 1800, S).Decision);
         Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.60, 0.9)), 1800, _ => 1800, S).Decision);
@@ -203,10 +242,11 @@ public class PreCheckTests : IDisposable
     [Fact]
     public void Every_threshold_is_a_setting()
     {
-        var s = new PreCheckSettings { SkipShare = 0.95, PartialShare = 0.5, DurationPercent = 0.5, DurationMinSeconds = 0 };
+        var s = new PreCheckSettings { SkipShare = 0.95, PartialShare = 0.5, DurationPercent = 0.5, DurationMinSeconds = 0, DurationSlackPercent = 0.5, DurationSlackSeconds = 0 };
         Assert.Equal("partial", PreCheck.Decide(A(("u", 0.9, 0.9)), 100, _ => 100, s).Decision);
-        Assert.Equal("duplicate", PreCheck.Decide(A(("u", 0.96, 0.9)), 140, _ => 100, s).Decision);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("u", 0.96, 0.9)), 140, _ => 100, s).Decision);   // longer by 40% of L: inside the 50% slack setting
         Assert.Equal("partial", PreCheck.Decide(A(("u", 0.96, 0.9)), 160, _ => 100, s).Decision);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("u", 0.96, 0.9)), 55, _ => 100, s).Decision); Assert.Equal("partial", PreCheck.Decide(A(("u", 0.96, 0.9)), 45, _ => 100, s).Decision);   // shorter: the 50% percent setting
         Assert.Equal("partial", PreCheck.Decide(A(("u", 0.5, 0.9)), 100, _ => 100, s).Decision);
         Assert.Equal("new", PreCheck.Decide(A(("u", 0.49, 0.9)), 100, _ => 100, s).Decision);
     }

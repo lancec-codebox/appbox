@@ -366,8 +366,8 @@ public class GroupStepTests
         var r2 = Rec("n2"); Assert.Equal("new", (string)r2["proposal"]!["kind"]!);
         Assert.Equal(1200, (int)r2["frames"]!); Assert.Equal(sample, (int)r2["sampled"]!); Assert.Null(r2["covered"]); Assert.NotNull(r2["sampleCovered"]); Assert.Null(r2["retainedFile"]);
         await RunGroup(s, q, g, "j1");
-        Assert.Equal(1200, searched.Sum()); Assert.Equal(sample, searched[0]); searched.Clear();   // a join: the sample, then the rest (the sample's results are reused, nothing searched twice)
-        var r3 = Rec("j1"); Assert.Equal("join", (string)r3["proposal"]!["kind"]!); Assert.Equal(1200, (int)r3["sampled"]!); Assert.NotNull(r3["covered"]);
+        Assert.Equal([sample], searched.ToList()); searched.Clear();                          // a join (0.13.13): only the sample is searched in the index; the dedup is a brute-force pass against the group's full frames
+        var r3 = Rec("j1"); Assert.Equal("join", (string)r3["proposal"]!["kind"]!); Assert.Equal(1200, (int)r3["sampled"]!); Assert.NotNull(r3["covered"]); Assert.Equal("n1", (string)((JsonArray)r3["dedupAgainst"]!)[0]!);
         Assert.NotNull(r3["retainedFile"]); Assert.NotNull(await s.HeadAsync(P.RetainedFile("j1"), default));
         await RunGroup(s, q, g, "m1");
         Assert.Equal(1200, searched.Sum()); searched.Clear();                                // mixed: the full pass too
@@ -383,6 +383,135 @@ public class GroupStepTests
         var ups = await SearchIndexBuild.ListCentersAsync(s, P, default); var idx = await SearchIndexBuild.BuildAsync(s, P, ups, null, null, 1, 1, 2, _ => { }, default);
         var set = await GroupBuild.ApplyAsync(s, P, null, idx, default, null, 2, null, requireGroups: true, foldOnly: true);
         Assert.True(set.GroupOf().ContainsKey("k1"));
+    }
+
+
+    // ---- 0.13.13: dedup of a join against the earlier members of its group only
+    static float[] Mix(params (float[] Src, int From, int Count)[] parts)
+    {
+        var x = new float[parts.Sum(q => q.Count) * D]; int at = 0;
+        foreach (var (src, from, n) in parts) { Array.Copy(src, from * D, x, at * D, n * D); at += n; }
+        return x;
+    }
+    static JsonObject Rec13(FakeStore s, string id) => (JsonObject)VideoJson.ReadAsync(s, P, id, default).Result!.Root["grouping"]!;
+    static async Task<int> RetainedFrames(FakeStore s, string id) => CentersFile.ParseHeader((await s.GetAsync(P.RetainedFile(id), default))!.Data).Frames;
+
+    [Fact]
+    public async Task A_three_member_chain_compares_the_third_against_both_earlier_members_and_keeps_only_frames_unique_in_the_chain()
+    {
+        var a = Make(600, 60, 1); var extra = Make(600, 60, 2); var unique = Make(300, 60, 3);
+        var (s, q, g, _) = await Rig(async st =>
+        {
+            await PutFrames(st, "c1", Mix((a, 0, 400)), 400);                                                  // c1: A[0..400)
+            await PutFrames(st, "c2", Mix((a, 0, 400), (extra, 0, 200)), 600, 1.0, 100);                       // c2: A[0..400) + E[0..200): joins c1, keeps the 200 frames of E
+            await PutFrames(st, "c3", Mix((a, 0, 400), (extra, 0, 40), (unique, 0, 60)), 500, 1.0, 900);              // c3: A (c1 and c2 have it) + 40 frames of E (only c2 has them) + 60 new
+        }, ("c1", 1), ("c2", 2), ("c3", 3));
+        await RunGroup(s, q, g, "c1"); await RunGroup(s, q, g, "c2"); await RunGroup(s, q, g, "c3");
+        var r2 = Rec13(s, "c2"); Assert.Equal("join", (string)r2["proposal"]!["kind"]!); Assert.Equal(["c1"], ((JsonArray)r2["dedupAgainst"]!).Select(x => (string)x!).ToArray());
+        Assert.Equal(400, (int)r2["dedupFrames"]!); Assert.InRange(await RetainedFrames(s, "c2"), 195, 215);        // c2 keeps what c1 does not have
+        var r3 = Rec13(s, "c3"); Assert.Equal("join", (string)r3["proposal"]!["kind"]!);
+        Assert.Equal(["c1", "c2"], ((JsonArray)r3["dedupAgainst"]!).Select(x => (string)x!).ToArray());              // the whole predecessor chain, each by its FULL frames
+        Assert.Equal(1000, (int)r3["dedupFrames"]!);                                                                  // c1's 400 + c2's 600 (its FULL frames, not its retained file)
+        Assert.InRange(await RetainedFrames(s, "c3"), 55, 65);                                                        // the 40 frames of E are covered by c2 (not by c1): dropped too; only the 60 new frames stay
+        Assert.Equal(500, (int)r3["frames"]!); Assert.InRange((double)r3["coveredShare"]!, 0.86, 0.90);
+    }
+
+    [Fact]
+    public async Task Frames_covered_only_by_a_non_group_drama_are_kept_and_a_join_with_30_percent_covered_still_writes_a_file_with_only_the_uncovered_frames_no_gate()
+    {
+        var a = Make(500, 60, 11); var other = Make(500, 60, 12); var fresh = Make(500, 60, 13);
+        var (s, q, g, _) = await Rig(async st =>
+        {
+            await PutFrames(st, "g1", Mix((a, 0, 500)), 500);                                                  // the group's first member
+            await PutFrames(st, "x1", Mix((other, 0, 500)), 500, 1.0, 40);                                     // a drama of ANOTHER group
+            // j: 30% of it is g1's frames (what makes it join g1), 20% is x1's frames (another group), 50% is its own; interleaved, so the hits are no contiguous run (that would be a mixed cut)
+            var jx = new float[500 * D]; int ia = 0, io = 0, ifr = 0;
+            for (int i = 0; i < 500; i++) { var (src, k) = i % 10 < 3 ? (a, ia++) : i % 10 < 5 ? (other, io++) : (fresh, ifr++); Array.Copy(src, k * D, jx, i * D, D); }
+            await PutFrames(st, "j1", jx, 500, 1.0, 700);
+        }, ("g1", 1), ("x1", 2), ("j1", 3));
+        await RunGroup(s, q, g, "g1"); await RunGroup(s, q, g, "x1"); await RunGroup(s, q, g, "j1");
+        var r = Rec13(s, "j1"); Assert.Equal("join", (string)r["proposal"]!["kind"]!); Assert.Equal("g1", (string)r["proposal"]!["joinUpload"]!);
+        Assert.Equal(["g1"], ((JsonArray)r["dedupAgainst"]!).Select(x => (string)x!).ToArray());                // x1 is not in the group: never compared
+        Assert.InRange((double)r["coveredShare"]!, 0.27, 0.33);                                                   // 30% covered: below the old 80% gate, and still written
+        Assert.InRange(await RetainedFrames(s, "j1"), 345, 355);                                                  // the other 70% stays: x1's frames (not the group's) and its own
+        Assert.InRange((int)r["retained"]!, 345, 355);
+    }
+
+    [Fact]
+    public async Task A_mixed_drama_writes_no_retained_file_and_keeps_all_its_frames()
+    {
+        var a = Make(600, 60, 21); var b = Make(600, 60, 22);
+        var (s, q, g, _) = await Rig(async st =>
+        {
+            await PutFrames(st, "m0", Mix((a, 0, 600)), 600); await PutFrames(st, "m00", Mix((b, 0, 600)), 600, 1.0, 10);
+            await PutFrames(st, "mm", Mix((a, 0, 300), (b, 0, 300)), 600, 1.0, 900);
+        }, ("m0", 1), ("m00", 2), ("mm", 3));
+        await RunGroup(s, q, g, "m0"); await RunGroup(s, q, g, "m00"); await RunGroup(s, q, g, "mm");
+        var r = Rec13(s, "mm"); Assert.Equal("mixed", (string)r["proposal"]!["kind"]!); Assert.Null(r["retainedFile"]); Assert.Null(await s.HeadAsync(P.RetainedFile("mm"), default)); Assert.Null(r["dedupAgainst"]);
+    }
+
+    [Fact]
+    public async Task Groups_rerun_re_adds_the_group_entry_of_every_join_keeps_the_seq_rewrites_the_record_and_is_idempotent()
+    {
+        var a = Make(300, 40, 31);
+        var (s, q, g, _) = await Rig(async st => { await PutFrames(st, "r1", Mix((a, 0, 300)), 300); await PutFrames(st, "r2", Mix((a, 0, 300)), 300, 1.0, 50); await PutFrames(st, "r3", Make(300, 40, 32), 300); },
+            ("r1", 1), ("r2", 2), ("r3", 3));
+        async Task Step(string id) { var h = (await q.TryClaimAsync(id, Pick, default))!; await RunGroup(s, q, g, id); await h.AppendAsync([new QLine { T = "done", Stage = "group" }], true, default); await h.FinishAsync(); }
+        foreach (var id in new[] { "r1", "r2", "r3" }) { await q.AppendLinesAsync([QLine.Add(id, "group", GroupSequencing.NewJob(id, 0), "2026-11-21T08:00:00Z")], default); await Step(id); }
+        var before = Rec13(s, "r2"); Assert.Equal("join", (string)before["proposal"]!["kind"]!); var atBefore = (string)before["at"]!;
+        var dry = await SeqCommand.RerunGroupsAsync(q, s, P, "join", true, default); Assert.Equal(1, dry.Joins); Assert.Equal(1, dry.Added); Assert.Equal("done", q.Read(st => st.Entry("r2", "group")!.State));   // dry run changes nothing
+        var run1 = await SeqCommand.RerunGroupsAsync(q, s, P, "join", false, default); Assert.Equal(1, run1.Added);
+        Assert.Equal("pending", q.Read(st => st.Entry("r2", "group")!.State)); Assert.Equal("done", q.Read(st => st.Entry("r1", "group")!.State)); Assert.Equal("done", q.Read(st => st.Entry("r3", "group")!.State));   // only the join
+        Assert.Equal(2L, q.Read(st => st.Get("r2")!.Seq!.Value));                                                  // the seq is kept
+        var run2 = await SeqCommand.RerunGroupsAsync(q, s, P, "join", false, default); Assert.Equal(0, run2.Added); Assert.Equal(0, run2.Joins);   // idempotent: pending now, not "done" any more
+        await Step("r2");
+        var after = Rec13(s, "r2"); Assert.Equal("join", (string)after["proposal"]!["kind"]!); Assert.NotNull(after["dedupAgainst"]); Assert.NotNull(await s.HeadAsync(P.RetainedFile("r2"), default));   // the record and the retained file are rewritten
+        Assert.Equal(1, (await SeqCommand.RerunGroupsAsync(q, s, P, "join", false, default)).Added);               // run again after it finished: again exactly the one join
+    }
+
+    // ---- 0.13.13: precheck whatif
+    [Fact]
+    public async Task Precheck_whatif_looks_each_drama_up_without_itself_compares_both_rules_summarises_and_never_writes()
+    {
+        var s = new FakeStore(); var a = Make(300, 40, 41); var other = Make(300, 40, 42);
+        // w1 (1800 s) and w2 (the same video, 1800 s) are one group; w3 is the same video but 2400 s long; x1 is unrelated
+        await PutFrames(s, "w1", a, 300, 6.0); await PutFrames(s, "w2", a, 300, 6.0); await PutFrames(s, "w3", a, 300, 8.0); await PutFrames(s, "x1", other, 300, 6.0);
+        foreach (var (id, dur) in new[] { ("w1", 1800.0), ("w2", 1800.0), ("w3", 2400.0), ("x1", 1800.0) }) await VideoJsonSeed.PutAsync(s, P, id, dur);
+        var ups = await SearchIndexBuild.ListCentersAsync(s, P, default);
+        var head = await SearchIndexBuild.BuildAsync(s, P, ups.Where(u => u.Id is "w1" or "w2" or "x1").ToList(), null, null, 1, 1, 2, _ => { }, default);
+        head.BuiltAt = DateTimeOffset.UtcNow.AddMinutes(-5); await head.PublishAsync(s, P, default);
+        await GroupStore.WriteAsync(s, P, new GroupSet { Groups = [new DramaGroup { Id = "G1", Canonical = "w1", Members = [new GroupMember { Upload = "w1", Duration = 1800 }, new GroupMember { Upload = "w2", Duration = 1800 }] }] }, head.Version, default);
+        var before = s.Calls.Count(x => x.StartsWith("Put") || x.StartsWith("Delete") || x.StartsWith("Append"));
+        var o = new StringWriter(); var progress = new List<string>();
+        var sum = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, int.MaxValue, null, o, progress.Add, default);
+        var rows = o.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => (JsonObject)JsonNode.Parse(l)!).ToDictionary(r => (string)r["id"]!);
+        Assert.Equal(4, sum.Dramas); Assert.Equal(4, rows.Count);
+        // w1 does not see itself: its top is w2, whose group (without w1) is G1, longest w2
+        Assert.Equal("w2", (string)rows["w1"]["top"]!); Assert.Equal("G1", (string)rows["w1"]["group"]!); Assert.Equal("w2", (string)rows["w1"]["longest"]!["id"]!);
+        Assert.Equal("duplicate", (string)rows["w1"]["old"]!["decision"]!); Assert.Equal("duplicate", (string)rows["w1"]["new"]!["decision"]!);
+        // w3 (2400 s) against the group's longest (1800 s): the old rule still skips it (within 10 min), the new one processes it as longer than L
+        Assert.Equal("duplicate", (string)rows["w3"]["old"]!["decision"]!); Assert.Equal("partial", (string)rows["w3"]["new"]!["decision"]!); Assert.True((bool)rows["w3"]["new"]!["longerThanL"]!);
+        Assert.Equal(1, sum.OldDupNewPartial); Assert.Equal(1, sum.OldDupNewPartialLonger);
+        Assert.Equal("new", (string)rows["x1"]["new"]!["decision"]!); Assert.Null(rows["x1"]["top"]);                     // nothing else looks like x1 (and x1 never matches itself)
+        Assert.Equal(before, s.Calls.Count(x => x.StartsWith("Put") || x.StartsWith("Delete") || x.StartsWith("Append")));   // read-only
+        var one = new StringWriter(); var s1 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, 1, null, one, _ => { }, default); Assert.Equal(1, s1.Dramas);   // --limit
+        var ids = new StringWriter(); var s2 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, int.MaxValue, ["w3"], ids, _ => { }, default); Assert.Equal(1, s2.Dramas); Assert.Contains("\"w3\"", ids.ToString());   // --ids
+    }
+
+
+    [Fact]
+    public void Dedup_of_6k_frames_against_20k_takes_a_few_seconds_at_most()
+    {
+        var rng = new Random(5); int n = 6000, m = 20000, d = CentersFile.Dim;
+        float[] Rows(int k) { var x = new float[k * d]; for (int i = 0; i < k; i++) { double sq = 0; for (int j = 0; j < d; j++) { x[i * d + j] = (float)(rng.NextDouble() - 0.5); sq += x[i * d + j] * x[i * d + j]; } float inv = (float)(1 / Math.Sqrt(sq)); for (int j = 0; j < d; j++) x[i * d + j] *= inv; } return x; }
+        var set = Rows(m); var ownM = Rows(n); var own = Enumerable.Range(0, n).Select(i => ownM.AsSpan(i * d, d).ToArray()).ToList();
+        Array.Copy(set, 777 * d, ownM, 0, d); own[0] = set.AsSpan(777 * d, d).ToArray();                                   // frame 0 is exactly set row 777
+        var member = Enumerable.Range(0, m).Select(i => i < 12000 ? 0 : 1).ToArray(); var time = Enumerable.Range(0, m).Select(i => (float)i).ToArray();
+        var sw = System.Diagnostics.Stopwatch.StartNew(); var best = GroupDedup.Best(own, set, member, time, Environment.ProcessorCount, default); sw.Stop();
+        Console.WriteLine($"dedup {n} x {m}: {sw.Elapsed.TotalMilliseconds:F0} ms on {Environment.ProcessorCount} cores");
+        File.WriteAllText(Path.Combine(Path.GetTempPath(), "dedup-timing.txt"), $"{sw.Elapsed.TotalMilliseconds:F0} ms, {Environment.ProcessorCount} cores");
+        Assert.Equal(777.0, best[0]!.Time); Assert.True(best[0]!.Cosine > 0.9999f);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), $"dedup took {sw.Elapsed.TotalSeconds:F1} s");
     }
 
 

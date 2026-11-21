@@ -11,6 +11,7 @@ public static class PreCheckCommand
 {
     public static async Task<int> RunAsync(Args a, IStore? remote = null, Tools? toolsOverride = null, PreCheckAnalyzer? analyzerOverride = null)
     {
+        if (a.Positional.FirstOrDefault() == "whatif") return await PreCheckWhatIf.RunAsync(a, remote);
         string outDir = Path.GetFullPath(a.Get("output-local") ?? "precheck-out");
         string? inL = a.Get("input-local") ?? a.Get("local");
         var cfg = NodeConfig.Load(); var http = Commands.NewHttp(); var paths = new Paths(a.Get("prefix") ?? "index/");

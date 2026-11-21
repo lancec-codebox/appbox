@@ -160,7 +160,7 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         for (int i = 0; i < best.Length; i++) if (best[i] is { } b && b.Cosine >= s.Tau && b.Upload >= 0 && b.Upload < upIds.Count) hits.Add(new FrameHit(i, upIds[b.Upload], b.Time, b.Cosine));
         var ofGroup = gs?.GroupOf() ?? new Dictionary<string, string>(StringComparer.Ordinal);
         var ug = hits.Select(h => h.Upload).Distinct(StringComparer.Ordinal).ToDictionary(u => u, u => ofGroup.GetValueOrDefault(u), StringComparer.Ordinal);
-        var gm = (gs?.Groups ?? []).Where(g => ug.Values.Contains(g.Id)).ToDictionary(g => g.Id, g => (IReadOnlyList<GroupCopy>)g.Members.Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed)).ToList(), StringComparer.Ordinal);
+        var gm = (gs?.Groups ?? []).Where(g => ug.Values.Contains(g.Id)).ToDictionary(g => g.Id, g => (IReadOnlyList<GroupCopy>)g.Members.Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration)).ToList(), StringComparer.Ordinal);
         secs["lookup"] = sw.Elapsed.TotalSeconds; secs["lookupScan"] = st.ScanMs / 1000; secs["lookupRead"] = st.ReadMs / 1000; secs["lookupScore"] = st.ScoreMs / 1000; secs["lookupRequests"] = st.Requests; secs["lookupBytes"] = st.Bytes; sw.Restart();
         double ai = AiProbe.Default.Score(rows);
         secs["ai"] = sw.Elapsed.TotalSeconds; sw.Restart();

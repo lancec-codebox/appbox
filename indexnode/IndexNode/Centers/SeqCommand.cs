@@ -26,7 +26,41 @@ public static class SeqCommand
         return started;
     }
 
-    public sealed record ClearReport(int Cleared, int Started, List<string> First);
+    public sealed record RerunReport(int Joins, int Added, int AlreadyPending);
+
+    /// <summary>
+    /// 0.13.13: `groups rerun --kind join`: re-adds (force) the group entry of every drama whose grouping record is a join. A rerun keeps its sequence number and rewrites its record and retained file. Idempotent (a drama whose entry is already pending is left alone) and it never cascades:
+    /// later members compare against earlier members' FULL frames files, which a rerun does not touch.
+    /// </summary>
+    public static async Task<RerunReport> RerunGroupsAsync(JobQueue q, IStore store, Paths paths, string kind, bool dry, CancellationToken ct)
+    {
+        if (kind != GroupProposal.JoinKind) throw new ArgumentException("groups rerun --kind join [--dry-run] (only join is supported)");
+        await q.PollAsync(ct);
+        var cand = q.Read(st => st.Subjects.Values.Where(s => s.Seq != null && s.Entries.TryGetValue("group", out var g) && g.State == "done").Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
+        var joins = new List<string>();
+        await Parallel.ForEachAsync(cand, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, c) =>
+        {
+            try { var g = (await VideoJson.ReadAsync(store, paths, id, c))?.Root["grouping"] as System.Text.Json.Nodes.JsonObject; if (GroupProposal.FromJson(g?["proposal"] as System.Text.Json.Nodes.JsonObject)?.Kind == GroupProposal.JoinKind) lock (joins) joins.Add(id); }
+            catch (Exception e) when (e is not OperationCanceledException) { }
+        });
+        joins.Sort(StringComparer.Ordinal);
+        var pending = q.Read(st => joins.Count(id => st.Entry(id, "group") is { State: "pending" }));
+        int added = 0;
+        if (!dry)
+        {
+            var at = q.NowUtc();
+            foreach (var chunk in JobQueue.Chunks(joins, id => id.Length + 200))
+            {
+                var ids = chunk;
+                // the entry goes back to pending (a force add); one already pending or claimed is left alone, so a second run adds nothing
+                await q.AppendLinesAsync(st => { var l = ids.Where(id => st.Entry(id, "group") is { State: "done" }).Select(id => QLine.Add(id, "group", GroupSequencing.NewJob(id, 0), at, force: true)).ToList(); Interlocked.Add(ref added, l.Count); return l; }, ct);
+            }
+        }
+        return new RerunReport(joins.Count, dry ? joins.Count - pending : added, pending);
+    }
+
+    public sealed record ClearReport(
+int Cleared, int Started, List<string> First);
 
     /// <summary>0.13.12: one clear line (force, no number) per numbered drama that is not started, batched. Allowed after group steps have finished: the order of the rest does not change (gaps are fine), and a cleared drama had no frames, so no finished group record changes.</summary>
     public static async Task<ClearReport> ClearUnstartedAsync(JobQueue q, IStore store, Paths paths, bool dry, CancellationToken ct)

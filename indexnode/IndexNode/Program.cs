@@ -805,6 +805,8 @@ public static class Commands
                 case "precheck.skip-share": (file.PreCheck ??= new()).SkipShare = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.partial-share": (file.PreCheck ??= new()).PartialShare = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.duration-percent": (file.PreCheck ??= new()).DurationPercent = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.duration-slack-percent": (file.PreCheck ??= new()).DurationSlackPercent = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.duration-slack-seconds": (file.PreCheck ??= new()).DurationSlackSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.duration-min": (file.PreCheck ??= new()).DurationMinSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.top-centers": (file.PreCheck ??= new()).TopCenters = int.Parse(val); break;
                 case "precheck.window-seconds": (file.PreCheck ??= new()).WindowSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;

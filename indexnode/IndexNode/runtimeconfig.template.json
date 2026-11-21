@@ -1,0 +1,6 @@
+{
+  "configProperties": {
+    "System.GC.HeapHardLimitPercent": 60,
+    "System.GC.ConserveMemory": 5
+  }
+}

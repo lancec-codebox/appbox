@@ -11,6 +11,7 @@ namespace IndexNode;
 /// </summary>
 public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) : IStageHandler
 {
+    readonly GroupDedup dedup = new(store);
     public const int Chunk = 60;
 
     /// <summary>Maps the best-match arrays to covered runs: [from, to] own times (seconds) with the source upload and the median offset.</summary>
@@ -37,7 +38,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var ct = ctx.Token; var paths = ctx.Paths; var id = ctx.BlobName; var s = settings ?? new PreCheckSettings();
         long seq = ctx.Queue?.Read(st => st.Get(id)?.Seq) ?? throw new InvalidOperationException($"group {id}: no sequence number");
         ctx.Report("group", "index");
-        var clock = Stopwatch.StartNew(); double tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
+        var clock = Stopwatch.StartNew(); double tDedup = 0, tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
         var head = await SearchData.LoadAsync(store, paths, null, ct);
         var q = ctx.Queue!;
         bool Earlier(string other) => other != id && (q.Read(st => st.Get(other)?.Seq) is not { } o || o < seq);
@@ -46,7 +47,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var inIndex = head?.Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal) ?? [];
         var fresh = q.Read(st => st.Subjects.Values.Where(x => x.Id != id && !inIndex.Contains(x.Id) && Earlier(x.Id) && (x.CentersAt != null || x.Entries.TryGetValue("process", out var pe) && pe.State == "done")).OrderBy(x => x.Seq ?? long.MaxValue).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList());
         tIdx = clock.Elapsed.TotalMilliseconds; int earlier = (idx?.Uploads.Count ?? 0) + fresh.Count;
-        string Split() => $"{earlier} earlier ({idx?.Uploads.Count ?? 0} indexed + {fresh.Count} fresh); index {tIdx:F0} ms, own frames {tOwn:F0} ms, search {tSearch:F0} ms (scan {tScan:F0}, read {tRead:F0}, score {tScore:F0}), fresh {tFresh:F0} ms, write {tWrite:F0} ms; {searched} frames searched";
+        string Split() => $"{earlier} earlier ({idx?.Uploads.Count ?? 0} indexed + {fresh.Count} fresh); index {tIdx:F0} ms, own frames {tOwn:F0} ms, search {tSearch:F0} ms (scan {tScan:F0}, read {tRead:F0}, score {tScore:F0}), fresh {tFresh:F0} ms, dedup {tDedup:F0} ms, write {tWrite:F0} ms; {searched} frames searched";
 
         if (idx == null && fresh.Count == 0) { await WriteAsync(ctx, id, seq, GroupProposal.None, [], null, 0, 0, 0, [], null, s, ct, null); return; }
         // own frames, from the node's local copy of the frames file
@@ -102,7 +103,23 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
             await WriteAsync(ctx, id, seq, prop, [], null, own.Count, pick.Length, sampleCovered, sampleStretches, null, s, ct, Split);
             return;
         }
-        // join or mixed: the full pass over the frames the sample did not search (its results are reused)
+        if (prop.Kind == GroupProposal.JoinKind && !prop.Mixed && prop.JoinUpload != null)
+        {
+            // 0.13.13: DEDUP against the group only: every earlier member of the target's group, by its FULL frames file, brute force (no global index search)
+            var td = Stopwatch.StartNew();
+            var earlierSeq = q.Read(st => st.Subjects.Values.Where(x => x.Id != id && (x.Seq is not { } o || o < seq)).ToDictionary(x => x.Id, x => x.Seq, StringComparer.Ordinal));
+            GroupSet? known = null; try { if (head != null) known = await GroupStore.LoadAsync(store, paths, head.Version, ct); } catch (Exception e) when (e is not OperationCanceledException) { }
+            var members = await dedup.SetAsync(paths, prop.JoinUpload, earlierSeq, known, ct);
+            if (!members.Contains(prop.JoinUpload)) members.Insert(0, prop.JoinUpload);
+            var (M, mem, tm, used) = await GroupDedup.LoadAsync(store, paths, members, ct);
+            var dbest = GroupDedup.Best(own.Select(f => f.V).ToList(), M, mem, tm, threads, ct);
+            tDedup = td.Elapsed.TotalMilliseconds;
+            string DIdOf(int u) => used[u];
+            int dcov = dbest.Count(b => b != null && b.Cosine >= s.RetainT);
+            await WriteAsync(ctx, id, seq, prop, own.Select(f => ((double)f.T, f.F16)).ToList(), dcov, own.Count, own.Count, dcov, Stretches(times, dbest, DIdOf, s.RetainT, s.OffsetTolerance), dbest, s, ct, Split, used, M.Length / CentersFile.Dim);
+            return;
+        }
+        // mixed: the full pass over the frames the sample did not search (its results are reused); keeps all frames, writes no file
         var inSample = new HashSet<int>(pick); var rest = Enumerable.Range(0, own.Count).Where(i => !inSample.Contains(i)).ToList();
         await SearchAsync(rest, 600);
         int covered = best.Count(b => b != null && b.Cosine >= s.RetainT);
@@ -110,10 +127,11 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         await WriteAsync(ctx, id, seq, prop, own.Select(f => ((double)f.T, f.F16)).ToList(), covered, own.Count, own.Count, covered, stretches, best, s, ct, Split);
     }
 
-    async Task WriteAsync(JobContext ctx, string id, long seq, GroupProposal prop, IReadOnlyList<(double T, byte[] F16)> own, int? covered, int total, int sampled, int sampleCovered, List<JsonObject> stretches, FrameBest?[]? best, PreCheckSettings s, CancellationToken ct, Func<string>? split)
+
+    async Task WriteAsync(JobContext ctx, string id, long seq, GroupProposal prop, IReadOnlyList<(double T, byte[] F16)> own, int? covered, int total, int sampled, int sampleCovered, List<JsonObject> stretches, FrameBest?[]? best, PreCheckSettings s, CancellationToken ct, Func<string>? split, IReadOnlyList<string>? dedupAgainst = null, int dedupFrames = 0)
     {
         var paths = ctx.Paths; int kept = total; string? retained = null; var wsw = Stopwatch.StartNew();
-        bool retain = s.RetainEnabled && covered != null && total > 0 && best != null && prop.Kind == GroupProposal.JoinKind && !prop.Mixed && (double)covered.Value / total >= s.RetainF;
+        bool retain = s.RetainEnabled && covered != null && total > 0 && best != null && prop.Kind == GroupProposal.JoinKind && !prop.Mixed;   // 0.13.13: no retain.f gate: every join keeps only its frames unique among the group's earlier members (at least one)
         if (retain)
         {
             // only the frames no earlier drama covers; at least one (the least covered) so the file is never empty
@@ -132,6 +150,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
             ["v"] = 1, ["seq"] = seq, ["at"] = Protocol.NowUtc(), ["proposal"] = prop.ToJson(), ["frames"] = total,
             // 0.13.12: `covered` is null when only the even sample was searched (new / none): `sampled` frames were searched, `sampleCovered` of them at cosine >= t
             ["sampled"] = sampled, ["sampleCovered"] = sampleCovered, ["covered"] = covered, ["coveredShare"] = covered == null || total == 0 ? null : Math.Round((double)covered.Value / total, 4),
+            ["dedupAgainst"] = dedupAgainst == null ? null : new JsonArray(dedupAgainst.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()), ["dedupFrames"] = dedupAgainst == null ? null : dedupFrames,
             ["retained"] = retained == null ? null : kept, ["retainedFile"] = retained, ["t"] = s.RetainT, ["f"] = s.RetainF, ["stretches"] = new JsonArray(stretches.Select(x => (JsonNode?)x).ToArray()),
         };
         await VideoJson.UpdateAsync(store, paths, id, root => root["grouping"] = rec, ct);

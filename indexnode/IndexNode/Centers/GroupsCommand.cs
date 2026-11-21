@@ -69,7 +69,17 @@ public static class GroupsCommand
             Console.WriteLine($"groups enqueue{(a.Has("dry-run") ? " (dry run)" : "")}: {er.Candidates} dramas with frames, {er.Existing} already have a group entry, {er.NoSeq} have no sequence number (run: indexnode seq assign), {er.Added} {(a.Has("dry-run") ? "would be " : "")}added");
             return 0;
         }
-        if (a.Positional.FirstOrDefault() != "build") throw new ArgumentException("groups build [--dry-run] [--threads N] [--check-pairs <file>] [--top 20]");
+        if (a.Positional.FirstOrDefault() == "rerun")
+        {
+            var (_, rs, rp, _) = CentersCommands.OpenStore(a, remote);
+            await JobQueue.RequireSnapshotAsync(rs, rp, default);
+            var rq = new JobQueue(rs, rp, "cli"); await rq.LoadAsync(default);
+            var rr = await SeqCommand.RerunGroupsAsync(rq, rs, rp, a.Get("kind") ?? throw new ArgumentException("groups rerun --kind join [--dry-run]"), a.Has("dry-run"), default);
+            Console.WriteLine($"groups rerun --kind join{(a.Has("dry-run") ? " (dry run)" : "")}: {rr.Joins} drama(s) with a join record, {rr.Added} group entr{(rr.Added == 1 ? "y" : "ies")} {(a.Has("dry-run") ? "would be " : "")}added, {rr.AlreadyPending} already pending (sequence numbers kept; later members compare against earlier members' full frames, so nothing cascades)");
+            return 0;
+        }
+        if (a.Positional.FirstOrDefault() != "build")
+ throw new ArgumentException("groups build [--dry-run] [--threads N] [--check-pairs <file>] [--top 20]");
         var (cfg, store, paths, _) = CentersCommands.OpenStore(a, remote);
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads; bool dry = a.Has("dry-run");
         var pairs = a.Get("check-pairs") is { } cp ? ReadPairs(cp) : null; int topRows = a.Get("top") is { } tp ? int.Parse(tp) : 20;

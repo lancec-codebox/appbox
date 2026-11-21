@@ -6,7 +6,7 @@ namespace IndexNode;
 public sealed record FrameHit(int Frame, string Upload, double Time, double Cosine);
 
 /// <summary>A known copy of a drama (a group member) as the pre-check sees it.</summary>
-public sealed record GroupCopy(string Upload, string? SpeechLanguage, bool? Dubbed);
+public sealed record GroupCopy(string Upload, string? SpeechLanguage, bool? Dubbed, double? Duration = null);
 
 /// <summary>
 /// 0.13.2: the pre-check's PROPOSED membership (the search-index job is the only writer of groups). Kind: join (an existing group, through <see cref="JoinUpload"/>), mixed (one contiguous part of an upload, flagged, own group, never canonical), new.

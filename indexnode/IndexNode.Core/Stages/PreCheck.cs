@@ -17,6 +17,10 @@ public sealed class PreCheckSettings
     /// <summary>The duration rule: |duration - matched duration| &lt;= max(DurationPercent of the matched duration, DurationMinSeconds).</summary>
     public double DurationPercent { get; set; } = 0.15;
     public double DurationMinSeconds { get; set; } = 600;
+    /// <summary>0.13.13, the asymmetric rule: a download is a duplicate only when L - DurationPercent*L &lt;= duration &lt;= L + max(DurationSlackPercent*L, DurationSlackSeconds), L = the duration of the LONGEST member of the matched upload's group (the matched upload itself without a group). Longer than that: processed.</summary>
+    public double DurationSlackPercent { get; set; } = 0.02;
+    public double DurationSlackSeconds { get; set; } = 60;
+
     /// <summary>Centers whose member blocks are read per frame.</summary>
     public int TopCenters { get; set; } = 100;
     public double WindowSeconds { get; set; } = 300;
@@ -113,6 +117,8 @@ public interface IPreCheckAnalyzer
 
 public sealed record PreCheckDecision(string Decision, IReadOnlyList<string> Reasons, PreCheckMatch? Match)
 {
+    /// <summary>0.13.13: the longest member of the matched upload's group (id and duration), the L of the duration rule; null when the rule did not run or L is unknown.</summary>
+    public (string Id, double Duration)? MatchedLongest { get; init; }
     public const string Duplicate = "duplicate", Partial = "partial", Canonical = "canonical", New = "new", Skipped = "skipped";
 }
 
@@ -192,17 +198,33 @@ public static class PreCheck
 
     public static bool DurationClose(double duration, double matched, PreCheckSettings s) => Math.Abs(duration - matched) <= Math.Max(s.DurationPercent * matched, s.DurationMinSeconds);
 
-    /// <summary>The rule. <paramref name="matchedDuration"/>: the matched upload's duration, null when the store does not know it (then a skip is never taken).</summary>
-    public static PreCheckDecision Decide(PreCheckAnalysis a, double duration, Func<string, double?> matchedDuration, PreCheckSettings s)
+    /// <summary>0.13.13: L = the longest member of the group of <paramref name="top"/> (members with a known duration, the matched upload included), else the matched upload itself. Null when no duration is known.</summary>
+    public static (string Id, double Duration)? Longest(PreCheckAnalysis a, PreCheckMatch top, double? matchedDuration)
     {
+        (string Id, double Duration)? best = matchedDuration is { } md ? (top.Upload, md) : null;
+        if (a.UploadGroups.TryGetValue(top.Upload, out var g) && g != null && a.GroupMembers.TryGetValue(g, out var members))
+            foreach (var m in members) if (m.Duration is { } d && (best == null || d > best.Value.Duration)) best = (m.Upload, d);
+        return best;
+    }
+
+    /// <summary>The rule. <paramref name="matchedDuration"/>: the matched upload's duration, null when the store does not know it (then a skip is never taken). <paramref name="legacy"/>: the 0.13.12 symmetric duration rule (what-if comparisons only).</summary>
+    public static PreCheckDecision Decide(PreCheckAnalysis a, double duration, Func<string, double?> matchedDuration, PreCheckSettings s, bool legacy = false)
+    {
+
         if (a.SkippedReason != null) return new(PreCheckDecision.Skipped, [a.SkippedReason], null);
         var top = a.Top.OrderByDescending(m => m.Share).ThenByDescending(m => m.BestCosine).FirstOrDefault();
         if (top == null || top.Share < s.PartialShare) return new(PreCheckDecision.New, [top == null ? "no sample frame matched any indexed upload" : $"top share {top.Share:0.00} < {s.PartialShare:0.00}"], top);
         if (top.Share >= s.SkipShare)
         {
             var md = top.Duration ?? matchedDuration(top.Upload);
-            if (md == null) return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} >= {s.SkipShare:0.00} but the duration of {top.Upload} is unknown: not skipped"], top);
-            if (DurationClose(duration, md.Value, s))
+            if (md == null) return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} >= {s.SkipShare:0.00} but the duration of {top.Upload} is unknown (L unknown): not skipped"], top);
+            var longest = legacy ? null : Longest(a, top, md);
+            double lref = legacy ? md.Value : longest!.Value.Duration;   // L (the asymmetric rule) or the matched upload's own duration (the symmetric one)
+            string? tooLong = null;
+            if (!legacy && duration > lref + Math.Max(s.DurationSlackPercent * lref, s.DurationSlackSeconds))
+                tooLong = $"top share {top.Share:0.00} >= {s.SkipShare:0.00} but longer than the group's longest copy ({duration:0} s vs {lref:0} s, {longest!.Value.Id}; slack max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s)): processed";
+            if (tooLong != null) return new(PreCheckDecision.Partial, [tooLong], top) { MatchedLongest = longest };
+            if (legacy ? DurationClose(duration, md.Value, s) : duration >= lref - s.DurationPercent * lref)
             {
                 // canonical = Chinese audio only. A visual duplicate keeps only its metadata, EXCEPT an original-language upload (zh/yue, measured on the audio) of a drama whose known copies are all dubs: that one is processed fully
                 // and becomes the canonical copy. The drama's copies are the members of the group the pre-check proposed to join (0.13.2; the matched upload alone when there is none). A copy with no recorded language counts as zh.
@@ -210,11 +232,11 @@ public static class PreCheck
                 // the group's copies when the pre-check proposed a join (every known copy must be a dub), else the matched upload alone
                 var copies = a.Group is { Kind: GroupProposal.JoinKind, Copies.Count: > 0 } gp ? gp.Copies.Select(c => (Up: c.Upload, Lang: NormLang(c.SpeechLanguage) ?? "zh")).ToList() : [(top.Upload, NormLang(top.SpeechLanguage) ?? "zh")];
                 var theirs = copies.All(c => c.Lang != "zh") ? copies[0].Lang : "zh";
-                var dup = new[] { $"top share {top.Share:0.00} >= {s.SkipShare:0.00}", $"duration {duration:0}s within max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s) of {top.Upload} ({md.Value:0}s)" };
-                if (mine == "zh" && theirs != "zh") return new(PreCheckDecision.Canonical, [dup[0], dup[1], copies.Count > 1 ? $"the new upload is original-language (zh) and all {copies.Count} known copies in the group are dubs ({string.Join(", ", copies.Select(c => c.Up + ":" + c.Lang))}): processed as the canonical copy" : $"the new upload is original-language (zh) and {top.Upload} is a {theirs} dub: processed as the canonical copy"], top);
-                return new(PreCheckDecision.Duplicate, dup, top);
+                var dup = new[] { $"top share {top.Share:0.00} >= {s.SkipShare:0.00}", legacy ? $"duration {duration:0}s within max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s) of {top.Upload} ({md.Value:0}s)" : $"duration {duration:0}s within [-{s.DurationPercent:0%}, +max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0}s)] of the group's longest copy {longest!.Value.Id} ({lref:0}s)" };
+                if (mine == "zh" && theirs != "zh") return new(PreCheckDecision.Canonical, [dup[0], dup[1], copies.Count > 1 ? $"the new upload is original-language (zh) and all {copies.Count} known copies in the group are dubs ({string.Join(", ", copies.Select(c => c.Up + ":" + c.Lang))}): processed as the canonical copy" : $"the new upload is original-language (zh) and {top.Upload} is a {theirs} dub: processed as the canonical copy"], top) { MatchedLongest = longest };
+                return new(PreCheckDecision.Duplicate, dup, top) { MatchedLongest = longest };
             }
-            return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} >= {s.SkipShare:0.00} but duration {duration:0}s differs from {top.Upload} ({md.Value:0}s) by more than max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s)"], top);
+            return new(PreCheckDecision.Partial, [legacy ? $"top share {top.Share:0.00} >= {s.SkipShare:0.00} but duration {duration:0}s differs from {top.Upload} ({md.Value:0}s) by more than max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s)" : $"top share {top.Share:0.00} >= {s.SkipShare:0.00} but shorter than the group's longest copy by more than {s.DurationPercent:0%} ({duration:0} s vs {lref:0} s, {longest!.Value.Id}): processed"], top) { MatchedLongest = longest };
         }
         return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} in [{s.PartialShare:0.00}, {s.SkipShare:0.00}): another cut of the same drama"], top);
     }
@@ -260,7 +282,7 @@ public static class PreCheck
             ["top"] = new JsonArray(a.Top.Take(5).Select(m => (JsonNode?)new JsonObject { ["upload"] = m.Upload, ["share"] = Math.Round(m.Share, 4), ["bestCosine"] = Math.Round(m.BestCosine, 4), ["bestTime"] = Math.Round(m.BestTime, 1), ["frames"] = m.Frames, ["speechLanguage"] = m.SpeechLanguage, ["dubbed"] = m.Dubbed }).ToArray()),
             ["window"] = new JsonObject { ["start"] = window.Start, ["end"] = window.End, ["length"] = Math.Round(window.End - window.Start, 2) },
             ["frames"] = a.Frames, ["noHit"] = a.NoHit, ["indexVersion"] = a.IndexVersion,
-            ["settings"] = new JsonObject { ["tau"] = s.Tau, ["skipShare"] = s.SkipShare, ["partialShare"] = s.PartialShare, ["durationPercent"] = s.DurationPercent, ["durationMinSeconds"] = s.DurationMinSeconds, ["topCenters"] = s.TopCenters, ["windowSeconds"] = s.WindowSeconds, ["videoHeight"] = s.VideoHeight, ["audioFormat"] = s.AudioFormat, ["frames"] = s.Frames, ["languageSeconds"] = s.LanguageSeconds, ["languageMinSeconds"] = s.LanguageMinSeconds, ["windowPosition"] = s.WindowPosition },
+            ["settings"] = new JsonObject { ["tau"] = s.Tau, ["skipShare"] = s.SkipShare, ["partialShare"] = s.PartialShare, ["durationPercent"] = s.DurationPercent, ["durationMinSeconds"] = s.DurationMinSeconds, ["durationSlackPercent"] = s.DurationSlackPercent, ["durationSlackSeconds"] = s.DurationSlackSeconds, ["topCenters"] = s.TopCenters, ["windowSeconds"] = s.WindowSeconds, ["videoHeight"] = s.VideoHeight, ["audioFormat"] = s.AudioFormat, ["frames"] = s.Frames, ["languageSeconds"] = s.LanguageSeconds, ["languageMinSeconds"] = s.LanguageMinSeconds, ["windowPosition"] = s.WindowPosition },
             ["video"] = new JsonObject
             {
                 ["duration"] = Math.Round(duration, 2), ["claimedHeight"] = (int?)info["height"], ["title"] = (string?)info["title"], ["channel"] = (string?)info["channel"] ?? (string?)info["uploader"], ["channelId"] = (string?)info["channel_id"],
@@ -277,6 +299,7 @@ public static class PreCheck
             ["seconds"] = new JsonObject(a.Seconds.Select(kv => KeyValuePair.Create(kv.Key, (JsonNode?)Math.Round(kv.Value, 3)))) { ["sampleDownload"] = Math.Round(sampleDownloadSeconds, 2) },
             ["node"] = nodeId, ["version"] = version,
         };
+        if (d.MatchedLongest is { } ml) o["matchedLongest"] = new JsonObject { ["id"] = ml.Id, ["duration"] = Math.Round(ml.Duration, 2) };
         if (a.Group is { } g) { o["group"] = g.ToJson(); o["groupId"] = g.Group; o["groupOffset"] = Math.Round(g.Offset, 2); o["matchShare"] = Math.Round(g.MatchShare, 4); o["dupShare"] = Math.Round(g.DupShare, 4); }
         return o;
     }
