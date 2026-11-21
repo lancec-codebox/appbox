@@ -172,7 +172,12 @@ public sealed class FakeStore : IStore
     /// <summary>Head with a real ETag ("v&lt;version&gt;", as GetAsync gives), size and metadata.</summary>
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
     {
-        lock (gate) return Task.FromResult<BlobProps?>(Blobs.TryGetValue(name, out var b) ? new BlobProps(b.Data.Length, "\"v" + b.Version + "\"", new Dictionary<string, string>(b.Meta)) : null);
+        lock (gate)
+        {
+            if (!Blobs.TryGetValue(name, out var b)) return Task.FromResult<BlobProps?>(null);
+            var et = "\"v" + b.Version + "\""; SeenEtags[name + "|" + et] = ((b.GhostData ?? b.Data).Length, b.Meta.GetValueOrDefault("idx_sha256"));
+            return Task.FromResult<BlobProps?>(new BlobProps(b.Data.Length, et, new Dictionary<string, string>(b.Meta)));
+        }
     }
 
     public int ZipPuts, ZipConflicts;
@@ -199,13 +204,28 @@ public sealed class FakeStore : IStore
         }
     }
 
-    public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    /// <summary>What each ETag handed out held (name|etag -> length, idx_sha256): content identity for the reader.</summary>
+    readonly Dictionary<string, (int Len, string? Sha)> SeenEtags = new();
+    /// <summary>0.13.8: a round trip per ranged read (a real store's latency), and how many reads were in flight at once.</summary>
+    public TimeSpan RangeLatency; public int RangeInFlightPeak, RangeReads; int rangeNow;
+    public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    {
+        if (RangeLatency == TimeSpan.Zero) return GetRangeCore(name, off, len, ifMatch);
+        int n = Interlocked.Increment(ref rangeNow); int pk; while (n > (pk = RangeInFlightPeak)) Interlocked.CompareExchange(ref RangeInFlightPeak, n, pk);
+        try { await Task.Delay(RangeLatency, ct); Interlocked.Increment(ref RangeReads); return GetRangeCore(name, off, len, ifMatch); } finally { Interlocked.Decrement(ref rangeNow); }
+    }
+    RangeRead GetRangeCore(string name, long off, int len, string? ifMatch)
     {
         lock (gate)
         {
-            if (!Blobs.TryGetValue(name, out var b)) return Task.FromResult(new RangeRead(null, false));
-            if (ifMatch != null && "\"v" + b.Version + "\"" != ifMatch) return Task.FromResult(new RangeRead(null, true));
-            return Task.FromResult(new RangeRead(b.Data.AsSpan((int)Math.Min(off, b.Data.Length), (int)Math.Max(0, Math.Min(len, b.Data.Length - off))).ToArray(), false));
+            if (!Blobs.TryGetValue(name, out var b)) return new RangeRead(null, false);
+            // the one ghost-aware reader, as RestStore does it: a ghost is hydrated, and an ETag that moved with the same content (length + idx_sha256) is not an error
+            if (b.GhostData != null) { b.Data = b.GhostData; b.GhostData = null; b.Version++; }
+            if (ifMatch != null && "\"v" + b.Version + "\"" != ifMatch)
+            {
+                if (!SeenEtags.TryGetValue(name + "|" + ifMatch, out var seen) || seen.Len != b.Data.Length || (seen.Sha != null && b.Meta.TryGetValue("idx_sha256", out var sh0) && sh0 != seen.Sha)) return new RangeRead(null, true);
+            }
+            return new RangeRead(b.Data.AsSpan((int)Math.Min(off, b.Data.Length), (int)Math.Max(0, Math.Min(len, b.Data.Length - off))).ToArray(), false);
         }
     }
 

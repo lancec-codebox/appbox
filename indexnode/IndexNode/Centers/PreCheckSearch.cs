@@ -54,7 +54,7 @@ public static class PreCheckSearch
         foreach (var rs in rows) foreach (var r in rs) { var u = idx.RefUpload[r]; if (!need.TryGetValue(u, out var set)) need[u] = set = []; set.Add(idx.RefCenter[r]); }
         var cache = new ConcurrentDictionary<(int Up, int Center), (float[] Vec, float[] Times)>();
         long bytes = 0; int requests = 0;
-        await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(32, threads * 4)), CancellationToken = ct }, async (kv, t) =>
+        await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>   // 0.13.8: the real bound is CentersZip.MaxInFlight requests process-wide
         {
             var up = idx.Uploads[kv.Key]; var centers = new List<int>();
             foreach (var c in kv.Value) { if (shared != null && shared.TryGet(up.Id, c, out var hit)) cache[(kv.Key, c)] = hit; else centers.Add(c); }

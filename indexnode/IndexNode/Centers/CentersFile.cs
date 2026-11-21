@@ -123,6 +123,14 @@ public sealed class CentersZip
 
     public int Requests; public long BytesRead;
 
+    /// <summary>0.13.8: at most this many ranged reads of centers.zip members are in flight in the whole process (the bound is on requests, not threads: a read is a round trip, not CPU).</summary>
+    public const int MaxInFlight = 64;
+    static readonly SemaphoreSlim InFlightGate = new(MaxInFlight, MaxInFlight);
+    static int inFlight, peakInFlight;
+    public static int InFlight => Volatile.Read(ref inFlight);
+    /// <summary>The highest number of reads in flight since the last call (resets the peak).</summary>
+    public static int TakePeakInFlight() => Interlocked.Exchange(ref peakInFlight, Volatile.Read(ref inFlight));
+
     /// <summary>The member blocks of the given centers: one table read, then ranges merged when the blocks are close (gap at most <paramref name="gap"/> bytes, a merged range at most <paramref name="maxMerged"/>).</summary>
     public async Task<List<(int Center, CentersFile.Members Members)>> ReadBlocksAsync(IReadOnlyList<int> centers, int gap, int maxMerged, CancellationToken ct)
     {
@@ -134,14 +142,17 @@ public sealed class CentersZip
         foreach (var x in all.Where(x => x.B.Length == 0 || x.B.Count == 0)) result.Add((x.C, CentersFile.ParseBlock([], 0)));
         var want = all.Where(x => x.B.Length > 0 && x.B.Count > 0).OrderBy(x => x.B.Offset).ToList();
 
+        // 0.13.8: the merged ranges of one zip go out together (bounded by the process-wide in-flight cap in ReadAsync), not one after the other: on a real store each is a round trip
+        var spans = new List<(int I, int J, long Start, long End)>();
         for (int i = 0; i < want.Count;)
         {
             int j = i; long start = want[i].B.Offset, end = start + want[i].B.Length;
             while (j + 1 < want.Count && want[j + 1].B.Offset - end <= gap && want[j + 1].B.Offset + want[j + 1].B.Length - start <= maxMerged) { j++; end = want[j].B.Offset + want[j].B.Length; }
-            var buf = await ReadAsync(start, (int)(end - start), ct);
-            for (int m = i; m <= j; m++) result.Add((want[m].C, CentersFile.ParseBlock(buf.AsSpan((int)(want[m].B.Offset - start), want[m].B.Length), want[m].B.Count)));
-            i = j + 1;
+            spans.Add((i, j, start, end)); i = j + 1;
         }
+        var bufs = await Task.WhenAll(spans.Select(sp => ReadAsync(sp.Start, (int)(sp.End - sp.Start), ct)));
+        for (int si = 0; si < spans.Count; si++)
+            for (int m = spans[si].I; m <= spans[si].J; m++) result.Add((want[m].C, CentersFile.ParseBlock(bufs[si].AsSpan((int)(want[m].B.Offset - spans[si].Start), want[m].B.Length), want[m].B.Count)));
         return result;
     }
 
@@ -149,7 +160,10 @@ public sealed class CentersZip
     public async Task<byte[]> ReadAsync(long off, int len, CancellationToken ct)
     {
         Interlocked.Increment(ref Requests); Interlocked.Add(ref BytesRead, len);
-        var pin = new BlobPin(Blob, ETag, ZipSize, Sha); var r = await GhostSafeRead.RangeAsync(Store, pin, DataStart + off, len, ct); ETag = pin.ETag;
+        await InFlightGate.WaitAsync(ct); int now = Interlocked.Increment(ref inFlight); int pk; while (now > (pk = peakInFlight)) Interlocked.CompareExchange(ref peakInFlight, now, pk);
+        RangeRead r; var pin = new BlobPin(Blob, ETag, ZipSize, Sha);
+        try { r = await GhostSafeRead.RangeAsync(Store, pin, DataStart + off, len, ct); ETag = pin.ETag; }
+        finally { Interlocked.Decrement(ref inFlight); InFlightGate.Release(); }
         if (r.Mismatch) throw new StaleZipException(Blob);
         var d = r.Data ?? throw new FileNotFoundException(Blob + " is gone");
         if (d.Length != len) throw new InvalidDataException($"{Blob}: asked for {len} bytes at {off}, got {d.Length}");

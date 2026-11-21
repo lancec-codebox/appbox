@@ -99,6 +99,27 @@ public sealed class RestStore : IStore
         return await SendAsync(make, ct, opt: opt);
     }
 
+    // ---- 0.13.8: one ghost-aware reader. Identity of a blob is its CONTENT (real length + idx_sha256), never its ETag: a Nexis transition (dehydrate, hydrate) changes the ETag and nothing else.
+    private sealed record Ident(long Length, string? Sha);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Ident> idents = new();     // name|etag -> what that ETag held when we saw it
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> etagAlias = new();  // name|etag a caller holds -> the current ETag of the same content
+    private static string K(string name, string? etag) => name + "|" + etag;
+    private void Know(string name, string? etag, long length, string? sha) { if (etag != null && length >= 0) { if (idents.Count > 20000) idents.Clear(); idents[K(name, etag)] = new Ident(length, string.IsNullOrEmpty(sha) ? null : sha); } }
+    private static string? ShaOf(HttpResponseMessage r) => r.Headers.TryGetValues("x-ms-meta-idx_sha256", out var v) ? v.FirstOrDefault() : null;
+    private static long? TotalOf(HttpResponseMessage r) => r.Content.Headers.ContentRange?.Length;
+
+    /// <summary>The state of a blob that a read found odd (empty, short, gone, changed): look at it and make it readable. True when the read is worth repeating (hydrated, snapshot set, or the blob is simply active now).</summary>
+    private async Task<bool> SettleAsync(string name, CancellationToken ct)
+    {
+        for (int i = 1; ; i++)
+        {
+            try { return await HydrateGhostAsync(name, ct) || (await (GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(this, name)).ReadAsync(ct)) is { Length: > 0 }; }
+            catch (PermanentFailure e) when (i < 6) { Log.Info($"nexis: {name} is still changing state ({e.Message}), looking again"); await Task.Delay(RetryDelay(i), ct); }
+        }
+    }
+
+    public Task PrepareReadAsync(string name, CancellationToken ct) => NexisAccess.PrepareAsync(this, name, ct);
+
     private Uri ReadUri(string name) => BlobUri(name, ReadSnapshots.TryGetValue(name, out var snap) ? "snapshot=" + Uri.EscapeDataString(snap) : null);
 
     public Uri BlobUri(string name, string? extra = null)
@@ -208,13 +229,15 @@ public sealed class RestStore : IStore
             .ContinueWith(t => (IReadOnlyList<BlobEntry>)t.Result, ct);
     }
 
-    public async Task<BlobContent?> GetAsync(string name, CancellationToken ct)
+    public Task<BlobContent?> GetAsync(string name, CancellationToken ct) => GetAsync(name, ct, 0);
+    private async Task<BlobContent?> GetAsync(string name, CancellationToken ct, int depth)
     {
         using var r = await SendReadAsync(name, () => Req(HttpMethod.Get, ReadUri(name)), ct);
         if (r.StatusCode == HttpStatusCode.NotFound) return null;
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
         var body = await r.Content.ReadAsByteArrayAsync(ct);
-        if (body.Length == 0 && !ReadSnapshots.ContainsKey(name) && await HydrateGhostAsync(name, ct)) return await GetAsync(name, ct);   // a ghost: hydrated, read again
+        if (body.Length == 0 && depth < 5 && await SettleAsync(name, ct)) return await GetAsync(name, ct, depth + 1);   // a ghost: hydrated, read again
+        Know(name, r.Headers.ETag?.Tag, body.Length, ShaOf(r));
         return new BlobContent(body, r.Headers.ETag?.Tag);
     }
 
@@ -222,17 +245,17 @@ public sealed class RestStore : IStore
     public async Task<byte[]> GetRangeAsync(string name, long off, int len, CancellationToken ct)
     {
         if (len <= 0) return [];   // no HTTP form for an empty range: off+len-1 < 0 made RangeHeaderValue throw "to ('-1') must be non-negative"
-        if (!ReadSnapshots.ContainsKey(name)) await HydrateGhostAsync(name, ct);
-        using var r = await SendReadAsync(name, () => { var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1); return q; }, ct);
-        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (range)");
-        return await r.Content.ReadAsByteArrayAsync(ct);
+        var got = await GetRangeAsync(name, off, len, null, ct);
+        return got.Data ?? throw new FileNotFoundException(name + " is gone");
     }
 
-    public async Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct)
+    public Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct) => GetIfChangedAsync(name, etag, ct, 0);
+    private async Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct, int depth)
     {
-        using var r = await SendAsync(() =>
+        if (etag != null && etagAlias.TryGetValue(K(name, etag), out var cur)) etag = cur;   // the same content under a newer ETag (a ghost transition) is not a change
+        using var r = await SendReadAsync(name, () =>
         {
-            var q = Req(HttpMethod.Get, BlobUri(name));
+            var q = Req(HttpMethod.Get, ReadUri(name));
             if (etag != null) q.Headers.TryAddWithoutValidation("If-None-Match", etag);
             return q;
         }, ct);
@@ -240,7 +263,8 @@ public sealed class RestStore : IStore
         if (r.StatusCode == HttpStatusCode.NotFound) return new(true, false, null, null);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (conditional)");
         var body = await r.Content.ReadAsByteArrayAsync(ct);
-        if (body.Length == 0 && !ReadSnapshots.ContainsKey(name) && await HydrateGhostAsync(name, ct)) return await GetIfChangedAsync(name, null, ct);
+        if (body.Length == 0 && depth < 5 && await SettleAsync(name, ct)) return await GetIfChangedAsync(name, null, ct, depth + 1);
+        Know(name, r.Headers.ETag?.Tag, body.Length, ShaOf(r));
         return new(true, true, body, r.Headers.ETag?.Tag);
     }
 
@@ -297,7 +321,8 @@ public sealed class RestStore : IStore
     }
 
     /// <summary>Size, ETag and metadata. 0.13.0: this never hydrates a ghost (a metadata check must not make Nexis bring 1 GB back); only reading the contents does. A ghost's size is what is committed (0) and its ETag and metadata are the blob's own.</summary>
-    public async Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
+    public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => HeadAsync(name, ct, 0);
+    private async Task<BlobProps?> HeadAsync(string name, CancellationToken ct, int depth)
     {
         using var r = await SendReadAsync(name, () => Req(HttpMethod.Head, ReadUri(name)), ct);
         if (r.StatusCode == HttpStatusCode.NotFound) return null;
@@ -305,7 +330,18 @@ public sealed class RestStore : IStore
         long size = r.Content.Headers.ContentLength ?? 0;
         var meta = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var h in r.Headers) if (h.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase)) meta[h.Key[10..]] = h.Value.FirstOrDefault() ?? "";
-        return new BlobProps(size, r.Headers.ETag?.Tag, meta);
+        var etag = r.Headers.ETag?.Tag;
+        // 0.13.8: a ghost (or a blob mid-transition) HEADs as 0 committed bytes; its length is the recorded ghostd_size. The length of a blob is content, whatever state Nexis has it in. Nothing is hydrated here.
+        // The tags are read after the HEAD, so the state may have moved on (hydrated meanwhile: HEAD again); a blob with no ghost tags and 0 bytes is really empty.
+        if (size == 0 && r.Headers.TryGetValues("x-ms-tag-count", out var tc) && int.TryParse(tc.FirstOrDefault(), out var ntags) && ntags > 0 && r.RequestMessage?.RequestUri?.Query.Contains("snapshot=") != true)
+        {
+            var t = await GetTagsAsync(name, ct);
+            if (t == null) return null;
+            if (t.GetValueOrDefault("ghostd_state") is "ghost" or "transitioning" && long.TryParse(t.GetValueOrDefault("ghostd_size"), out var real) && real > 0) size = real;
+            else if (t.GetValueOrDefault("ghostd_state") == "active" && long.TryParse(t.GetValueOrDefault("ghostd_size"), out var rr) && rr > 0 && depth < 4) return await HeadAsync(name, ct, depth + 1);
+        }
+        Know(name, etag, size, meta.GetValueOrDefault("idx_sha256"));
+        return new BlobProps(size, etag, meta);
     }
 
     // ---------------------------------------------------------------- append blobs (the queue log)
@@ -392,20 +428,55 @@ public sealed class RestStore : IStore
         return new(r.Content.Headers.ContentLength ?? 0, Sealed(r), Blocks(r));
     }
 
+    /// <summary>
+    /// 0.13.8: THE ranged read. Identity is content: a read pinned to an ETag that the blob no longer has (412) is looked at, not failed: when the blob still exists with the length (and idx_sha256, when both
+    /// sides have one) it had under that ETag, the ETag change was a Nexis transition and the read goes on with the current ETag (remembered, so the next read of the old ETag is not even refused).
+    /// An empty answer (416, or no bytes) from a blob that is a ghost or transitioning is settled (hydrate, or read the snapshot, or wait for a vanished snapshot's blob to settle) and read again.
+    /// Only a 404 on the base blob (data null) or different content (Mismatch) is an error.
+    /// </summary>
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
     {
         if (len <= 0) return new([], false);
-        using var r = await SendReadAsync(name, () =>
+        for (int attempt = 0; attempt < 8; attempt++)
         {
-            var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1);
-            if (ifMatch != null) q.Headers.TryAddWithoutValidation("If-Match", ifMatch);
-            return q;
-        }, ct);
-        if (r.StatusCode == HttpStatusCode.NotFound) return new(null, false);
-        if (r.StatusCode == HttpStatusCode.PreconditionFailed) return new(null, true);
-        if (r.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable) return new([], false);
-        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (range)");
-        return new(await r.Content.ReadAsByteArrayAsync(ct), false);
+            var tag = ifMatch != null && etagAlias.TryGetValue(K(name, ifMatch), out var al) ? al : ifMatch;
+            using var r = await SendReadAsync(name, () =>
+            {
+                var q = Req(HttpMethod.Get, ReadUri(name)); q.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(off, off + len - 1);
+                if (tag != null && !ReadSnapshots.ContainsKey(name)) q.Headers.TryAddWithoutValidation("If-Match", tag);   // a snapshot has its own ETag: content identity is checked below instead
+                return q;
+            }, ct);
+            if (r.StatusCode == HttpStatusCode.NotFound) return new(null, false);
+            if (r.StatusCode == HttpStatusCode.PreconditionFailed)
+            {
+                var h = await HeadAsync(name, ct);
+                if (h == null) return new(null, false);
+                if (ifMatch == null || h.ETag == null) { if (attempt < 7) continue; return new(null, true); }
+                if (!idents.TryGetValue(K(name, ifMatch), out var id)) return new(null, true);                                   // an ETag we never saw: cannot prove it is the same content
+                var sha = h.Metadata.GetValueOrDefault("idx_sha256");
+                if (id.Length != h.Size || (id.Sha != null && !string.IsNullOrEmpty(sha) && id.Sha != sha)) return new(null, true);   // different bytes
+                etagAlias[K(name, ifMatch)] = h.ETag; Know(name, h.ETag, id.Length, id.Sha ?? (string.IsNullOrEmpty(sha) ? null : sha));
+                Log.Info($"{name}: ETag changed without a change of content (ghost transition): reading on with the new ETag");
+                continue;
+            }
+            if (r.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+            {   // nothing at that offset: a ghost has 0 committed bytes. Settle it and ask again; the state may also have changed since (so look a few times before believing the blob is short)
+                if (attempt < 5) { await SettleAsync(name, ct); continue; }
+                return new([], false);
+            }
+            if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob (range)");
+            var data = await r.Content.ReadAsByteArrayAsync(ct);
+            if (data.Length == 0 && attempt < 5) { await SettleAsync(name, ct); continue; }
+            return new(data, false);
+        }
+        throw new PermanentFailure($"blob {name} kept changing while it was being read; not retrying");
+    }
+
+    /// <summary>True when the blob is a Nexis ghost or mid-transition with nothing committed (its content is in blocks or a snapshot).</summary>
+    private async Task<bool> IsEmptyGhostAsync(string name, CancellationToken ct)
+    {
+        var s = await (GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(this, name)).ReadAsync(ct);
+        return s != null && s.Length == 0 && (s.State is "ghost" or "transitioning" || (s.Tags.TryGetValue("ghostd_size", out var z) && long.TryParse(z, out var n) && n > 0));
     }
 
     public async Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) =>
@@ -478,11 +549,12 @@ public sealed class RestStore : IStore
         return true;
     }
 
-    public async Task DownloadToFileAsync(string name, string path, CancellationToken ct)
+    public Task DownloadToFileAsync(string name, string path, CancellationToken ct) => DownloadToFileAsync(name, path, ct, 0);
+    private async Task DownloadToFileAsync(string name, string path, CancellationToken ct, int depth)
     {
         using var r = await SendReadAsync(name, () => Req(HttpMethod.Get, ReadUri(name)), ct, HttpCompletionOption.ResponseHeadersRead);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
-        if (r.Content.Headers.ContentLength == 0 && !ReadSnapshots.ContainsKey(name) && await HydrateGhostAsync(name, ct)) { await DownloadToFileAsync(name, path, ct); return; }
+        if (r.Content.Headers.ContentLength == 0 && depth < 5 && await SettleAsync(name, ct)) { await DownloadToFileAsync(name, path, ct, depth + 1); return; }
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         await using var fs = File.Create(path);
         await r.Content.CopyToAsync(fs, ct);

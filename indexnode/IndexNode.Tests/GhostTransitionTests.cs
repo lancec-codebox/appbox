@@ -17,11 +17,11 @@ public class GhostTransitionTests
     [Fact]
     public async Task A_dehydrated_blob_is_read_with_the_same_bytes_after_the_ETag_changed()
     {
-        var (s, pin) = await Setup(); var old = pin.ETag;
+        var (s, pin) = await Setup();
         Assert.Equal(Bytes[10..30], (await GhostSafeRead.RangeAsync(s, pin, 10, 20, default)).Data);
         s.Dehydrate(Blob);
         var r = await GhostSafeRead.RangeAsync(s, pin, 50, 40, default);
-        Assert.False(r.Mismatch); Assert.Equal(Bytes[50..90], r.Data); Assert.NotEqual(old, pin.ETag);
+        Assert.False(r.Mismatch); Assert.Equal(Bytes[50..90], r.Data);   // 0.13.8: the store, not the pin, follows the new ETag
         Assert.Equal(Bytes[0..5], (await GhostSafeRead.RangeAsync(s, pin, 0, 5, default)).Data);   // the pin follows the new ETag
     }
 

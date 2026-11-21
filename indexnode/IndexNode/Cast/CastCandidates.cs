@@ -97,7 +97,7 @@ public static class CastCandidates
         {
             var (c, f) = rowOf[Math.Round(t, 3)]; var name = paths.Video(id, $"frames/{c.Chunk}.mjpeg");
             if (rest == null) { var all = store.GetAsync(name, ct).GetAwaiter().GetResult()!.Data; return all.AsSpan((int)f.Off, f.Len).ToArray(); }
-            return rest.GetRangeAsync(name, f.Off, f.Len, ct).GetAwaiter().GetResult();   // a ghost chunk is hydrated first
+            return (store.GetRangeAsync(name, f.Off, f.Len, null, ct).GetAwaiter().GetResult().Data ?? throw new FileNotFoundException(name + " is gone"));   // the one reader hydrates a ghost chunk
         }
         Rgb? last = null; double lastT = double.NaN;
         var (matched, unmatched, dropped) = Annotate(pool, t => { var im = Imaging.DecodeJpeg(FrameJpeg(t)); return (det.Detect(im), im); }, fh);

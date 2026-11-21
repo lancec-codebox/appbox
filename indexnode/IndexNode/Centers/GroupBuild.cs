@@ -22,19 +22,37 @@ public static class GroupBuild
 
     public const int ChunkFrames = 30;
 
+    /// <summary>0.13.8: where the time of a full check goes, summed over the uploads checked (thread-safe): scan, member reads, scoring, and the requests and bytes of the reads.</summary>
+    public sealed class CheckStats
+    {
+        long scan, read, score, own, uploads, requests, bytes; int peak;
+        public void Add(double scanMs, double readMs, double scoreMs, int req, long by) { Interlocked.Add(ref scan, (long)(scanMs * 1000)); Interlocked.Add(ref read, (long)(readMs * 1000)); Interlocked.Add(ref score, (long)(scoreMs * 1000)); Interlocked.Add(ref requests, req); Interlocked.Add(ref bytes, by); }
+        public void AddOwn(double ms, int req, long by) { Interlocked.Add(ref own, (long)(ms * 1000)); Interlocked.Add(ref requests, req); Interlocked.Add(ref bytes, by); }
+        public void Done() => Interlocked.Increment(ref uploads);
+        public void Peak(int p) { int c; while (p > (c = Volatile.Read(ref peak))) Interlocked.CompareExchange(ref peak, p, c); }
+        /// <summary>"avg per upload: scan 12 ms, read 3400 ms (own centers 800 ms), score 40 ms; 190 requests, 38.0 MB; reads in flight 7 now, peak 61".</summary>
+        public string Line()
+        {
+            long n = Math.Max(1, Interlocked.Read(ref uploads)); string Ms(long us) => (us / 1000.0 / n).ToString("F0");
+            return $"avg per upload: scan {Ms(Interlocked.Read(ref scan))} ms, read {Ms(Interlocked.Read(ref read))} ms (own centers {Ms(Interlocked.Read(ref own))} ms), score {Ms(Interlocked.Read(ref score))} ms; {Interlocked.Read(ref requests) / n} requests, {Interlocked.Read(ref bytes) / n / 1048576.0:F1} MB; reads in flight {CentersZip.InFlight} now, peak {Math.Max(Volatile.Read(ref peak), CentersZip.TakePeakInFlight())}";
+        }
+    }
+
     /// <summary>The frames to search: the pre-check's own selection (<see cref="PreCheck.SubsampleIndices"/>, one sampler for both callers), here spread over the whole upload (the pre-check's window is 5 minutes around 50% of the video), so mixed cuts and the offset see its full length.</summary>
     public static List<(float T, float[] V)> Sample(List<(float T, float[] V)> frames, int max) =>
         max <= 0 || frames.Count <= max ? frames : PreCheck.SubsampleIndices(frames.Count, max).Select(i => frames[i]).ToList();
 
     /// <summary>The full check of one processed upload: every frame vector of its centers.zip (time order) against <paramref name="next"/> without itself. Null when its centers cannot be read (the caller falls back to the pre-check's hint).</summary>
-    public static async Task<GroupProposal?> FullCheckAsync(IStore store, Paths paths, SearchData next, SearchUpload u, GroupSet set, PreCheckSettings s, int threads, CancellationToken ct, BlockCache? cache = null)
+    public static async Task<GroupProposal?> FullCheckAsync(IStore store, Paths paths, SearchData next, SearchUpload u, GroupSet set, PreCheckSettings s, int threads, CancellationToken ct, BlockCache? cache = null, CheckStats? stats = null)
     {
         List<(float T, float[] V)> frames = [];
         try
         {
+            var own = Stopwatch.StartNew();
             var z = await CentersZip.OpenAsync(store, paths.Video(u.Id, "centers.zip"), ct); if (z == null) return null;
             var h = await z.ReadHeaderAsync(ct);
             var blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
+            stats?.AddOwn(own.Elapsed.TotalMilliseconds, z.Requests, z.BytesRead);
             foreach (var (_, m) in blocks) { var rows = AiProbe.RowsFromF16(m.Vectors); for (int i = 0; i < rows.Length && i < m.Times.Length; i++) { Sscd.L2Normalize(rows[i]); frames.Add((m.Times[i], rows[i])); } }
         }
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"groups: centers of {u.Id} not read ({e.Message})"); return null; }
@@ -48,7 +66,8 @@ public static class GroupBuild
         for (int at = 0; at < frames.Count; at += ChunkFrames)
         {
             var part = frames.Skip(at).Take(ChunkFrames).Select(f => f.V).ToList();
-            var (b, _) = await PreCheckSearch.BestPerFrameAsync(store, paths, next, part, s.TopCenters, threads, ct, ex, cache);
+            var (b, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, next, part, s.TopCenters, threads, ct, ex, cache);
+            stats?.Add(st.ScanMs, st.ReadMs, st.ScoreMs, st.Requests, st.Bytes); stats?.Peak(CentersZip.InFlight);
             Array.Copy(b, 0, best, at, b.Length);
         }
         var hits = new List<FrameHit>();
@@ -99,16 +118,17 @@ public static class GroupBuild
         var cache = new BlockCache(s.GroupCacheMb * 1024L * 1024L);
         // 0.13.7: several uploads are checked at once (bounded by threads), each with its share of the threads for its own frames; the check only reads the index and the (still unchanged) set, the placements are applied after, in index order
         int par = Math.Max(1, Math.Min(threads, unknown.Count)), inner = Math.Max(1, threads / par);
-        var placed = new NewUpload?[unknown.Count]; int fullN = 0, hintN = 0;
+        var placed = new NewUpload?[unknown.Count]; int fullN = 0, hintN = 0; var cstats = new CheckStats();
+        using var tick = new Timer(_ => { try { cstats.Peak(CentersZip.InFlight); } catch { } }, null, 0, 200);
         await Parallel.ForEachAsync(Enumerable.Range(0, unknown.Count), new ParallelOptions { MaxDegreeOfParallelism = par, CancellationToken = ct }, async (k, t) =>
         {
             var u = unknown[k];
             var r = await ReadRecAsync(store, paths, u.Id, t, say);
-            var prop = await FullCheckAsync(store, paths, next, u, set, s, inner, t, cache);
+            var prop = await FullCheckAsync(store, paths, next, u, set, s, inner, t, cache, cstats); cstats.Done();
             if (prop == null) { prop = r.Proposal; Interlocked.Increment(ref hintN); } else Interlocked.Increment(ref fullN);
             var (l0, d0) = Sp(u);
             placed[k] = new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop);
-            int n = Interlocked.Increment(ref done); if (n % 10 == 0 || n == todo) say?.Invoke(Progress(n, todo, clock.Elapsed));
+            int n = Interlocked.Increment(ref done); if (n % 10 == 0 || n == todo) say?.Invoke(Progress(n, todo, clock.Elapsed) + "; " + cstats.Line() + $"; {par} uploads at once, {inner} threads each");
         });
         news.AddRange(placed.Select(x => x!)); full += fullN; hinted += hintN;
         // the uploads the pre-check short-circuited (record, no centers.zip) with a proposal in it
