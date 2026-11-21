@@ -214,7 +214,7 @@ public class GroupStepTests
         Assert.Equal(3, q.Read(st => st.MaxSeq));
         // a group step has finished: refused, nothing changes
         await q.AppendLinesAsync([QLine.Add("p2", "group", GroupSequencing.NewJob("p2", 0), "2026-11-21T08:00:00Z")], default);
-        var h = (await q.TryClaimAsync("p2", st => ["group"], default))!; await h.AppendAsync([new QLine { T = "done", Stage = "group" }], true, default);
+        var h = (await q.TryClaimAsync("p2", st => new[] { "group" }, default))!; await h.AppendAsync([new QLine { T = "done", Stage = "group" }], true, default);
         var e = await Assert.ThrowsAsync<InvalidOperationException>(() => SeqCommand.AssignAsync(q, s, P, false, default, renumber: true));
         Assert.Contains("refused", e.Message); Assert.Equal(1L, q.Read(st => st.Get("p2")!.Seq!.Value));
     }
@@ -242,6 +242,147 @@ public class GroupStepTests
         var o = new StringWriter(); var old = Console.Out; Console.SetOut(o);
         try { Assert.Equal(0, await JobsCommand.ListAsync(Args.Parse(["list", "--stage", "group"]), q)); Assert.Equal(0, await JobsCommand.ListAsync(Args.Parse(["list", "--held", "ai"]), q)); } finally { Console.SetOut(old); }
         Assert.Contains("group/g1", o.ToString()); Assert.DoesNotContain("process/v1", o.ToString());
+    }
+
+
+    // ---- 0.13.12: unstarted dramas carry no number, the claim gate, group entries in seq order
+
+    [Fact]
+    public async Task A_forced_seq_line_without_a_number_clears_it_and_the_next_number_is_still_highest_plus_one()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        await q.AppendLinesAsync([AddProcess("x"), AddProcess("y"), new QLine { T = "seq", S = "x", Seq = 1 }, new QLine { T = "seq", S = "y", Seq = 2 }], default);
+        await q.AppendLinesAsync([new QLine { T = "seq", S = "y", Force = true }], default);
+        Assert.Null(q.Read(st => st.Get("y")!.Seq)); Assert.Equal(1L, q.Read(st => st.Get("x")!.Seq!.Value)); Assert.Equal(3, q.Read(st => st.NextSeq()));
+        var late = await Node(s, c, "late"); Assert.Null(late.Read(st => st.Get("y")!.Seq)); Assert.Equal(3, late.Read(st => st.NextSeq()));   // a later node replays the same
+    }
+
+    [Fact]
+    public async Task Clear_unstarted_clears_only_unframed_unstarted_dramas_keeps_framed_claimed_stepped_and_pre_checked_ones_and_works_after_group_steps_finished()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        string[] ids = ["framed", "stepped", "claimed", "prechecked", "idle1", "idle2", "gdone"];
+        await q.AppendLinesAsync(ids.Select(AddProcess), default);
+        await q.AppendLinesAsync(ids.Select((id, k) => new QLine { T = "seq", S = id, Seq = k + 1 }), default);
+        await PutFrames(s, "framed", Make(20, 4, 1), 20); await PutFrames(s, "gdone", Make(20, 4, 2), 20);
+        await VideoJsonSeed.PutAsync(s, P, "prechecked", 300, precheck: new JsonObject { ["at"] = "2026-01-01T00:00:00Z", ["decision"] = "new" });
+        await VideoJsonSeed.PutAsync(s, P, "idle1", 300); await VideoJsonSeed.PutAsync(s, P, "idle2", 300);
+        var hs = (await q.TryClaimAsync("stepped", Pick, default))!; await hs.AppendAsync([new QLine { T = "done", Stage = "process", Step = "frames", State = "pending", Due = "2026-11-21T09:00:00Z" }], true, default);   // one step done, claim released
+        var hc = (await q.TryClaimAsync("claimed", Pick, default))!;                                                           // claimed right now
+        // a finished group step
+        await q.AppendLinesAsync([QLine.Add("gdone", "group", GroupSequencing.NewJob("gdone", 0), "2026-11-21T08:00:00Z")], default);
+        var hg = (await q.TryClaimAsync("gdone", st => new[] { "group" }, default))!; await hg.AppendAsync([new QLine { T = "done", Stage = "group" }], true, default);
+        var dry = await SeqCommand.ClearUnstartedAsync(q, s, P, true, default);
+        Assert.Equal(2, dry.Cleared); Assert.Equal(["idle1", "idle2"], dry.First); Assert.Equal(7, q.Read(st => st.Subjects.Values.Count(x => x.Seq != null)));
+        var real = await SeqCommand.ClearUnstartedAsync(q, s, P, false, default);
+        Assert.Equal(2, real.Cleared);
+        Assert.Null(q.Read(st => st.Get("idle1")!.Seq)); Assert.Null(q.Read(st => st.Get("idle2")!.Seq));
+        foreach (var id in new[] { "framed", "stepped", "claimed", "prechecked", "gdone" }) Assert.NotNull(q.Read(st => st.Get(id)!.Seq));   // never cleared
+        Assert.Equal(0, (await SeqCommand.ClearUnstartedAsync(q, s, P, false, default)).Cleared);                              // idempotent
+        Assert.Equal(8, q.Read(st => st.NextSeq()));                                                                           // gaps are fine: the next number is highest + 1
+        await hc.AppendAsync([new QLine { T = "done", Stage = "process" }], true, default);
+    }
+
+    [Fact]
+    public async Task Seq_assign_and_renumber_never_number_an_unstarted_drama_and_renumber_clears_the_old_numbers_of_unstarted_ones()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        await PutFrames(s, "f1", Make(20, 4, 1), 20); await PutFrames(s, "f2", Make(20, 4, 2), 20);
+        await VideoJsonSeed.PutAsync(s, P, "u1", 300); await VideoJsonSeed.PutAsync(s, P, "u2", 300);
+        await q.AppendLinesAsync([AddProcess("f1"), AddProcess("u1"), AddProcess("u2"), new QLine { T = "seq", S = "u2", Seq = 5 }], default);   // u2: numbered by 0.13.11's renumber, never started
+        var r = await SeqCommand.AssignAsync(q, s, P, false, default); Assert.Equal(2, r.Assigned);                           // f1, f2 only
+        Assert.Null(q.Read(st => st.Get("u1")!.Seq)); Assert.Equal(5L, q.Read(st => st.Get("u2")!.Seq!.Value));                  // assign leaves an existing number alone (clear-unstarted removes it)
+        var rn = await SeqCommand.AssignAsync(q, s, P, false, default, renumber: true);
+        Assert.Equal(2, rn.Assigned); Assert.Null(q.Read(st => st.Get("u1")!.Seq)); Assert.Null(q.Read(st => st.Get("u2")!.Seq));
+        Assert.Equal([1L, 2L], new[] { "f1", "f2" }.Select(id => q.Read(st => st.Get(id)!.Seq!.Value)).OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task A_blocked_group_entry_produces_no_claim_line_and_becomes_runnable_when_the_lowest_unframed_drama_clears_and_group_entries_go_in_seq_order()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        // seq 1 framed, 2 stuck in processing (no frames), 3 and 4 framed with group entries added in reverse order
+        await q.AppendLinesAsync(new[] { "d1", "d2", "d3", "d4" }.Select(AddProcess), default);
+        await q.AppendLinesAsync(new[] { "d1", "d2", "d3", "d4" }.Select((id, k) => new QLine { T = "seq", S = id, Seq = k + 1 }), default);
+        foreach (var id in new[] { "d1", "d3", "d4" }) await PutFrames(s, id, Make(20, 4, id.GetHashCode()), 20);
+        foreach (var id in new[] { "d1", "d3" }) await q.AppendLinesAsync([new QLine { T = "done", S = id, Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }], default);
+        c.T = c.T.AddMinutes(1);
+        await q.AppendLinesAsync([QLine.Add("d4", "group", GroupSequencing.NewJob("d4", 0), Protocol.Utc(c.T)), QLine.Add("d3", "group", GroupSequencing.NewJob("d3", 0), Protocol.Utc(c.T)), QLine.Add("d1", "group", GroupSequencing.NewJob("d1", 0), Protocol.Utc(c.T))], default);
+        var gate = new GroupSequencing.Gate(s, P); var now = new DateTimeOffset(c.T.UtcDateTime, TimeSpan.Zero);
+        var v = await gate.RefreshAsync(q, now, default);
+        Assert.Equal(2L, v.L); Assert.Equal("d2", v.LId);
+        var cands = q.Read(st => st.Candidates(Protocol.Utc(c.T), x => x == "group", (sub, e) => v.Runnable_(sub))).Select(x => x.Subject.Id).ToList();
+        Assert.Equal(["d1"], cands);                                                                                          // d3, d4 wait behind seq 2: not even a candidate, so no claim and no append
+        Assert.Equal(2, v.Waiting); Assert.Equal(1, v.Runnable);
+        Assert.NotNull(gate.Summary(v, now)); Assert.Null(gate.Summary(v, now.AddMinutes(1))); Assert.Contains("2 waiting behind seq 2 (d2), 1 runnable", gate.Summary(v, now.AddMinutes(6)));
+        // d2 gets its frames: L clears (the listing is re-done at most every two minutes)
+        await PutFrames(s, "d2", Make(20, 4, 9), 20);
+        var same = await gate.RefreshAsync(q, now.AddMinutes(1), default); Assert.Equal(2L, same.L);                          // listed 1 minute ago: not re-listed yet
+        var v2 = await gate.RefreshAsync(q, now.AddMinutes(3), default); Assert.Null(v2.L);
+        var order = q.Read(st => st.Candidates(Protocol.Utc(c.T), x => x == "group", (sub, e) => v2.Runnable_(sub))).Select(x => x.Subject.Id).ToList();
+        Assert.Equal(["d1", "d3", "d4"], order);                                                                              // lowest seq first, whatever the order they were added in
+    }
+
+    [Fact]
+    public async Task The_gate_runs_no_claim_for_a_blocked_group_entry_in_the_engine_log()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        await q.AppendLinesAsync([AddProcess("w1"), AddProcess("w2"), new QLine { T = "seq", S = "w1", Seq = 1 }, new QLine { T = "seq", S = "w2", Seq = 2 }], default);
+        await PutFrames(s, "w2", Make(20, 4, 3), 20);
+        await q.AppendLinesAsync([QLine.Add("w2", "group", GroupSequencing.NewJob("w2", 0), "2026-11-21T08:00:00Z")], default);
+        var before = s.AppendText("index/jobs/queue.log").Length;
+        var v = await new GroupSequencing.Gate(s, P).RefreshAsync(q, c.T, default);
+        Assert.Empty(q.Read(st => st.Candidates("2026-11-21T09:00:00Z", x => x == "group", (sub, e) => v.Runnable_(sub))));
+        Assert.Equal(before, s.AppendText("index/jobs/queue.log").Length);                                                    // looking appends nothing
+    }
+
+    // ---- 0.13.12: the group step samples first
+    static async Task<(FakeStore S, JobQueue Q, GroupStage Stage, List<int> Searched)> Rig(Func<FakeStore, Task> seed, params (string Id, long Seq)[] dramas)
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a"); await seed(s);
+        await q.AppendLinesAsync(dramas.Select(d => AddProcess(d.Id)), default); await q.AppendLinesAsync(dramas.Select(d => new QLine { T = "seq", S = d.Id, Seq = d.Seq }), default);
+        await q.AppendLinesAsync(dramas.Select(d => new QLine { T = "done", S = d.Id, Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }), default);
+        var searched = new List<int>(); return (s, q, new GroupStage(s) { OnSearch = n => { lock (searched) searched.Add(n); } }, searched);
+    }
+    static Task RunGroup(FakeStore s, JobQueue q, GroupStage g, string id) =>
+        g.RunAsync(new JobContext { Job = new JobDescriptor { Stage = "group", JobId = id }, Stage = "group", BlobName = id, Worker = 0, Store = s, Paths = P, NodeId = "t", Token = default, Queue = q, ThreadShare = () => 2, Report = (_, _) => { } });
+
+    [Fact]
+    public async Task A_new_drama_searches_only_the_even_sample_and_records_it_a_join_runs_the_full_pass_and_still_retains_and_a_mixed_one_writes_full_stretches()
+    {
+        var cfg = new PreCheckSettings(); int sample = cfg.GroupCheckFrames;
+        var (s, q, g, searched) = await Rig(async st =>
+        {
+            await PutFrames(st, "n1", Make(1200, 60, 1), 1200);                              // 1,200 frames: more than the sample
+            await PutFrames(st, "n2", Make(1200, 60, 2), 1200);                              // unrelated: new
+            await PutFrames(st, "j1", Make(1200, 60, 1), 1200, 1.0, 5000);                   // the same video as n1: join
+            var half = new float[1200 * D]; Array.Copy(Make(1200, 60, 1), 0, half, 0, 600 * D); Array.Copy(Make(1200, 60, 2), 600 * D, half, 600 * D, 600 * D);
+            await PutFrames(st, "m1", half, 1200, 1.0, 9000);                                // half n1, half n2: mixed
+        }, ("n1", 1), ("n2", 2), ("j1", 3), ("m1", 4));
+        JsonObject Rec(string id) => (JsonObject)VideoJson.ReadAsync(s, P, id, default).Result!.Root["grouping"]!;
+        await RunGroup(s, q, g, "n1"); Assert.Empty(searched);                               // nothing is before the first: no search at all
+        await RunGroup(s, q, g, "n2");
+        Assert.Equal([sample], searched.ToList()); searched.Clear();                         // a new drama: the sample only (240 of 1,200 frames), one pass
+        var r2 = Rec("n2"); Assert.Equal("new", (string)r2["proposal"]!["kind"]!);
+        Assert.Equal(1200, (int)r2["frames"]!); Assert.Equal(sample, (int)r2["sampled"]!); Assert.Null(r2["covered"]); Assert.NotNull(r2["sampleCovered"]); Assert.Null(r2["retainedFile"]);
+        await RunGroup(s, q, g, "j1");
+        Assert.Equal(1200, searched.Sum()); Assert.Equal(sample, searched[0]); searched.Clear();   // a join: the sample, then the rest (the sample's results are reused, nothing searched twice)
+        var r3 = Rec("j1"); Assert.Equal("join", (string)r3["proposal"]!["kind"]!); Assert.Equal(1200, (int)r3["sampled"]!); Assert.NotNull(r3["covered"]);
+        Assert.NotNull(r3["retainedFile"]); Assert.NotNull(await s.HeadAsync(P.RetainedFile("j1"), default));
+        await RunGroup(s, q, g, "m1");
+        Assert.Equal(1200, searched.Sum()); searched.Clear();                                // mixed: the full pass too
+        var r4 = Rec("m1"); Assert.Equal("mixed", (string)r4["proposal"]!["kind"]!); Assert.True(((JsonArray)r4["stretches"]!).Count >= 2, "a mixed drama writes full stretches (one per source)");
+        Assert.Null(r4["retainedFile"]);
+    }
+
+    [Fact]
+    public async Task The_index_fold_accepts_a_group_record_whose_covered_is_null()
+    {
+        var s = new FakeStore(); await PutFrames(s, "k1", Make(100, 10, 1), 100);
+        await VideoJson.UpdateAsync(s, P, "k1", root => root["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = GroupProposal.None.ToJson(), ["frames"] = 100, ["sampled"] = 50, ["sampleCovered"] = 0, ["covered"] = null, ["coveredShare"] = null, ["stretches"] = new JsonArray() }, default);
+        var ups = await SearchIndexBuild.ListCentersAsync(s, P, default); var idx = await SearchIndexBuild.BuildAsync(s, P, ups, null, null, 1, 1, 2, _ => { }, default);
+        var set = await GroupBuild.ApplyAsync(s, P, null, idx, default, null, 2, null, requireGroups: true, foldOnly: true);
+        Assert.True(set.GroupOf().ContainsKey("k1"));
     }
 
 

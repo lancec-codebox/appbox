@@ -4,7 +4,46 @@ namespace IndexNode;
 /// `indexnode groups enqueue [--dry-run]` adds the group step for every drama whose centers are done and that has no group record yet (create-only: an existing group entry is left alone).</summary>
 public static class SeqCommand
 {
-    public sealed record Report(int Dramas, int Assigned, int Already, long First, long Last, int PreLog = 0, int Renumbered = 0);
+    /// <summary>
+    /// 0.13.12: the dramas that are STARTED: a frames file, or process steps done / done, or claimed now, or video.json precheck.at. Everything else with a process entry (downloaded, pending) is unstarted and carries no number.
+    /// </summary>
+    public static async Task<HashSet<string>> StartedAsync(JobQueue q, IStore store, Paths paths, CancellationToken ct, HashSet<string>? frames = null)
+    {
+        frames ??= await GroupSequencing.ListFramesAsync(store, paths, ct);
+        var started = new HashSet<string>(frames, StringComparer.Ordinal);
+        var rest = new List<string>();
+        foreach (var s in q.Read(st => st.Subjects.Values.ToList()))
+        {
+            if (started.Contains(s.Id)) continue;
+            if (GroupSequencing.StartedInQueue(s)) started.Add(s.Id); else if (s.Entries.ContainsKey("process")) rest.Add(s.Id);
+        }
+        // the rest: precheck.at in video.json
+        await Parallel.ForEachAsync(rest, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, c) =>
+        {
+            string? at = null; try { at = (string?)(await VideoJson.ReadAsync(store, paths, id, c))?.Root["precheck"]?["at"]; } catch (Exception e) when (e is not OperationCanceledException) { }
+            if (at != null) lock (started) started.Add(id);
+        });
+        return started;
+    }
+
+    public sealed record ClearReport(int Cleared, int Started, List<string> First);
+
+    /// <summary>0.13.12: one clear line (force, no number) per numbered drama that is not started, batched. Allowed after group steps have finished: the order of the rest does not change (gaps are fine), and a cleared drama had no frames, so no finished group record changes.</summary>
+    public static async Task<ClearReport> ClearUnstartedAsync(JobQueue q, IStore store, Paths paths, bool dry, CancellationToken ct)
+    {
+        await q.PollAsync(ct);
+        var started = await StartedAsync(q, store, paths, ct);
+        var clear = q.Read(st => st.Subjects.Values.Where(s => s.Seq != null && !started.Contains(s.Id)).OrderBy(s => s.Seq).Select(s => s.Id).ToList());
+        if (!dry && clear.Count > 0)
+        {
+            var at = q.NowUtc();
+            foreach (var chunk in JobQueue.Chunks(clear, id => id.Length + 60)) { var ids = chunk; await q.AppendLinesAsync(st => ids.Where(id => st.Get(id) is { Seq: not null }).Select(id => new QLine { T = "seq", S = id, Force = true, At = at, By = "cli" }).ToList(), ct); }
+        }
+        return new ClearReport(clear.Count, started.Count, clear.Take(5).ToList());
+    }
+
+    public sealed record Report(
+int Dramas, int Assigned, int Already, long First, long Last, int PreLog = 0, int Renumbered = 0);
 
     /// <summary>
     /// 0.13.11: EVERY drama with a frames file (or a row in the head index) gets a number, not only those with a process entry in the queue log (most dramas were processed before the log existed, migration 2026-11-20 18:12Z).
@@ -20,7 +59,8 @@ public static class SeqCommand
             if (done.Count > 0) throw new InvalidOperationException($"seq assign --renumber refused: {done.Count} group step(s) have finished (e.g. {done[0]}); their grouping records depend on the current numbers");
         }
         // the dramas: every frames file and every row of the head index, plus every subject of the log with a process entry
-        var inLog = q.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("process") && s.Entries["process"].State != "duplicate").ToDictionary(s => s.Id, s => (s.CentersAt, s.LastAt, s.Seq, HasLine: true), StringComparer.Ordinal));
+        var started = await StartedAsync(q, store, paths, ct);
+        var inLog = q.Read(st => st.Subjects.Values.Where(s => s.Entries.ContainsKey("process") && s.Entries["process"].State != "duplicate" && started.Contains(s.Id)).ToDictionary(s => s.Id, s => (s.CentersAt, s.LastAt, s.Seq, HasLine: true), StringComparer.Ordinal));
         var head = await SearchData.LoadAsync(store, paths, null, ct);
         var headRows = head?.Uploads.Select(u => u.Id).ToList() ?? [];
         var frames = new HashSet<string>(StringComparer.Ordinal); var fp = paths.Prefix + "search/frames/";
@@ -29,7 +69,7 @@ public static class SeqCommand
         var all = new List<string>(); var seen = new HashSet<string>(StringComparer.Ordinal);
         void Add(string id) { if (seen.Add(id)) all.Add(id); }
         // dramas with no log line: head index row order, then (deterministic) the rest of the frames files by id
-        var noLine = headRows.Where(id => !inLog.ContainsKey(id)).ToList(); noLine.AddRange(frames.Where(id => !inLog.ContainsKey(id) && !headRows.Contains(id)).OrderBy(x => x, StringComparer.Ordinal));
+        var noLine = headRows.Where(id => !inLog.ContainsKey(id) && started.Contains(id)).ToList(); noLine.AddRange(frames.Where(id => !inLog.ContainsKey(id) && !headRows.Contains(id) && started.Contains(id)).OrderBy(x => x, StringComparer.Ordinal));
         foreach (var id in noLine) Add(id);
         var keyed = new List<(string Key, string Id)>();
         await Parallel.ForEachAsync(inLog, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (t, c) =>
@@ -39,7 +79,7 @@ public static class SeqCommand
             lock (keyed) keyed.Add((at ?? t.Value.CentersAt ?? t.Value.LastAt ?? "\uffff", t.Key));
         });
         foreach (var k in keyed.OrderBy(k => k.Key, StringComparer.Ordinal).ThenBy(k => k.Id, StringComparer.Ordinal)) Add(k.Id);
-        if (renumber) foreach (var id in q.Read(st => st.Subjects.Values.Where(x => x.Seq != null).OrderBy(x => x.Seq).Select(x => x.Id).ToList())) Add(id);   // a numbered subject outside the set is renumbered too: no two share a number
+        if (renumber) foreach (var id in q.Read(st => st.Subjects.Values.Where(x => x.Seq != null && started.Contains(x.Id)).OrderBy(x => x.Seq).Select(x => x.Id).ToList())) Add(id);   // a started numbered subject outside the set is renumbered too: no two share a number
         var cur = q.Read(st => all.ToDictionary(id => id, id => st.Get(id)?.Seq, StringComparer.Ordinal));
         var order = renumber ? all : all.Where(id => cur[id] == null).ToList();
         int already = renumber ? 0 : all.Count - order.Count; int renumbered = renumber ? all.Count(id => cur[id] != null) : 0;
@@ -50,7 +90,8 @@ public static class SeqCommand
             if (renumber)
             {
                 // explicit numbers from 1 in the rule's order; a seq line overrides in the log (renumber = true on the line)
-                long n0 = 1; var lines = order.Select(id => new QLine { T = "seq", S = id, Seq = n0++, At = at, By = "cli", Force = true }).ToList();
+                long n0 = 1; var lines = q.Read(st => st.Subjects.Values.Where(x => x.Seq != null && !started.Contains(x.Id)).Select(x => new QLine { T = "seq", S = x.Id, Force = true, At = at, By = "cli" }).ToList());   // unstarted dramas carry no number: cleared first, so none collides with the new ones
+                lines.AddRange(order.Select(id => new QLine { T = "seq", S = id, Seq = n0++, At = at, By = "cli", Force = true }));
                 foreach (var chunk in JobQueue.Chunks(lines, l => l.ToJson().Length)) { var ch = chunk; await q.AppendLinesAsync(ch, ct); }
             }
             else foreach (var chunk in JobQueue.Chunks(order, id => id.Length + 60))
@@ -99,6 +140,12 @@ public static class SeqCommand
             Console.WriteLine($"seq assign{(a.Has("renumber") ? " --renumber" : "")}{(dry ? " (dry run)" : "")}: {r.Dramas} dramas ({r.PreLog} with no queue line, numbered first in the head index's order), {r.Already} already numbered, {r.Assigned} {(dry ? "would be" : "")} numbered {(r.Assigned > 0 ? $"{r.First}..{r.Last}" : "")}");
             return 0;
         }
-        throw new ArgumentException("seq assign [--dry-run] [--renumber]");
+        if (a.Positional.FirstOrDefault() == "clear-unstarted")
+        {
+            var c = await ClearUnstartedAsync(q, store, paths, dry, cts.Token);
+            Console.WriteLine($"seq clear-unstarted{(dry ? " (dry run)" : "")}: {c.Cleared} unstarted dramas {(dry ? "would lose" : "lost")} their number ({c.Started} started dramas keep theirs){(c.First.Count > 0 ? "; first: " + string.Join(", ", c.First) : "")}");
+            return 0;
+        }
+        throw new ArgumentException("seq assign [--dry-run] [--renumber] | seq clear-unstarted [--dry-run]");
     }
 }

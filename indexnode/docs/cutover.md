@@ -29,3 +29,15 @@ Before a 0.13.2 search-index job runs (it reads video.json for every upload, and
 2. `indexnode videos backfill`: creates the missing ones (create-only; run it again for the claimed ones once their claims end).
 3. `indexnode sources migrate-seen --dry-run`, then without `--dry-run`: seen.json ids become members of `index/sources/<id>/members.json` and seen.json is deleted (a refresh also does it for its own source on first touch).
 4. **0.13.1 live repair**: `indexnode jobs repair-steps --dry-run`, then `indexnode jobs repair-steps` (corrects the wrongly done steps, re-opens the finished dramas without centers.zip), then `indexnode sources set-tabs videos --all --dry-run` and without `--dry-run`.
+
+## 0.13.12: rollout on a node that ran 0.13.11's `seq assign --renumber`
+
+Do this once per sandbox, with the node stopped, so nothing claims a numbered-but-unstarted drama meanwhile:
+
+1. Stop the node (`indexnode` service / process); wait for its lanes to finish or release their claims.
+2. Install 0.13.12.
+3. `indexnode seq clear-unstarted --dry-run` and check the count (the dramas that are downloaded but not started: process pending, no steps done, no frames file, no `precheck.at`; the first few ids are printed). Then `indexnode seq clear-unstarted`. It is safe after group steps have finished: the order of the remaining dramas is unchanged (gaps in the numbers are fine) and a cleared drama had no frames, so no finished group record changes.
+4. Start the node. Group steps now wait in memory (no claim, no log line) behind the lowest numbered drama that has no frames; one summary line every 5 minutes says how many wait. A cleared drama is numbered when its pre-check starts.
+
+Do not run `seq assign --renumber` again once group steps have finished (it refuses); `seq assign` itself only numbers dramas that are started.
+

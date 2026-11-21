@@ -44,7 +44,13 @@ public sealed partial class NodeEngine
         return StandardSteps.Where(s => !done.Contains(s) && (o.Stages.Contains("process") || o.Stages.Contains(s)) && (o.Steps == null || o.Steps.Contains(s)) && Control.Effective(s) == Level.Run).ToArray();
     }
 
-    private bool CanRunEntry(QSubject s, QEntry e) => e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
+    // 0.13.12: the node-wide group gate (frames listing + L), refreshed before each look for work
+    private GroupSequencing.Gate? gate; private volatile GroupSequencing.Gate.View? gateView;
+
+    private bool CanRunEntry(QSubject s, QEntry e) =>
+        e.Stage == "group" ? gateView is not { } gv || gv.Runnable_(s)   // a blocked group step is never claimed and nothing is appended for it (the claim-time BlockersAsync stays as the race safety net)
+        : e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
+   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
 
     // ---------------------------------------------------------------- the lanes
 
@@ -63,7 +69,17 @@ public sealed partial class NodeEngine
                     Interlocked.Increment(ref busyClaims);
                     try
                     {
-                        try { look = await queue.LookAsync(StageEnabled, CanRunEntry, ct); }
+                        try
+                        {
+                            if (StageEnabled("group"))
+                            {
+                                gate ??= new GroupSequencing.Gate(store, paths);
+                                var gv = await gate.RefreshAsync(queue, queue.Now, ct); gateView = gv;
+                                if (gate.Summary(gv, queue.Now) is { } gsum) Log.Info(gsum);
+                            }
+                            look = await queue.LookAsync(StageEnabled, CanRunEntry, ct);
+                        }
+
                         catch (OperationCanceledException) { throw; }
                         catch (Exception e) { Log.Info($"queue: looking for work failed ({e.Message})"); }
                         if (look != null)
@@ -234,8 +250,10 @@ public sealed partial class NodeEngine
                 case "group":
                     {
                         // 0.13.10: sequence order. A drama waits (the entry goes back to pending, due in two minutes, nothing else written) while an earlier one is still in flight.
-                        if (queue.Read(st => st.Get(id)?.Seq) == null) await h.AssignSeqAsync(token);
+                        // a group entry of a drama without frames is not runnable (the gate keeps it from being claimed; this is the race safety net): a number is given only to a drama that has frames
+                        if (queue.Read(st => st.Get(id)?.Seq) == null && await store.HeadAsync(paths.FramesFile(id), token) != null) await h.AssignSeqAsync(token);
                         var blockers = await GroupSequencing.BlockersAsync(queue, store, paths, id, token);
+                        if (blockers.Count == 0 && queue.Read(st => st.Get(id)?.Seq) == null) blockers = [id];   // no frames, so no number: not runnable yet
                         if (blockers.Count > 0)
                         {
                             Log.Info($"group {id}: waiting for {blockers.Count} earlier drama(s) ({string.Join(", ", blockers.Take(3))}{(blockers.Count > 3 ? ", ..." : "")})");

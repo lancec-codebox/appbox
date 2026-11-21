@@ -157,6 +157,7 @@ public sealed class QueueState
             case "seq":   // 0.13.10: first writer wins (unless forced by --renumber); a repeated line (a retry after a lost race) never renumbers
                 {
                     if (!Subjects.TryGetValue(l.S, out var sub)) Subjects[l.S] = sub = new QSubject { Id = l.S };
+                    if (l.Force == true && l.Seq == null) { sub.Seq = null; break; }   // 0.13.12: `seq clear-unstarted`: a forced line with no number clears the drama's number (0.13.11 nodes ignore it, harmlessly); MaxSeq stays, so the next number is still highest + 1
                     if ((sub.Seq == null || l.Force == true) && l.Seq != null) { sub.Seq = l.Seq;   // 0.13.11: force = `seq assign --renumber`
                      if (l.Seq > MaxSeq) MaxSeq = l.Seq.Value; }
                     break;
@@ -234,7 +235,8 @@ public sealed class QueueState
         }
         // 0.13.2: a due search-index entry goes before any drama work (a singleton added today must not wait behind a backlog of older priority-0 entries); then priority, added, id as before
         // 0.13.11: a due group entry goes right behind search-index and before process work: group steps are short, and a group entry added today must not wait behind a backlog of older priority-0 process entries
-        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage == "search-index") ? 2 : x.Item2.Any(e => e.Stage == "group") ? 1 : 0).ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
+        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage == "search-index") ? 2 : x.Item2.Any(e => e.Stage == "group") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage == "group") && !x.Item2.Any(e => e.Stage == "search-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.12: group entries lowest sequence number first
+            .ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
     }
 
     public Dictionary<string, int> PendingByStage(string nowUtc) =>
