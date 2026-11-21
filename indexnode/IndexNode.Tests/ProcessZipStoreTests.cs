@@ -34,6 +34,8 @@ public class ProcessZipStoreTests
         return null;
     }
 
+    const string Vid = "vzip-sscd";   // its own id: ProcessStage.WorkDir is /tmp/indexnode/p-<id>-<step>, shared with RedoCleanupTests ("vid") that runs in parallel
+
     [Fact]
     public async Task Process_job_steps_sscd_redoes_sscd_on_a_store_that_has_only_stage_zips()
     {
@@ -51,31 +53,31 @@ public class ProcessZipStoreTests
                 var j = Imaging.EncodeJpeg(new Rgb(px, 360, 640), 85); frames.Add(new ChunkFrame(k, k, k, [], null, chunk.Length, j.Length)); chunk.Write(j);
             }
             var meta = new List<(string, double, int, long)> { ("0000", 0, 4, chunk.Length) };
-            await build.PutAsync(P.Video("vid", "frames/0000.mjpeg"), chunk.ToArray(), null, null, false, default);
-            await build.PutAsync(P.Video("vid", "frames/0000.json"), FrameChunks.JpegIndexJson("0000", 0, 360, 640, 85, frames), null, null, false, default);
-            await build.PutAsync(P.Video("vid", "frames/manifest.json"), FrameChunks.ManifestJson("frames", 360, 640, 0, 4, meta, null, "mjpeg", "jpeg"), null, null, false, default);
-            await build.PutAsync(P.Video("vid", "downloaded.json"), Encoding.UTF8.GetBytes("{\"durationSeconds\":4}"), null, null, false, default);
-            await VideoJsonSeed.PutAsync(build, P, "vid", 4);
-            await build.PutAsync(P.Video("vid", "info.json"), Encoding.UTF8.GetBytes("{\"id\":\"vid\"}"), null, null, false, default);
-            await build.PutAsync(P.Video("vid", "sscd/manifest.json"), Encoding.UTF8.GetBytes("{\"old\":true}"), null, null, false, default);
-            foreach (var st in new[] { "frames", "download", "sscd" }) Assert.True(await StageZipStore.Stage(build)!.CommitStageAsync("vid", st, "n1", false, false, default), st);
-            Assert.DoesNotContain(fs.Names("index/videos/vid/"), n => n.EndsWith(".json") && !n.EndsWith("/video.json", StringComparison.Ordinal));   // only stage zips are in the store, like the real one
-            var oldSscd = fs[P.Video("vid", "sscd.zip")].Data.ToArray(); Assert.NotEmpty(oldSscd);
+            await build.PutAsync(P.Video(Vid, "frames/0000.mjpeg"), chunk.ToArray(), null, null, false, default);
+            await build.PutAsync(P.Video(Vid, "frames/0000.json"), FrameChunks.JpegIndexJson("0000", 0, 360, 640, 85, frames), null, null, false, default);
+            await build.PutAsync(P.Video(Vid, "frames/manifest.json"), FrameChunks.ManifestJson("frames", 360, 640, 0, 4, meta, null, "mjpeg", "jpeg"), null, null, false, default);
+            await build.PutAsync(P.Video(Vid, "downloaded.json"), Encoding.UTF8.GetBytes("{\"durationSeconds\":4}"), null, null, false, default);
+            await VideoJsonSeed.PutAsync(build, P, Vid, 4);
+            await build.PutAsync(P.Video(Vid, "info.json"), Encoding.UTF8.GetBytes("{\"id\":\"vid\"}"), null, null, false, default);
+            await build.PutAsync(P.Video(Vid, "sscd/manifest.json"), Encoding.UTF8.GetBytes("{\"old\":true}"), null, null, false, default);
+            foreach (var st in new[] { "frames", "download", "sscd" }) Assert.True(await StageZipStore.Stage(build)!.CommitStageAsync(Vid, st, "n1", false, false, default), st);
+            Assert.DoesNotContain(fs.Names("index/videos/vzip-sscd/"), n => n.EndsWith(".json") && !n.EndsWith("/video.json", StringComparison.Ordinal));   // only stage zips are in the store, like the real one
+            var oldSscd = fs[P.Video(Vid, "sscd.zip")].Data.ToArray(); Assert.NotEmpty(oldSscd);
 
             var model = Path.Combine(dir, "tiny.onnx"); File.WriteAllBytes(model, TinyModel());
             var tools = new Tools(new HttpClient()); tools.UseFfmpeg(ff!, pr!);
             ProcessStage.Ai = new AiConfig();
             // what `process --job vid --steps sscd` builds: the raw store wrapped by SiteCommands.ProcessStore
             var store = SiteCommands.ProcessStore(fs);
-            var ctx = new JobContext { Job = new JobDescriptor { Stage = "process", JobId = "vid", Steps = ["sscd"] }, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = store, Paths = P, NodeId = "t", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+            var ctx = new JobContext { Job = new JobDescriptor { Stage = "process", JobId = Vid, Steps = ["sscd"] }, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = store, Paths = P, NodeId = "t", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
             await new ProcessStage(tools, store, new NodeConfig { ModelPath = model }, new HttpClient()) { Redo = true }.RunAsync(ctx);
 
-            var newSscd = fs[P.Video("vid", "sscd.zip")].Data.ToArray();
+            var newSscd = fs[P.Video(Vid, "sscd.zip")].Data.ToArray();
             Assert.NotEqual(oldSscd, newSscd);   // sscd.zip replaced
-            var man = System.Text.Json.JsonDocument.Parse((await store.GetAsync(P.Video("vid", "sscd/manifest.json"), default))!.Data).RootElement;
+            var man = System.Text.Json.JsonDocument.Parse((await store.GetAsync(P.Video(Vid, "sscd/manifest.json"), default))!.Data).RootElement;
             Assert.Equal(4, man.GetProperty("frames").GetInt32()); Assert.Equal("sscd", man.GetProperty("step").GetString());
-            Assert.False(System.Text.Json.JsonDocument.Parse((await store.GetAsync(P.Video("vid", "sscd/manifest.json"), default))!.Data).RootElement.TryGetProperty("old", out _));
-            Assert.False(fs.Exists(P.Video("vid", "processed.json")));   // a redo leaves it alone
+            Assert.False(System.Text.Json.JsonDocument.Parse((await store.GetAsync(P.Video(Vid, "sscd/manifest.json"), default))!.Data).RootElement.TryGetProperty("old", out _));
+            Assert.False(fs.Exists(P.Video(Vid, "processed.json")));   // a redo leaves it alone
             // and the raw, unwrapped store is what failed before 0.10.8
             var raw = new JobContext { Job = ctx.Job, Stage = "process", BlobName = "", LeaseId = "", Worker = 0, Store = fs, Paths = P, NodeId = "t", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
             var e = await Assert.ThrowsAsync<InvalidOperationException>(() => new ProcessStage(tools, fs, new NodeConfig { ModelPath = model }, new HttpClient()) { Redo = true }.RunAsync(raw));

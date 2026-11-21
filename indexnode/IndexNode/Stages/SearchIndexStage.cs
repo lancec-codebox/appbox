@@ -25,11 +25,13 @@ public sealed class SearchIndexStage(IStore store, int keepVersions = 3) : IStag
         ctx.Report("search-index", "catalog");
         next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, m => Log.Info("search-index: " + m), ct);
         next.Catalog.ApplyGroups(groups);
+        var missing = next.Catalog.Missing;
+        if (missing.Count > 0) Log.Info($"search-index: WARNING {missing.Count} upload(s) have no readable video.json (catalog data \"missing\"; run: indexnode videos backfill, the next build fills them in): {string.Join(", ", missing.Take(20))}{(missing.Count > 20 ? ", ..." : "")}");
         ctx.Report("search-index", $"publishing v{next.Version}");
         await next.PublishAsync(store, paths, ct);
         try { var gone = await SearchData.PruneAsync(store, paths, keepVersions, ct); if (gone.Count > 0) Log.Info($"search-index: removed old versions {string.Join(", ", gone.Select(g => "v" + g))} (keeping {keepVersions} back)"); }
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: pruning old versions failed ({e.Message})"); }
-        Log.Info($"search-index: published v{next.Version}: {next.Uploads.Count} uploads, {next.Count} centers, {sw.Elapsed.TotalSeconds:F1}s (head {(head == null ? "none" : "v" + head.Version)}, {ups.Count} centers.zip)");
+        Log.Info($"search-index: published v{next.Version}: {next.Uploads.Count} uploads, {next.Count} centers, {sw.Elapsed.TotalSeconds:F1}s (head {(head == null ? "none" : "v" + head.Version)}, {ups.Count} centers.zip{(missing.Count > 0 ? $", {missing.Count} with video.json missing" : "")})");
         ctx.Job.ElapsedSeconds = Math.Round(sw.Elapsed.TotalSeconds, 1);
         // centers finished while this ran are not in the new version: the next build is due in 15 minutes
         var cut = Protocol.Utc(started);

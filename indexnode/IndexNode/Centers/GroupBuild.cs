@@ -12,7 +12,9 @@ public static class GroupBuild
     /// <summary>The group proposal, time and duration of an upload from its video.json (0.13.2: no precheck.json, no downloaded.json). A missing or unreadable video.json throws: the group build fails loudly and is retried.</summary>
     static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say)
     {
-        var root = (await VideoJson.RequireAsync(store, paths, id, ct)).Root;
+        JsonObject root;
+        try { root = (await VideoJson.ReadAsync(store, paths, id, ct))?.Root ?? new JsonObject(); }   // 0.13.3: a missing or bad video.json places the upload with no hint (the catalog marks it missing), it does not fail the build
+        catch (InvalidDataException) { root = new JsonObject(); }
         var pc = root["precheck"] as JsonObject;
         return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null);
     }
@@ -42,7 +44,7 @@ public static class GroupBuild
         return DramaGroups.Propose(a, 0, 0, s, i => frames[i].T);
     }
 
-    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null)
+    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true)
     {
         var s = settings ?? new PreCheckSettings();
         var prior = head == null ? null : await GroupStore.LoadAsync(store, paths, head.Version, ct);
@@ -53,12 +55,22 @@ public static class GroupBuild
         set.Groups.RemoveAll(g => g.Members.Count == 0);
         var known = set.GroupOf();
         var news = new List<NewUpload>(); int full = 0, hinted = 0;
+        // 0.13.3: the speech language of every upload is video.json's as it is NOW (not the index table's copy from when the centers were read): a group's canonical election and its reason use it
+        var speech = new System.Collections.Concurrent.ConcurrentDictionary<string, (string? Lang, bool? Dub)>(StringComparer.Ordinal);
+        await Parallel.ForEachAsync(next.Uploads, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (u, t) =>
+        {
+            try { speech[u.Id] = await SearchIndexBuild.ReadSpeechAsync(store, paths, u.Id, t); } catch (Exception e) when (e is not OperationCanceledException) { }
+        });
+        (string? Lang, bool? Dub) Sp(SearchUpload u) => speech.TryGetValue(u.Id, out var x) && x.Lang != null ? x : (u.SpeechLanguage, u.Dubbed);
+        int done = 0, todo = next.Uploads.Count(u => !known.ContainsKey(u.Id));
         foreach (var u in next.Uploads.Where(u => !known.ContainsKey(u.Id)))
         {
             var r = await ReadRecAsync(store, paths, u.Id, ct, say);
             var prop = await FullCheckAsync(store, paths, next, u, set, s, threads, ct);
             if (prop == null) { prop = r.Proposal; hinted++; } else full++;
-            news.Add(new NewUpload(u.Id, u.SpeechLanguage, u.Dubbed, r.Duration, r.At, prop));
+            var (l0, d0) = Sp(u);
+            news.Add(new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop));
+            if (bootstrap && ++done % 50 == 0) say?.Invoke($"groups: checked {done} of {todo}");
         }
         // the uploads the pre-check short-circuited (record, no centers.zip) with a proposal in it
         var shorts = new HashSet<string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/";
@@ -71,18 +83,19 @@ public static class GroupBuild
             shorts.Add(id); if (known.ContainsKey(id)) continue;
             if (r.Proposal == null) continue;   // nothing to place it by
             var (lang, dub) = await SearchIndexBuild.ReadSpeechAsync(store, paths, id, ct);
-            var pc = await CatalogBuild.ReadPrecheckAsync(store, paths, id, ct);
+            CatalogBuild.Pre pc;
+            try { pc = await CatalogBuild.ReadPrecheckAsync(store, paths, id, ct); } catch (Exception e) when (e is VideoJsonMissingException or InvalidDataException) { continue; }
             news.Add(new NewUpload(id, pc.Language ?? lang, pc.Language != null ? pc.Dubbed : dub, r.Duration, r.At, r.Proposal, true));
         }
         var before = set.Groups.ToDictionary(g => g.Id, g => g.Canonical, StringComparer.Ordinal);
-        set.Apply(news, id => byId.TryGetValue(id, out var u) ? (u.SpeechLanguage, u.Dubbed, null) : null);   // the language of a known member may have been measured since
+        set.Apply(news, id => byId.TryGetValue(id, out var u) ? (Sp(u).Lang, Sp(u).Dub, null) : null, bootstrap);   // the language of a known member may have been measured since
         // an upload no longer in the index (and not short-circuited) leaves its group; an emptied group goes
         foreach (var g in set.Groups) g.Members.RemoveAll(m => !byId.ContainsKey(m.Upload) && !shorts.Contains(m.Upload));
         set.Groups.RemoveAll(g => g.Members.Count == 0); set.ElectAll();
         set.BuiltAt = next.BuiltAt == null ? null : Protocol.Utc(next.BuiltAt.Value);
         var of = set.GroupOf();
         next.Uploads = next.Uploads.Select(u => u with { Group = of.GetValueOrDefault(u.Id) }).ToList();
-        await GroupStore.WriteAsync(store, paths, set, next.Version, ct);
+        if (write) await GroupStore.WriteAsync(store, paths, set, next.Version, ct);
         int moved = set.Groups.Count(g => before.TryGetValue(g.Id, out var c) && c != g.Canonical);
         say?.Invoke($"groups: {news.Count} new uploads placed ({full} full check, {hinted} from the pre-check hint, {news.Count(n => n.ShortCircuit)} short-circuited), {set.Groups.Count} groups, {moved} canonical changed");
         return set;

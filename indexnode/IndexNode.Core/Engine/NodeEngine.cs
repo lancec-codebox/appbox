@@ -69,6 +69,8 @@ public sealed class EngineOptions
     public string[]? Steps { get; init; }
     /// <summary>Claim filter: a job this returns false for is left to another node.</summary>
     public Func<JobDescriptor, bool>? CanRun { get; init; }
+    /// <summary>0.13.3: builds a missing video.json for a video whose lease the claim holds (the backfill's builder); null: a missing descriptor fails the claim as before.</summary>
+    public Func<IStore, Paths, string, CancellationToken, Task>? EnsureVideoJson { get; init; }
     /// <summary>Budget, schedule and window; null: no limits.</summary>
     public LimitState? Limits { get; init; }
     /// <summary>Tests replace the delay of the renewal and control loops with a fake timer (default Task.Delay), so no test depends on real time.</summary>

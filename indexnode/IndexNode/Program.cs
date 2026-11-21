@@ -61,7 +61,7 @@ public static class Program
         indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
         indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
         indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
-        indexnode groups build [--dry-run] [--threads N] [--link 0.75]   (the one-time drama groups from center-level shares; then the search-index job keeps them)
+        indexnode groups build [--dry-run] [--threads N] [--check-pairs <file>]   (the one-time drama groups by the frame-level full check; --check-pairs: lines "idA idB", reports how many share a group; then the search-index job keeps them)
         indexnode search-index build [--new-mean] | update [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (the global search table under index/search/vN/)
         indexnode search --vector <f32|f16 file of 512> | --image <file> [--trim] [--top-centers 300] [--top 20] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (screenshot search over the centers; "search <text> --job <id>" is the clip text search)
         indexnode ai score [--ids <file>] [--all-frames] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (0.12.0: the AI-drama probe on processed uploads' stored sscd.zip -> videos/<id>/ai.json)
@@ -237,6 +237,7 @@ public static class Commands
             Steps = ProcessStage.SupportedSteps(cfg),
             Stages = stages, Workers = workers, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
+            EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
             MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",

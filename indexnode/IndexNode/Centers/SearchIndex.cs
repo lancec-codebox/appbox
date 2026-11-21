@@ -226,7 +226,10 @@ public static class SearchIndexBuild
     /// <summary>The upload's speech language and dubbed from its video.json (0.13.2; the transcribe.zip range reads are gone). Null/null when the descriptor has no speech yet; a missing or unreadable video.json THROWS (the caller's entry fails and is retried).</summary>
     public static async Task<(string? Language, bool? Dubbed)> ReadSpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct)
     {
-        var sp = (await VideoJson.RequireAsync(raw, paths, id, ct)).Root["speech"] as System.Text.Json.Nodes.JsonObject;
+        // 0.13.3: the centers index does not need video.json: a missing or unreadable one gives no language (the catalog marks the upload data:"missing"), it never stops the build
+        System.Text.Json.Nodes.JsonObject? sp;
+        try { sp = (await VideoJson.ReadAsync(raw, paths, id, ct))?.Root["speech"] as System.Text.Json.Nodes.JsonObject; }
+        catch (InvalidDataException e) { Log.Info($"search-index: WARNING {id}: {e.Message}"); sp = null; }
         return ((string?)sp?["language"] is { Length: > 0 } l ? l : null, (bool?)sp?["dubbed"]);
     }
 

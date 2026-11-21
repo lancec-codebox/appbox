@@ -153,7 +153,7 @@ public class PreCheckTests : IDisposable
             Assert.Equal((null, null), await VideosBackfill.LegacySpeechAsync(store, paths, "none", default));
             await store.PutAsync(paths.Video("a", "video.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"id\":\"a\",\"speech\":{\"language\":\"en\",\"dubbed\":true,\"source\":\"transcribe\"}}"), null, null, false, default);
             Assert.Equal(("en", (bool?)true), await SearchIndexBuild.ReadSpeechAsync(store, paths, "a", default));
-            await Assert.ThrowsAsync<VideoJsonMissingException>(() => SearchIndexBuild.ReadSpeechAsync(store, paths, "none", default));
+            Assert.Equal((null, null), await SearchIndexBuild.ReadSpeechAsync(store, paths, "none", default));   // 0.13.3: a missing video.json gives no language, it does not stop the index build
             var y = new SearchData { Mean = new float[512], Bits = [], RefUpload = [], RefCenter = [], Uploads = [new SearchUpload("a", "s", "e", 1, 0, 1, 1, 1, 0, "en", true), new SearchUpload("b", "s", "e", 1, 0, 1, 1, 1, 0)] }.UploadsYaml();
             var (_, _, _, ups) = SearchData.ParseUploadsYaml(y);
             Assert.Equal("en", ups[0].SpeechLanguage); Assert.True(ups[0].Dubbed); Assert.Null(ups[1].SpeechLanguage); Assert.Null(ups[1].Dubbed);

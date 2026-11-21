@@ -3,7 +3,7 @@ using System.Text.Json.Nodes;
 
 namespace IndexNode;
 
-/// <summary>`indexnode groups build [--dry-run] [--threads N] [--link 0.75] [--top 20]`: the one-time group table over the indexed uploads, from center-level shares.</summary>
+/// <summary>`indexnode groups build`: the one-time group table over the indexed uploads (0.13.3: by the frame-level full check, not center shares).</summary>
 public static class GroupsCommand
 {
     public const float Cos = 0.80f, DupCos = 0.85f;
@@ -41,52 +41,46 @@ public static class GroupsCommand
         return set;
     }
 
+    /// <summary>0.13.3: lines "idA idB" (blank lines and # comments skipped).</summary>
+    public static List<(string A, string B)> ReadPairs(string path) => File.ReadAllLines(path).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith('#'))
+        .Select(l => l.Split([' ', '\t', ',', ';'], StringSplitOptions.RemoveEmptyEntries)).Where(p => p.Length >= 2).Select(p => (p[0], p[1])).ToList();
+
+    /// <summary>0.13.3: how many listed pairs end up in the same group; the ids of the others with why (not indexed, or in different groups).</summary>
+    public static (int Same, int Total, List<string> Apart) CheckPairs(GroupSet set, IReadOnlyList<(string A, string B)> pairs, IEnumerable<string> indexed)
+    {
+        var of = set.GroupOf(); var idx = indexed.ToHashSet(StringComparer.Ordinal); int same = 0; var apart = new List<string>();
+        foreach (var (a, b) in pairs)
+        {
+            if (of.TryGetValue(a, out var ga) && of.TryGetValue(b, out var gb) && ga == gb) same++;
+            else apart.Add($"{a} {b}: " + (!idx.Contains(a) || !idx.Contains(b) ? $"not indexed ({(idx.Contains(a) ? "" : a)}{(idx.Contains(a) || idx.Contains(b) ? "" : " ")}{(idx.Contains(b) ? "" : b)})" : $"different groups ({of.GetValueOrDefault(a)} / {of.GetValueOrDefault(b)})"));
+        }
+        return (same, pairs.Count, apart);
+    }
+
+    /// <summary>0.13.3: `groups build [--dry-run] [--threads N] [--check-pairs FILE]`: the one-time group table, by the SAME frame-level full check the index build runs for a new upload (each upload's own frames searched against the index, joined at &gt;= 5 distinct-frame hits, mixed and offset as in 0.13.2; the language is video.json's).</summary>
     public static async Task<int> RunAsync(Args a, IStore? remote = null)
     {
-        if (a.Positional.FirstOrDefault() != "build") throw new ArgumentException("groups build [--dry-run] [--threads N] [--link 0.75] [--top 20]");
+        if (a.Positional.FirstOrDefault() != "build") throw new ArgumentException("groups build [--dry-run] [--threads N] [--check-pairs <file>] [--top 20]");
         var (cfg, store, paths, _) = CentersCommands.OpenStore(a, remote);
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads; bool dry = a.Has("dry-run");
-        double link = a.Get("link") is { } l ? double.Parse(l, System.Globalization.CultureInfo.InvariantCulture) : 0.75; int topRows = a.Get("top") is { } tp ? int.Parse(tp) : 20;
+        var pairs = a.Get("check-pairs") is { } cp ? ReadPairs(cp) : null; int topRows = a.Get("top") is { } tp ? int.Parse(tp) : 20;
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         var sw = Stopwatch.StartNew();
         var idx = await SearchData.LoadAsync(store, paths, null, cts.Token) ?? throw new InvalidOperationException("no search index yet: run search-index build first");
         if (!dry && await store.GetAsync(GroupStore.File(paths, idx.Version), cts.Token) != null) throw new InvalidOperationException($"{GroupStore.File(paths, idx.Version)} exists: the groups are written once (the search-index job maintains them from here)");
-        int n = idx.Uploads.Count; Console.WriteLine($"groups build: {n} indexed uploads (index v{idx.Version}){(dry ? ", dry run" : "")}");
-        var cen = new float[n][]; int done = 0;
-        await Parallel.ForEachAsync(Enumerable.Range(0, n), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = cts.Token }, async (i, ct) =>
-        {
-            try { var l2 = await SearchIndexBuild.LoadUploadAsync(store, paths, idx.Uploads[i].Id, ct); cen[i] = l2.Centers; for (int r = 0; r < l2.Up.K; r++) Vec.Normalize(cen[i].AsSpan(r * CentersFile.Dim, CentersFile.Dim)); }
-            catch (Exception e) when (e is not OperationCanceledException) { Console.Error.WriteLine($"groups: {idx.Uploads[i].Id}: {e.Message}"); cen[i] = []; }
-            if (Interlocked.Increment(ref done) % 100 == 0) Console.WriteLine($"  read {done}/{n}");
-        });
-        // candidates per center from the index's sign codes, then exact cosines on the centers themselves
-        var cand = new System.Collections.Concurrent.ConcurrentDictionary<(int, int), byte>();
-        await Parallel.ForEachAsync(Enumerable.Range(0, n), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = cts.Token }, (i, ct) =>
-        {
-            int k = cen[i].Length / CentersFile.Dim; var seen = new HashSet<int>();
-            for (int c = 0; c < k; c++)
-            {
-                var q = CenterSearch.MinusMean(cen[i].AsSpan(c * CentersFile.Dim, CentersFile.Dim).ToArray(), idx.Mean);
-                foreach (var row in idx.Scan(q, topRows, 1, i)) seen.Add(idx.RefUpload[row]);
-            }
-            foreach (var j in seen) cand[i < j ? (i, j) : (j, i)] = 1;
-            return ValueTask.CompletedTask;
-        });
-        var pairs = new System.Collections.Concurrent.ConcurrentDictionary<(string, string), (double, double)>();
-        Parallel.ForEach(cand.Keys, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = cts.Token }, p =>
-        {
-            var (i, j) = p; if (cen[i].Length == 0 || cen[j].Length == 0) return;
-            double m = Math.Max(Share(cen[i], cen[j], Cos), Share(cen[j], cen[i], Cos)), d = Math.Max(Share(cen[i], cen[j], DupCos), Share(cen[j], cen[i], DupCos));
-            if (m > 0) pairs[(idx.Uploads[i].Id, idx.Uploads[j].Id)] = (m, d);
-        });
-        var ce = (await SearchIndexBuild.ListCentersAsync(store, paths, cts.Token)).ToDictionary(x => x.Id, x => x.Zip.Created, StringComparer.Ordinal);
-        var durs = new Dictionary<string, double?>(StringComparer.Ordinal);
-        foreach (var u in idx.Uploads) { try { durs[u.Id] = store.GetAsync(paths.Video(u.Id, "downloaded.json"), cts.Token).GetAwaiter().GetResult() is { } d ? (double?)JsonNode.Parse(d.Data)?["durationSeconds"] : null; } catch (Exception e) when (e is not OperationCanceledException) { durs[u.Id] = null; } }
-        var set = FromPairs(idx.Uploads, pairs, link, id => (durs.GetValueOrDefault(id), ce.GetValueOrDefault(id) is { } c ? Protocol.Utc(c) : null));
-        set.BuiltAt = Protocol.NowUtc(); set.IndexVersion = idx.Version;
+        Console.WriteLine($"groups build: {idx.Uploads.Count} indexed uploads (index v{idx.Version}), frame-level full check per upload{(dry ? ", dry run" : "")}");
+        // an empty group set with no head: every upload of the index is "new" and goes through the full check (bootstrap: join cycles are broken, the earliest processed owns the group)
+        var set = await GroupBuild.ApplyAsync(store, paths, null, idx, cts.Token, m => Console.WriteLine("  " + m), threads, null, bootstrap: true, write: false);
+        set.IndexVersion = idx.Version;
         int multi = set.Groups.Count(g => g.Members.Count > 1), single = set.Groups.Count - multi;
-        Console.WriteLine($"groups: {set.Groups.Count} groups ({multi} with 2+ uploads, {single} single), {n} uploads, {pairs.Count} linked-or-near pairs, link >= {link:0.00} (center share at cosine {Cos:0.00}), {sw.Elapsed.TotalSeconds:F1}s");
-        foreach (var g in set.Groups.Take(10)) Console.WriteLine($"  {g.Id}: {g.Members.Count} uploads, canonical {g.Canonical ?? "none"} ({g.CanonicalWhy})");
+        Console.WriteLine($"groups: {set.Groups.Count} groups ({multi} with 2+ uploads, {single} single), {idx.Uploads.Count} uploads, {sw.Elapsed.TotalSeconds:F1}s (join at >= {new PreCheckSettings().GroupMinHits} distinct-frame hits at cosine {new PreCheckSettings().Tau:0.00}; mixed and offset as in the index build)");
+        foreach (var g in set.Groups.Where(g => g.Members.Count > 1).OrderByDescending(g => g.Members.Count).Take(topRows)) Console.WriteLine($"  {g.Id}: {g.Members.Count} uploads, canonical {g.Canonical ?? "none"} ({g.CanonicalWhy})");
+        if (pairs != null)
+        {
+            var (same, total, apart) = CheckPairs(set, pairs, idx.Uploads.Select(u => u.Id));
+            Console.WriteLine($"check-pairs: {same} of {total} listed pair(s) share a group");
+            foreach (var x in apart) Console.WriteLine("  apart: " + x);
+        }
         if (dry) { Console.WriteLine("dry run: nothing written"); return 0; }
         if (!await GroupStore.WriteAsync(store, paths, set, idx.Version, cts.Token)) throw new InvalidOperationException("groups were written meanwhile");
         Console.WriteLine($"wrote {GroupStore.File(paths, idx.Version)}");

@@ -76,6 +76,7 @@ public sealed partial class NodeEngine
                 }
                 if (!worked)
                 {
+                    await RetryFailedSearchIndexAsync(ct);
                     RegistryChanged();
                     if (o.Once) return;
                     await Wait(o.PollInterval < o.ControlInterval ? o.PollInterval : o.ControlInterval, ct);
@@ -91,6 +92,21 @@ public sealed partial class NodeEngine
         if (!o.SearchIndexCatchUp || !handlers.ContainsKey("search-index") || !StageEnabled("search-index")) return;
         try { await queue.AppendLinesAsync(st => SearchIndexJobs.AddLine(st, NowUtc, TimeSpan.Zero) is { } l ? [l] : null, ct); }
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: catch-up add failed ({e.Message})"); }
+    }
+
+    private DateTimeOffset nextSearchIndexRetry;
+    /// <summary>0.13.3: a search-index entry that ended failed (attempts used up) is added again by a node that runs the stage, at most every 15 minutes: no operator step (the manual one is: indexnode jobs retry --stage search-index).</summary>
+    private async Task RetryFailedSearchIndexAsync(CancellationToken ct)
+    {
+        if (!handlers.ContainsKey("search-index") || !StageEnabled("search-index") || DateTimeOffset.UtcNow < nextSearchIndexRetry) return;
+        nextSearchIndexRetry = DateTimeOffset.UtcNow + SearchIndexJobs.Delay;
+        try
+        {
+            if (!queue.Read(st => st.Entry(SearchIndexJobs.Subject, SearchIndexJobs.Stage) is { State: "failed" })) return;
+            await queue.AppendLinesAsync(st => st.Entry(SearchIndexJobs.Subject, SearchIndexJobs.Stage) is { State: "failed" } && SearchIndexJobs.AddLine(st, NowUtc, TimeSpan.Zero) is { } l ? [l] : null, ct);
+            Log.Info("search-index: the failed entry is added again (automatic retry)");
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: automatic retry failed ({e.Message})"); }
     }
 
     private static IEnumerable<string> QueueStages() => new[] { "download", "process", "describe", "translate", "refresh", "classify", "availability", "search-index" };
@@ -272,6 +288,12 @@ public sealed partial class NodeEngine
         // the video must be downloaded: checked here, when we run, never while finding work (a HEAD never hydrates)
         var dl = await store.HeadAsync(paths.Video(id, "download.zip"), token);
         if (dl == null && await store.HeadAsync(paths.Video(id, "downloaded.json"), token) == null) return (Outcome.Permanent, "invalid: " + paths.Video(id, "download.zip") + " is missing (nothing was downloaded for this video)", false, null);
+        // 0.13.3: the claim holds the video's lease, so it builds a missing video.json itself (the backfill's builder), then goes on
+        if (o.EnsureVideoJson != null && await store.HeadAsync(VideoJson.Name(paths, id), token) == null)
+        {
+            Log.Info($"process {id}: video.json is missing: building it from what is stored");
+            await o.EnsureVideoJson(store, paths, id, token);
+        }
         w.Local ??= new LocalCacheStore(store, Path.Combine(Path.GetTempPath(), "indexnode", "c-" + instanceTag + "-" + id));
         // 0.13.0: the pre-check is the first step of a process claim, only for a drama with no processing done yet (a part-processed one resumes from its first unfinished step)
         bool ranPre = false;

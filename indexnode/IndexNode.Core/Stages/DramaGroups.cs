@@ -95,7 +95,7 @@ public sealed class GroupSet
     /// Applies the new uploads' proposals. A join goes to the CURRENT group of the proposed upload (it may have moved since: group-follow; a target placed in this same batch is waited for); mixed and new start their own group (id g-&lt;first member&gt;).
     /// <paramref name="refresh"/> brings every known member's language/duration up to date first. Everything is re-elected.
     /// </summary>
-    public void Apply(IEnumerable<NewUpload> news, Func<string, (string? Lang, bool? Dubbed, double? Duration)?>? refresh = null)
+    public void Apply(IEnumerable<NewUpload> news, Func<string, (string? Lang, bool? Dubbed, double? Duration)?>? refresh = null, bool breakCycles = false)
     {
         if (refresh != null) foreach (var g in Groups) foreach (var m in g.Members) if (refresh(m.Upload) is { } r) { m.SpeechLanguage = r.Lang; m.Dubbed = r.Dubbed; m.Duration = r.Duration ?? m.Duration; }
         var of = GroupOf(); var pending = news.Where(n => !of.ContainsKey(n.Id)).OrderBy(n => n.ProcessedAt ?? "\uffff", StringComparer.Ordinal).ThenBy(n => n.Id, StringComparer.Ordinal).ToList();
@@ -112,6 +112,21 @@ public sealed class GroupSet
                 if (p == null || p.Kind != GroupProposal.JoinKind || p.JoinUpload == null || p.Mixed) { Own(n); pending.Remove(n); progress = true; continue; }
                 if (of.TryGetValue(p.JoinUpload, out var gid)) { Groups.First(g => g.Id == gid).Members.Add(Mem(n, false)); of[n.Id] = gid; pending.Remove(n); progress = true; }
                 else if (!ids.Contains(p.JoinUpload) || p.JoinUpload == n.Id) { Own(n); pending.Remove(n); progress = true; }   // the target is not in any group and is not coming: starts its own
+            }
+        }
+        // a join cycle (A joins B, B joins A: both are in the batch, as in the one-time build over a whole index): the first by time owns the group and the rest follow it; otherwise nobody can go first and each stands alone
+        while (breakCycles && pending.Count > 0)
+        {
+            var first = pending[0]; Own(first); pending.Remove(first);
+            bool again = true;
+            while (again && pending.Count > 0)
+            {
+                again = false;
+                foreach (var n in pending.ToList())
+                {
+                    var p = n.Proposal;
+                    if (p?.JoinUpload != null && !p.Mixed && of.TryGetValue(p.JoinUpload, out var gid)) { Groups.First(g => g.Id == gid).Members.Add(Mem(n, false)); of[n.Id] = gid; pending.Remove(n); again = true; }
+                }
             }
         }
         foreach (var n in pending) Own(n);   // a join cycle: nobody can go first

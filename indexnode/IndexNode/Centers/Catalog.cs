@@ -22,11 +22,13 @@ public sealed record CatalogGroup(string Id, string? Canonical, IReadOnlyList<st
 /// <summary>What the pre-check needs about every upload without opening it: duration, language, AI. Published next to the index version it was built for.</summary>
 public sealed class Catalog
 {
-    public const string File = "catalog.json.gz", Processed = "processed", MetadataOnly = "metadata-only", HeldAi = "ai", ByIndex = "index", ByPrecheck = "precheck", DataFull = "full", DataPrecheck = "precheck";
+    public const string File = "catalog.json.gz", Processed = "processed", MetadataOnly = "metadata-only", HeldAi = "ai", ByIndex = "index", ByPrecheck = "precheck", DataFull = "full", DataPrecheck = "precheck", DataMissing = "missing";
     static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { DefaultIgnoreCondition = JsonIgnoreCondition.Never, WriteIndented = false };
     public int Version { get; set; }
     public List<CatalogUpload> Uploads { get; set; } = [];
     public List<CatalogGroup> Groups { get; set; } = [];
+    /// <summary>0.13.3: the uploads whose video.json was missing or unreadable at this build (their entries say Data "missing"); not serialized.</summary>
+    [JsonIgnore] public List<string> Missing { get; set; } = [];
     Dictionary<string, CatalogUpload>? by;
     public CatalogUpload? Find(string id) => (by ??= Uploads.GroupBy(u => u.Id).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal)).GetValueOrDefault(id);
 
@@ -111,7 +113,11 @@ public static class CatalogBuild
             if (prev?.Find(id) is { } old && old.CheckedBy != null && old.Data != null && old.State == state && old.DurationSeconds != null && (old.Ai?.Score != null || state == Catalog.MetadataOnly) && (old.SpeechLanguage != null || lang0 == null)) { res[i] = old with { GroupId = null, Canonical = false, Mixed = false, GroupOffset = null }; return; }
             Pre pc;
             try { pc = await ReadPrecheckAsync(store, paths, id, t); }
-            catch (Exception e) when (e is not OperationCanceledException) { lock (failed) failed.Add($"{id}: {e.Message}"); return; }   // loud, below: the build fails and the entry is retried at the next build
+            catch (Exception e) when (e is not OperationCanceledException)
+            {   // 0.13.3: the build goes on: the entry is marked data:"missing" and named in a warning (the centers index does not need video.json)
+                lock (failed) failed.Add(id); Log.Info($"catalog: WARNING {id}: {e.Message}");
+                res[i] = new CatalogUpload(id, null, null, null, lang0, dub0, null, null, false, false, null, state, state == Catalog.Processed ? Catalog.ByIndex : Catalog.ByPrecheck, null, Data: Catalog.DataMissing); return;
+            }
             if (state == Catalog.MetadataOnly && !pc.Exists) return;   // downloaded, not pre-checked yet (and not indexed): not in the catalog
             string? held = null;
             if (state == Catalog.MetadataOnly && pc.AiFlag == true && pc.Decision != PreCheckDecision.Duplicate) held = Catalog.HeldAi;   // the AI hold: short-circuited, not processed (yet); state stays metadata-only
@@ -124,7 +130,7 @@ public static class CatalogBuild
                 state == Catalog.Processed ? Catalog.DataFull : Catalog.DataPrecheck);
             int d = Interlocked.Increment(ref done); if (d % 100 == 0) say?.Invoke($"  catalog: {d} uploads");
         });
-        if (failed.Count > 0) throw new InvalidOperationException($"catalog: {failed.Count} upload(s) have no readable video.json (run: indexnode videos backfill): {string.Join("; ", failed.Order().Take(5))}{(failed.Count > 5 ? "; ..." : "")}");
-        return new Catalog { Version = version, Uploads = res.Where(r => r != null).Select(r => r!).ToList() };
+        failed.Sort(StringComparer.Ordinal);
+        return new Catalog { Version = version, Uploads = res.Where(r => r != null).Select(r => r!).ToList(), Missing = failed };
     }
 }

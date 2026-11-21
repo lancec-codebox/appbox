@@ -106,9 +106,9 @@ public class VideoJsonTests
         await s.PutAsync(P.Active("bbbbbbbbbb2"), Encoding.UTF8.GetBytes("{}"), null, null, false, default);
         Assert.NotNull(await s.AcquireLeaseAsync(P.Active("bbbbbbbbbb2"), 60, default));   // a live lease: a node is working on it
         var rep = await VideosBackfill.BackfillAsync(s, P, false, 0.479, 1, null, default);
-        Assert.Equal((3, 1, 1), (rep.Videos, rep.Created, rep.Claimed)); Assert.Equal(["bbbbbbbbbb2"], rep.ClaimedIds);
+        Assert.Equal((3, 2, 1), (rep.Videos, rep.Created, rep.Claimed)); Assert.Equal(["bbbbbbbbbb2"], rep.ClaimedIds);
         Assert.False(s.Exists(P.Video("bbbbbbbbbb2", "video.json"))); Assert.True(s.Exists(P.Video("aaaaaaaaaa1", "video.json")));   // its claim writes it
-        Assert.Single(rep.Failed); Assert.StartsWith("nodurationn1:", rep.Failed[0]); Assert.False(s.Exists(P.Video("nodurationn1", "video.json")));   // reported, not given an empty descriptor
+        Assert.Empty(rep.Failed); var nd = await Read(s, "nodurationn1"); Assert.Null(VideoJson.Duration(nd)); Assert.Equal("unknown", (string?)nd["youtube"]!["durationSource"]);   // 0.13.3: recorded as unknown, not failed
     }
 
     // ------------------------------------------------------------------ the catalog from video.json
@@ -137,13 +137,17 @@ public class VideoJsonTests
     }
 
     [Fact]
-    public async Task A_missing_or_unreadable_video_json_fails_the_catalog_build_loudly_naming_the_upload()
+    public async Task A_missing_or_unreadable_video_json_marks_the_entry_missing_and_the_catalog_build_goes_on()
     {
         var s = new FakeStore(); await VideoJsonSeed.PutAsync(s, P, "good0000001", 900, "en", true, aiScore: 0.2, aiFlag: false);
-        var e = await Assert.ThrowsAsync<InvalidOperationException>(() => CatalogBuild.BuildAsync(s, P, 1, [Up("good0000001", "en", true), Up("gone0000001")], null, 0.479, null, default));   // processed, but no video.json
-        Assert.Contains("gone0000001", e.Message); Assert.Contains("videos backfill", e.Message);
         await s.PutAsync(P.Video("bad00000001", "video.json"), Encoding.UTF8.GetBytes("{nope"), null, null, false, default);
-        var e2 = await Assert.ThrowsAsync<InvalidOperationException>(() => CatalogBuild.BuildAsync(s, P, 1, [Up("good0000001", "en", true), Up("bad00000001")], null, 0.479, null, default));
-        Assert.Contains("bad00000001", e2.Message);
+        var cat = await CatalogBuild.BuildAsync(s, P, 1, [Up("good0000001", "en", true), Up("gone0000001", "zh", false), Up("bad00000001")], null, 0.479, null, default);
+        Assert.Equal(["bad00000001", "gone0000001"], cat.Missing);
+        Assert.Equal("missing", cat.Find("gone0000001")!.Data); Assert.Equal("missing", cat.Find("bad00000001")!.Data); Assert.Null(cat.Find("gone0000001")!.DurationSeconds);
+        Assert.Equal("full", cat.Find("good0000001")!.Data);
+        // the entry is complete again at the next build, once video.json exists (a missing entry is never reused)
+        await VideoJsonSeed.PutAsync(s, P, "gone0000001", 500, "zh", false, aiScore: 0.1, aiFlag: false); s.Blobs.Remove(P.Video("bad00000001", "video.json"));
+        var next = await CatalogBuild.BuildAsync(s, P, 2, [Up("good0000001", "en", true), Up("gone0000001", "zh", false)], cat, 0.479, null, default);
+        Assert.Empty(next.Missing); Assert.Equal((500.0, "full"), (next.Find("gone0000001")!.DurationSeconds, next.Find("gone0000001")!.Data));
     }
 }
