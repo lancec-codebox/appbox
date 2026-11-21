@@ -787,6 +787,8 @@ public static class Commands
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
                 case "search.keep-versions": case "search.keepversions": { var kv = int.Parse(val); if (kv < 0) throw new ArgumentException("search.keep-versions must be 0 or more"); (file.Search ??= new()).KeepVersions = kv; break; }
+                case "scan.mode": { var m = val.Trim().ToLowerInvariant(); if (m is not ("fast" or "exact")) throw new ArgumentException("scan.mode must be fast or exact"); (file.Search ??= new()).ScanMode = m; break; }
+                case "scan.rerank": { var rr = int.Parse(val); if (rr < 1) throw new ArgumentException("scan.rerank must be 1 or more"); (file.Search ??= new()).ScanRerank = rr; break; }
                 case "precheck.enabled": (file.PreCheck ??= new()).Enabled = bool.Parse(val); break;
                 case "precheck.tau": (file.PreCheck ??= new()).Tau = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.skip-share": (file.PreCheck ??= new()).SkipShare = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;

@@ -46,7 +46,8 @@ public static class PreCheckSearch
         int n = queries.Count; var q = new float[n][]; var rows = new int[n][];
         for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
         var sw = Stopwatch.StartNew();
-        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, i => rows[i] = idx.Scan(CenterSearch.MinusMean(q[i], idx.Mean), topCenters, 1, excludeUpload));   // frames are the parallel axis
+        var qm = new float[n][]; for (int i = 0; i < n; i++) qm[i] = CenterSearch.MinusMean(q[i], idx.Mean);
+        var scanned = idx.ScanMany(qm, topCenters, threads, excludeUpload); for (int i = 0; i < n; i++) rows[i] = scanned[i];   // frames are the parallel axis
         double scanMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
 
         var need = new Dictionary<int, HashSet<int>>();

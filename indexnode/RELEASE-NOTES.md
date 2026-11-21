@@ -1,3 +1,13 @@
+## 0.13.7
+
+Center-scan speedup, and `groups build` now uses the cores (live 0.13.6 dry run: 5.6 uploads/min at ~240% CPU of 8 cores, 4.76 GB peak).
+
+- **Two-stage scan (`scan.mode fast`, default).** Stage 1: the symmetric popcount distance of the query's sign code to every code (8 x XOR + PopCount of a ulong, unsafe pointers, no bounds checks) keeps the best R = max(`scan.rerank` (default 10000), 20 x topC) rows (ties by row; the excluded upload's rows never count). Stage 2: the exact asymmetric LUT score of those R only; the top C come from it in the exact scan's order (score desc, row asc). The old scan is kept as `scan.mode exact` (also env INDEXNODE_SCAN_MODE=exact) to compare live; new config keys `scan.mode`, `scan.rerank`.
+- **Batched queries.** The 240 frames of a pre-check / group-check chunk are scanned in ONE pass over the codes in 2048-code blocks (the 128 KB block stays in cache while every query scores it).
+- **`groups build` / index job check several uploads at once**, up to `--threads` (default = cores) uploads in parallel, each with its share of the threads for its frames. The checks read the index and the unchanged set; placements are applied after, in index order, so the result does not depend on the thread count. Progress lines count completed uploads.
+- Measured on a 4-core CI runner (no 8-core sandbox here, no live store): scan 54-60 ns/(query,center) exact vs 7-8 ns fast single-thread at 280k synthetic centers (about 8x; 6.7 ns in a 240-query batch), 25 ns exact vs 7-9 ns fast wall with the cores busy; at 41k centers 59 vs 25 ns. Top-100 overlap with the exact scan at 280k synthetic centers: 83% at rerank 2000, 93% at 5000, **97.6% at 10000 (the default, owner-approved)**, 99.4% at 20000 (about 16 ns/(query,center) single-thread at 10000 vs 54-60 exact); the best row's cosine was identical for every query at every rerank. Group joins and the mixed flag were identical in both modes.
+- Tests: fast scan = exact scan when the shortlist covers the table (order and excluded upload included), same rows at any thread count, best row kept; group joins / mixed cut identical in both modes.
+
 ## 0.13.6
 
 Live fix: `groups build` took ~14 h and 14 GB RSS on 1,083 uploads, and the first search-index build would have done the same inline.

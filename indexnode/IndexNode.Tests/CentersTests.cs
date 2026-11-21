@@ -154,8 +154,8 @@ public class CentersTests
         var rng = new Random(8); var mean = Gauss(rng); for (int i = 0; i < D; i++) mean[i] *= 0.2f;
         var cs = Enumerable.Range(0, 20000).Select(_ => Gauss(rng)).ToArray(); var idx = Data(mean, cs, 1); var q = CenterSearch.MinusMean(Gauss(rng), mean); var lut = SearchData.Lut(q);
         var expect = Enumerable.Range(0, cs.Length).OrderByDescending(i => SearchData.ScoreCode(lut, idx.Bits.AsSpan(i * 64, 64))).ThenBy(i => i).Take(100).ToArray();
-        Assert.Equal(expect, idx.Scan(q, 100, 1)); Assert.Equal(expect, idx.Scan(q, 100, 4));
-        Assert.Equal(cs.Length, idx.Scan(q, 99999, 2).Length);
+        Assert.Equal(expect, idx.ScanExact(q, 100, 1)); Assert.Equal(expect, idx.ScanExact(q, 100, 4));
+        Assert.Equal(cs.Length, idx.ScanExact(q, 99999, 2).Length); Assert.Equal(cs.Length, idx.ScanBatch([q], 99999, 2, -1, 2000)[0].Length);
     }
 
     [Fact]

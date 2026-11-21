@@ -120,6 +120,63 @@ public class GroupSampleTests
     }
 
     [Fact]
+    public async Task Group_joins_and_mixed_cuts_are_identical_in_scan_mode_exact_and_fast()
+    {
+        var cache = Tmp(); bool was = SearchData.ScanFast;
+        try
+        {
+            var a = Frames(N, 1); var mixed = Frames(N, 2); Array.Copy(a, 0, mixed, 0, 120 * D);
+            var fs = await Fixture(cache, ("a1", a), ("b9", Frames(N, 7)), ("dup", (float[])a.Clone()), ("mix", mixed), ("oth", Frames(N, 3)));
+            var idx = await Index(fs, 1, "a1", "b9");
+            var s = new PreCheckSettings { GroupCheckFrames = 100 };
+            async Task<List<string>> Run(bool fast)
+            {
+                SearchData.Configure(fast ? "fast" : "exact", 2000); var o = new List<string>();
+                foreach (var id in new[] { "dup", "mix", "oth" })
+                { var g = (await GroupBuild.FullCheckAsync(fs, P, idx, new SearchUpload(id, "", "", 1, 0, 1, N, 1, 0), new GroupSet(), s, 2, default, new BlockCache(64L << 20)))!; o.Add($"{id}:{g.Kind}:{g.JoinUpload}:{g.Hits}:{g.Mixed}:{g.Share:F3}:{g.Offset:F1}"); }
+                return o;
+            }
+            var exact = await Run(false); var fast = await Run(true);
+            Assert.Equal(exact, fast); Assert.StartsWith("dup:join:a1:", exact[0]); Assert.StartsWith("mix:mixed:", exact[1]); Assert.StartsWith("oth:new:", exact[2]);
+        }
+        finally { SearchData.Configure(was ? "fast" : "exact", 2000); foreach (var id in new[] { "a1", "b9", "dup", "mix", "oth" }) try { Directory.Delete(cache + id, true); } catch { } }
+    }
+
+    static SearchData Table(int n, int seed, out float[][] rows, out float[] mean)
+    {
+        var rng = new Random(seed); int nd = Math.Max(1, n / 20); var dirs = Enumerable.Range(0, nd).Select(_ => Gauss(rng)).ToArray();
+        rows = new float[n][]; mean = new float[D]; var rr = rows;
+        for (int i = 0; i < n; i++) { var d = dirs[rng.Next(nd)]; var g = Gauss(rng); var v = new float[D]; for (int j = 0; j < D; j++) v[j] = d[j] + 0.5f * g[j]; Vec.Normalize(v); rows[i] = v; }
+        foreach (var r in rows) for (int j = 0; j < D; j++) mean[j] += r[j] / n;
+        var bits = new byte[(long)n * SearchData.CodeBytes]; for (int i = 0; i < n; i++) SearchData.Code(rows[i], mean, bits.AsSpan(i * SearchData.CodeBytes, SearchData.CodeBytes));
+        return new SearchData { Mean = mean, Bits = bits, RefUpload = Enumerable.Range(0, n).Select(i => i % 3).ToArray(), RefCenter = Enumerable.Range(0, n).ToArray(), Uploads = [] };
+    }
+
+    [Fact]
+    public void The_fast_scan_is_the_exact_scan_when_the_shortlist_covers_the_table_and_keeps_the_best_hit_otherwise()
+    {
+        var idx = Table(9000, 11, out var rows, out var mean); var rng = new Random(3);
+        var qs = Enumerable.Range(0, 20).Select(_ => { var b = rows[rng.Next(rows.Length)]; var g = Gauss(rng); var v = new float[D]; for (int j = 0; j < D; j++) v[j] = b[j] + 0.3f * g[j] - mean[j]; return v; }).ToList();
+        foreach (var ex in new[] { -1, 1 })
+        {
+            // shortlist >= table: stage 1 keeps everything, so the result is the exact scan's, order included (and the excluded upload never appears)
+            var all = idx.ScanBatch(qs, 100, 3, ex, 100000);
+            for (int i = 0; i < qs.Count; i++) { Assert.Equal(idx.ScanExact(qs[i], 100, 1, ex), all[i]); if (ex >= 0) Assert.All(all[i], r => Assert.NotEqual(ex, idx.RefUpload[r])); }
+            // a real shortlist: one pass or many threads give the same rows, the best exact row stays, and most of the exact top C is found
+            var one = idx.ScanBatch(qs, 100, 1, ex, 2000); var many = idx.ScanBatch(qs, 100, 4, ex, 2000); double ov = 0;
+            for (int i = 0; i < qs.Count; i++)
+            {
+                Assert.Equal(one[i], many[i]); var e = idx.ScanExact(qs[i], 100, 1, ex);
+                Assert.Equal(e[0], one[i][0]); ov += e.Intersect(one[i]).Count() / 100.0;
+                if (ex >= 0) Assert.All(one[i], r => Assert.NotEqual(ex, idx.RefUpload[r]));
+            }
+            Assert.True(ov / qs.Count >= 0.85, "overlap " + ov / qs.Count);
+            Assert.Equal(idx.ScanBatch([qs[0]], 100, 1, ex, 2000)[0], one[0]);   // a batch of one = the query alone
+        }
+        Assert.Equal(20, idx.ScanBatch(qs, 20, 2, -1, 3)[0].Length);   // the shortlist is at least 20 x topC
+    }
+
+    [Fact]
     public void Progress_reads_checked_n_of_m_with_rate_and_eta()
     {
         Assert.Equal("groups: checked 10 of 50 (5.0/min, ETA 00:08)", GroupBuild.Progress(10, 50, TimeSpan.FromMinutes(2)));

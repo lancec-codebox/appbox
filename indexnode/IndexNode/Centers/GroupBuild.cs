@@ -97,15 +97,20 @@ public static class GroupBuild
         if (!bootstrap && unknown.Count > s.GroupMaxNewPerBuild) { say?.Invoke($"groups: {unknown.Count} new uploads, checking {s.GroupMaxNewPerBuild} now (groups.max-new-per-build); the rest wait for the next build"); unknown = unknown.Take(s.GroupMaxNewPerBuild).ToList(); }
         int done = 0, todo = unknown.Count; var clock = Stopwatch.StartNew();
         var cache = new BlockCache(s.GroupCacheMb * 1024L * 1024L);
-        foreach (var u in unknown)
+        // 0.13.7: several uploads are checked at once (bounded by threads), each with its share of the threads for its own frames; the check only reads the index and the (still unchanged) set, the placements are applied after, in index order
+        int par = Math.Max(1, Math.Min(threads, unknown.Count)), inner = Math.Max(1, threads / par);
+        var placed = new NewUpload?[unknown.Count]; int fullN = 0, hintN = 0;
+        await Parallel.ForEachAsync(Enumerable.Range(0, unknown.Count), new ParallelOptions { MaxDegreeOfParallelism = par, CancellationToken = ct }, async (k, t) =>
         {
-            var r = await ReadRecAsync(store, paths, u.Id, ct, say);
-            var prop = await FullCheckAsync(store, paths, next, u, set, s, threads, ct, cache);
-            if (prop == null) { prop = r.Proposal; hinted++; } else full++;
+            var u = unknown[k];
+            var r = await ReadRecAsync(store, paths, u.Id, t, say);
+            var prop = await FullCheckAsync(store, paths, next, u, set, s, inner, t, cache);
+            if (prop == null) { prop = r.Proposal; Interlocked.Increment(ref hintN); } else Interlocked.Increment(ref fullN);
             var (l0, d0) = Sp(u);
-            news.Add(new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop));
-            if (++done % 10 == 0 || done == todo) say?.Invoke(Progress(done, todo, clock.Elapsed));
-        }
+            placed[k] = new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop);
+            int n = Interlocked.Increment(ref done); if (n % 10 == 0 || n == todo) say?.Invoke(Progress(n, todo, clock.Elapsed));
+        });
+        news.AddRange(placed.Select(x => x!)); full += fullN; hinted += hintN;
         // the uploads the pre-check short-circuited (record, no centers.zip) with a proposal in it
         var shorts = new HashSet<string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/";
         foreach (var b in await store.ListAsync(pre, false, false, ct))

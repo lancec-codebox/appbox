@@ -71,6 +71,7 @@ public sealed class NodeConfig
         var c = File.Exists(p) ? JsonSerializer.Deserialize<NodeConfig>(File.ReadAllText(p), Json) ?? new() : new();
         var envSas = Environment.GetEnvironmentVariable("INDEXNODE_SAS_URL");
         if (!string.IsNullOrWhiteSpace(envSas)) c.Sas = envSas.Trim();
+        SearchData.Configure(c.Search?.ScanMode, c.Search?.ScanRerank);
         Redact.Register(c.Ai?.Key);
         Redact.Register(Environment.GetEnvironmentVariable("INDEXNODE_AI_KEY"));
         return c;
@@ -253,4 +254,11 @@ public sealed class BrowserConfig
     public int ResolvePort() => Port ?? DefaultPort;
 }
 
-public sealed class SearchSettings { public int KeepVersions { get; set; } = 3; }
+public sealed class SearchSettings
+{
+    public int KeepVersions { get; set; } = 3;
+    /// <summary>0.13.7 (config scan.mode): "fast" (default: popcount shortlist, then the exact LUT score on it) or "exact" (the 0.13.6 scan of every code with the LUT).</summary>
+    public string ScanMode { get; set; } = "fast";
+    /// <summary>0.13.7 (config scan.rerank): codes the fast scan's first stage keeps for the exact score (at least 20 x topC).</summary>
+    public int ScanRerank { get; set; } = 10000;
+}

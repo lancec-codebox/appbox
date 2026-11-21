@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Numerics;
 using System.Text;
 using System.Text.Json;
 
@@ -50,7 +51,99 @@ public sealed class SearchData
     public static float ScoreCode(float[] lut, ReadOnlySpan<byte> code) { float s = 0; for (int b = 0; b < 64; b++) s += lut[b * 256 + code[b]]; return s; }
 
     /// <summary>The rows with the highest asymmetric score for <paramref name="q"/> (already minus the mean), best first. Parallel over row ranges, each keeping its own top C.</summary>
-    public int[] Scan(float[] q, int topC, int threads, int excludeUpload = -1)
+    public int[] Scan(float[] q, int topC, int threads, int excludeUpload = -1) => Scan(q, topC, threads, excludeUpload, ScanFast, ScanRerank);
+
+    /// <summary>0.13.7 (config scan.mode, scan.rerank; env INDEXNODE_SCAN_MODE=exact|fast overrides the default): the process-wide default of <see cref="Scan(float[], int, int, int)"/>.</summary>
+    public static bool ScanFast { get; private set; } = !string.Equals(Environment.GetEnvironmentVariable("INDEXNODE_SCAN_MODE"), "exact", StringComparison.OrdinalIgnoreCase);
+    public static int ScanRerank { get; private set; } = 10000;
+    public static void Configure(string? mode, int? rerank) { if (mode != null && Environment.GetEnvironmentVariable("INDEXNODE_SCAN_MODE") == null) ScanFast = !string.Equals(mode, "exact", StringComparison.OrdinalIgnoreCase); if (rerank is > 0) ScanRerank = rerank.Value; }
+
+    public int[] Scan(float[] q, int topC, int threads, int excludeUpload, bool fast, int rerank) => fast ? ScanFastImpl(q, topC, threads, excludeUpload, rerank) : ScanExact(q, topC, threads, excludeUpload);
+
+    public int[] ScanFastImpl(float[] q, int topC, int threads, int excludeUpload, int rerank) => ScanBatch([q], topC, threads, excludeUpload, rerank)[0];
+
+    /// <summary>The scan of several queries (already minus the mean) at once, by the configured mode: fast = one pass over each block of codes for all queries (the codes are read from memory once, not once per query), exact = the 0.13.6 scan per query.</summary>
+    public int[][] ScanMany(IReadOnlyList<float[]> qs, int topC, int threads, int excludeUpload = -1)
+    {
+        if (ScanFast) return ScanBatch(qs, topC, threads, excludeUpload, ScanRerank);
+        var o = new int[qs.Count][]; Parallel.For(0, qs.Count, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads) }, i => o[i] = ScanExact(qs[i], topC, 1, excludeUpload)); return o;
+    }
+
+    const int Block = 2048;   // codes per block (128 KB: stays in L2 while every query of the batch scores it)
+
+    public unsafe int[][] ScanBatch(IReadOnlyList<float[]> qs, int topC, int threads, int excludeUpload, int rerank)
+    {
+        int n = Count, Q = qs.Count; topC = Math.Min(topC, n); var result = new int[Q][];
+        if (topC <= 0 || Q == 0) { for (int i = 0; i < Q; i++) result[i] = []; return result; }
+        int skip = 0; if (excludeUpload >= 0) for (int i = 0; i < n; i++) if (RefUpload[i] == excludeUpload) skip++;   // the excluded upload's own rows never count towards the R kept
+        int R = (int)Math.Min(n - skip, Math.Max((long)rerank, 20L * topC)) + skip; if (R > n) R = n;
+        var cand = new int[Q][];
+        if (R >= n) { var all = Enumerable.Range(0, n).ToArray(); for (int i = 0; i < Q; i++) cand[i] = all; }
+        else
+        {
+            var qw = new ulong[Q * 8]; var qc = new byte[CodeBytes]; var zero = new float[CentersFile.Dim];
+            for (int i = 0; i < Q; i++) { Code(qs[i], zero, qc); for (int w = 0; w < 8; w++) qw[i * 8 + w] = BitConverter.ToUInt64(qc, w * 8); }
+            int parts = Math.Max(1, Math.Min(threads, n / 4096 + 1)); var local = new (ushort[] D, int[] I, int N)[parts][];
+            Parallel.For(0, parts, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads) }, p =>
+            {
+                int lo = (int)((long)n * p / parts), hi = (int)((long)n * (p + 1) / parts); int m = hi - lo;
+                // per query: the candidates whose popcount distance is <= thr; thr starts open and tightens each time the list passes 3 R (the R-th best distance of what was seen: never drops a row of the final R)
+                var cd = new ushort[Q][]; var ci = new int[Q][]; var cn = new int[Q]; var thr = new int[Q]; int cap0 = Math.Min(m, 3 * R) + Block;
+                for (int i = 0; i < Q; i++) { cd[i] = new ushort[cap0]; ci[i] = new int[cap0]; thr[i] = int.MaxValue; }
+                var hist = new int[CodeBytes * 8 + 2];
+                fixed (byte* b0 = Bits) fixed (ulong* qp = qw)
+                    for (int at = 0; at < m; at += Block)
+                    {
+                        int cnt = Math.Min(Block, m - at); ulong* blk = (ulong*)(b0 + (long)(lo + at) * CodeBytes);
+                        for (int i = 0; i < Q; i++)
+                        {
+                            if (cn[i] + cnt > cd[i].Length) { Array.Resize(ref cd[i], cd[i].Length * 2); Array.Resize(ref ci[i], ci[i].Length * 2); }
+                            ulong q0 = qp[i * 8], q1 = qp[i * 8 + 1], q2 = qp[i * 8 + 2], q3 = qp[i * 8 + 3], q4 = qp[i * 8 + 4], q5 = qp[i * 8 + 5], q6 = qp[i * 8 + 6], q7 = qp[i * 8 + 7];
+                            int t = thr[i], k0 = cn[i]; var dd = cd[i]; var ii = ci[i]; ulong* c = blk; int rowBase = lo + at;
+                            for (int k = 0; k < cnt; k++, c += 8)
+                            {
+                                int d = BitOperations.PopCount(c[0] ^ q0) + BitOperations.PopCount(c[1] ^ q1) + BitOperations.PopCount(c[2] ^ q2) + BitOperations.PopCount(c[3] ^ q3)
+                                      + BitOperations.PopCount(c[4] ^ q4) + BitOperations.PopCount(c[5] ^ q5) + BitOperations.PopCount(c[6] ^ q6) + BitOperations.PopCount(c[7] ^ q7);
+                                if (d <= t) { dd[k0] = (ushort)d; ii[k0++] = rowBase + k; }
+                            }
+                            cn[i] = k0;
+                            if (k0 > 3 * R)   // tighten: the distance at which R candidates are reached, keep those at or below it (ties stay: the final order is (distance, row))
+                            {
+                                Array.Clear(hist); for (int k = 0; k < k0; k++) hist[dd[k]]++;
+                                int th = 0, cum = 0; while (th < hist.Length - 1 && cum + hist[th] < R) { cum += hist[th]; th++; }
+                                int w = 0; for (int k = 0; k < k0; k++) if (dd[k] <= th) { dd[w] = dd[k]; ii[w] = ii[k]; w++; }
+                                cn[i] = w; thr[i] = th;
+                            }
+                        }
+                    }
+                var mine = new (ushort[], int[], int)[Q]; for (int i = 0; i < Q; i++) mine[i] = (cd[i], ci[i], cn[i]);
+                local[p] = mine;
+            });
+            for (int i = 0; i < Q; i++)
+            {
+                int qi = i; var rows = new List<(int D, int I)>();
+                foreach (var l in local) { var (d, ix, cnn) = l[qi]; for (int k = 0; k < cnn; k++) if (excludeUpload < 0 || RefUpload[ix[k]] != excludeUpload) rows.Add((d[k], ix[k])); }
+                cand[i] = rows.OrderBy(x => x.D).ThenBy(x => x.I).Take(R - skip).Select(x => x.I).ToArray();
+            }
+        }
+        Parallel.For(0, Q, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads) }, i =>
+        {
+            var lut = Lut(qs[i]); var cdx = cand[i]; var sc = new float[cdx.Length];
+            fixed (float* lp = lut) fixed (byte* b0 = Bits)
+                for (int k = 0; k < cdx.Length; k++)
+                {
+                    if (excludeUpload >= 0 && RefUpload[cdx[k]] == excludeUpload) { sc[k] = float.NegativeInfinity; continue; }
+                    byte* code = b0 + (long)cdx[k] * CodeBytes; float s0 = 0, s1 = 0, s2 = 0, s3 = 0;   // four independent sums: the add chain is the latency, not the lookups
+                    for (int bb = 0; bb < 64; bb += 4) { s0 += lp[bb * 256 + code[bb]]; s1 += lp[(bb + 1) * 256 + code[bb + 1]]; s2 += lp[(bb + 2) * 256 + code[bb + 2]]; s3 += lp[(bb + 3) * 256 + code[bb + 3]]; }
+                    sc[k] = (s0 + s1) + (s2 + s3);
+                }
+            result[i] = Enumerable.Range(0, cdx.Length).Where(k => !float.IsNegativeInfinity(sc[k])).OrderByDescending(k => sc[k]).ThenBy(k => cdx[k]).Take(topC).Select(k => cdx[k]).ToArray();
+        });
+        return result;
+    }
+
+    /// <summary>The 0.13.6 scan, kept as scan.mode exact: every code scored with the LUT, the top C kept in a heap.</summary>
+    public int[] ScanExact(float[] q, int topC, int threads, int excludeUpload = -1)
     {
         var lut = Lut(q); int n = Count; topC = Math.Min(topC, n);
         if (topC <= 0) return [];

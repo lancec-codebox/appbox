@@ -8,7 +8,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.13.6</Version>
+    <Version>0.13.7</Version>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
     <PackageId>IndexNode</PackageId>
