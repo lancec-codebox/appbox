@@ -36,6 +36,7 @@ public static class CentersStep
         var b = Build(id, f16, times, threads, sscdSha);
         await wst.PutAsync(paths.Video(id, CentersFile.Member), b.Bin, null, null, false, ct, "application/octet-stream");
         await wst.PutAsync(paths.Video(id, CentersFile.ManifestMember), b.Manifest, null, null, false, ct);
+        await FramesFile.WriteAsync(wst, paths, id, b.Bin, 0, false, ct);   // 0.13.9: the lookup copy, created, or replaced under this claim's lease (a re-run writes a new one)
         return $"{b.Header.Frames} frames -> {b.Header.K} centers, {b.Bin.Length / 1024} KB, kmeans {b.Result.TotalSeconds:F2}s, total {sw.Elapsed.TotalSeconds:F1}s";
     }
 

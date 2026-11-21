@@ -81,7 +81,7 @@ public static class CatalogBuild
     {
         try
         {
-            var z = await CentersZip.OpenAsync(store, paths.Video(id, "centers.zip"), ct); if (z == null) return null;
+            var z = await FramesReader.OpenAsync(store, paths.FramesFile(id), ct); if (z == null) return null;
             var h = await z.ReadHeaderAsync(ct);
             var blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
             var frames = new List<(float T, float[] V)>();

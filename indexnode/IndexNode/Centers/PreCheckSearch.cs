@@ -32,7 +32,7 @@ public sealed class BlockCache(long maxBytes)
     public (int Entries, long Bytes, long Hits, long Misses, long MaxBytes) Stats() { lock (gate) return (map.Count, bytes, hits, misses, maxBytes); }
 }
 
-/// <summary>The pre-check lookup: many query frames against the global search table (0.11.0 SearchData/CentersZip), with member blocks read once per (upload, center) and cached for the whole pre-check.</summary>
+/// <summary>The pre-check lookup: many query frames against the global search table (0.11.0 SearchData/frames files), with member blocks read once per (upload, center) and cached for the whole pre-check.</summary>
 public static class PreCheckSearch
 {
     public sealed record Stats(double ScanMs, double ReadMs, double ScoreMs, int Blocks, int Requests, long Bytes);
@@ -54,7 +54,7 @@ public static class PreCheckSearch
         foreach (var rs in rows) foreach (var r in rs) { var u = idx.RefUpload[r]; if (!need.TryGetValue(u, out var set)) need[u] = set = []; set.Add(idx.RefCenter[r]); }
         var cache = new ConcurrentDictionary<(int Up, int Center), (float[] Vec, float[] Times)>();
         long bytes = 0; int requests = 0;
-        await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>   // 0.13.8: the real bound is CentersZip.MaxInFlight requests process-wide
+        await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>   // 0.13.8: the real bound is CentersBlob.MaxInFlight requests process-wide
         {
             var up = idx.Uploads[kv.Key]; var centers = new List<int>();
             foreach (var c in kv.Value) { if (shared != null && shared.TryGet(up.Id, c, out var hit)) cache[(kv.Key, c)] = hit; else centers.Add(c); }
@@ -63,7 +63,7 @@ public static class PreCheckSearch
             {
                 try
                 {
-                    var z = attempt == 0 ? CentersZip.FromIndex(raw, paths.Video(up.Id, "centers.zip"), up) : await CentersZip.OpenAsync(raw, paths.Video(up.Id, "centers.zip"), t) ?? throw new FileNotFoundException(up.Id);
+                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t);
                     var res = await z.ReadBlocksAsync(centers, CenterSearch.MergeGap, CenterSearch.MaxMerged, t);
                     Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests);
                     foreach (var (c, m) in res)
@@ -106,16 +106,16 @@ public static class PreCheckSearch
         for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
         foreach (var id in fresh)
         {
-            CentersZip? z; List<(int Center, CentersFile.Members Members)> blocks;
+            CentersBlob? z; List<(int Center, CentersFile.Members Members)> blocks;
             try
             {
-                z = await CentersZip.OpenAsync(raw, paths.Video(id, "centers.zip"), ct); if (z == null) continue;
+                z = await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct); if (z == null) continue;
                 var h = await z.ReadHeaderAsync(ct);
                 blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
             }
             catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"pre-check: fresh centers of {id} not searched ({e.Message})"); continue; }
             var (sl, db) = await SearchIndexBuild.ReadSpeechAsync(raw, paths, id, ct);
-            int up = idx.Uploads.Count + used.Count; used.Add(new SearchUpload(id, "", z.ETag ?? "", z.ZipSize, z.DataStart, z.DataLength, 0, blocks.Count, 0, sl, db));
+            int up = idx.Uploads.Count + used.Count; used.Add(new SearchUpload(id, "", z.ETag ?? "", z.ZipSize, 0, z.DataLength, 0, blocks.Count, 0, sl, db, null, z.Blob, 0));
             var vecs = blocks.Select(b => { var v = new float[b.Members.Count * CentersFile.Dim]; Vec.FromHalf(b.Members.Vectors, v); return (v, b.Members.Times); }).ToList();
             Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, i =>
             {

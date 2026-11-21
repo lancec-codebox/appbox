@@ -101,6 +101,9 @@ public sealed class Paths(string prefix)
     public string JobsDir(string stage) => $"{Prefix}jobs/{stage}/";
     public string Video(string id, string file) => $"{Prefix}videos/{id}/{file}";
     public string VideoDir(string id) => $"{Prefix}videos/{id}/";
+    /// <summary>0.13.9: a drama's frames file, the lookup readers' only source of its frames (never centers.zip).</summary>
+    public string FramesFile(string id) => $"{Prefix}search/frames/{id}.bin";
+    public string FramesDir => $"{Prefix}search/frames/";
     /// <summary>0.13.0: the control file lives with the queue (jobs/control.json). The old index/control.json stays mode=stop for ever (so old binaries never resume on the old store) and is never read.</summary>
     public string Control => $"{Prefix}jobs/control.json";
     public string LegacyControl => $"{Prefix}control.json";

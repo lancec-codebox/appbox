@@ -14,8 +14,11 @@ public static class CentersFile
     public const int Dim = 512, Version = 1, Build = 1, HeaderSize = 2144, TableEntry = 16, SumOff = 64, HashOff = 32;
     public const string Member = "centers/centers.bin", ManifestMember = "centers/manifest.json";
     public static readonly byte[] Magic = "IXCT"u8.ToArray();
+    /// <summary>0.13.9: the frames file (index/search/frames/&lt;id&gt;.bin) is this same layout with this magic and the drama's sequence number (i64, 0 = unknown) in the reserved bytes at 24.</summary>
+    public static readonly byte[] FramesMagic = "IXFR"u8.ToArray();
+    public const int SeqOff = 24;
 
-    public sealed record Header(int Version, int K, int Dim, int Frames, int Build, byte[] InputHash, float[] Sum, long CentersOff, long TableOff, long MembersOff, long TotalLength);
+    public sealed record Header(int Version, int K, int Dim, int Frames, int Build, byte[] InputHash, float[] Sum, long CentersOff, long TableOff, long MembersOff, long TotalLength, long Seq = 0);
     public readonly record struct Block(long Offset, int Length, int Count);
     public sealed record Members(byte[] Vectors, float[] Times, int[] Rows) { public int Count => Times.Length; }
 
@@ -56,7 +59,7 @@ public static class CentersFile
 
     public static Header ParseHeader(ReadOnlySpan<byte> b)
     {
-        if (b.Length < HeaderSize || !b[..4].SequenceEqual(Magic)) throw new InvalidDataException("not a centers file (bad magic)");
+        if (b.Length < HeaderSize || !(b[..4].SequenceEqual(Magic) || b[..4].SequenceEqual(FramesMagic))) throw new InvalidDataException("not a centers file (bad magic)");
         int ver = BinaryPrimitives.ReadInt32LittleEndian(b[4..]);
         if (ver != Version) throw new InvalidDataException($"centers file version {ver} (this build reads {Version})");
         int dim = BinaryPrimitives.ReadInt32LittleEndian(b[12..]); if (dim != Dim) throw new InvalidDataException($"centers dim {dim}");
@@ -92,8 +95,8 @@ public static class CentersFile
     static byte[] JsonSerializerBytes(object o) => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(o);
 }
 
-/// <summary>A centers.zip read by ranges: only what a query needs is fetched (the zip's central directory, then the header, centers, table or a member block of centers/centers.bin).</summary>
-public sealed class CentersZip
+/// <summary>A centers file read by ranges (inside centers.zip, or a frames file on its own): only what a query needs is fetched (header, centers, table or a member block).</summary>
+public abstract class CentersBlob
 {
     public required IStore Store { get; init; }
     public required string Blob { get; init; }
@@ -105,23 +108,13 @@ public sealed class CentersZip
     public required long DataStart { get; init; }
     public required long DataLength { get; init; }
 
-    public static async Task<CentersZip?> OpenAsync(IStore store, string blob, CancellationToken ct)
-    {
-        // a Nexis ghost HEADs as 0 bytes (the data sits in uncommitted blocks): ZipOpen hydrates it and HEADs again; a 0-byte blob that is no ghost is "not a zip"
-        var h = await ZipOpen.HeadReadableAsync(store, blob, ct); if (h == null) return null;
-        var src = new BlobZipSource(store, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
-        var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
-        var e = es.FirstOrDefault(x => x.Name == CentersFile.Member) ?? throw new InvalidDataException($"{blob} has no {CentersFile.Member}");
-        if (e.Method != 0) throw new NotSupportedException("centers.bin must be stored, not deflated");
-        var lh = await src.ReadAsync(e.LocalOffset, 30 + 256, ct);
-        if (lh.Length < 30 || BitConverter.ToUInt32(lh, 0) != 0x04034b50) throw new InvalidDataException("bad local header");
-        return new CentersZip { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = e.LocalOffset + 30 + BitConverter.ToUInt16(lh, 26) + BitConverter.ToUInt16(lh, 28), DataLength = e.Size };
-    }
+    /// <summary>Where the center table is and how many centers there are, when the index recorded them: the header read is then skipped.</summary>
+    public long KnownTableOff { get; init; }
+    public int KnownK { get; init; }
 
-    /// <summary>A zip whose place is already known (the search index records ETag, size and where centers.bin starts): no HEAD, no directory read.</summary>
-    public static CentersZip FromIndex(IStore store, string blob, SearchUpload u) => new() { Store = store, Blob = blob, ETag = u.ETag.Length == 0 ? null : u.ETag, Sha = u.Sha, ZipSize = u.ZipSize, DataStart = u.DataStart, DataLength = u.DataLength };
-
-    public int Requests; public long BytesRead;
+    /// <summary>0.13.9: a whole local copy of the file (the node's frames cache): reads come from it, no range request goes to the store.</summary>
+    public string? LocalPath { get; set; }
+    public int Requests; public long BytesRead; public int LocalReads;
 
     /// <summary>0.13.8: at most this many ranged reads of centers.zip members are in flight in the whole process (the bound is on requests, not threads: a read is a round trip, not CPU).</summary>
     public const int MaxInFlight = 64;
@@ -159,6 +152,14 @@ public sealed class CentersZip
     /// <summary>Bytes off..off+len of centers.bin (one HTTP range request), pinned to the zip's ETag.</summary>
     public async Task<byte[]> ReadAsync(long off, int len, CancellationToken ct)
     {
+        if (LocalPath != null)
+        {
+            Interlocked.Increment(ref LocalReads);
+            using var fh = File.OpenHandle(LocalPath); var lb = new byte[len]; int got = 0;
+            while (got < len) { int n = RandomAccess.Read(fh, lb.AsSpan(got), off + got); if (n <= 0) break; got += n; }
+            if (got != len) throw new InvalidDataException($"{Blob}: asked for {len} bytes at {off}, the local copy has {got}");
+            return lb;
+        }
         Interlocked.Increment(ref Requests); Interlocked.Add(ref BytesRead, len);
         await InFlightGate.WaitAsync(ct); int now = Interlocked.Increment(ref inFlight); int pk; while (now > (pk = peakInFlight)) Interlocked.CompareExchange(ref peakInFlight, now, pk);
         RangeRead r; var pin = new BlobPin(Blob, ETag, ZipSize, Sha);
@@ -173,4 +174,68 @@ public sealed class CentersZip
     public async Task<CentersFile.Header> ReadHeaderAsync(CancellationToken ct) => CentersFile.ParseHeader(await ReadAsync(0, CentersFile.HeaderSize, ct));
     public async Task<CentersFile.Block[]> ReadTableAsync(CentersFile.Header h, CancellationToken ct) => CentersFile.ParseTable(await ReadAsync(h.TableOff, h.K * CentersFile.TableEntry, ct), h.K);
     public async Task<CentersFile.Members> ReadBlockAsync(CentersFile.Block b, CancellationToken ct) => CentersFile.ParseBlock(await ReadAsync(b.Offset, b.Length, ct), b.Count);
+}
+
+
+/// <summary>centers.zip: the processing archive. Only the centers step, `frames convert` and tests open it; no lookup or index build does (0.13.9).</summary>
+public sealed class CentersZip : CentersBlob
+{
+    public static async Task<CentersZip?> OpenAsync(IStore store, string blob, CancellationToken ct)
+    {
+        // a Nexis ghost HEADs as 0 bytes (the data sits in uncommitted blocks): ZipOpen hydrates it and HEADs again; a 0-byte blob that is no ghost is "not a zip"
+        var h = await ZipOpen.HeadReadableAsync(store, blob, ct); if (h == null) return null;
+        var src = new BlobZipSource(store, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
+        var es = await ZipFormat.ReadDirectoryAsync(src, ct, 2048);
+        var e = es.FirstOrDefault(x => x.Name == CentersFile.Member) ?? throw new InvalidDataException($"{blob} has no {CentersFile.Member}");
+        if (e.Method != 0) throw new NotSupportedException("centers.bin must be stored, not deflated");
+        var lh = await src.ReadAsync(e.LocalOffset, 30 + 256, ct);
+        if (lh.Length < 30 || BitConverter.ToUInt32(lh, 0) != 0x04034b50) throw new InvalidDataException("bad local header");
+        return new CentersZip { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = e.LocalOffset + 30 + BitConverter.ToUInt16(lh, 26) + BitConverter.ToUInt16(lh, 28), DataLength = e.Size };
+    }
+
+    /// <summary>A zip whose place is already known (the search index records ETag, size and where centers.bin starts): no HEAD, no directory read.</summary>
+    public static CentersZip FromIndex(IStore store, string blob, SearchUpload u) => new() { Store = store, Blob = blob, ETag = u.ETag.Length == 0 ? null : u.ETag, Sha = u.Sha, ZipSize = u.ZipSize, DataStart = u.DataStart, DataLength = u.DataLength };
+}
+
+/// <summary>0.13.9: a per-drama frames file (index/search/frames/&lt;id&gt;.bin) read by ranges. The lookup readers' only source of a drama's frames.</summary>
+public sealed class FramesReader : CentersBlob
+{
+    public static async Task<FramesReader?> OpenAsync(IStore store, string blob, CancellationToken ct)
+    {
+        var h = await store.HeadAsync(blob, ct); if (h == null || h.Size < CentersFile.HeaderSize) return null;
+        return await LocalAsync(new FramesReader { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = 0, DataLength = h.Size }, ct);
+    }
+
+    /// <summary>The place the index recorded (file, size, ETag, table offset): no HEAD, no header read. Null when the version records none (built before 0.13.9).</summary>
+    /// <summary>With the node's frames cache on, the whole file is fetched once (one GET) and kept; every later read is from disk.</summary>
+    static async Task<FramesReader> LocalAsync(FramesReader r, CancellationToken ct)
+    {
+        if (FramesCache.Current is { } c) r.LocalPath = await c.EnsureAsync(r.Store, r.Blob, r.Sha, r.ZipSize, ct);
+        return r;
+    }
+
+    public static FramesReader? FromIndex(IStore store, SearchUpload u) => u.File == null ? null : new FramesReader { Store = store, Blob = u.File, ETag = u.ETag.Length == 0 ? null : u.ETag, Sha = u.Sha, ZipSize = u.ZipSize, DataStart = 0, DataLength = u.DataLength, KnownTableOff = u.TableOff, KnownK = u.K };
+
+    /// <summary>The recorded place on the first attempt, a fresh open after a stale read (or when the version records none).</summary>
+    public static async Task<FramesReader> ForAsync(IStore store, Paths paths, SearchUpload u, int attempt, CancellationToken ct) =>
+        (attempt == 0 && FromIndex(store, u) is { } fr ? await LocalAsync(fr, ct) : null) ?? await OpenAsync(store, paths.FramesFile(u.Id), ct) ?? throw new FileNotFoundException(paths.FramesFile(u.Id));
+}
+
+/// <summary>The frames file's bytes and the conversion from a centers.bin (same layout, new magic, the sequence number).</summary>
+public static class FramesFile
+{
+    public static byte[] FromCenters(byte[] centersBin, long seq = 0)
+    {
+        var b = (byte[])centersBin.Clone(); CentersFile.FramesMagic.CopyTo(b, 0); BinaryPrimitives.WriteInt64LittleEndian(b.AsSpan(CentersFile.SeqOff), seq); return b;
+    }
+    public static Dictionary<string, string> Metadata(byte[] bin) => new() { ["idx_sha256"] = Convert.ToHexString(bin.AsSpan(CentersFile.HashOff, 32)).ToLowerInvariant() };
+
+    /// <summary>Writes (creates, or replaces under the caller's lease) a drama's frames file with its idx_sha256 metadata (the input hash). With <paramref name="onlyIfNew"/> false when it exists.</summary>
+    public static async Task<bool> WriteAsync(IStore store, Paths paths, string id, byte[] bin, long seq, bool onlyIfNew, CancellationToken ct)
+    {
+        var f = FromCenters(bin, seq); var name = paths.FramesFile(id);
+        if (!await store.PutAsync(name, f, null, null, onlyIfNew, ct, "application/octet-stream")) return false;
+        await store.SetMetadataAsync(name, Metadata(f), null, ct);
+        return true;
+    }
 }

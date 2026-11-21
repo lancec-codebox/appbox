@@ -942,9 +942,9 @@ public class PreCheckTests : IDisposable
     public async Task The_index_build_runs_the_full_check_for_an_upload_without_a_precheck_and_prunes_no_centers()
     {
         var v = await BuildIndexAsync(); var st = OpenLocal();
-        var zip = await st.GetAsync(P.Video("a1", "centers.zip"), default);
+        var zip = await st.GetAsync(P.FramesFile("a1"), default);
         await VideoJsonSeed.PutAsync(st, P, "a1copy", 900);   // a processed copy of a1: its descriptor has no precheck section (an upload from before the pre-check)
-        await st.PutAsync(P.Video("a1copy", "centers.zip"), zip!.Data, null, null, false, default);   // a processed copy of a1: no precheck.json at all (an upload from before the pre-check)
+        await st.PutAsync(P.FramesFile("a1copy"), zip!.Data, null, null, false, default);   // a processed copy of a1: no precheck.json at all (an upload from before the pre-check)
         Assert.Equal(0, await CentersCommands.SearchIndexAsync(Args.Parse(["update", "--local", root, "--threads", "2"])));   // (its output goes to the console: no Console.SetOut here, other classes capture it in parallel)
         var idx = (await new SearchIndexCache(Path.Combine(root, "cfull"), TimeSpan.FromMinutes(10)).GetAsync(st, P, default))!;
         var g = (await GroupStore.LoadAsync(st, P, idx.Version, default))!; var of = g.GroupOf();

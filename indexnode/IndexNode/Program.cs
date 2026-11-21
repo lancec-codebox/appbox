@@ -60,6 +60,7 @@ public static class Program
         indexnode tools install --ytdlp-zipapp
         indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
         indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
+        indexnode frames convert [--dry-run] [--threads N] [--limit N]   (0.13.9: write index/search/frames/<id>.bin for every drama from its centers.zip; create-only, skips dramas under a claim)
         indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
         indexnode groups build [--dry-run] [--threads N] [--check-pairs <file>]   (the one-time drama groups by the frame-level full check; --check-pairs: lines "idA idB", reports how many share a group; then the search-index job keeps them)
         indexnode search-index build [--new-mean] | update [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (the global search table under index/search/vN/)
@@ -102,6 +103,7 @@ public static class Program
             if (a.Positional.Count == 0 || a.Has("help")) { Console.WriteLine(Usage); return a.Has("help") ? 0 : 2; }
             var cmd = a.Positional[0].ToLowerInvariant();
             a.Positional.RemoveAt(0);
+            try { FramesCache.Configure(NodeConfig.Load()); } catch (Exception e) when (e is not OperationCanceledException) { }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
             return cmd switch
             {
                 "run" => await Commands.RunAsync(a),
@@ -124,6 +126,7 @@ public static class Program
                 "centers" => await CentersCommands.CentersAsync(a),
                 "search-index" => await CentersCommands.SearchIndexAsync(a),
                 "groups" => await GroupsCommand.RunAsync(a),
+                "frames" => await FramesCommand.RunAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await JobsCommand.RunAsync(Args.Parse(["retry", .. (a.Get("stage") is { } rs ? new[] { "--stage", rs } : [])])),
                 "classify" => await ClassifyCommand.RunAsync(a),
@@ -787,6 +790,7 @@ public static class Commands
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
                 case "search.keep-versions": case "search.keepversions": { var kv = int.Parse(val); if (kv < 0) throw new ArgumentException("search.keep-versions must be 0 or more"); (file.Search ??= new()).KeepVersions = kv; break; }
+                case "index.local-cache-gb": { var gb = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); if (gb < 0) throw new ArgumentException("index.local-cache-gb must be 0 or more"); (file.Search ??= new()).LocalCacheGb = gb; break; }
                 case "scan.mode": { var m = val.Trim().ToLowerInvariant(); if (m is not ("fast" or "exact")) throw new ArgumentException("scan.mode must be fast or exact"); (file.Search ??= new()).ScanMode = m; break; }
                 case "scan.rerank": { var rr = int.Parse(val); if (rr < 1) throw new ArgumentException("scan.rerank must be 1 or more"); (file.Search ??= new()).ScanRerank = rr; break; }
                 case "precheck.enabled": (file.PreCheck ??= new()).Enabled = bool.Parse(val); break;

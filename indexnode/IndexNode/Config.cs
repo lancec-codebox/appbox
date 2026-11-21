@@ -257,6 +257,8 @@ public sealed class BrowserConfig
 public sealed class SearchSettings
 {
     public int KeepVersions { get; set; } = 3;
+    /// <summary>0.13.9 (config index.local-cache-gb): the size bound of the node's local copy of the frames files; 0 turns the local copy off (every lookup is range requests).</summary>
+    public double LocalCacheGb { get; set; } = 20;
     /// <summary>0.13.7 (config scan.mode): "fast" (default: popcount shortlist, then the exact LUT score on it) or "exact" (the 0.13.6 scan of every code with the LUT).</summary>
     public string ScanMode { get; set; } = "fast";
     /// <summary>0.13.7 (config scan.rerank): codes the fast scan's first stage keeps for the exact score (at least 20 x topC).</summary>

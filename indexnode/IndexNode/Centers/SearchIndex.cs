@@ -8,7 +8,7 @@ using System.Text.Json;
 namespace IndexNode;
 
 /// <summary>One upload in the global search table: where its centers.zip is and which rows of bits.bin/refs.bin are its centers.</summary>
-public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null, string? Group = null);
+public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null, string? Group = null, string? File = null, long TableOff = 0);
 
 /// <summary>The global search table, as published under index/search/vN/: mean.f32 (512 f32), bits.bin (64-byte sign codes of center - mean), refs.bin (per row: u32 upload index, u32 center index), uploads.yaml.</summary>
 public sealed class SearchData
@@ -181,7 +181,7 @@ public sealed class SearchData
         foreach (var u in Uploads)
             sb.Append("  - id: ").Append(Q(u.Id)).Append("\n    sha: ").Append(Q(u.Sha)).Append("\n    etag: ").Append(Q(u.ETag)).Append("\n    zipSize: ").Append(u.ZipSize).Append("\n    dataStart: ").Append(u.DataStart)
               .Append("\n    dataLength: ").Append(u.DataLength).Append("\n    frames: ").Append(u.Frames).Append("\n    k: ").Append(u.K).Append("\n    rowStart: ").Append(u.RowStart).Append('\n')
-              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n").Append(u.Group == null ? "" : "    group: " + Q(u.Group) + "\n");
+              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n").Append(u.Group == null ? "" : "    group: " + Q(u.Group) + "\n").Append(u.File == null ? "" : "    file: " + Q(u.File) + "\n    tableOff: " + u.TableOff + "\n");
         return sb.ToString();
     }
 
@@ -195,7 +195,7 @@ public sealed class SearchData
     public static (int Version, int MeanVersion, long MeanFrames, List<SearchUpload> Uploads) ParseUploadsYaml(string yaml)
     {
         int version = 0, meanVersion = 0; long meanFrames = 0; var ups = new List<SearchUpload>(); Dictionary<string, string>? cur = null;
-        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null, cur.GetValueOrDefault("group") is { Length: > 0 } gr && gr != "null" ? gr : null)); cur = null; }
+        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null, cur.GetValueOrDefault("group") is { Length: > 0 } gr && gr != "null" ? gr : null, cur.GetValueOrDefault("file") is { Length: > 0 } ff && ff != "null" ? ff : null, cur.TryGetValue("tableOff", out var to) ? long.Parse(to) : 0)); cur = null; }
         foreach (var raw in yaml.Split('\n'))
         {
             var line = raw.TrimEnd('\r'); if (line.Length == 0 || line.StartsWith('#')) continue;
@@ -287,14 +287,14 @@ public sealed class SearchData
 
 public static class SearchIndexBuild
 {
-    /// <summary>The centers.zip of every upload: id, ETag, size, idx_sha256.</summary>
+    /// <summary>0.13.9: the frames file of every drama (index/search/frames/&lt;id&gt;.bin): id, ETag, size, idx_sha256. centers.zip is never listed or opened here.</summary>
     public static async Task<List<(string Id, BlobEntry Zip)>> ListCentersAsync(IStore raw, Paths paths, CancellationToken ct)
     {
-        var l = new List<(string, BlobEntry)>(); var pre = paths.Prefix + "videos/";
+        var l = new List<(string, BlobEntry)>(); var pre = paths.FramesDir;
         foreach (var b in await raw.ListAsync(pre, false, true, ct))
         {
-            if (!b.Name.EndsWith("/centers.zip", StringComparison.Ordinal)) continue;
-            var id = b.Name[pre.Length..^"/centers.zip".Length]; if (id.Contains('/')) continue;
+            if (!b.Name.EndsWith(".bin", StringComparison.Ordinal)) continue;
+            var id = b.Name[pre.Length..^".bin".Length]; if (id.Contains('/')) continue;
             l.Add((id, b));
         }
         return l.OrderBy(x => x.Item1, StringComparer.Ordinal).ToList();
@@ -305,7 +305,7 @@ public static class SearchIndexBuild
     /// <summary>Reads one upload's header and center vectors (a few range requests).</summary>
     public static async Task<Loaded> LoadUploadAsync(IStore raw, Paths paths, string id, CancellationToken ct)
     {
-        var z = await CentersZip.OpenAsync(raw, paths.Video(id, "centers.zip"), ct) ?? throw new FileNotFoundException(id + "/centers.zip");
+        var z = await FramesReader.OpenAsync(raw, paths.FramesFile(id), ct) ?? throw new FileNotFoundException(paths.FramesFile(id));
         int first = (int)Math.Min(z.DataLength, CentersFile.HeaderSize + 256 * CentersFile.Dim * 2);
         var buf = await z.ReadAsync(0, first, ct); var h = CentersFile.ParseHeader(buf);
         int need = CentersFile.HeaderSize + h.K * CentersFile.Dim * 2;
@@ -313,7 +313,7 @@ public static class SearchIndexBuild
         var centers = CentersFile.ParseCenters(buf.AsSpan(CentersFile.HeaderSize, h.K * CentersFile.Dim * 2), h.K);
         var sha = (await raw.HeadAsync(z.Blob, ct))?.Metadata.GetValueOrDefault("idx_sha256") ?? "";
         var (sl, db) = await ReadSpeechAsync(raw, paths, id, ct);
-        return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, z.DataStart, z.DataLength, h.Frames, h.K, 0, sl, db), centers, h.Sum);
+        return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, 0, z.DataLength, h.Frames, h.K, 0, sl, db, null, z.Blob, h.TableOff), centers, h.Sum);
     }
 
     /// <summary>The upload's speech language and dubbed from its video.json (0.13.2; the transcribe.zip range reads are gone). Null/null when the descriptor has no speech yet; a missing or unreadable video.json THROWS (the caller's entry fails and is retried).</summary>
@@ -343,7 +343,7 @@ public static class SearchIndexBuild
         {
             var sum = new double[CentersFile.Dim];
             foreach (var l in loaded) { if (l == null) continue; for (int d = 0; d < CentersFile.Dim; d++) sum[d] += l.Sum[d]; frames += l.Up.Frames; }
-            if (frames == 0) throw new InvalidOperationException("no frames in any centers.zip");
+            if (frames == 0) throw new InvalidOperationException("no frames in any frames file");
             mean = sum.Select(s => (float)(s / frames)).ToArray(); total = frames;
         }
         var ups = new List<SearchUpload>(); var bits = new List<byte[]>(); var ru = new List<int>(); var rc = new List<int>(); int row = 0;
@@ -398,7 +398,7 @@ public static class CenterSearch
             {
                 try
                 {
-                    var z = attempt == 0 ? CentersZip.FromIndex(raw, paths.Video(up.Id, "centers.zip"), up) : await CentersZip.OpenAsync(raw, paths.Video(up.Id, "centers.zip"), t) ?? throw new FileNotFoundException(up.Id);
+                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t);
                     var res = await z.ReadBlocksAsync(centers, MergeGap, MaxMerged, t);
                     Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests);
                     perUpload[g] = res.Select(x => (up, x.Center, x.Members)).ToList(); return;

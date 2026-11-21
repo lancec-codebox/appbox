@@ -34,7 +34,7 @@ public static class GroupBuild
         public string Line()
         {
             long n = Math.Max(1, Interlocked.Read(ref uploads)); string Ms(long us) => (us / 1000.0 / n).ToString("F0");
-            return $"avg per upload: scan {Ms(Interlocked.Read(ref scan))} ms, read {Ms(Interlocked.Read(ref read))} ms (own centers {Ms(Interlocked.Read(ref own))} ms), score {Ms(Interlocked.Read(ref score))} ms; {Interlocked.Read(ref requests) / n} requests, {Interlocked.Read(ref bytes) / n / 1048576.0:F1} MB; reads in flight {CentersZip.InFlight} now, peak {Math.Max(Volatile.Read(ref peak), CentersZip.TakePeakInFlight())}";
+            return $"avg per upload: scan {Ms(Interlocked.Read(ref scan))} ms, read {Ms(Interlocked.Read(ref read))} ms (own centers {Ms(Interlocked.Read(ref own))} ms), score {Ms(Interlocked.Read(ref score))} ms; {Interlocked.Read(ref requests) / n} requests, {Interlocked.Read(ref bytes) / n / 1048576.0:F1} MB; reads in flight {CentersBlob.InFlight} now, peak {Math.Max(Volatile.Read(ref peak), CentersBlob.TakePeakInFlight())}";
         }
     }
 
@@ -49,7 +49,7 @@ public static class GroupBuild
         try
         {
             var own = Stopwatch.StartNew();
-            var z = await CentersZip.OpenAsync(store, paths.Video(u.Id, "centers.zip"), ct); if (z == null) return null;
+            var z = await FramesReader.OpenAsync(store, paths.FramesFile(u.Id), ct); if (z == null) return null;
             var h = await z.ReadHeaderAsync(ct);
             var blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
             stats?.AddOwn(own.Elapsed.TotalMilliseconds, z.Requests, z.BytesRead);
@@ -67,7 +67,7 @@ public static class GroupBuild
         {
             var part = frames.Skip(at).Take(ChunkFrames).Select(f => f.V).ToList();
             var (b, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, next, part, s.TopCenters, threads, ct, ex, cache);
-            stats?.Add(st.ScanMs, st.ReadMs, st.ScoreMs, st.Requests, st.Bytes); stats?.Peak(CentersZip.InFlight);
+            stats?.Add(st.ScanMs, st.ReadMs, st.ScoreMs, st.Requests, st.Bytes); stats?.Peak(CentersBlob.InFlight);
             Array.Copy(b, 0, best, at, b.Length);
         }
         var hits = new List<FrameHit>();
@@ -119,7 +119,7 @@ public static class GroupBuild
         // 0.13.7: several uploads are checked at once (bounded by threads), each with its share of the threads for its own frames; the check only reads the index and the (still unchanged) set, the placements are applied after, in index order
         int par = Math.Max(1, Math.Min(threads, unknown.Count)), inner = Math.Max(1, threads / par);
         var placed = new NewUpload?[unknown.Count]; int fullN = 0, hintN = 0; var cstats = new CheckStats();
-        using var tick = new Timer(_ => { try { cstats.Peak(CentersZip.InFlight); } catch { } }, null, 0, 200);
+        using var tick = new Timer(_ => { try { cstats.Peak(CentersBlob.InFlight); } catch { } }, null, 0, 200);
         await Parallel.ForEachAsync(Enumerable.Range(0, unknown.Count), new ParallelOptions { MaxDegreeOfParallelism = par, CancellationToken = ct }, async (k, t) =>
         {
             var u = unknown[k];
