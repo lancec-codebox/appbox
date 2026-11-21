@@ -75,13 +75,18 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             if (audio is { Length: > 0 }) { ap = Path.Combine(work, Path.GetFileName(string.IsNullOrEmpty(audioName) ? "clip.wav" : audioName)); await File.WriteAllBytesAsync(ap, audio, ct); }
             secs["queue"] = sw.Elapsed.TotalSeconds;
             await IndexAsync(ct);
-            var a = await analyzer.AnalyzeFramesAsync(fdir, frames.Count, null, ap, settings, threads, _ => { }, secs, excludeSelf ? id : null, ct);
+            // 0.13.15: meta.segments = [{position,start,end,frames}] in frame order (the client's two segments); without it the frames are one window
+            var segInfo = (meta["segments"] as JsonArray)?.OfType<JsonObject>().Select(x => new PreCheckAnalyzer.SegInfo((double?)x["position"] ?? 0.5, (double?)x["start"] ?? 0, (double?)x["end"] ?? 0, (int?)x["frames"] ?? 0)).ToList();
+            if (segInfo != null && segInfo.Sum(x => x.Frames) != frames.Count) throw new ArgumentException("meta.segments frames do not add up to the frames sent");
+            var a = await analyzer.AnalyzeFramesAsync(fdir, frames.Count, null, segInfo != null ? null : ap, settings, threads, _ => { }, secs, excludeSelf ? id : null, ct, segInfo);
             if (a.IndexVersion > 0) NoteVersion(a.IndexVersion);
-            a = a with { Group = DramaGroups.Propose(a, window.Item1, window.Item2 - window.Item1, settings) };
+            var segs0 = segInfo?.Select(x => new SampleSegment("", x.Start, x.End, x.Position)).ToList();
+            a = a with { Group = segs0 is { Count: > 0 } ? PreCheckStage.ProposeGroup(a, segs0, settings) : DramaGroups.Propose(a, window.Item1, window.Item2 - window.Item1, settings) };
             var decision = PreCheck.Decide(a, duration, _ => null, settings);
+            if (PreCheck.SpeechNeeded(a, decision) && ap != null) { var sp = await analyzer.SpeechAsync(ap, threads, settings.LanguageSeconds, settings.LanguageMinSeconds, ct); a = a with { Speech = sp }; decision = PreCheck.Decide(a, duration, _ => null, settings); }
             bool ai = a.AiScore >= settings.AiFlag;
-            var rec = PreCheck.Record(id, decision, a, info, DownloadedFormats.FromInfo(info), window, duration, settings, "precheck-service", version, ai, (double?)meta["sampleDownloadSeconds"] ?? 0, decision.Decision != PreCheckDecision.Duplicate);
-            rec["matchUpload"] = decision.Match?.Upload; rec["excludedSelfCenters"] = excludeSelf ? a.Excluded : null;
+            var rec = PreCheck.Record(id, decision, a, info, DownloadedFormats.FromInfo(info), window, duration, settings, "precheck-service", version, ai, (double?)meta["sampleDownloadSeconds"] ?? 0, !PreCheckDecision.IsSkip(decision.Decision));
+            rec["matchUpload"] = decision.MatchedMember ?? decision.Match?.Upload; rec["excludedSelfCenters"] = excludeSelf ? a.Excluded : null;
             rec["service"] = new JsonObject { ["version"] = version, ["threads"] = threads, ["framesReceived"] = frames.Count, ["audioBytes"] = audio?.Length ?? 0, ["totalSeconds"] = Math.Round(sw.Elapsed.TotalSeconds, 3) };
             Log.Info($"serve: {id} {decision.Decision} ({frames.Count} frames, {audio?.Length ?? 0} B audio) {sw.Elapsed.TotalSeconds:0.0}s");
             return rec;

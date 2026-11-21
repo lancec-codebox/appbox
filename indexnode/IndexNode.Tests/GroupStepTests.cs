@@ -318,6 +318,27 @@ public class GroupStepTests
     }
 
     [Fact]
+    public async Task Membership_among_20k_non_dramas_and_1000_dramas_needs_no_store_reads_and_is_fast()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        var lines = new List<QLine>();
+        for (int i = 0; i < 20000; i++) lines.Add(AddProcess("ch" + i));   // channels / refresh sources / unstarted downloads: no seq, no frames
+        var ids = Enumerable.Range(0, 1000).Select(i => "d" + i).ToArray();
+        for (int i = 0; i < ids.Length; i++) { lines.AddRange(GroupDone(ids[i], i % 10 == 0 ? null : ids[i - i % 10], i % 10 == 0 ? "new" : "join")); lines.Add(new QLine { T = "seq", S = ids[i], Seq = i + 1 }); }
+        foreach (var chunk in JobQueue.Chunks(lines, l => 300)) await q.AppendLinesAsync(chunk, default);
+        var frames = new HashSet<string>(ids, StringComparer.Ordinal);
+        var d = new GroupDedup(s, Tmp()); int before = Gets(s) + s.Ops.GetValueOrDefault("put");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var earlier = q.Read(st => GroupStage.EarlierDramas(st, "d999", 1000, frames));
+        var ms = await d.SetAsync(P, "d995", earlier, QJ(q), null, default);
+        sw.Stop();
+        Assert.Equal(999, earlier.Count);   // only dramas with a seq below this one and a frames file
+        Assert.Equal(ids.Where(x => int.Parse(x[1..]) is >= 990 and <= 999 && x != "d999").Order().ToList(), ms.Members.Order().ToList());   // d995 joins d990: the group is d990..d998 (d999 is the drama being grouped)
+        Assert.Equal(0, ms.Reads); Assert.Equal(before, Gets(s) + s.Ops.GetValueOrDefault("put"));
+        Assert.True(sw.ElapsedMilliseconds < 50, $"membership took {sw.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
     public async Task The_groups_file_is_read_once_and_a_restarted_node_with_the_same_cache_directory_reads_nothing()
     {
         var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a"); var dir = Tmp();
@@ -474,6 +495,43 @@ public class GroupStepTests
         Assert.Null(r4["retainedFile"]);
     }
 
+    /// <summary>0.13.15 fixture ids: n1 (seq 1) and n2 (seq 2) are unrelated; j1 (seq 3) is the same video as n1 (a JOIN); m1 (seq 4) is half n1, half n2 (MIXED). The dramas are in the queue with their seq and have frames files.</summary>
+    [Fact]
+    public async Task Groups_step_runs_one_drama_as_the_node_would_and_a_dry_run_writes_nothing_to_the_store_or_the_queue()
+    {
+        var (s, q, g, _) = await Rig(async st =>
+        {
+            await PutFrames(st, "n1", Make(300, 30, 1), 300); await PutFrames(st, "n2", Make(300, 30, 2), 300);
+            await PutFrames(st, "j1", Make(300, 30, 1), 300, 1.0, 5000);
+        }, ("n1", 1), ("n2", 2), ("j1", 3));
+        await RunGroup(s, q, g, "n1"); await RunGroup(s, q, g, "n2");
+        await q.AppendLinesAsync([new QLine { T = "done", S = "n1", Stage = "group", Join = null, JoinKind = "new" }, new QLine { T = "done", S = "n2", Stage = "group", Join = null, JoinKind = "new" }], default);
+        await s.PutAsync(P.QueueSnapshotGz, System.Text.Encoding.UTF8.GetBytes("{}"), null, null, false, default);   // the command's cutover guard: a queue exists
+        int Writes() => s.Calls.Count(x => x.StartsWith("Put") || x.StartsWith("Delete") || x.StartsWith("Append") || x.StartsWith("SetMetadata") || x.StartsWith("SetTags"));
+        string Fp() => string.Join("|", s.Calls.Where(x => x.StartsWith("Put") || x.StartsWith("Delete") || x.StartsWith("Append")));
+        int before = Writes(); var fp0 = Fp();
+        var o = new StringWriter(); var code = await GroupsCommand.StepAsync(s, P, new PreCheckSettings(), "j1", true, 2, o, default);
+        var text = o.ToString();
+        Assert.Equal(0, code); Assert.Contains("dry run: nothing written", text);
+        Assert.Contains("\"kind\": \"join\"", text); Assert.Contains("\"dedupAgainst\"", text);                 // the record it would write
+        Assert.Contains("retained file:", text); Assert.Contains("would be kept in index/search/retained/j1.bin", text);
+        Assert.Contains("queue line it would append: done group, join n1, kind join", text);
+        Assert.Contains("time split:", text); Assert.Contains("membership", text); Assert.Contains("search", text); Assert.Contains("dedup", text); Assert.Contains("write-free", text);
+        Assert.Contains("members of", text); Assert.Contains("from the queue", text);                              // the join-source counts
+        Assert.Equal(before, Writes()); Assert.Equal(fp0, Fp());                                                   // not one write, delete or append
+        Assert.Null(await s.HeadAsync(P.RetainedFile("j1"), default));                                            // no retained file
+        Assert.Null((await VideoJson.ReadAsync(s, P, "j1", default))?.Root["grouping"]);                           // no video.json record
+        Assert.Null(q.Read(st => st.Get("j1")!.JoinKind));                                                         // no queue line
+        // the real run does what the node does: record, retained file, the done line with the join
+        var o2 = new StringWriter(); Assert.Equal(0, await GroupsCommand.StepAsync(s, P, new PreCheckSettings(), "j1", false, 2, o2, default));
+        var rec = (JsonObject)(await VideoJson.ReadAsync(s, P, "j1", default))!.Root["grouping"]!;
+        Assert.Equal("join", (string)rec["proposal"]!["kind"]!); Assert.NotNull(await s.HeadAsync(P.RetainedFile("j1"), default));
+        await q.PollAsync(default);
+        Assert.Equal(("n1", "join"), q.Read(st => (st.Get("j1")!.JoinOf, st.Get("j1")!.JoinKind)));
+        // an unknown drama and a drama without frames are refused with a message, no exception
+        var o3 = new StringWriter(); Assert.Equal(1, await GroupsCommand.StepAsync(s, P, new PreCheckSettings(), "nope", true, 2, o3, default)); Assert.Contains("no sequence number", o3.ToString());
+    }
+
     [Fact]
     public async Task The_index_fold_accepts_a_group_record_whose_covered_is_null()
     {
@@ -586,14 +644,18 @@ public class GroupStepTests
         var rows = o.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => (JsonObject)JsonNode.Parse(l)!).ToDictionary(r => (string)r["id"]!);
         Assert.Equal(4, sum.Dramas); Assert.Equal(4, rows.Count);
         // w1 does not see itself: its top is w2, whose group (without w1) is G1, longest w2
-        Assert.Equal("w2", (string)rows["w1"]["top"]!); Assert.Equal("G1", (string)rows["w1"]["group"]!); Assert.Equal("w2", (string)rows["w1"]["longest"]!["id"]!);
-        Assert.Equal("duplicate", (string)rows["w1"]["old"]!["decision"]!); Assert.Equal("duplicate", (string)rows["w1"]["new"]!["decision"]!);
-        // w3 (2400 s) against the group's longest (1800 s): the old rule still skips it (within 10 min), the new one processes it as longer than L
-        Assert.Equal("duplicate", (string)rows["w3"]["old"]!["decision"]!); Assert.Equal("partial", (string)rows["w3"]["new"]!["decision"]!); Assert.True((bool)rows["w3"]["new"]!["longerThanL"]!);
-        Assert.Equal(1, sum.OldDupNewPartial); Assert.Equal(1, sum.OldDupNewPartialLonger);
-        Assert.Equal("new", (string)rows["x1"]["new"]!["decision"]!); Assert.Null(rows["x1"]["top"]);                     // nothing else looks like x1 (and x1 never matches itself)
+        // 0.13.15: the new rule is the two-segment one (0.30/0.70 windows of the drama's own frames, itself excluded)
+        Assert.Equal("w2", (string)rows["w1"]["new"]!["member"]!); Assert.Equal("duplicate", (string)rows["w1"]["old"]!["decision"]!); Assert.Equal("duplicate", (string)rows["w1"]["new"]!["decision"]!);
+        Assert.Equal(2, rows["w1"]["segments"]!.AsArray().Count); Assert.Equal(60, (int)rows["w1"]["sampleFrames"]!); Assert.NotEmpty(rows["w1"]["membersChecked"]!.AsArray());
+        // w3 = the same video at 2400 s against w1/w2 (1800 s)
+        Assert.Equal("overlap", (string)rows["w3"]["old"]!["decision"]!); Assert.Equal("overlap", (string)rows["w3"]["new"]!["decision"]!);   // the old rule: longer than the group's longest copy; the new one: the stretched copy's segment gap (960 s) is longer than the member's (720 s) by more than the tolerance
+        Assert.Contains("shorter than the gap", (string)rows["w3"]["membersChecked"]![0]!["reason"]!);
+        Assert.Equal(0, sum.OldSkipNewProcessed); Assert.Equal(0, sum.NewSkipOldProcessed); Assert.Empty(sum.FalseSkips);
+        Assert.Equal("new", (string)rows["x1"]["new"]!["decision"]!); Assert.Null(rows["x1"]["new"]!["member"]);          // nothing else looks like x1 (and x1 never matches itself)
+        Assert.Contains("AI flag would change", PreCheckWhatIf.Format(sum)); Assert.True(sum.Seconds > 0);
         Assert.Equal(before, s.Calls.Count(x => x.StartsWith("Put") || x.StartsWith("Delete") || x.StartsWith("Append")));   // read-only
-        var one = new StringWriter(); var s1 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, 1, null, one, _ => { }, default); Assert.Equal(1, s1.Dramas);   // --limit
+        var one = new StringWriter(); var s1 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, 1, null, one, _ => { }, default); Assert.Equal(1, s1.Dramas); Assert.Contains("1 dramas", PreCheckWhatIf.Format(s1)); Assert.Contains(" s (", PreCheckWhatIf.Format(s1));   // --limit 1 and its run time
+        var one2 = new StringWriter(); var s3 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, 1, ["w3", "w1"], one2, _ => { }, default); Assert.Equal(1, s3.Dramas);   // --ids with --limit 1
         var ids = new StringWriter(); var s2 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings(), 2, int.MaxValue, ["w3"], ids, _ => { }, default); Assert.Equal(1, s2.Dramas); Assert.Contains("\"w3\"", ids.ToString());   // --ids
     }
 

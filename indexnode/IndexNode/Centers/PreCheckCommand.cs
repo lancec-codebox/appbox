@@ -22,6 +22,7 @@ public static class PreCheckCommand
         if (inputs.Count == 0) throw new ArgumentException("precheck <id>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N]");
         int threads = Math.Max(1, a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads);
         var st = cfg.PreCheck ?? new();
+        if (a.Get("order-tolerance-seconds") is { } ot) st.OrderToleranceSeconds = double.Parse(ot, System.Globalization.CultureInfo.InvariantCulture);
         if (a.Get("window-position") is { } wp) st.WindowPosition = double.Parse(wp, System.Globalization.CultureInfo.InvariantCulture);
         var tools = toolsOverride ?? new Tools(http, cfg);
         bool exclude = a.Has("exclude-self");
@@ -59,6 +60,8 @@ public static class PreCheckCommand
         string top = d.Match is { } m ? $"{m.Upload} share {m.Share:0.00} (cos {m.BestCosine:0.00})" : "no match";
         string ai = $"ai {r.Analysis.AiScore:0.000}{(r.Ai ? " FLAG" : "")}";
         string speech = r.Analysis.Speech is { } sp ? (sp.Unavailable == null ? "  speech " + (sp.Language ?? "-") + (sp.Dubbed ? " DUB" : "") : "  speech: metadata fallback") : "";
-        return $"{id}: {d.Decision}  {top}  {ai}  threads={threads}  frames {Sec("frames")}s, sscd {Sec("sscd")}s, lookup {Sec("lookup")}s, ai {Sec("ai")}s{speech}";
+        string member = d.MatchedMember != null ? $"  member {d.MatchedMember} ({d.Checked.Count} checked)" : d.Checked.Count > 0 ? $"  ({d.Checked.Count} members checked, none passed)" : "";
+        string sp2 = r.Analysis.Speech == null ? "  speech: skipped (not needed)" : speech;
+        return $"{id}: {d.Decision}  {top}{member}  {ai}  threads={threads}\n    time split: cut {Sec("cut")}s, frames {Sec("frames")}s, sscd {Sec("sscd")}s, lookup {Sec("lookup")}s ({Sec("lookupRequests")} requests, {(s.TryGetValue("lookupBytes", out var by) ? by / 1048576 : 0):0.0} MB), members {Sec("members")}s ({Sec("membersDirect")} of {Sec("membersChecked")} scored directly), ai {Sec("ai")}s{sp2}, total {Sec("total")}s (the section download is timed apart)";
     }
 }

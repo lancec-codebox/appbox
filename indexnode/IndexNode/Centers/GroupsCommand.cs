@@ -58,8 +58,46 @@ public static class GroupsCommand
     }
 
     /// <summary>0.13.3: `groups build [--dry-run] [--threads N] [--check-pairs FILE]`: the one-time group table, by the SAME frame-level full check the index build runs for a new upload (each upload's own frames searched against the index, joined at &gt;= 5 distinct-frame hits, mixed and offset as in 0.13.2; the language is video.json's).</summary>
+    /// <summary>
+    /// 0.13.15: `indexnode groups step &lt;id&gt; [--dry-run]`: the group step of ONE drama exactly as a node runs it: the queue state (seq, join lines), the node's FramesCache and the dedup set (membership from the queue / groups file / cache / video.json).
+    /// --dry-run writes NOTHING (no video.json, no retained file, no queue line); it prints the record it would write, the retained count and the time split (queue load, membership with join-source counts, search, dedup, write-free totals).
+    /// Without --dry-run it behaves as the node: it writes the record and the retained file and appends the group done line (join and kind) to the queue.
+    /// </summary>
+    public static async Task<int> StepAsync(IStore store, Paths paths, PreCheckSettings s, string id, bool dry, int threads, TextWriter o, CancellationToken ct)
+    {
+        var total = Stopwatch.StartNew();
+        await JobQueue.RequireSnapshotAsync(store, paths, ct);
+        var q = new JobQueue(store, paths, "cli"); await q.LoadAsync(ct);
+        double tQueue = total.Elapsed.TotalMilliseconds;
+        var seq = q.Read(st => st.Get(id)?.Seq);
+        if (seq == null) { o.WriteLine($"groups step {id}: no sequence number in the queue (run: indexnode seq assign)"); return 1; }
+        var tl = Stopwatch.StartNew(); var frames = await GroupSequencing.ListFramesAsync(store, paths, ct); double tList = tl.Elapsed.TotalMilliseconds;
+        if (!frames.Contains(id)) { o.WriteLine($"groups step {id}: no frames file (index/search/frames/{id}.bin)"); return 1; }
+        var stage = new GroupStage(store, s) { DryRun = dry };
+        var ctx = new JobContext { Job = new JobDescriptor { Stage = "group", JobId = id }, Stage = "group", BlobName = id, Worker = 0, Store = store, Paths = paths, NodeId = "cli", Token = ct, Queue = q, ThreadShare = () => Math.Max(1, threads), Report = (_, _) => { }, Frames = frames };
+        var run = Stopwatch.StartNew();
+        await stage.RunAsync(ctx);
+        double tRun = run.Elapsed.TotalMilliseconds;
+        o.WriteLine($"groups step {id}{(dry ? " (dry run: nothing written to the store or the queue)" : "")}: seq {seq}");
+        o.WriteLine("record" + (dry ? " it would write" : " written") + " (video.json grouping):");
+        o.WriteLine(stage.LastRecord?.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }) ?? "  (none: no earlier dramas to search)");
+        if (stage.LastRetained is { } r) o.WriteLine($"retained file: {r.Kept} of {r.Total} frames{(dry ? " would be kept in index/search/retained/" + id + ".bin" : " kept")}");
+        else o.WriteLine("retained file: none");
+        o.WriteLine($"queue line {(dry ? "it would append" : "appended")}: done group, join {ctx.GroupJoin ?? "-"}, kind {ctx.GroupJoinKind ?? "-"}");
+        if (!dry) await q.AppendLinesAsync([new QLine { T = "done", S = id, Stage = "group", Join = ctx.GroupJoin, JoinKind = ctx.GroupJoinKind }], ct);
+        o.WriteLine($"time split: queue load {tQueue:F0} ms, frames list {tList:F0} ms; step {tRun:F0} ms = {stage.LastSplit ?? "(no search: nothing earlier)"}; total {total.Elapsed.TotalMilliseconds:F0} ms{(dry ? " (write-free)" : "")}");
+        return 0;
+    }
+
     public static async Task<int> RunAsync(Args a, IStore? remote = null)
     {
+        if (a.Positional.FirstOrDefault() == "step")
+        {
+            var (scfg, ss, sp, _) = CentersCommands.OpenStore(a, remote);
+            string sid = a.Positional.Count > 1 ? a.Positional[1] : throw new ArgumentException("groups step <id> [--dry-run] [--threads N]");
+            using var scts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; scts.Cancel(); };
+            return await StepAsync(ss, sp, scfg.PreCheck ?? new(), sid, a.Has("dry-run"), a.Get("threads") is { } stt ? int.Parse(stt) : scfg.EffectiveThreads, Console.Out, scts.Token);
+        }
         if (a.Positional.FirstOrDefault() == "enqueue")
         {
             var (_, es, ep, _) = CentersCommands.OpenStore(a, remote);

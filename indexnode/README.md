@@ -70,7 +70,12 @@ indexnode config set precheck.partial-share 0.60     # share that records anothe
 indexnode config set precheck.duration-percent 0.15  # duration rule: max(15%, 600 s)
 indexnode config set precheck.duration-min 600
 indexnode config set precheck.top-centers 100
-indexnode config set precheck.window-seconds 300
+indexnode config set precheck.window-seconds 300      # 0.13.15: two segments of this length
+indexnode config set precheck.window-positions 0.30,0.70   # 0.13.15: centres of the two segments (30 frames each at precheck.frames 60)
+indexnode config set precheck.order-tolerance-seconds 120  # 0.13.15: a member passes when gap_M >= gap_N - this
+indexnode config set describe.main-min-screen 0.10    # 0.13.15: main cast needs this share of the lesser lead's face time, or a mention in title/teaser/synopsis
+indexnode config set describe.main-max 6              # 0.13.15: at most this many main cast (most face time kept)
+indexnode groups step <id> --dry-run                  # 0.13.15: the group step of one drama as the node runs it, writing nothing; prints the record and the time split
 indexnode config set precheck.language-seconds 60     # seconds of audio tagged Speech with a language (~15 s chunks from the middle outwards, no VAD; music, events and nospeech dropped); 0 or all = every chunk. A non-zh call needs >= 3 chunks and 2/3 agreeing, else unclear (null = zh); under 10 s = no-speech
 indexnode config set precheck.language-min-seconds 10
 indexnode config set precheck.frames 60             # max SSCD frames per sample, evenly subsampled (a number, or 0/all); the AI thresholds are calibrated at 60

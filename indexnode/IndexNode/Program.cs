@@ -59,8 +59,10 @@ public static class Program
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
         indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
-        indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
+        indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--order-tolerance-seconds 120] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
         indexnode seq assign [--dry-run]   (0.13.10: give every existing drama its sequence number, by first pre-check)
+        indexnode groups step <id> [--dry-run] [--threads N]   (0.13.15: the group step of ONE drama exactly as the node runs it (queue state, FramesCache, dedup set); --dry-run writes nothing to the store or the queue and prints the record it would write and the time split: membership with join-source counts, search, dedup, write-free total)
+        indexnode precheck whatif [--ids <file>] [--limit N] [--threads N]   (0.13.15: the two-segment pre-check on each drama's stored frames (itself excluded) against the old single window: decisions, possible false skips, AI flag changes, run time; works with --limit 1)
         indexnode groups enqueue [--dry-run]   (0.13.10: add the group step for every processed drama, in sequence order; create-only)
         indexnode frames convert [--dry-run] [--threads N] [--limit N]   (0.13.9: write index/search/frames/<id>.bin for every drama from its centers.zip; create-only, skips dramas under a claim)
         indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
@@ -815,6 +817,10 @@ public static class Commands
                 case "precheck.frames": (file.PreCheck ??= new()).Frames = PreCheckSettings.ParseFrames(val); break;
                 case "precheck.video-height": (file.PreCheck ??= new()).VideoHeight = int.Parse(val); break;
                 case "precheck.audio-format": (file.PreCheck ??= new()).AudioFormat = val.Trim(); break;
+                case "precheck.window-positions": (file.PreCheck ??= new()).WindowPositions = val.Split([',', ' ', ';'], StringSplitOptions.RemoveEmptyEntries).Select(x => double.Parse(x, System.Globalization.CultureInfo.InvariantCulture)).ToArray(); break;
+                case "precheck.order-tolerance-seconds": (file.PreCheck ??= new()).OrderToleranceSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "describe.main-min-screen": { var mv = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); if (mv < 0) throw new ArgumentException("describe.main-min-screen must be 0 or more"); file.DescribeMainMinScreen = mv; break; }
+                case "describe.main-max": { var mx = int.Parse(val); if (mx < 0) throw new ArgumentException("describe.main-max must be 0 or more"); file.DescribeMainMax = mx; break; }
                 case "precheck.window-position": (file.PreCheck ??= new()).WindowPosition = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.ai-flag": (file.PreCheck ??= new()).AiFlag = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "groups.check-frames": (file.PreCheck ??= new()).GroupCheckFrames = PreCheckSettings.ParseFrames(val); break;

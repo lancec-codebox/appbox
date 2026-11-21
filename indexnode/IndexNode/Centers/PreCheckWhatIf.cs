@@ -13,7 +13,8 @@ namespace IndexNode;
 /// </summary>
 public static class PreCheckWhatIf
 {
-    public sealed record Summary(int Dramas, Dictionary<string, int> Old, Dictionary<string, int> New, int OldDupNewPartial, int OldDupNewPartialLonger, int DupButGroupNewOrMixed, int NewButGroupJoin, int Failed);
+    /// <summary>0.13.15: Old = the 0.13.14 single-window rule on one window at 0.5; New = the two-segment rule (windows at 0.30/0.70, 30 frames each, the drama itself excluded). FalseSkips: every new duplicate/subset where the drama's own group step says new or mixed, or its covered share is under 0.5. AiChanges: dramas whose AI flag differs between the two samples.</summary>
+    public sealed record Summary(int Dramas, Dictionary<string, int> Old, Dictionary<string, int> New, int OldSkipNewProcessed, int NewSkipOldProcessed, int NewButGroupJoin, int Failed, IReadOnlyList<string> FalseSkips, IReadOnlyList<string> AiChanges, double Seconds);
 
     public static async Task<int> RunAsync(Args a, IStore? remote = null)
     {
@@ -36,7 +37,13 @@ public static class PreCheckWhatIf
     public static string Format(Summary s)
     {
         string C(Dictionary<string, int> d) => string.Join(", ", d.OrderBy(x => x.Key, StringComparer.Ordinal).Select(x => $"{x.Key} {x.Value}"));
-        return $"precheck whatif: {s.Dramas} dramas{(s.Failed > 0 ? $" ({s.Failed} failed)" : "")}\n  old rule: {C(s.Old)}\n  new rule: {C(s.New)}\n  old duplicate but new partial: {s.OldDupNewPartial} (longer than L: {s.OldDupNewPartialLonger})\n  disagreements with the group step: pre-check duplicate where the group step said new or mixed: {s.DupButGroupNewOrMixed}; pre-check new where the group step said join: {s.NewButGroupJoin}";
+        var sb = new StringBuilder();
+        sb.Append($"precheck whatif: {s.Dramas} dramas{(s.Failed > 0 ? $" ({s.Failed} failed)" : "")} in {s.Seconds:0.0} s ({(s.Dramas == 0 ? 0 : s.Seconds / s.Dramas):0.00} s per drama)\n  old (one window at 0.5): {C(s.Old)}\n  new (two segments 0.30/0.70): {C(s.New)}\n  skipped by the old rule, processed by the new: {s.OldSkipNewProcessed}; skipped by the new, processed by the old: {s.NewSkipOldProcessed}; new says new where the group step said join: {s.NewButGroupJoin}");
+        sb.Append($"\n  possible false skips (new duplicate/subset where the group step said new/mixed or covered < 0.5): {s.FalseSkips.Count}");
+        foreach (var x in s.FalseSkips) sb.Append("\n    " + x);
+        sb.Append($"\n  AI flag would change: {s.AiChanges.Count}");
+        foreach (var x in s.AiChanges) sb.Append("\n    " + x);
+        return sb.ToString();
     }
 
     public static async Task<Summary> RunAsync(IStore store, Paths paths, PreCheckSettings s, int threads, int limit, IReadOnlyList<string>? only, TextWriter output, Action<string> progress, CancellationToken ct)
@@ -52,7 +59,7 @@ public static class PreCheckWhatIf
         var work = (only == null ? all : only.Where(x => all.Contains(x)).ToList()).Take(limit).ToList();
         var cache = new BlockCache(s.GroupCacheMb * 1024L * 1024L);
         var oldC = new ConcurrentDictionary<string, int>(); var newC = new ConcurrentDictionary<string, int>();
-        int done = 0, oldDupNewPartial = 0, longer = 0, dupVsGroup = 0, newVsJoin = 0, failed = 0; var outLock = new object();
+        int done = 0, oldSkipNewNot = 0, newSkipOldNot = 0, newVsJoin = 0, failed = 0; var outLock = new object(); var falseSkips = new ConcurrentBag<string>(); var aiChanges = new ConcurrentBag<string>(); var clock = System.Diagnostics.Stopwatch.StartNew();
         int perDrama = Math.Max(1, threads / 2);
         await Parallel.ForEachAsync(work, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(threads, 8)), CancellationToken = ct }, async (id, c) =>
         {
@@ -62,10 +69,12 @@ public static class PreCheckWhatIf
                 if (rec == null) { Interlocked.Increment(ref failed); return; }
                 string od = (string)rec["old"]!["decision"]!, nd = (string)rec["new"]!["decision"]!;
                 oldC.AddOrUpdate(od, 1, (_, v) => v + 1); newC.AddOrUpdate(nd, 1, (_, v) => v + 1);
-                if (od == PreCheckDecision.Duplicate && nd == PreCheckDecision.Partial) { Interlocked.Increment(ref oldDupNewPartial); if ((bool?)rec["new"]!["longerThanL"] == true) Interlocked.Increment(ref longer); }
+                if (PreCheckDecision.IsSkip(od) && !PreCheckDecision.IsSkip(nd)) Interlocked.Increment(ref oldSkipNewNot);
+                if (!PreCheckDecision.IsSkip(od) && PreCheckDecision.IsSkip(nd)) Interlocked.Increment(ref newSkipOldNot);
                 var gk = (string?)rec["groupStep"]?["kind"];
-                if (nd == PreCheckDecision.Duplicate && gk is "new" or "mixed") Interlocked.Increment(ref dupVsGroup);
                 if (nd == PreCheckDecision.New && gk == "join") Interlocked.Increment(ref newVsJoin);
+                if (rec["possibleFalseSkip"] is JsonObject fsk) falseSkips.Add(fsk.ToJsonString());
+                if ((bool?)rec["ai"]?["changed"] == true) aiChanges.Add($"{id}: score {rec["ai"]!["old"]} -> {rec["ai"]!["new"]} (flag {rec["ai"]!["oldFlag"]} -> {rec["ai"]!["newFlag"]})");
                 lock (outLock) output.WriteLine(rec.ToJsonString());
             }
             catch (OperationCanceledException) { throw; }
@@ -73,7 +82,7 @@ public static class PreCheckWhatIf
             int n = Interlocked.Increment(ref done); if (n % 50 == 0) progress($"precheck whatif: {n}/{work.Count} dramas");
         });
         lock (outLock) output.Flush();
-        return new Summary(work.Count - failed, new Dictionary<string, int>(oldC), new Dictionary<string, int>(newC), oldDupNewPartial, longer, dupVsGroup, newVsJoin, failed);
+        return new Summary(work.Count - failed, new Dictionary<string, int>(oldC), new Dictionary<string, int>(newC), oldSkipNewNot, newSkipOldNot, newVsJoin, failed, falseSkips.OrderBy(x => x, StringComparer.Ordinal).ToList(), aiChanges.OrderBy(x => x, StringComparer.Ordinal).ToList(), clock.Elapsed.TotalSeconds);
     }
 
     static async Task<JsonObject?> OneAsync(IStore store, Paths paths, SearchData head, Dictionary<string, string> ofGroup, Dictionary<string, List<GroupMember>> groupMembers, Dictionary<string, int> indexOf, PreCheckSettings s, string id, int threads, BlockCache cache, CancellationToken ct)
@@ -86,46 +95,73 @@ public static class PreCheckWhatIf
         foreach (var (_, m) in blocks) { var rows = AiProbe.RowsFromF16(m.Vectors); for (int i = 0; i < rows.Length && i < m.Times.Length; i++) { Sscd.L2Normalize(rows[i]); own.Add((m.Times[i], rows[i])); } }
         own.Sort((x, y) => x.T.CompareTo(y.T)); if (own.Count == 0) return null;
         double duration = (vj != null ? VideoJson.Duration(vj.Root) : null) ?? own[^1].T;
-        var (start, end, _) = PreCheck.Window(duration, s.WindowSeconds, s.WindowPosition);
-        var inWin = own.Where(f => f.T >= start && f.T <= end).ToList(); if (inWin.Count == 0) inWin = own;   // a drama with no frame in the window: all of them
-        var pick = s.Frames <= 0 ? Enumerable.Range(0, inWin.Count).ToArray() : PreCheck.SubsampleIndices(inWin.Count, s.Frames);
-        var rowsQ = pick.Select(i => inWin[i].V).ToList();
-        int ex = indexOf.TryGetValue(id, out var xi) ? xi : -1;
-        var (best, _) = await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsQ, s.TopCenters, threads, ct, ex, cache);
-        var (matches, noHit) = PreCheckSearch.Shares(head, best, s.Tau);
-        matches = matches.Where(m => m.Upload != id).ToList();
-        // the groups WITHOUT this drama
         string? GroupOf(string up) => ofGroup.TryGetValue(up, out var g) ? g : null;
         double? DurationOf(string up) => head.Catalog?.Find(up)?.DurationSeconds;
-        var hits = new List<FrameHit>();
-        for (int i = 0; i < best.Length; i++) if (best[i] is { } b && b.Cosine >= s.Tau && b.Upload >= 0 && b.Upload < head.Uploads.Count && head.Uploads[b.Upload].Id != id) hits.Add(new FrameHit(i, head.Uploads[b.Upload].Id, b.Time, b.Cosine));
-        var ug = hits.Select(x => x.Upload).Distinct(StringComparer.Ordinal).ToDictionary(u => u, u => GroupOf(u), StringComparer.Ordinal);
-        var gm = ug.Values.Where(g => g != null).Distinct().ToDictionary(g => g!, g => (IReadOnlyList<GroupCopy>)groupMembers[g!].Where(m => m.Upload != id).Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration ?? DurationOf(m.Upload))).ToList(), StringComparer.Ordinal);
-        // the top matches' groups too (the decision may look at the group of a match that came with fewer hits)
-        foreach (var m in matches.Take(5)) { var g = GroupOf(m.Upload); if (g != null) { ug.TryAdd(m.Upload, g); if (!gm.ContainsKey(g)) gm[g] = groupMembers[g].Where(x => x.Upload != id).Select(x => new GroupCopy(x.Upload, x.SpeechLanguage, x.Dubbed, x.Duration ?? DurationOf(x.Upload))).ToList(); } }
-        for (int i = 0; i < matches.Count && i < 5; i++)
+        int ex = indexOf.TryGetValue(id, out var xi) ? xi : -1;
+        List<float[]> Pick(double ws, double we, int frames)
         {
-            var m = matches[i]; double? d = DurationOf(m.Upload);
-            if (d == null) { try { d = (await CatalogBuild.ReadPrecheckAsync(store, paths, m.Upload, ct)).Duration; } catch (Exception e) when (e is not OperationCanceledException) { } }
-            matches[i] = m with { Duration = d, SpeechLanguage = head.Catalog?.Find(m.Upload)?.SpeechLanguage, Dubbed = head.Catalog?.Find(m.Upload)?.Dubbed };
+            var inWin = own.Where(f => f.T >= ws && f.T <= we).ToList(); if (inWin.Count == 0) inWin = own;   // a drama with no frame in the window: all of them
+            return (frames <= 0 ? Enumerable.Range(0, inWin.Count).ToArray() : PreCheck.SubsampleIndices(inWin.Count, frames)).Select(i => inWin[i].V).ToList();
         }
-        var an = new PreCheckAnalysis(null, head.Version, rowsQ.Count, noHit, matches, 0, new Dictionary<string, double>()) { Hits = hits, UploadGroups = ug, GroupMembers = gm };
-        an = an with { Group = DramaGroups.Propose(an, start, end - start, s) };
-        var oldD = PreCheck.Decide(an, duration, _ => null, s, legacy: true); var newD = PreCheck.Decide(an, duration, _ => null, s);
-        var top = newD.Match ?? oldD.Match ?? matches.FirstOrDefault();
-        var longest = top == null ? null : PreCheck.Longest(an, top, top.Duration);
-        bool longerThanL = longest != null && duration > longest.Value.Duration + Math.Max(s.DurationSlackPercent * longest.Value.Duration, s.DurationSlackSeconds);
+        // ---- the new sample: one window per position, frames/2 each, one lookup; the old sample: the single window at 0.5, all frames
+        var wins = PreCheck.Windows(duration, s.WindowSeconds, s.WindowPositions);
+        int per = s.Frames <= 0 ? 0 : Math.Max(1, s.Frames / Math.Max(1, wins.Count));
+        var rowsNew = new List<float[]>(); var info = new List<PreCheckAnalyzer.SegInfo>();
+        foreach (var (ws, we, wp) in wins) { var r = Pick(ws, we, per); rowsNew.AddRange(r); info.Add(new PreCheckAnalyzer.SegInfo(wp, ws, we, r.Count)); }
+        var (os, oe, _) = PreCheck.Window(duration, s.WindowSeconds, s.WindowPosition);
+        var rowsOld = Pick(os, oe, s.Frames);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (bestN, _) = await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsNew, s.TopCenters, threads, ct, ex, cache);
+        var (bestO, _) = await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsOld, s.TopCenters, threads, ct, ex, cache);
+        var upIds = head.Uploads.Select(u => u.Id).ToList();
+        IReadOnlyList<GroupCopy> Copies(string g) => groupMembers[g].Where(m => m.Upload != id).Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration ?? DurationOf(m.Upload))).ToList();
+        PreCheckAnalysis Build(FrameBest?[] best, int n, List<float[]> rows)
+        {
+            var hits = new List<FrameHit>();
+            for (int i = 0; i < best.Length; i++) if (best[i] is { } b && b.Cosine >= s.Tau && b.Upload >= 0 && b.Upload < upIds.Count && upIds[b.Upload] != id) hits.Add(new FrameHit(i, upIds[b.Upload], b.Time, b.Cosine));
+            var ug = hits.Select(x => x.Upload).Distinct(StringComparer.Ordinal).ToDictionary(u => u, u => GroupOf(u), StringComparer.Ordinal);
+            var gm = ug.Values.Where(g => g != null).Distinct().ToDictionary(g => g!, g => Copies(g!), StringComparer.Ordinal);
+            var (matches, noHit) = PreCheckSearch.Shares(head, best, s.Tau); matches = matches.Where(m => m.Upload != id).ToList();
+            for (int i = 0; i < matches.Count; i++) { var m = matches[i]; matches[i] = m with { Duration = DurationOf(m.Upload) ?? (GroupOf(m.Upload) is { } mg ? groupMembers[mg].FirstOrDefault(x => x.Upload == m.Upload)?.Duration : null), SpeechLanguage = head.Catalog?.Find(m.Upload)?.SpeechLanguage, Dubbed = head.Catalog?.Find(m.Upload)?.Dubbed }; }
+            return new PreCheckAnalysis(null, head.Version, n, noHit, matches, AiProbe.Default.Score(rows.ToArray()), new Dictionary<string, double>()) { Hits = hits, UploadGroups = ug, GroupMembers = gm };
+        }
+        var anOld = Build(bestO, rowsOld.Count, rowsOld);
+        anOld = anOld with { Group = DramaGroups.Propose(anOld, os, oe - os, s) };
+        var anNew = Build(bestN, rowsNew.Count, rowsNew);
+        var segs = await PreCheckAnalyzer.SegmentsAsync(store, paths, info, bestN, upIds, anNew.UploadGroups.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal), anNew.GroupMembers.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal), id, rowsNew.ToArray(), s, threads, new Dictionary<string, double>(), ct);
+        // every upload a segment matched needs its group known (a member the lookup did not list but a direct check found)
+        var ugAll = new Dictionary<string, string?>(anNew.UploadGroups, StringComparer.Ordinal); var gmAll = new Dictionary<string, IReadOnlyList<GroupCopy>>(anNew.GroupMembers, StringComparer.Ordinal);
+        foreach (var u in segs.SelectMany(x => x.Shares.Keys).Distinct()) { var g = GroupOf(u); ugAll[u] = g; if (g != null && !gmAll.ContainsKey(g)) gmAll[g] = Copies(g); }
+        anNew = anNew with { Segments = segs, UploadGroups = ugAll, GroupMembers = gmAll };
+        var segInfoW = wins.Select(w => new SampleSegment("", w.Start, w.End, w.Position)).ToList();
+        anNew = anNew with { Group = PreCheckStage.ProposeGroup(anNew, segInfoW, s) };
+        var oldD = PreCheck.DecideSingle(anOld, duration, _ => null, s);
+        if (oldD.Decision == PreCheckDecision.Partial) oldD = oldD with { Decision = PreCheckDecision.Overlap };   // the retired word, written as it would be today
+        var newD = PreCheck.Decide(anNew, duration, _ => null, s);
+        double lookupSecs = sw.Elapsed.TotalSeconds;
         var grp = (vj?.Root["grouping"] as JsonObject); var gp = GroupProposal.FromJson(grp?["proposal"] as JsonObject);
-        JsonObject Dec(PreCheckDecision d) => new() { ["decision"] = d.Decision, ["reasons"] = new JsonArray(d.Reasons.Select(r => (JsonNode?)r).ToArray()) };
+        JsonObject Dec(PreCheckDecision d) => new() { ["decision"] = d.Decision, ["reasons"] = new JsonArray(d.Reasons.Select(r => (JsonNode?)r).ToArray()), ["member"] = d.MatchedMember ?? d.Match?.Upload };
+        double aiOld = anOld.AiScore, aiNew = anNew.AiScore; bool fOld = aiOld >= s.AiFlag, fNew = aiNew >= s.AiFlag;
         var o = new JsonObject
         {
-            ["id"] = id, ["duration"] = Math.Round(duration, 2), ["sampleFrames"] = rowsQ.Count, ["window"] = new JsonArray((JsonNode?)Math.Round(start, 1), Math.Round(end, 1)),
-            ["top"] = top?.Upload, ["group"] = top == null ? null : GroupOf(top.Upload), ["share"] = top == null ? null : Math.Round(top.Share, 4), ["bestCosine"] = top == null ? null : Math.Round(top.BestCosine, 4), ["matchedDuration"] = top?.Duration,
-            ["longest"] = longest == null ? null : new JsonObject { ["id"] = longest.Value.Id, ["duration"] = Math.Round(longest.Value.Duration, 2) },
+            ["id"] = id, ["duration"] = Math.Round(duration, 2), ["sampleFrames"] = rowsNew.Count, ["oldFrames"] = rowsOld.Count,
+            ["window"] = new JsonArray((JsonNode?)Math.Round(os, 1), Math.Round(oe, 1)),
+            ["segments"] = new JsonArray(segs.Select(x => (JsonNode?)new JsonObject { ["position"] = x.Position, ["start"] = Math.Round(x.Start, 1), ["end"] = Math.Round(x.End, 1), ["frames"] = x.Frames, ["top"] = new JsonObject(x.Shares.OrderByDescending(kv => kv.Value.Share).Take(3).Select(kv => KeyValuePair.Create(kv.Key, (JsonNode?)new JsonObject { ["share"] = Math.Round(kv.Value.Share, 3), ["time"] = Math.Round(kv.Value.MedianTime, 1) }))) }).ToArray()),
             ["old"] = Dec(oldD), ["new"] = Dec(newD),
+            ["membersChecked"] = new JsonArray(newD.Checked.Select(c => (JsonNode?)new JsonObject { ["member"] = c.Member, ["group"] = c.Group, ["duration"] = c.Duration, ["shares"] = new JsonArray(c.Shares.Select(x => (JsonNode?)Math.Round(x, 3)).ToArray()), ["times"] = new JsonArray(c.Times.Select(x => (JsonNode?)(x == null ? null : Math.Round(x.Value, 1))).ToArray()), ["passed"] = c.Passed, ["reason"] = c.Reason }).ToArray()),
+            ["ai"] = new JsonObject { ["old"] = Math.Round(aiOld, 4), ["new"] = Math.Round(aiNew, 4), ["oldFlag"] = fOld, ["newFlag"] = fNew, ["changed"] = fOld != fNew },
             ["groupStep"] = grp == null ? null : new JsonObject { ["kind"] = gp?.Kind, ["joinUpload"] = gp?.JoinUpload, ["sampled"] = grp["sampled"]?.DeepClone(), ["sampleCovered"] = grp["sampleCovered"]?.DeepClone(), ["covered"] = grp["covered"]?.DeepClone(), ["coveredShare"] = grp["coveredShare"]?.DeepClone() },
+            ["lookupSeconds"] = Math.Round(lookupSecs, 2),
         };
-        o["new"]!["longerThanL"] = longerThanL;
+        if (PreCheckDecision.IsSkip(newD.Decision))
+        {
+            var kind = gp?.Kind; double? cov = (double?)grp?["coveredShare"];
+            if (kind is "new" or "mixed" || cov is < 0.5)
+            {
+                var chk = newD.Checked.FirstOrDefault(c => c.Passed);
+                o["possibleFalseSkip"] = new JsonObject { ["id"] = id, ["decision"] = newD.Decision, ["member"] = newD.MatchedMember, ["duration"] = Math.Round(duration, 1), ["memberDuration"] = chk?.Duration, ["shares"] = chk == null ? null : new JsonArray(chk.Shares.Select(x => (JsonNode?)Math.Round(x, 3)).ToArray()), ["times"] = chk == null ? null : new JsonArray(chk.Times.Select(x => (JsonNode?)(x == null ? null : Math.Round(x.Value, 1))).ToArray()), ["groupStepKind"] = kind, ["coveredShare"] = cov };
+            }
+        }
         return o;
     }
 }

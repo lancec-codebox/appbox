@@ -30,6 +30,8 @@ public sealed class JobContext
     public string? NextDue { get; set; }
     /// <summary>0.13.14 (group step): the join its grouping record holds, put on the step's done line.</summary>
     public string? GroupJoin { get; set; }
+    /// <summary>0.13.15 (group step): the node's frames-file set (the gate's), so membership never lists the store.</summary>
+    public IReadOnlySet<string>? Frames { get; init; }
     public string? GroupJoinKind { get; set; }
 }
 

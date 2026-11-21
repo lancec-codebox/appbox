@@ -14,6 +14,7 @@ public sealed class GroupDedup(IStore store, string? cacheDir = null)
     // and only for a drama in neither place from its video.json grouping record, which is then kept for good (memory + an append file in the cache directory). Nothing here expires.
     readonly ConcurrentDictionary<string, string?> parents = new(StringComparer.Ordinal);   // id -> the upload its grouping record joins (null: it is new / mixed / none)
     readonly ConcurrentDictionary<int, Lazy<Task<GroupSet?>>> groupFiles = new();   // index version -> the groups file (null: none)
+    readonly ConcurrentDictionary<string, string> noRecord = new(StringComparer.Ordinal);   // id -> the queue LastAt when its video.json had no grouping record
     readonly object fileGate = new(); bool loaded;
     string? Dir => cacheDir ?? FramesCache.Current?.Dir;
 
@@ -69,7 +70,7 @@ public sealed class GroupDedup(IStore store, string? cacheDir = null)
     }
 
     /// <summary>The ids of the earlier members of the group the join target belongs to, lowest seq first (the target included). <paramref name="earlierSeq"/>: the seq of every earlier drama (null seq counts as earlier, as in the group step). <paramref name="queueJoin"/>: the queue state's record of a drama's join (null: not recorded).</summary>
-    public async Task<Membership> SetAsync(Paths paths, string target, IReadOnlyDictionary<string, long?> earlierSeq, Func<string, (string? Join, string? Kind)?> queueJoin, GroupSet? known, CancellationToken ct)
+    public async Task<Membership> SetAsync(Paths paths, string target, IReadOnlyDictionary<string, long?> earlierSeq, Func<string, (string? Join, string? Kind)?> queueJoin, GroupSet? known, CancellationToken ct, Func<string, string?>? queueStamp = null)
     {
         LoadJoins();
         int fq = 0, fg = 0, fc = 0, reads = 0;
@@ -86,9 +87,12 @@ public sealed class GroupDedup(IStore store, string? cacheDir = null)
             if (queueJoin(x) is { Kind: not null } qj) { Interlocked.Increment(ref fq); return qj.Kind == GroupProposal.JoinKind ? qj.Join : null; }
             if (parents.TryGetValue(x, out var c)) { Interlocked.Increment(ref fc); return c; }
             if (inGroups.TryGetValue(x, out var jt)) { Interlocked.Increment(ref fg); return jt; }
+            // a confirmed "no record" (its group step has not run) is remembered until a queue line for the drama arrives (its LastAt changes)
+            var stamp = queueStamp?.Invoke(x) ?? "";
+            if (noRecord.TryGetValue(x, out var ns) && ns == stamp) { Interlocked.Increment(ref fc); return null; }
             Interlocked.Increment(ref reads);
             var (found, join) = await ReadAsync(paths, x, ct);
-            if (found) Remember(x, join);
+            if (found) Remember(x, join); else noRecord[x] = stamp;
             return join;
         }
         async Task<string> RootAsync(string x) { var seen = new HashSet<string>(StringComparer.Ordinal) { x }; while (await ParentAsync(x) is { } up && seen.Add(up)) x = up; return x; }

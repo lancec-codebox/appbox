@@ -150,15 +150,64 @@ public class DescribeShapeTests
         Assert.Equal("supporting", (string)Describe.Normalize(g, In())["cast"]![2]!["role"]!);
     }
 
+    /// <summary>0.13.15 fixture: leads 0 (200 s) and 1 (100 s); the default floor is 0.10 x 100 = 10 s. Clusters 2.. are "main" in the model's reply.</summary>
+    static (JsonArray Cast, DescribeInput D) Mains(params (int Id, double Secs, string Name)[] mains)
+    {
+        var cl = new List<MainCluster> { new(0, 200, 5, false), new(1, 100, 9, false) }; cl.AddRange(mains.Select(m => new MainCluster(m.Id, m.Secs, 12, false)));
+        var cast = new JsonArray(new JsonObject { ["cluster"] = 0, ["role"] = "female lead", ["label"] = new JsonObject { ["en"] = "Lin" } }, new JsonObject { ["cluster"] = 1, ["role"] = "male lead", ["label"] = new JsonObject { ["en"] = "Hao" } });
+        foreach (var m in mains) cast.Add(new JsonObject { ["cluster"] = m.Id, ["role"] = "main", ["label"] = new JsonObject { ["en"] = m.Name } });
+        return (cast, new DescribeInput { Title = "t", Duration = 600, Clusters = cl });
+    }
+
+    [Fact]
+    public void The_main_gate_defaults_to_ten_percent_and_a_villain_named_in_the_title_teaser_or_synopsis_stays_main()
+    {
+        Assert.Equal(0.10, Describe.MainMinScreen); Assert.Equal(6, Describe.MainMax);
+        // 3: the scumbag Gu, 4 s of face time (< 10 s floor) but named in the teaser; 4: a shop manager, 4 s, named nowhere; 5: 12 s (above the 10 s floor)
+        var (cast, d) = Mains((3, 4, "Gu Chen"), (4, 4, "Shop Manager"), (5, 12, "Friend"));
+        Describe.DemoteLowScreenMains(cast, d, null, ["Reborn as the Villainess", "She vows to marry the prince. Gu schemes against her.", "Everything."]);
+        Assert.Equal("main", (string)cast[2]!["role"]!); Assert.False(((JsonObject)cast[2]!).ContainsKey("demoted"));           // named: stays main with 4 s
+        Assert.Equal("supporting", (string)cast[3]!["role"]!); Assert.Equal("screen time", (string)cast[3]!["demoted"]!);        // not named, under the floor
+        Assert.Equal("main", (string)cast[4]!["role"]!);                                                                          // enough face time
+        // named in the TITLE or the SYNOPSIS counts too; the match is on whole words
+        var (c2, d2) = Mains((3, 4, "Gu Chen"), (4, 4, "Mei"));
+        Describe.DemoteLowScreenMains(c2, d2, null, ["Gu and the Crown", null, "Meiling appears."]);
+        Assert.Equal("main", (string)c2[2]!["role"]!); Assert.Equal("supporting", (string)c2[3]!["role"]!);   // "Mei" is not the word "Meiling"
+        Assert.True(Describe.NamedIn("Gu Chen", "the scumbag Chen")); Assert.False(Describe.NamedIn("Al", "Alan")); Assert.False(Describe.NamedIn(null, "x"));
+        // through Normalize: the reply's own title/teaser/synopsis are the named texts
+        var r = JsonNode.Parse(Reply.Replace("\"cluster\":3,\"role\":\"main\"", "\"cluster\":3,\"role\":\"main\"").Replace("\"label\":{\"en\":\"Friend\"}", "\"label\":{\"en\":\"Gu\"}"))!.AsObject();
+        var dd = new DescribeInput { Title = "t", Duration = 600, Clusters = [new(0, 100, 5, false), new(1, 80, 9, false), new(2, 60, 12, false), new(3, 1, 14, false)] };
+        var n = Describe.Normalize(r, dd);
+        Assert.Equal("main", (string)n["cast"]![3]!["role"]!);   // 1 s of face time, but "Gu" is in the teaser ("The villain Gu schemes.")
+    }
+
+    [Fact]
+    public void At_most_six_main_remain_and_the_seventh_is_demoted_keeping_the_most_face_time()
+    {
+        var (cast, d) = Mains((2, 90, "A"), (3, 80, "B"), (4, 70, "C"), (5, 60, "D"), (6, 50, "E"), (7, 40, "F"), (8, 30, "G"), (9, 20, "H"));   // 8 mains, all above the floor
+        Describe.DemoteLowScreenMains(cast, d);
+        var mains = cast.OfType<JsonObject>().Where(c => (string)c["role"]! == "main").Select(c => (int)c["cluster"]!).ToList();
+        Assert.Equal([2, 3, 4, 5, 6, 7], mains);                                            // six remain: the most face time
+        Assert.Equal("main limit", (string)cast[8]!["demoted"]!); Assert.Equal("supporting", (string)cast[8]!["role"]!);   // G, the 7th by face time
+        Assert.Equal("main limit", (string)cast[9]!["demoted"]!);
+        Assert.Equal("female lead", (string)cast[0]!["role"]!);                                  // leads are not counted or touched
+        var (c2, d2) = Mains((2, 90, "A"), (3, 80, "B"), (4, 70, "C")); Describe.DemoteLowScreenMains(c2, d2, null, null, 2);   // the limit is a setting
+        Assert.Equal(2, c2.OfType<JsonObject>().Count(c => (string)c["role"]! == "main"));
+        // a named character below the floor still counts toward the limit and goes last
+        var (c3, d3) = Mains((2, 90, "A"), (3, 80, "B"), (4, 3, "Gu")); Describe.DemoteLowScreenMains(c3, d3, null, ["Gu"], 2);
+        Assert.Equal("main limit", (string)c3[4]!["demoted"]!);
+    }
+
     // clusters: 0 = 100 s, 1 = 80 s (the lower lead), 2 = 60 s, 3 = 50 s; floor = 0.25 x 80 = 20 s
     [Fact]
     public void A_low_screen_time_main_is_demoted_and_a_high_one_is_kept()
     {
         var d = new DescribeInput { Title = "t", Duration = 600, Clusters = [new(0, 100, 5, false), new(1, 80, 9, false), new(2, 60, 12, false), new(3, 10, 14, false)] };
         var r = JsonNode.Parse(Reply.Replace("\"cluster\":2,\"role\":\"supporting\"", "\"cluster\":2,\"role\":\"main\"")).AsObject();   // 2: main with 60 s; 3: main with 10 s
-        var n = Describe.Normalize(r, d);
+        var n = Describe.Normalize(r, d);   // 3: 10 s, floor 0.10 x 80 = 8 s: kept now (it was demoted at 0.25)
         Assert.Equal("main", (string)n["cast"]![2]!["role"]!); Assert.False(((JsonObject)n["cast"]![2]!).ContainsKey("demoted"));
-        Assert.Equal("supporting", (string)n["cast"]![3]!["role"]!); Assert.Equal("screen time", (string)n["cast"]![3]!["demoted"]!);
+        var strict = JsonNode.Parse(r.ToJsonString())!.AsObject(); var cs = new JsonArray(strict["cast"]!.AsArray().Select(x => JsonNode.Parse(x!.ToJsonString())).ToArray()); Describe.DemoteLowScreenMains(cs, d, 0.25);
+        Assert.Equal("supporting", (string)cs[3]!["role"]!); Assert.Equal("screen time", (string)cs[3]!["demoted"]!);
         var j = new JsonArray(new JsonObject { ["cluster"] = 0, ["role"] = "male lead" }, new JsonObject { ["cluster"] = 3, ["role"] = "main" });
         Describe.DemoteLowScreenMains(j, d, 0.05); Assert.Equal("main", (string)j[1]!["role"]!);   // 10 s >= 0.05 x 100 s: the factor is a setting
     }

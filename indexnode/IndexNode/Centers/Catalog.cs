@@ -14,7 +14,7 @@ public sealed record CatalogAi(double? Score, bool? Flag);
 public sealed record CatalogUpload(string Id, double? DurationSeconds, string? Title, string? Channel, string? SpeechLanguage, bool? Dubbed, CatalogAi? Ai,
     string? GroupId, bool Canonical, bool Mixed, double? GroupOffset, string State,
     string? CheckedBy = null, string? Held = null, string? Decision = null, string? MatchUpload = null, double? MatchShare = null, double? MatchOffset = null, double? MatchCosine = null,
-    string? Data = null);
+    string? Data = null, double? GroupDuration = null, double? MemberCovered = null, double? CanonicalCovered = null, string? RelationKind = null);
 
 /// <summary>Per-group section: empty in 0.13.1.</summary>
 public sealed record CatalogGroup(string Id, string? Canonical, IReadOnlyList<string> Members);
@@ -37,7 +37,7 @@ public sealed class Catalog
     {
         var m = new Dictionary<string, (string G, GroupMember M, DramaGroup D)>(StringComparer.Ordinal);
         foreach (var g in set.Groups) foreach (var x in g.Members) m[x.Upload] = (g.Id, x, g);
-        Uploads = Uploads.Select(u => m.TryGetValue(u.Id, out var e) ? u with { GroupId = e.G, Canonical = e.D.Canonical == u.Id, Mixed = e.M.Mixed, GroupOffset = e.M.Offset } : u).ToList();
+        Uploads = Uploads.Select(u => m.TryGetValue(u.Id, out var e) ? u with { GroupId = e.G, Canonical = e.D.Canonical == u.Id, Mixed = e.M.Mixed, GroupOffset = e.M.Offset, GroupDuration = e.M.Duration ?? u.DurationSeconds, MemberCovered = e.M.MemberCovered, CanonicalCovered = e.M.CanonicalCovered, RelationKind = e.M.Kind } : u).ToList();
         Groups = set.Groups.Select(g => new CatalogGroup(g.Id, g.Canonical, g.Members.Select(x => x.Upload).ToList())).ToList();
         by = null;
     }
@@ -120,7 +120,7 @@ public static class CatalogBuild
             }
             if (state == Catalog.MetadataOnly && !pc.Exists) return;   // downloaded, not pre-checked yet (and not indexed): not in the catalog
             string? held = null;
-            if (state == Catalog.MetadataOnly && pc.AiFlag == true && pc.Decision != PreCheckDecision.Duplicate) held = Catalog.HeldAi;   // the AI hold: short-circuited, not processed (yet); state stays metadata-only
+            if (state == Catalog.MetadataOnly && pc.AiFlag == true && !PreCheckDecision.IsSkip(pc.Decision)) held = Catalog.HeldAi;   // the AI hold: short-circuited, not processed (yet); state stays metadata-only
             var dur = pc.Duration;
             string? lang = pc.Language ?? lang0; bool? dub = pc.Language != null ? pc.Dubbed : dub0;
             double? score = pc.AiScore; bool? flag = pc.AiFlag;

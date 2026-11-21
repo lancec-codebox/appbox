@@ -34,6 +34,9 @@ public sealed class NodeConfig
     public YtDlpConfig? Ytdlp { get; set; }
     /// <summary>0.12.0 download pre-check (config keys precheck.*): sample, duplicate lookup, AI flag. Null = defaults.</summary>
     public PreCheckSettings? PreCheck { get; set; }
+    /// <summary>0.13.15 (config describe.main-min-screen / describe.main-max): the main-cast gate; null = 0.10 and 6 (the env INDEXNODE_DESCRIBE_MAIN_MIN_SCREEN / _MAIN_MAX override).</summary>
+    public double? DescribeMainMinScreen { get; set; }
+    public int? DescribeMainMax { get; set; }
     /// <summary>0.13.1 (config key search.keep-versions): how many search-index versions to keep behind the head. Null = 3.</summary>
     public SearchSettings? Search { get; set; }
 
@@ -72,6 +75,7 @@ public sealed class NodeConfig
         var envSas = Environment.GetEnvironmentVariable("INDEXNODE_SAS_URL");
         if (!string.IsNullOrWhiteSpace(envSas)) c.Sas = envSas.Trim();
         SearchData.Configure(c.Search?.ScanMode, c.Search?.ScanRerank);
+        Describe.ConfigMainMinScreen = c.DescribeMainMinScreen; Describe.ConfigMainMax = c.DescribeMainMax;
         Redact.Register(c.Ai?.Key);
         Redact.Register(Environment.GetEnvironmentVariable("INDEXNODE_AI_KEY"));
         return c;

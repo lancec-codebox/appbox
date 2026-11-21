@@ -42,6 +42,52 @@ public sealed class GroupMember
     public string? JoinedThrough { get; set; }
     /// <summary>"index": placed by the index build's full check; "precheck": a short-circuited upload placed from its pre-check record (replaced by a full check once it is processed).</summary>
     public string? CheckedBy { get; set; }
+    /// <summary>0.13.15, the member's relation to the group's canonical (written by the index job's fold from the drama's grouping record): the share of its own frames the group covers, the share of the canonical's timeline it spans, and the kind (copy / cut / part / longer / mixed).</summary>
+    public double? MemberCovered { get; set; }
+    public double? CanonicalCovered { get; set; }
+    public string? Kind { get; set; }
+    /// <summary>Transient (never serialized): the stretches of the grouping record this build folded, for <see cref="GroupRelation"/>.</summary>
+    public IReadOnlyList<RelStretch>? Stretches { get; set; }
+    public double? CoveredShare { get; set; }
+}
+
+/// <summary>One covered run of a member (own seconds [From, To]) matched in <see cref="Source"/> at <see cref="Offset"/> (source time - own time).</summary>
+public sealed record RelStretch(double From, double To, string Source, double Offset);
+
+/// <summary>
+/// 0.13.15: how a member relates to its group's canonical, derived from numbers the group step already measured.
+/// memberCovered = the share of the member's frames the group covers (its grouping record). canonicalCovered = the union of the member's stretches mapped onto the canonical's clock
+/// (own time + the stretch's offset in its source + that source's offset to the canonical; the canonical's own stretches map by their offset) divided by the canonical's duration.
+/// Kinds: mixed (a mixed cut, as before); copy = both >= <see cref="Threshold"/> and the durations within the duplicate window; longer = canonicalCovered >= 0.8 and memberCovered &lt; 0.8;
+/// part = memberCovered >= 0.8, canonicalCovered &lt; 0.8 and ONE contiguous span on the canonical clock; cut = the same with several (scattered) spans; anything else stays mixed.
+/// </summary>
+public static class GroupRelation
+{
+    public const double Threshold = 0.8;
+
+    /// <summary>The union of the mapped intervals on the canonical clock, runs closer than <paramref name="gap"/> seconds merged (one contiguous span), clipped to [0, canonicalDuration].</summary>
+    public static List<(double From, double To)> Spans(IEnumerable<(double From, double To)> mapped, double canonicalDuration, double gap)
+    {
+        var iv = mapped.Select(x => (From: Math.Max(0, Math.Min(x.From, x.To)), To: Math.Min(canonicalDuration, Math.Max(x.From, x.To)))).Where(x => x.To > x.From).OrderBy(x => x.From).ToList();
+        var res = new List<(double From, double To)>();
+        foreach (var x in iv) { if (res.Count > 0 && x.From <= res[^1].To + gap) res[^1] = (res[^1].From, Math.Max(res[^1].To, x.To)); else res.Add(x); }
+        return res;
+    }
+
+    public static (double? CanonicalCovered, string? Kind, int Spans) Derive(bool mixed, double? memberCovered, double memberDuration, double canonicalDuration, IEnumerable<(double From, double To)> mappedStretches, PreCheckSettings s)
+    {
+        if (mixed) return (null, "mixed", 0);
+        if (memberCovered == null || canonicalDuration <= 0) return (null, null, 0);
+        var spans = Spans(mappedStretches, canonicalDuration, s.OffsetTolerance);
+        double cc = Math.Min(1, spans.Sum(x => x.To - x.From) / canonicalDuration);
+        double lo = canonicalDuration - s.DurationPercent * canonicalDuration, hi = canonicalDuration + Math.Max(s.DurationSlackPercent * canonicalDuration, s.DurationSlackSeconds);
+        bool mem = memberCovered >= Threshold, can = cc >= Threshold;
+        string kind = mem && can && memberDuration >= lo && memberDuration <= hi ? "copy"
+            : can && !mem ? "longer"
+            : mem && !can ? (spans.Count <= 1 ? "part" : "cut")
+            : "mixed";
+        return (Math.Round(cc, 4), kind, spans.Count);
+    }
 }
 
 public sealed class DramaGroup
@@ -53,7 +99,12 @@ public sealed class DramaGroup
 }
 
 /// <summary>What the index job knows of an upload it has not placed yet: its record's proposal plus the facts the election needs.</summary>
-public sealed record NewUpload(string Id, string? SpeechLanguage, bool? Dubbed, double? Duration, string? ProcessedAt, GroupProposal? Proposal, bool ShortCircuit = false);
+public sealed record NewUpload(string Id, string? SpeechLanguage, bool? Dubbed, double? Duration, string? ProcessedAt, GroupProposal? Proposal, bool ShortCircuit = false)
+{
+    /// <summary>0.13.15: from the drama's grouping record: the share of its frames the group covers and its covered runs (null: no record, or a short-circuited upload).</summary>
+    public double? CoveredShare { get; init; }
+    public IReadOnlyList<RelStretch>? Stretches { get; init; }
+}
 
 /// <summary>The group table: pure logic (proposal from per-frame matches, election, applying proposals at an index build, union for the one-time build) plus its JSON.</summary>
 public sealed class GroupSet
@@ -100,7 +151,7 @@ public sealed class GroupSet
         if (refresh != null) foreach (var g in Groups) foreach (var m in g.Members) if (refresh(m.Upload) is { } r) { m.SpeechLanguage = r.Lang; m.Dubbed = r.Dubbed; m.Duration = r.Duration ?? m.Duration; }
         var of = GroupOf(); var pending = news.Where(n => !of.ContainsKey(n.Id)).OrderBy(n => n.ProcessedAt ?? "\uffff", StringComparer.Ordinal).ThenBy(n => n.Id, StringComparer.Ordinal).ToList();
         var ids = pending.Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
-        GroupMember Mem(NewUpload n, bool mixed) => new() { Upload = n.Id, Offset = n.Proposal?.Offset, MatchShare = n.Proposal?.MatchShare ?? 0, DupShare = n.Proposal?.DupShare ?? 0, SpeechLanguage = n.SpeechLanguage, Dubbed = n.Dubbed, Mixed = mixed, Duration = n.Duration, ProcessedAt = n.ProcessedAt, JoinedThrough = n.Proposal?.JoinUpload, CheckedBy = n.ShortCircuit ? "precheck" : "index" };
+        GroupMember Mem(NewUpload n, bool mixed) => new() { Upload = n.Id, Offset = n.Proposal?.Offset, MatchShare = n.Proposal?.MatchShare ?? 0, DupShare = n.Proposal?.DupShare ?? 0, SpeechLanguage = n.SpeechLanguage, Dubbed = n.Dubbed, Mixed = mixed, Duration = n.Duration, CoveredShare = n.CoveredShare, Stretches = n.Stretches, ProcessedAt = n.ProcessedAt, JoinedThrough = n.Proposal?.JoinUpload, CheckedBy = n.ShortCircuit ? "precheck" : "index" };
         void Own(NewUpload n) { var g = new DramaGroup { Id = "g-" + n.Id, Members = [Mem(n, n.Proposal?.Mixed == true || n.Proposal?.Kind == GroupProposal.MixedKind)] }; Groups.Add(g); of[n.Id] = g.Id; }
         bool progress = true;
         while (pending.Count > 0 && progress)
@@ -133,6 +184,35 @@ public sealed class GroupSet
         ElectAll();
     }
 
+    /// <summary>
+    /// 0.13.15: fills memberCovered / canonicalCovered / kind of every member that has a grouping record's numbers (a member folded earlier keeps its stored ones). The canonical clock: a stretch of a member covers its own [From, To] mapped to its source's time
+    /// (+ the stretch offset), and from the source onto the canonical (+ the source's own offset to the canonical, followed along the chain up to <c>maxHops</c> hops); a stretch whose source is not in the group counts as not mapped.
+    /// </summary>
+    public void Relate(PreCheckSettings s, int maxHops = 8)
+    {
+        foreach (var g in Groups)
+        {
+            var canon = g.Members.FirstOrDefault(m => m.Upload == g.Canonical);
+            var by = g.Members.ToDictionary(m => m.Upload, StringComparer.Ordinal);
+            // offset of a member to the canonical clock: canonical time = own time + OffsetToCanon(member)
+            double? ToCanon(string up, int hops)
+            {
+                if (up == g.Canonical) return 0;
+                if (hops > maxHops || !by.TryGetValue(up, out var m) || m.Offset == null) return null;
+                return m.Offset.Value + (m.JoinedThrough != null && m.JoinedThrough != g.Canonical && m.JoinedThrough != up && by.ContainsKey(m.JoinedThrough) ? ToCanon(m.JoinedThrough, hops + 1) ?? 0 : 0);
+            }
+            foreach (var m in g.Members)
+            {
+                if (g.Canonical == null || canon?.Duration is not { } cd) { if (m.Mixed) m.Kind = "mixed"; continue; }
+                if (m.Upload == g.Canonical) { m.MemberCovered ??= 1; m.CanonicalCovered = 1; m.Kind = "copy"; continue; }
+                if (m.Stretches == null) { if (m.Mixed) m.Kind = "mixed"; continue; }
+                var mapped = m.Stretches.Select(x => (From: x.From + x.Offset + (ToCanon(x.Source, 0) ?? 0), To: x.To + x.Offset + (ToCanon(x.Source, 0) ?? 0)));
+                var (cc, kind, _) = GroupRelation.Derive(m.Mixed, m.CoveredShare ?? m.MemberCovered, m.Duration ?? 0, cd, mapped, s);
+                m.MemberCovered = m.CoveredShare ?? m.MemberCovered; m.CanonicalCovered = cc; m.Kind = kind;
+            }
+        }
+    }
+
     /// <summary>Connected components of the links (the one-time build). Every id in <paramref name="ids"/> is in exactly one component.</summary>
     public static List<List<string>> Components(IEnumerable<string> ids, IEnumerable<(string A, string B)> links)
     {
@@ -152,6 +232,7 @@ public sealed class GroupSet
             {
                 ["upload"] = m.Upload, ["offset"] = m.Offset == null ? null : Math.Round(m.Offset.Value, 2), ["matchShare"] = Math.Round(m.MatchShare, 4), ["dupShare"] = Math.Round(m.DupShare, 4), ["speechLanguage"] = m.SpeechLanguage, ["dubbed"] = m.Dubbed,
                 ["mixed"] = m.Mixed, ["duration"] = m.Duration, ["processedAt"] = m.ProcessedAt, ["joinedThrough"] = m.JoinedThrough, ["checkedBy"] = m.CheckedBy,
+                ["memberCovered"] = m.MemberCovered == null ? null : Math.Round(m.MemberCovered.Value, 4), ["canonicalCovered"] = m.CanonicalCovered == null ? null : Math.Round(m.CanonicalCovered.Value, 4), ["kind"] = m.Kind,
             }).ToArray()),
         }).ToArray()),
     };
@@ -162,7 +243,7 @@ public sealed class GroupSet
         Groups = (o["groups"] as JsonArray ?? []).OfType<JsonObject>().Select(g => new DramaGroup
         {
             Id = (string)g["id"]!, Canonical = (string?)g["canonical"], CanonicalWhy = (string?)g["canonicalWhy"],
-            Members = (g["members"] as JsonArray ?? []).OfType<JsonObject>().Select(m => new GroupMember { Upload = (string)m["upload"]!, Offset = (double?)m["offset"], MatchShare = (double?)m["matchShare"] ?? 0, DupShare = (double?)m["dupShare"] ?? 0, SpeechLanguage = (string?)m["speechLanguage"], Dubbed = (bool?)m["dubbed"], Mixed = (bool?)m["mixed"] ?? false, Duration = (double?)m["duration"], ProcessedAt = (string?)m["processedAt"], JoinedThrough = (string?)m["joinedThrough"], CheckedBy = (string?)m["checkedBy"] }).ToList(),
+            Members = (g["members"] as JsonArray ?? []).OfType<JsonObject>().Select(m => new GroupMember { Upload = (string)m["upload"]!, Offset = (double?)m["offset"], MatchShare = (double?)m["matchShare"] ?? 0, DupShare = (double?)m["dupShare"] ?? 0, SpeechLanguage = (string?)m["speechLanguage"], Dubbed = (bool?)m["dubbed"], Mixed = (bool?)m["mixed"] ?? false, Duration = (double?)m["duration"], ProcessedAt = (string?)m["processedAt"], JoinedThrough = (string?)m["joinedThrough"], CheckedBy = (string?)m["checkedBy"], MemberCovered = (double?)m["memberCovered"], CanonicalCovered = (double?)m["canonicalCovered"], Kind = (string?)m["kind"] }).ToList(),
         }).ToList(),
     };
 }

@@ -117,7 +117,7 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
     /// The analysis proper, on frames already extracted (000000.jpg ... in <paramref name="fdir"/>) and an audio file: bar box (from the frames when not given), SSCD, lookup, AI probe, language ID.
     /// The service runs exactly this on what a node sent; the in-process path runs it on the sample it just extracted.
     /// </summary>
-    public async Task<PreCheckAnalysis> AnalyzeFramesAsync(string fdir, int count, BarCrop? box, string? audioPath, PreCheckSettings s, int threads, Action<string> progress, Dictionary<string, double> secs, string? excludeId, CancellationToken ct)
+    public async Task<PreCheckAnalysis> AnalyzeFramesAsync(string fdir, int count, BarCrop? box, string? audioPath, PreCheckSettings s, int threads, Action<string> progress, Dictionary<string, double> secs, string? excludeId, CancellationToken ct, IReadOnlyList<SegInfo>? segInfo = null)
     {
         var idx = await cache.GetAsync(store, paths, ct);
         if (idx == null) return PreCheckAnalysis.Skipped("no search index");
@@ -165,9 +165,106 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         double ai = AiProbe.Default.Score(rows);
         secs["ai"] = sw.Elapsed.TotalSeconds; sw.Restart();
         SpeechResult? speech = null;
+        IReadOnlyList<PreCheckSegment>? segments = null;
+        if (segInfo != null)
+        {
+            sw.Restart();
+            segments = await SegmentsAsync(store, paths, segInfo, best, upIds, ug, gm, excludeId, rows, s, threads, secs, ct);
+            secs["members"] = sw.Elapsed.TotalSeconds; sw.Restart();
+        }
         if (audioPath != null) { progress("language"); speech = await SpeechAsync(audioPath, threads, s.LanguageSeconds, s.LanguageMinSeconds, ct); secs["speech"] = sw.Elapsed.TotalSeconds; }
-        return new PreCheckAnalysis(null, idx.Version, rows.Length, noHit, matches, ai, secs) { Speech = speech, Excluded = excluded, Hits = hits, UploadGroups = ug, GroupMembers = gm };
+        return new PreCheckAnalysis(null, idx.Version, rows.Length, noHit, matches, ai, secs) { Speech = speech, Excluded = excluded, Hits = hits, UploadGroups = ug, GroupMembers = gm, Segments = segments };
     }
+
+    /// <summary>One sample segment as the analysis sees it (frames are numbered in time order across the segments).</summary>
+    public sealed record SegInfo(double Position, double Start, double End, int Frames);
+
+    /// <summary>
+    /// 0.13.15: per segment and per upload the share of the segment's frames matched at Tau and the median matched time, from the lookup's per-frame best. Every member of every candidate group (a group either segment matched) is then
+    /// measured: a member the lookup already shows at >= SkipShare in every segment keeps those numbers; any other is scored directly from its frames file (through FramesCache: a cached file costs no request), because copies of one drama
+    /// tie in the lookup and a member must never be skipped just because a sibling ranked higher.
+    /// </summary>
+    public static async Task<List<PreCheckSegment>> SegmentsAsync(IStore store, Paths paths, IReadOnlyList<SegInfo> info, FrameBest?[] best, List<string> upIds, Dictionary<string, string?> ug, Dictionary<string, IReadOnlyList<GroupCopy>> gm, string? excludeId, float[][] rows, PreCheckSettings s, int threads, Dictionary<string, double> secs, CancellationToken ct)
+    {
+        var ranges = new List<(int From, int Count)>(); int at = 0; foreach (var si in info) { ranges.Add((at, si.Frames)); at += si.Frames; }
+        static double Median(List<double> v) { v.Sort(); return v.Count == 0 ? 0 : v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2; }
+        var shares = info.Select(_ => new Dictionary<string, SegmentShare>(StringComparer.Ordinal)).ToList();
+        for (int k = 0; k < info.Count; k++)
+        {
+            var by = new Dictionary<string, List<double>>(StringComparer.Ordinal);
+            for (int i = ranges[k].From; i < ranges[k].From + ranges[k].Count && i < best.Length; i++)
+                if (best[i] is { } b && b.Cosine >= s.Tau && b.Upload >= 0 && b.Upload < upIds.Count && upIds[b.Upload] != excludeId) { if (!by.TryGetValue(upIds[b.Upload], out var l)) by[upIds[b.Upload]] = l = []; l.Add(b.Time); }
+            foreach (var (u, l) in by) shares[k][u] = new SegmentShare((double)l.Count / Math.Max(1, ranges[k].Count), Median(l), l.Count);
+        }
+        var members = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var g in shares.SelectMany(x => x.Keys).Select(u => ug.GetValueOrDefault(u)).Where(g => g != null).Distinct()) if (gm.TryGetValue(g!, out var cs)) foreach (var c in cs) members.Add(c.Upload);
+        members.Remove(excludeId ?? "");
+        var todo = members.Where(m => !shares.All(x => x.TryGetValue(m, out var sh) && sh.Share >= s.SkipShare)).ToList();   // every member of every candidate group: no cap
+        int direct = 0;
+        await Parallel.ForEachAsync(todo, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, threads)), CancellationToken = ct }, async (m, c) =>
+        {
+            var res = await DirectSharesAsync(store, paths, m, rows, ranges, s.Tau, c);
+            if (res == null) return;
+            Interlocked.Increment(ref direct);
+            lock (shares) for (int k = 0; k < info.Count; k++) if (res[k].Frames > 0) shares[k][m] = res[k]; else shares[k].Remove(m);
+        });
+        secs["membersDirect"] = direct; secs["membersChecked"] = members.Count;
+        return info.Select((si, k) => new PreCheckSegment(si.Position, si.Start, si.End, si.Frames, shares[k])).ToList();
+    }
+
+    /// <summary>One member's segment shares computed from its own frames file (all of its vectors, exact cosine); null when it has none.</summary>
+    static async Task<SegmentShare[]?> DirectSharesAsync(IStore store, Paths paths, string id, float[][] rows, List<(int From, int Count)> ranges, double tau, CancellationToken ct)
+    {
+        try
+        {
+            var z = await FramesReader.OpenAsync(store, paths.FramesFile(id), ct); if (z == null) return null;
+            var h = await z.ReadHeaderAsync(ct);
+            var blocks = await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, ct);
+            var vs = new List<float[]>(); var ts = new List<float>();
+            foreach (var (_, m) in blocks) { var r = AiProbe.RowsFromF16(m.Vectors); for (int i = 0; i < r.Length && i < m.Times.Length; i++) { Sscd.L2Normalize(r[i]); vs.Add(r[i]); ts.Add(m.Times[i]); } }
+            var bestC = new float[rows.Length]; var bestT = new double[rows.Length];
+            Parallel.For(0, rows.Length, new ParallelOptions { CancellationToken = ct }, i => { float bc = -2; double bt = 0; for (int j = 0; j < vs.Count; j++) { float c = Vec.Dot(rows[i], vs[j]); if (c > bc) { bc = c; bt = ts[j]; } } bestC[i] = bc; bestT[i] = bt; });
+            var res = new SegmentShare[ranges.Count];
+            for (int k = 0; k < ranges.Count; k++)
+            {
+                var l = new List<double>(); for (int i = ranges[k].From; i < ranges[k].From + ranges[k].Count; i++) if (bestC[i] >= tau) l.Add(bestT[i]);
+                l.Sort(); res[k] = new SegmentShare((double)l.Count / Math.Max(1, ranges[k].Count), l.Count == 0 ? 0 : l.Count % 2 == 1 ? l[l.Count / 2] : (l[l.Count / 2 - 1] + l[l.Count / 2]) / 2, l.Count);
+            }
+            return res;
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"pre-check: member {id} not scored ({e.Message})"); return null; }
+    }
+
+    Task<SpeechResult> IPreCheckAnalyzer.SpeechAsync(string samplePath, PreCheckSettings s, int threads, CancellationToken ct) => SpeechAsync(samplePath, threads, s.LanguageSeconds, s.LanguageMinSeconds, ct);
+
+    /// <summary>0.13.15: the segments' frames (each decoded and subsampled to its share of precheck.frames), ONE SSCD batch over all of them, one lookup, per-segment shares and member checks. No language ID (the stage asks for it only when it can change the decision).</summary>
+    public async Task<PreCheckAnalysis> AnalyzeSegmentsAsync(IReadOnlyList<SampleSegment> segments, PreCheckSettings s, int threads, Action<string> progress, CancellationToken ct)
+    {
+        if (await cache.GetAsync(store, paths, ct) == null) return PreCheckAnalysis.Skipped("no search index");
+        var secs = new Dictionary<string, double>();
+        var work = Path.Combine(Path.GetTempPath(), "indexnode-precheck-" + Guid.NewGuid().ToString("N")[..10]);
+        var all = Path.Combine(work, "all"); Directory.CreateDirectory(all);
+        try
+        {
+            int per = s.Frames <= 0 ? 0 : Math.Max(1, s.Frames / Math.Max(1, segments.Count));
+            var info = new List<SegInfo>(); int n = 0; BarCrop? box = null; double frameSecs = 0;
+            for (int k = 0; k < segments.Count; k++)
+            {
+                var ss = new Dictionary<string, double>();
+                var f = await PreCheckFrames.ExtractSampleAsync(tools, cfg, segments[k].Path, Path.Combine(work, "s" + k), 0, 0, per <= 0 ? 0 : per, threads, progress, ss, ct);
+                frameSecs += ss.GetValueOrDefault("frames");
+                if (box == null && f.Count > 0) box = f.Box;
+                for (int i = 0; i < f.Count; i++) File.Move(Path.Combine(f.Dir, $"{i:D6}.jpg"), Path.Combine(all, $"{n + i:D6}.jpg"), true);
+                info.Add(new SegInfo(segments[k].Position, segments[k].Start, segments[k].End, f.Count)); n += f.Count;
+            }
+            secs["frames"] = frameSecs;
+            var a = await AnalyzeFramesAsync(all, n, box, null, s, threads, progress, secs, ExcludeId, ct, info);
+            Excluded = a.Excluded;
+            return a;
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
 
     /// <summary>The bar box from the frames themselves (a service that only received JPEGs): up to 24 evenly spaced frames, the frames step's rule.</summary>
     static BarCrop FrameBox(string fdir, int count)
@@ -207,6 +304,35 @@ public static class PreCheckFrames
         }
         secs["frames"] = sw.Elapsed.TotalSeconds;
         return new(fdir, count, times, box);
+    }
+
+    /// <summary>
+    /// 0.13.15: ONLY the sample frames of a clip: <paramref name="count"/> frames at the centres of that many equal slices of the clip (the same even spread the subsample picks), each one seeked to and decoded alone
+    /// (no full frames step over the clip: no colour-grid pruning, no chunk encode), scaled to the stored size (360 px short side, bicubic) and written as JPEG with the frames step's BT.601 full-range conversion and quality.
+    /// The bar box comes from those frames (<see cref="FrameChunks.BarsFromFrames"/>). Files are 000000.jpg ... in <paramref name="dir"/>; a frame that cannot be decoded is dropped (the rest are renumbered).
+    /// </summary>
+    public static async Task<Extracted> ExtractSampleAsync(Tools tools, NodeConfig cfg, string clip, string dir, double start, double length, int count, int threads, Action<string> progress, Dictionary<string, double> secs, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew(); Directory.CreateDirectory(dir);
+        var ffmpeg = await tools.FfmpegAsync(ct); var probe = await tools.FfprobeAsync(ct);
+        var pr = await Proc.RunAsync(probe, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", clip], ct);
+        var wh = pr.Stdout.Trim().Split('x'); var (SW, SH) = Frames.StoredSize(int.Parse(wh[0]), int.Parse(wh[1]));
+        double dur = length > 0 ? length : await Frames.DurationAsync(tools, clip, ct);
+        int n = count <= 0 ? Math.Max(1, (int)dur) : count; var q = FrameSettings.From(cfg).JpegQ.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var times = Enumerable.Range(0, n).Select(k => Math.Min(Math.Max(0, dur - 0.05), (k + 0.5) * dur / n)).ToList(); var ok = new bool[n];
+        progress("frames");
+        await Parallel.ForEachAsync(Enumerable.Range(0, n), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, async (k, t) =>
+        {
+            var o = Path.Combine(dir, $"s{k:D6}.jpg");
+            var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1", "-ss", times[k].ToString("F3", System.Globalization.CultureInfo.InvariantCulture), "-i", clip, "-an", "-sn", "-frames:v", "1",
+                "-vf", $"scale={SW}:{SH}:flags=bicubic,scale=out_color_matrix=bt601:out_range=full,format=yuvj444p", "-c:v", "mjpeg", "-q:v", q, "-f", "image2", o], t);
+            ok[k] = r.ExitCode == 0 && File.Exists(o) && new FileInfo(o).Length > 0;
+        });
+        int c = 0; var kept = new List<double>();
+        for (int k = 0; k < n; k++) if (ok[k]) { File.Move(Path.Combine(dir, $"s{k:D6}.jpg"), Path.Combine(dir, $"{c:D6}.jpg"), true); kept.Add(start + times[k]); c++; } else try { File.Delete(Path.Combine(dir, $"s{k:D6}.jpg")); } catch { }
+        secs["frames"] = sw.Elapsed.TotalSeconds;
+        if (c == 0) return new(dir, 0, [], BarCrop.None);
+        return new(dir, c, kept, FrameChunks.BarsFromFrames(dir, c, SW, SH));
     }
 
     /// <summary>The audio clip of the sample for the language ID: <paramref name="seconds"/> from the middle, 16 kHz mono 16-bit PCM WAV (the service decodes no Opus: it reads these samples as they are; the client's ffmpeg does the decoding). Null when the sample has no audio.</summary>

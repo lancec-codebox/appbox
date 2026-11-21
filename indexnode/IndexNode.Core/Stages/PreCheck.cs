@@ -26,6 +26,10 @@ public sealed class PreCheckSettings
     public double WindowSeconds { get; set; } = 300;
     /// <summary>Centre of the sample window as a fraction of the duration (0.5 = the middle).</summary>
     public double WindowPosition { get; set; } = 0.5;
+    /// <summary>0.13.15 (config precheck.window-positions): the two-segment sample: one window-seconds segment centred at each of these fractions of the duration; precheck.frames is the TOTAL, split evenly between them.</summary>
+    public double[] WindowPositions { get; set; } = [0.30, 0.70];
+    /// <summary>0.13.15 (config precheck.order-tolerance-seconds): the gap between the segments' times in the matched upload may be this much shorter than their gap in the new video (a shorter cut cannot stretch it).</summary>
+    public double OrderToleranceSeconds { get; set; } = 120;
     /// <summary>The sample video is the best stream of at most this height (config: precheck.video-height).</summary>
     public int VideoHeight { get; set; } = 360;
     /// <summary>yt-dlp format of the sample's audio, for the language ID: the lowest-bitrate audio-only format ('wa' = worst audio, on YouTube 249 opus ~50 kbit/s); a format id such as 249 also works (config: precheck.audio-format).</summary>
@@ -76,6 +80,15 @@ public sealed class PreCheckSettings
 }
 
 /// <summary>One candidate upload: the share of sample frames whose best match is in it with cosine &gt;= tau.</summary>
+/// <summary>0.13.15: how one segment of the sample matched one upload: the share of the segment's frames matched there at Tau and the median matched time in that upload.</summary>
+public sealed record SegmentShare(double Share, double MedianTime, int Frames);
+
+/// <summary>0.13.15: one sample segment (positions as fractions of the duration, start/end in the new video's seconds) and its per-upload shares.</summary>
+public sealed record PreCheckSegment(double Position, double Start, double End, int Frames, IReadOnlyDictionary<string, SegmentShare> Shares)
+{
+    public double Mid => (Start + End) / 2;
+}
+
 public sealed record PreCheckMatch(string Upload, double Share, double BestCosine, double BestTime, int Frames, string? SpeechLanguage = null, bool? Dubbed = null, double? Duration = null);
 
 /// <summary>What the analyzer measured on the sample clip (frames, SSCD, lookup, AI probe). SkippedReason set: nothing was measured.</summary>
@@ -97,6 +110,8 @@ public sealed record SpeechResult(string? Language, bool Dubbed, int Segments, d
 public sealed record PreCheckAnalysis(string? SkippedReason, int IndexVersion, int Frames, int NoHit, IReadOnlyList<PreCheckMatch> Top, double AiScore, IReadOnlyDictionary<string, double> Seconds)
 {
     public SpeechResult? Speech { get; init; }
+    /// <summary>0.13.15: the sample's segments with their per-upload shares (null: an older record or a one-window analysis; the decision then reads the top matches as a single segment).</summary>
+    public IReadOnlyList<PreCheckSegment>? Segments { get; init; }
     /// <summary>0.13.2: the frames that matched (cosine >= tau), the group of every upload they hit (null = none yet) and each hit group's known copies; the proposal is made from them by <see cref="DramaGroups.Propose"/>.</summary>
     public IReadOnlyList<FrameHit> Hits { get; init; } = [];
     public IReadOnlyDictionary<string, string?> UploadGroups { get; init; } = new Dictionary<string, string?>();
@@ -107,19 +122,37 @@ public sealed record PreCheckAnalysis(string? SkippedReason, int IndexVersion, i
     public static PreCheckAnalysis Skipped(string reason) => new(reason, 0, 0, 0, [], 0, new Dictionary<string, double>());
 }
 
+/// <summary>0.13.15: one cut sample segment: the clip, its place in the new video and its position (fraction of the duration).</summary>
+public sealed record SampleSegment(string Path, double Start, double End, double Position);
+
 /// <summary>Implemented by the desktop node (frames, SSCD and the search index live in the IndexNode project, not in Core).</summary>
 public interface IPreCheckAnalyzer
 {
     /// <summary>Null when the pre-check can run here; else why not (no search index, no SSCD model). Checked before anything is downloaded.</summary>
     Task<string?> UnavailableAsync(PreCheckSettings s, CancellationToken ct);
     Task<PreCheckAnalysis> AnalyzeAsync(string samplePath, PreCheckSettings s, int threads, Action<string> progress, CancellationToken ct);
+    /// <summary>0.13.15: the two-segment analysis (frames of every segment in one SSCD batch, one lookup, per-segment shares, every member of the candidate groups measured); the language ID is NOT run (see <see cref="PreCheck.SpeechNeeded"/>).</summary>
+    Task<PreCheckAnalysis> AnalyzeSegmentsAsync(IReadOnlyList<SampleSegment> segments, PreCheckSettings s, int threads, Action<string> progress, CancellationToken ct);
+    /// <summary>The language ID of one clip (the first segment's audio).</summary>
+    Task<SpeechResult> SpeechAsync(string samplePath, PreCheckSettings s, int threads, CancellationToken ct);
 }
+
+/// <summary>One member checked by the two-segment rule: its shares and matched times per segment, the timing result and why it passed or not.</summary>
+public sealed record MemberCheck(string Member, string? Group, double? Duration, IReadOnlyList<double> Shares, IReadOnlyList<double?> Times, bool Passed, string Reason);
 
 public sealed record PreCheckDecision(string Decision, IReadOnlyList<string> Reasons, PreCheckMatch? Match)
 {
     /// <summary>0.13.13: the longest member of the matched upload's group (id and duration), the L of the duration rule; null when the rule did not run or L is unknown.</summary>
     public (string Id, double Duration)? MatchedLongest { get; init; }
-    public const string Duplicate = "duplicate", Partial = "partial", Canonical = "canonical", New = "new", Skipped = "skipped";
+    /// <summary>0.13.15: the matched upload M (a member of the matched group, or the ungrouped upload) that made the decision authoritative; every member checked, with shares, times and the timing result.</summary>
+    public string? MatchedMember { get; init; }
+    public IReadOnlyList<MemberCheck> Checked { get; init; } = [];
+    public JsonObject? Extra { get; init; }
+    public const string Duplicate = "duplicate", Subset = "subset", Longer = "longer", Overlap = "overlap", Canonical = "canonical", New = "new", Skipped = "skipped";
+    /// <summary>"partial" is retired (0.13.15): old records still carry it and are read; it is never written.</summary>
+    public const string Partial = "partial";
+    /// <summary>A decision that skips the download (metadata only): duplicate and subset.</summary>
+    public static bool IsSkip(string? d) => d is Duplicate or Subset;
 }
 
 public static class PreCheck
@@ -130,6 +163,22 @@ public static class PreCheck
         if (duration <= length) return (0, duration, true);
         var start = Math.Clamp(duration * position - length / 2, 0, duration - length);
         return (Math.Round(start, 2), Math.Round(start + length, 2), false);
+    }
+
+    /// <summary>0.13.15: the sample segments: one window per position (a video not longer than one window is sampled whole, as a single segment).</summary>
+    public static List<(double Start, double End, double Position)> Windows(double duration, double length, IReadOnlyList<double> positions)
+    {
+        if (duration <= length || positions.Count == 0) return [(0, duration, 0.5)];
+        return positions.Select(p => { var w = Window(duration, length, p); return (w.Start, w.End, p); }).ToList();
+    }
+
+    /// <summary>0.13.15: one yt-dlp call fetching every segment: a --download-sections per range.</summary>
+    public static List<string> SampleArgs(PreCheckSettings s, IReadOnlyList<(double Start, double End)> ranges, string url)
+    {
+        var a = new List<string> { "-S", $"res:{s.VideoHeight}", "-f", $"bv*+{(string.IsNullOrWhiteSpace(s.AudioFormat) ? "wa" : s.AudioFormat.Trim())}/b" };
+        foreach (var r in ranges) { a.Add("--download-sections"); a.Add(SectionArg(r.Start, r.End)); }
+        a.AddRange(["--merge-output-format", "mp4", "-o", "sample.%(ext)s", url]);
+        return a;
     }
 
     /// <summary>The yt-dlp arguments of the one sample download (host-independent: the desktop node and an Android host with Medusa's yt-dlp build the same call).</summary>
@@ -207,8 +256,8 @@ public static class PreCheck
         return best;
     }
 
-    /// <summary>The rule. <paramref name="matchedDuration"/>: the matched upload's duration, null when the store does not know it (then a skip is never taken). <paramref name="legacy"/>: the 0.13.12 symmetric duration rule (what-if comparisons only).</summary>
-    public static PreCheckDecision Decide(PreCheckAnalysis a, double duration, Func<string, double?> matchedDuration, PreCheckSettings s, bool legacy = false)
+    /// <summary>The 0.13.14 single-window rule (kept for what-if comparisons and its tests). <paramref name="matchedDuration"/>: the matched upload's duration, null when the store does not know it (then a skip is never taken). <paramref name="legacy"/>: the 0.13.12 symmetric duration rule (what-if comparisons only).</summary>
+    public static PreCheckDecision DecideSingle(PreCheckAnalysis a, double duration, Func<string, double?> matchedDuration, PreCheckSettings s, bool legacy = false)
     {
 
         if (a.SkippedReason != null) return new(PreCheckDecision.Skipped, [a.SkippedReason], null);
@@ -239,6 +288,83 @@ public static class PreCheck
             return new(PreCheckDecision.Partial, [legacy ? $"top share {top.Share:0.00} >= {s.SkipShare:0.00} but duration {duration:0}s differs from {top.Upload} ({md.Value:0}s) by more than max({s.DurationPercent:0%}, {s.DurationMinSeconds:0}s)" : $"top share {top.Share:0.00} >= {s.SkipShare:0.00} but shorter than the group's longest copy by more than {s.DurationPercent:0%} ({duration:0} s vs {lref:0} s, {longest!.Value.Id}): processed"], top) { MatchedLongest = longest };
         }
         return new(PreCheckDecision.Partial, [$"top share {top.Share:0.00} in [{s.PartialShare:0.00}, {s.SkipShare:0.00}): another cut of the same drama"], top);
+    }
+
+    /// <summary>
+    /// 0.13.15, the two-segment rule. Candidates: every group (or ungrouped upload) either segment matched; the one with the highest combined share first. Inside a group EVERY member is tried in turn (ordered by the sum of its segment shares) until one passes:
+    /// each segment's share against the member >= SkipShare, and the timing is consistent in the member (segment 1 before segment 2, the gap there >= the gap in the new video minus OrderToleranceSeconds). The first member that passes is authoritative:
+    /// N within [M - durationPercent*M, M + max(slackPercent*M, slackSeconds)] = duplicate; N shorter = subset (a part of M); N longer = longer (processed). No member passes: the best group share >= PartialShare = overlap, else new.
+    /// Duplicate and subset keep the canonical-language exception. The shares of every member come with the analysis (a member the lookup did not list is measured directly from its frames file by the analyzer).
+    /// </summary>
+    public static PreCheckDecision Decide(PreCheckAnalysis a, double duration, Func<string, double?> matchedDuration, PreCheckSettings s, bool legacy = false)
+    {
+        if (a.SkippedReason != null) return new(PreCheckDecision.Skipped, [a.SkippedReason], null);
+        if (a.Segments is not { Count: > 0 } segs)
+        {   // an older / one-window analysis: the single-window rule, its "partial" written as overlap
+            var d = DecideSingle(a, duration, matchedDuration, s, legacy);
+            return !legacy && d.Decision == PreCheckDecision.Partial ? d with { Decision = PreCheckDecision.Overlap } : d;
+        }
+        string KeyOf(string up) => a.UploadGroups.TryGetValue(up, out var g) && g != null ? g : "u:" + up;
+        var uploads = segs.SelectMany(x => x.Shares.Keys).Distinct(StringComparer.Ordinal).ToList();
+        var groups = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var u in uploads) { var k = KeyOf(u); if (!groups.TryGetValue(k, out var l)) groups[k] = l = []; l.Add(u); }
+        foreach (var (g, copies) in a.GroupMembers) if (groups.TryGetValue(g, out var l)) foreach (var c in copies) if (!l.Contains(c.Upload)) l.Add(c.Upload);   // every member of a candidate group is tried, listed by the lookup or not
+        double Sh(PreCheckSegment sg, string u) => sg.Shares.TryGetValue(u, out var x) ? x.Share : 0;
+        double Sum(string u) => segs.Sum(sg => Sh(sg, u));
+        double GroupCombined(List<string> ms) => segs.Sum(sg => ms.Max(m => Sh(sg, m)));
+        var order = groups.OrderByDescending(kv => GroupCombined(kv.Value)).ThenBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+        var checks = new List<MemberCheck>();
+        double bestGroupShare = 0; string? bestUpload = null;
+        foreach (var (gk, ms0) in order)
+        {
+            string? gid = gk.StartsWith("u:", StringComparison.Ordinal) ? null : gk;
+            foreach (var u in ms0) foreach (var sg in segs) { var v = Sh(sg, u); if (v > bestGroupShare) { bestGroupShare = v; bestUpload = u; } }
+            var copies = gid != null && a.GroupMembers.TryGetValue(gid, out var gc) ? gc : [];
+            foreach (var m in ms0.OrderByDescending(Sum).ThenBy(x => x, StringComparer.Ordinal))
+            {
+                double? md = copies.FirstOrDefault(c => c.Upload == m)?.Duration ?? a.Top.FirstOrDefault(t => t.Upload == m)?.Duration ?? matchedDuration(m);
+                var shares = segs.Select(sg => Sh(sg, m)).ToList();
+                var times = segs.Select(sg => sg.Shares.TryGetValue(m, out var x) && x.Frames > 0 ? (double?)x.MedianTime : null).ToList();
+                string reason; bool ok = false;
+                if (shares.Any(x => x < s.SkipShare)) reason = "share " + string.Join("/", shares.Select(x => x.ToString("0.00", CultureInfo.InvariantCulture))) + $" below {s.SkipShare:0.00} in a segment";
+                else if (md == null) reason = "duration unknown";
+                else if (segs.Count >= 2 && times[0] is not { } t1 || segs.Count >= 2 && times[1] is not { }) reason = "no matched time";
+                else if (segs.Count >= 2 && !(times[0]!.Value < times[1]!.Value)) reason = $"segments out of order in {m} ({times[0]:0}s then {times[1]:0}s)";
+                else if (segs.Count >= 2 && times[1]!.Value - times[0]!.Value < (segs[1].Mid - segs[0].Mid) - s.OrderToleranceSeconds) reason = $"gap in {m} {times[1]!.Value - times[0]!.Value:0}s is shorter than the gap in the new video {segs[1].Mid - segs[0].Mid:0}s by more than {s.OrderToleranceSeconds:0}s";
+                else { ok = true; reason = "both segments match in order"; }
+                checks.Add(new MemberCheck(m, gid, md, shares, times, ok, reason));
+                if (!ok) continue;
+                double M = md!.Value, lo = M - s.DurationPercent * M, hi = M + Math.Max(s.DurationSlackPercent * M, s.DurationSlackSeconds);
+                var asTop = a.Top.FirstOrDefault(t => t.Upload == m);
+                var mt = new PreCheckMatch(m, shares.Average(), asTop?.BestCosine ?? 0, times[0] ?? 0, segs.Sum(x => x.Shares.TryGetValue(m, out var q) ? q.Frames : 0), asTop?.SpeechLanguage ?? copies.FirstOrDefault(c => c.Upload == m)?.SpeechLanguage, asTop?.Dubbed ?? copies.FirstOrDefault(c => c.Upload == m)?.Dubbed, M);
+                var longest = Longest(a, mt, M);
+                string basis = $"member {m} matches both segments (shares {string.Join("/", shares.Select(x => x.ToString("0.00", CultureInfo.InvariantCulture)))}, times {string.Join("/", times.Select(x => x?.ToString("0") ?? "?"))} s, in order)";
+                var extra = new JsonObject { ["memberDuration"] = Math.Round(M, 2), ["duration"] = Math.Round(duration, 2), ["timesInMember"] = new JsonArray(times.Select(x => (JsonNode?)(x == null ? null : Math.Round(x.Value, 1))).ToArray()) };
+                PreCheckDecision R(string d, string why) => new(d, [basis, why], mt) { MatchedMember = m, MatchedLongest = longest, Checked = checks.ToList(), Extra = extra };
+                if (duration > hi) return R(PreCheckDecision.Longer, $"longer than {m}: {duration:0} s vs {M:0} s + max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s): processed");
+                string kind = duration < lo ? PreCheckDecision.Subset : PreCheckDecision.Duplicate;
+                string why2 = kind == PreCheckDecision.Subset ? $"{duration:0} s is shorter than {M:0} s by more than {s.DurationPercent:0%}: a part of {m}" : $"duration {duration:0} s within [-{s.DurationPercent:0%}, +max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s)] of {m} ({M:0} s)";
+                if (kind == PreCheckDecision.Subset) extra["subsetOf"] = m;
+                // canonical = Chinese audio only: a zh-audio upload whose group copies are all dubs is processed fully and becomes the canonical copy
+                var mine = a.Speech is { Unavailable: null } sp ? NormLang(sp.Language) ?? "zh" : null;
+                var cs = (copies.Count > 0 ? copies.Select(c => (Up: c.Upload, Lang: NormLang(c.SpeechLanguage) ?? "zh")) : [(m, NormLang(mt.SpeechLanguage) ?? "zh")]).ToList();
+                if (mine == "zh" && cs.All(c => c.Lang != "zh")) return R(PreCheckDecision.Canonical, $"{why2}; the new upload is original-language (zh) and all {cs.Count} known copies are dubs ({string.Join(", ", cs.Select(c => c.Up + ":" + c.Lang))}): processed as the canonical copy");
+                return R(kind, why2);
+            }
+        }
+        var topM = bestUpload == null ? null : new PreCheckMatch(bestUpload, bestGroupShare, a.Top.FirstOrDefault(t => t.Upload == bestUpload)?.BestCosine ?? 0, 0, 0);
+        var note = $"{checks.Count} member(s) checked in {order.Count} candidate group(s), none passed both segments in order";
+        if (bestGroupShare >= s.PartialShare) return new(PreCheckDecision.Overlap, [$"best segment share {bestGroupShare:0.00} >= {s.PartialShare:0.00} ({bestUpload}); {note}"], topM) { Checked = checks };
+        return new(PreCheckDecision.New, [bestUpload == null ? "no sample frame matched any indexed upload" : $"best segment share {bestGroupShare:0.00} < {s.PartialShare:0.00}", note], topM) { Checked = checks };
+    }
+
+    /// <summary>0.13.15: the language ID can change the decision only for an authoritative skip (duplicate or subset) whose group copies are ALL dubs (the canonical-language exception); everything else skips it (the full download is transcribed anyway).</summary>
+    public static bool SpeechNeeded(PreCheckAnalysis a, PreCheckDecision d)
+    {
+        if (!PreCheckDecision.IsSkip(d.Decision) || d.MatchedMember == null) return false;
+        var copies = a.GroupMembers.Values.FirstOrDefault(c => c.Any(x => x.Upload == d.MatchedMember));
+        var langs = copies != null ? copies.Select(c => NormLang(c.SpeechLanguage) ?? "zh") : [NormLang(d.Match?.SpeechLanguage) ?? "zh"];
+        return langs.All(l => l != "zh");
     }
 
     public const string LangOriginal = "format-original", LangOnly = "format-only", LangVideo = "video", LangNone = "none";
@@ -282,7 +408,7 @@ public static class PreCheck
             ["top"] = new JsonArray(a.Top.Take(5).Select(m => (JsonNode?)new JsonObject { ["upload"] = m.Upload, ["share"] = Math.Round(m.Share, 4), ["bestCosine"] = Math.Round(m.BestCosine, 4), ["bestTime"] = Math.Round(m.BestTime, 1), ["frames"] = m.Frames, ["speechLanguage"] = m.SpeechLanguage, ["dubbed"] = m.Dubbed }).ToArray()),
             ["window"] = new JsonObject { ["start"] = window.Start, ["end"] = window.End, ["length"] = Math.Round(window.End - window.Start, 2) },
             ["frames"] = a.Frames, ["noHit"] = a.NoHit, ["indexVersion"] = a.IndexVersion,
-            ["settings"] = new JsonObject { ["tau"] = s.Tau, ["skipShare"] = s.SkipShare, ["partialShare"] = s.PartialShare, ["durationPercent"] = s.DurationPercent, ["durationMinSeconds"] = s.DurationMinSeconds, ["durationSlackPercent"] = s.DurationSlackPercent, ["durationSlackSeconds"] = s.DurationSlackSeconds, ["topCenters"] = s.TopCenters, ["windowSeconds"] = s.WindowSeconds, ["videoHeight"] = s.VideoHeight, ["audioFormat"] = s.AudioFormat, ["frames"] = s.Frames, ["languageSeconds"] = s.LanguageSeconds, ["languageMinSeconds"] = s.LanguageMinSeconds, ["windowPosition"] = s.WindowPosition },
+            ["settings"] = new JsonObject { ["tau"] = s.Tau, ["skipShare"] = s.SkipShare, ["partialShare"] = s.PartialShare, ["durationPercent"] = s.DurationPercent, ["durationMinSeconds"] = s.DurationMinSeconds, ["durationSlackPercent"] = s.DurationSlackPercent, ["durationSlackSeconds"] = s.DurationSlackSeconds, ["topCenters"] = s.TopCenters, ["windowSeconds"] = s.WindowSeconds, ["videoHeight"] = s.VideoHeight, ["audioFormat"] = s.AudioFormat, ["frames"] = s.Frames, ["languageSeconds"] = s.LanguageSeconds, ["languageMinSeconds"] = s.LanguageMinSeconds, ["windowPosition"] = s.WindowPosition, ["windowPositions"] = new JsonArray(s.WindowPositions.Select(x => (JsonNode?)x).ToArray()), ["orderToleranceSeconds"] = s.OrderToleranceSeconds },
             ["video"] = new JsonObject
             {
                 ["duration"] = Math.Round(duration, 2), ["claimedHeight"] = (int?)info["height"], ["title"] = (string?)info["title"], ["channel"] = (string?)info["channel"] ?? (string?)info["uploader"], ["channelId"] = (string?)info["channel_id"],
@@ -299,6 +425,21 @@ public static class PreCheck
             ["seconds"] = new JsonObject(a.Seconds.Select(kv => KeyValuePair.Create(kv.Key, (JsonNode?)Math.Round(kv.Value, 3)))) { ["sampleDownload"] = Math.Round(sampleDownloadSeconds, 2) },
             ["node"] = nodeId, ["version"] = version,
         };
+        if (a.Segments is { Count: > 0 } sgs)
+            o["segments"] = new JsonArray(sgs.Select(x => (JsonNode?)new JsonObject
+            {
+                ["position"] = x.Position, ["start"] = Math.Round(x.Start, 2), ["end"] = Math.Round(x.End, 2), ["frames"] = x.Frames,
+                ["shares"] = new JsonObject(x.Shares.OrderByDescending(kv => kv.Value.Share).Take(12).Select(kv => KeyValuePair.Create(kv.Key, (JsonNode?)new JsonObject { ["share"] = Math.Round(kv.Value.Share, 4), ["time"] = Math.Round(kv.Value.MedianTime, 1), ["frames"] = kv.Value.Frames }))),
+            }).ToArray());
+        if (d.MatchedMember != null) { o["matchedMember"] = d.MatchedMember; o["matchUpload"] = d.MatchedMember; }
+        if (d.Extra is { } ex) foreach (var kv in ex) o[kv.Key] = kv.Value?.DeepClone();
+        if (d.Checked.Count > 0)
+            o["membersChecked"] = new JsonArray(d.Checked.Select(c => (JsonNode?)new JsonObject
+            {
+                ["member"] = c.Member, ["group"] = c.Group, ["duration"] = c.Duration == null ? null : Math.Round(c.Duration.Value, 2), ["shares"] = new JsonArray(c.Shares.Select(x => (JsonNode?)Math.Round(x, 4)).ToArray()),
+                ["times"] = new JsonArray(c.Times.Select(x => (JsonNode?)(x == null ? null : Math.Round(x.Value, 1))).ToArray()), ["passed"] = c.Passed, ["reason"] = c.Reason,
+            }).ToArray());
+        if (a.Speech == null) o["speech"]!["speechSource"] = a.Segments != null ? "skipped (not needed)" : o["speech"]!["speechSource"];
         if (d.MatchedLongest is { } ml) o["matchedLongest"] = new JsonObject { ["id"] = ml.Id, ["duration"] = Math.Round(ml.Duration, 2) };
         if (a.Group is { } g) { o["group"] = g.ToJson(); o["groupId"] = g.Group; o["groupOffset"] = Math.Round(g.Offset, 2); o["matchShare"] = Math.Round(g.MatchShare, 4); o["dupShare"] = Math.Round(g.DupShare, 4); }
         return o;

@@ -136,7 +136,7 @@ public class PreCheckTests : IDisposable
         Assert.Equal("duplicate", PreCheck.Decide(AL("zh", null), 1800, _ => 1800, S).Decision);
         Assert.Equal("duplicate", PreCheck.Decide(AL("en", null), 1800, _ => 1800, S).Decision);
         Assert.Equal("duplicate", PreCheck.Decide(AL(null, "en"), 1800, _ => 1800, S).Decision);       // language ID did not run: nothing proves an original
-        Assert.Equal("partial", PreCheck.Decide(AL("zh", "en"), 1800, _ => 3000, S).Decision);         // the duration rule still comes first
+        Assert.Equal("overlap", PreCheck.Decide(AL("zh", "en"), 1800, _ => 3000, S).Decision);         // the duration rule still comes first
     }
 
     [Fact]
@@ -187,8 +187,8 @@ public class PreCheckTests : IDisposable
     public void A_duration_far_from_the_match_or_unknown_never_skips()
     {
         var far = PreCheck.Decide(A(("up1", 0.95, 0.99)), 1800 + 601, _ => 1800, S);
-        Assert.Equal("partial", far.Decision); Assert.Contains("longer than the group's longest copy", far.Reasons[0]);
-        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.95, 0.99)), 1800, _ => null, S).Decision);
+        Assert.Equal("overlap", far.Decision); Assert.Contains("longer than the group's longest copy", far.Reasons[0]);
+        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.95, 0.99)), 1800, _ => null, S).Decision);
     }
 
     // ---- 0.13.13: the asymmetric duplicate rule
@@ -202,15 +202,15 @@ public class PreCheckTests : IDisposable
     public void Asymmetric_rule_longer_by_ten_minutes_is_partial_equal_is_duplicate_shorter_by_5_percent_is_duplicate_shorter_by_30_percent_is_partial()
     {
         var longer = PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 600, _ => 1800, S);
-        Assert.Equal("partial", longer.Decision); Assert.Contains("longer than the group's longest copy (2400 s vs 1800 s", longer.Reasons[0]); Assert.Contains("processed", longer.Reasons[0]);
+        Assert.Equal("overlap", longer.Decision); Assert.Contains("longer than the group's longest copy (2400 s vs 1800 s", longer.Reasons[0]); Assert.Contains("processed", longer.Reasons[0]);
         Assert.Equal(("up1", 1800.0), longer.MatchedLongest);
         Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800, _ => 1800, S).Decision);
         Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 * 0.95, _ => 1800, S).Decision);
         var shorter = PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 * 0.70, _ => 1800, S);
-        Assert.Equal("partial", shorter.Decision); Assert.Contains("shorter than the group's longest copy", shorter.Reasons[0]);
+        Assert.Equal("overlap", shorter.Decision); Assert.Contains("shorter than the group's longest copy", shorter.Reasons[0]);
         Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 60, _ => 1800, S).Decision);       // the slack: max(2% = 36 s, 60 s)
-        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 61, _ => 1800, S).Decision);
-        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800, _ => null, S).Decision);              // L unknown: processed
+        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 61, _ => 1800, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800, _ => null, S).Decision);              // L unknown: processed
     }
 
     [Fact]
@@ -221,7 +221,7 @@ public class PreCheckTests : IDisposable
         a = a with { Top = [a.Top[0] with { Duration = 1500 }] };
         d = PreCheck.Decide(a, 2400, _ => null, S);
         Assert.Equal("duplicate", d.Decision); Assert.Equal(("long1", 2400.0), d.MatchedLongest);                         // longer than the matched upload (1500) but equal to L
-        Assert.Equal("partial", PreCheck.Decide(a, 2400 + 600, _ => null, S).Decision);                                  // longer than L + slack
+        Assert.Equal("overlap", PreCheck.Decide(a, 2400 + 600, _ => null, S).Decision);                                  // longer than L + slack
         var rec = PreCheck.Record("new1", d, a, new System.Text.Json.Nodes.JsonObject(), null, (0, 300), 2400, S, "n", "v", false, 0, false);
         Assert.Equal("long1", (string)rec["matchedLongest"]!["id"]!); Assert.Equal(2400.0, (double)rec["matchedLongest"]!["duration"]!);
         Assert.Equal(0.02, (double)rec["settings"]!["durationSlackPercent"]!); Assert.Equal(60.0, (double)rec["settings"]!["durationSlackSeconds"]!);
@@ -233,8 +233,8 @@ public class PreCheckTests : IDisposable
     public void Share_in_060_to_080_is_partial_and_below_060_is_new()
 
     {
-        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.79, 0.9)), 1800, _ => 1800, S).Decision);
-        Assert.Equal("partial", PreCheck.Decide(A(("up1", 0.60, 0.9)), 1800, _ => 1800, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.79, 0.9)), 1800, _ => 1800, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.60, 0.9)), 1800, _ => 1800, S).Decision);
         var n = PreCheck.Decide(A(("up1", 0.59, 0.9)), 1800, _ => 1800, S); Assert.Equal("new", n.Decision);
         Assert.Equal("new", PreCheck.Decide(A(), 1800, _ => 1800, S).Decision);
     }
@@ -243,11 +243,11 @@ public class PreCheckTests : IDisposable
     public void Every_threshold_is_a_setting()
     {
         var s = new PreCheckSettings { SkipShare = 0.95, PartialShare = 0.5, DurationPercent = 0.5, DurationMinSeconds = 0, DurationSlackPercent = 0.5, DurationSlackSeconds = 0 };
-        Assert.Equal("partial", PreCheck.Decide(A(("u", 0.9, 0.9)), 100, _ => 100, s).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(A(("u", 0.9, 0.9)), 100, _ => 100, s).Decision);
         Assert.Equal("duplicate", PreCheck.Decide(A(("u", 0.96, 0.9)), 140, _ => 100, s).Decision);   // longer by 40% of L: inside the 50% slack setting
-        Assert.Equal("partial", PreCheck.Decide(A(("u", 0.96, 0.9)), 160, _ => 100, s).Decision);
-        Assert.Equal("duplicate", PreCheck.Decide(A(("u", 0.96, 0.9)), 55, _ => 100, s).Decision); Assert.Equal("partial", PreCheck.Decide(A(("u", 0.96, 0.9)), 45, _ => 100, s).Decision);   // shorter: the 50% percent setting
-        Assert.Equal("partial", PreCheck.Decide(A(("u", 0.5, 0.9)), 100, _ => 100, s).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(A(("u", 0.96, 0.9)), 160, _ => 100, s).Decision);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("u", 0.96, 0.9)), 55, _ => 100, s).Decision); Assert.Equal("overlap", PreCheck.Decide(A(("u", 0.96, 0.9)), 45, _ => 100, s).Decision);   // shorter: the 50% percent setting
+        Assert.Equal("overlap", PreCheck.Decide(A(("u", 0.5, 0.9)), 100, _ => 100, s).Decision);
         Assert.Equal("new", PreCheck.Decide(A(("u", 0.49, 0.9)), 100, _ => 100, s).Decision);
     }
 
@@ -309,7 +309,7 @@ public class PreCheckTests : IDisposable
     static byte[] F16(float[] x) { var b = new byte[x.Length * 2]; for (int i = 0; i < x.Length; i++) BitConverter.TryWriteBytes(b.AsSpan(i * 2, 2), (Half)x[i]); return b; }
 
     /// <summary>Three uploads with sscd.zip in a folder -> centers backfill -> search-index build (the 0.11.0 local flow). Returns the vectors of each upload.</summary>
-    async Task<Dictionary<string, float[]>> BuildIndexAsync()
+    async Task<Dictionary<string, float[]>> BuildIndexAsync(string? language = null, bool? dubbed = null)
     {
         var local = new LocalStore(root); var wr = (StageZipStore)StageZipStore.Wrap(local, Path.Combine(root, ".indexnode-zips")); var vecs = new Dictionary<string, float[]>();
         foreach (var (id, seed) in new[] { ("a1", 41), ("b2", 42), ("c3", 43) })
@@ -321,7 +321,7 @@ public class PreCheckTests : IDisposable
             await wr.PutAsync(P.Video(id, "sscd/0000.f16"), F16(x), null, null, false, default);
             await wr.PutAsync(P.Video(id, "sscd/manifest.json"), Encoding.UTF8.GetBytes($"{{\"v\":1,\"step\":\"sscd\",\"chunks\":[{{\"chunk\":\"0000\",\"start\":0,\"rows\":{n}}}]}}"), null, null, false, default);
             foreach (var st in new[] { "frames", "sscd" }) Assert.True(await StageZipStore.Stage(wr)!.CommitStageAsync(id, st, "n1", false, false, default));
-            await VideoJsonSeed.PutAsync(local, P, id, 1800);
+            await VideoJsonSeed.PutAsync(local, P, id, 1800, language, dubbed);
         }
         var old = Console.Out; Console.SetOut(new StringWriter());
         try
@@ -427,7 +427,8 @@ public class PreCheckTests : IDisposable
             EmbedOverride = (dir, count, box, th, prog, ct) => { var b = rig.Rows(count); rig.Dbg = $"count={count} bytes={b.Length}"; return Task.FromResult(b); },
         };
         rig.An = an;
-        var stage = new PreCheckStage(rig.Tools, an, new PreCheckSettings(), "0.13.0-test");
+        // the one-window fixtures feed 60 consecutive frames of b2 (times 40..99) as both segments: a 30 s gap instead of the ~700 s a 1750 s video has, so the order rule's tolerance is opened up here (the order rule itself is tested in TwoSegmentPreCheckTests)
+        var stage = new PreCheckStage(rig.Tools, an, new PreCheckSettings { OrderToleranceSeconds = 100000 }, "0.13.0-test");
         return (rig, stage, id);
     }
 
@@ -519,7 +520,7 @@ public class PreCheckTests : IDisposable
     public async Task Speech_comes_from_the_audio_not_from_the_metadata_hint()
     {
         if (await RealFfmpegAsync() is null) return;
-        var v = await BuildIndexAsync();
+        var v = await BuildIndexAsync("en", true);   // the indexed copies are dubs, so the language ID can change the decision and runs
         // the metadata says en (the info has language=en), the audio is Chinese: not dubbed
         var (rig, stage, id) = await SetupAsync("zhaudio0001", n => Take(v["b2"], 40, n));
         rig.Speech = () => [C("speech", "yue"), C("speech", "zh", 15), C("speech", "en", 30)];
@@ -534,11 +535,11 @@ public class PreCheckTests : IDisposable
     public async Task A_missing_speech_model_falls_back_to_the_metadata_and_the_record_says_so()
     {
         if (await RealFfmpegAsync() is null) return;
-        var v = await BuildIndexAsync();
+        var v = await BuildIndexAsync("en", true);
         var (rig, stage, id) = await SetupAsync("nomodel0001", n => Take(v["b2"], 40, n));
         var an = new PreCheckAnalyzer(rig.Tools, new NodeConfig(), new HttpClient(), OpenLocal(), P, new SearchIndexCache(Path.Combine(root, "cache-nm"), TimeSpan.FromMinutes(10)))
         { SkipModelCheck = true, EmbedOverride = (dir, count, box, th, prog, ct) => Task.FromResult(rig.Rows(count)), SpeechOverride = (_, _) => throw new InvalidOperationException("model download failed") };
-        stage = new PreCheckStage(rig.Tools, an, new PreCheckSettings(), "t");
+        stage = new PreCheckStage(rig.Tools, an, new PreCheckSettings { OrderToleranceSeconds = 100000 }, "t");
         var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=nomodel0001", 480, null); job.JobId = id;
         try { await stage.RunAsync(Ctx(rig.Fs, job)); } catch (DuplicateFound) { }   // a broken language ID never loses the pre-check or the download
         var sp = Json(rig.Fs, P.Video(id, "precheck.json")).GetProperty("speech");
@@ -555,7 +556,7 @@ public class PreCheckTests : IDisposable
         rig.Fs.Blobs.Remove(P.Video(id, "downloaded.json")); await rig.Fs.PutAsync(P.Video(id, "downloaded.json"), Encoding.UTF8.GetBytes("{\"v\":1,\"durationSeconds\":1750}"), null, null, false, default);
         var before = rig.Fs.Blobs.ToDictionary(kv => kv.Key, kv => (kv.Value.Version, kv.Value.Data.Length));
         var outDir = Path.Combine(root, "pc-out-" + id);
-        var args = Args.Parse([id, "--output-local", outDir, "--keep-sample", "--threads", "3", "--window-position", "0.5"]);
+        var args = Args.Parse([id, "--output-local", outDir, "--keep-sample", "--threads", "3", "--window-position", "0.5", "--order-tolerance-seconds", "100000"]);
         var sw = new StringWriter(); var old = Console.Out; Console.SetOut(sw);
         int code; try { code = await PreCheckCommand.RunAsync(args, rig.Fs, rig.Tools, rig.An); } finally { Console.SetOut(old); }
         Assert.Equal(0, code);
@@ -566,10 +567,10 @@ public class PreCheckTests : IDisposable
         Assert.Empty(rig.Calls);   // 0.13.0: no yt-dlp at all, the window is cut from the stored video
         var rec = JsonDocument.Parse(File.ReadAllText(Path.Combine(outDir, id, "precheck.json"))).RootElement;
         Assert.Equal("duplicate", rec.GetProperty("decision").GetString()); Assert.Equal(3, rec.GetProperty("threads").GetInt32());
-        Assert.True(File.Exists(Path.Combine(outDir, id, "sample.mp4")));
+        Assert.True(File.Exists(Path.Combine(outDir, id, "sample0.mp4"))); Assert.True(File.Exists(Path.Combine(outDir, id, "sample1.mp4")));   // 0.13.15: one kept clip per segment
         var lines = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.Trim()).Where(l => l.StartsWith(id + ":")).ToList(); Assert.Single(lines); var line = lines[0];   // the node log shares stdout
         Assert.StartsWith(id + ": duplicate", line); Assert.Contains("b2 share", line); Assert.Contains("threads=3", line);
-        foreach (var k in new[] { "frames", "sscd", "lookup", "ai" }) Assert.Contains(k + " ", line);
+        var all = sw.ToString(); foreach (var k in new[] { "frames", "sscd", "lookup", "ai" }) Assert.Contains(k + " ", all); Assert.Contains("time split:", all);   // 0.13.15: the time split is the second line of the record
     }
 
     [Fact]
@@ -942,6 +943,39 @@ public class PreCheckTests : IDisposable
         return await an.AnalyzeFramesAsync(root, 40, BarCrop.None, null, new PreCheckSettings(), 1, _ => { }, new Dictionary<string, double>(), null, default);
     }
 
+    /// <summary>
+    /// 0.13.15 timing fixture: the catalog rig (uploads a1, b2, c3 in the index; 40-frame fixtures), a 60-frame two-segment sample made of b2's own vectors (30 + 30), the node's FramesCache WARM (every frames file already local).
+    /// Compute (SSCD stubbed, lookup, per-segment shares, member checks) must make 0 store requests for the frames files and stay far under the 5 s target (the bound here is generous: 8 s, slow runners).
+    /// </summary>
+    [Fact]
+    public async Task A_warm_cache_two_segment_lookup_of_60_frames_makes_no_frames_requests_and_is_fast()
+    {
+        var (st, v) = await CatalogRigAsync();
+        var cacheDir = Path.Combine(root, "frames-cache-warm"); var old = FramesCache.Current; FramesCache.Current = new FramesCache(cacheDir, 1L << 30);
+        try
+        {
+            var rows = new float[60 * D]; for (int i = 0; i < 60; i++) Array.Copy(v["b2"], (i % 40) * D, rows, i * D, D);
+            var counting = new CountingStore(st);
+            var an = new PreCheckAnalyzer(new Tools(new HttpClient(), new NodeConfig()), new NodeConfig(), new HttpClient(), counting, P, new SearchIndexCache(Path.Combine(root, "cache-timing"), TimeSpan.FromMinutes(10))) { SkipModelCheck = true, EmbedOverride = (dir, n, box, th, pr, ct) => Task.FromResult(F16(rows)) };
+            var info = new List<PreCheckAnalyzer.SegInfo> { new(0.30, 540, 840, 30), new(0.70, 1260, 1560, 30) };
+            var s = new PreCheckSettings();
+            await an.AnalyzeFramesAsync(root, 60, BarCrop.None, null, s, 4, _ => { }, new Dictionary<string, double>(), null, default, info);   // 1st run: fills the frames cache (a GET per file)
+            Assert.True(FramesCache.Current.Downloads > 0);
+            int downloads = FramesCache.Current.Downloads; counting.Reset();
+            var secs = new Dictionary<string, double>(); var sw = System.Diagnostics.Stopwatch.StartNew();
+            var a = await an.AnalyzeFramesAsync(root, 60, BarCrop.None, null, s, 4, _ => { }, secs, null, default, info);
+            sw.Stop();
+            Assert.Equal(downloads, FramesCache.Current.Downloads);                                           // nothing fetched again
+            Assert.Equal(0, counting.FramesReads);                                                            // no ranged read of a frames file: the cache serves every one
+            Assert.Equal(0, secs["lookupRequests"]);
+            Assert.Equal(2, a.Segments!.Count); Assert.Equal(60, a.Frames);
+            Assert.Contains("b2", a.Segments[0].Shares.Keys);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), $"compute took {sw.Elapsed.TotalSeconds:0.00} s");
+            Console.WriteLine($"TIMING 60 frames, warm cache: {sw.Elapsed.TotalSeconds:0.00} s; lookup {secs["lookup"]:0.00} s ({secs["lookupRequests"]} requests, {secs["lookupBytes"]} B), members {secs.GetValueOrDefault("members"):0.00} s");
+        }
+        finally { FramesCache.Current = old; }
+    }
+
     [Fact]
     public async Task A_real_duplicate_is_skipped_with_the_duration_of_the_catalog()
     {
@@ -996,4 +1030,37 @@ public class PreCheckTests : IDisposable
         // no center pruning: the table holds every center of every processed upload
         Assert.Equal(idx.Uploads.Sum(u => u.K), idx.Count);
     }
+}
+
+/// <summary>Forwards to another store and counts the reads of frames files (index/search/frames/): the warm-cache timing test needs 0.</summary>
+public sealed class CountingStore(IStore inner) : IStore
+{
+    int framesReads; public int FramesReads => Volatile.Read(ref framesReads); public void Reset() => Interlocked.Exchange(ref framesReads, 0);
+    void Count(string name) { if (name.Contains("search/frames/", StringComparison.Ordinal)) Interlocked.Increment(ref framesReads); }
+    public Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct) => inner.CreateAppendBlobAsync(name, onlyIfNew, ct);
+    public Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct) => inner.AppendBlockAsync(name, data, appendPos, ct);
+    public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => inner.ReadAppendAsync(name, offset, maxLen, ct);
+    public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => inner.SealAppendBlobAsync(name, appendPos, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchAsync(name, data, etag, ct);
+    public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => inner.GetAppendInfoAsync(name, ct);
+    public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(name, ct);
+    public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) { Count(name); return inner.GetRangeAsync(name, off, len, ifMatch, ct); }
+    public Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct) => inner.PutZipIfMatchAsync(name, path, metadata, tags, etag, ct);
+    public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) => inner.PutZipAsync(name, path, metadata, tags, onlyIfNew, ct);
+
+    public Task<IReadOnlyList<BlobEntry>> FindByTagsAsync(string where, CancellationToken ct) => inner.FindByTagsAsync(where, ct);
+    public Task<IReadOnlyList<BlobEntry>> ListAsync(string prefix, bool withTags, bool withMetadata, CancellationToken ct) => inner.ListAsync(prefix, withTags, withMetadata, ct);
+    public Task<BlobContent?> GetAsync(string name, CancellationToken ct) { Count(name); return inner.GetAsync(name, ct); }
+    public Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct) => inner.GetIfChangedAsync(name, etag, ct);
+    public Task<IReadOnlyDictionary<string, string>?> GetTagsAsync(string name, CancellationToken ct) => inner.GetTagsAsync(name, ct);
+    public Task<bool> PutAsync(string name, byte[] data, IReadOnlyDictionary<string, string>? tags, string? leaseId, bool onlyIfNew, CancellationToken ct, string contentType = "application/json") => inner.PutAsync(name, data, tags, leaseId, onlyIfNew, ct, contentType);
+    public Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct) => inner.PutFileAsync(name, path, contentType, progress, ct);
+    public Task DownloadToFileAsync(string name, string path, CancellationToken ct) { Count(name); return inner.DownloadToFileAsync(name, path, ct); }
+    public Task<string?> AcquireLeaseAsync(string name, int seconds, CancellationToken ct) => inner.AcquireLeaseAsync(name, seconds, ct);
+    public Task RenewLeaseAsync(string name, string leaseId, CancellationToken ct) => inner.RenewLeaseAsync(name, leaseId, ct);
+    public Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct) => inner.ReleaseLeaseAsync(name, leaseId, ct);
+    public Task SetMetadataAsync(string name, IReadOnlyDictionary<string, string> metadata, string? leaseId, CancellationToken ct) => inner.SetMetadataAsync(name, metadata, leaseId, ct);
+    public Task SetTagsAsync(string name, IReadOnlyDictionary<string, string> tags, string? leaseId, CancellationToken ct) => inner.SetTagsAsync(name, tags, leaseId, ct);
+    public Task DeleteAsync(string name, CancellationToken ct) => inner.DeleteAsync(name, ct);
+
 }

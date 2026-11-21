@@ -8,7 +8,7 @@ namespace IndexNode;
 /// No center pruning: every processed upload adds all its centers.</summary>
 public static class GroupBuild
 {
-    sealed record Rec(GroupProposal? Proposal, string? At, double? Duration, bool HasPrecheck = false, GroupProposal? Grouped = null);
+    sealed record Rec(GroupProposal? Proposal, string? At, double? Duration, bool HasPrecheck = false, GroupProposal? Grouped = null, double? CoveredShare = null, IReadOnlyList<RelStretch>? Stretches = null);
 
     /// <summary>The group proposal, time and duration of an upload from its video.json (0.13.2: no precheck.json, no downloaded.json). A missing or unreadable video.json throws: the group build fails loudly and is retried.</summary>
     static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say)
@@ -18,7 +18,8 @@ public static class GroupBuild
         catch (InvalidDataException) { root = new JsonObject(); }
         var pc = root["precheck"] as JsonObject;
         var gr = root["grouping"] as JsonObject;   // 0.13.10: the per-drama group step's record
-        return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null, gr == null ? null : GroupProposal.FromJson(gr["proposal"] as JsonObject));
+        return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null, gr == null ? null : GroupProposal.FromJson(gr["proposal"] as JsonObject),
+            (double?)gr?["coveredShare"], gr?["stretches"] is JsonArray sa ? sa.OfType<JsonObject>().Select(x => new RelStretch((double?)x["from"] ?? 0, (double?)x["to"] ?? 0, (string?)x["upload"] ?? "", (double?)x["offset"] ?? 0)).ToList() : null);
     }
 
     public const int ChunkFrames = 30;
@@ -132,7 +133,7 @@ public static class GroupBuild
             if (r.Grouped != null) Interlocked.Increment(ref folded);
             else if (prop == null) { prop = r.Proposal; Interlocked.Increment(ref hintN); } else Interlocked.Increment(ref fullN);
             var (l0, d0) = Sp(u);
-            placed[k] = new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop);
+            placed[k] = new NewUpload(u.Id, l0, d0, r.Duration, r.At, prop) { CoveredShare = r.Grouped != null ? r.CoveredShare : null, Stretches = r.Grouped != null ? r.Stretches : null };
             int n = Interlocked.Increment(ref done); if (n % 10 == 0 || n == todo) say?.Invoke(Progress(n, todo, clock.Elapsed) + "; " + cstats.Line() + $"; {par} uploads at once, {inner} threads each");
         });
         news.AddRange(placed.Select(x => x!)); full += fullN; foldedTotal = folded; hinted += hintN;
@@ -155,7 +156,7 @@ public static class GroupBuild
         set.Apply(news, id => byId.TryGetValue(id, out var u) ? (Sp(u).Lang, Sp(u).Dub, null) : null, bootstrap);   // the language of a known member may have been measured since
         // an upload no longer in the index (and not short-circuited) leaves its group; an emptied group goes
         foreach (var g in set.Groups) g.Members.RemoveAll(m => !byId.ContainsKey(m.Upload) && !shorts.Contains(m.Upload));
-        set.Groups.RemoveAll(g => g.Members.Count == 0); set.ElectAll();
+        set.Groups.RemoveAll(g => g.Members.Count == 0); set.ElectAll(); set.Relate(s);   // 0.13.15: each member's relation to the canonical
         set.BuiltAt = next.BuiltAt == null ? null : Protocol.Utc(next.BuiltAt.Value);
         var of = set.GroupOf();
         next.Uploads = next.Uploads.Select(u => u with { Group = of.GetValueOrDefault(u.Id) }).ToList();

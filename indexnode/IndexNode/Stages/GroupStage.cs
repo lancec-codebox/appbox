@@ -30,15 +30,31 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         return res;
     }
 
+    /// <summary>0.13.15 (`indexnode groups step --dry-run`): nothing is written to the store (no video.json, no retained file, no delete); the record the step would write and its time split are kept in <see cref="LastRecord"/> / <see cref="LastSplit"/>.</summary>
+    public bool DryRun { get; init; }
+    public JsonObject? LastRecord { get; private set; }
+    public string? LastSplit { get; private set; }
+    public string? LastLine { get; private set; }
+    /// <summary>The retained vectors the step would write (dry run): frames kept of the drama's total.</summary>
+    public (int Kept, int Total)? LastRetained { get; private set; }
+
     /// <summary>Test seam: called with the number of frames each search call handles (the frames actually searched, sample and full pass alike).</summary>
     public Action<int>? OnSearch { get; init; }
+
+    /// <summary>0.13.15: the earlier DRAMAS: a sequence number below this one AND a frames file. A null seq is never earlier (channels, refresh sources and unstarted downloads have none).</summary>
+    public static Dictionary<string, long?> EarlierDramas(QueueState st, string id, long seq, IReadOnlySet<string> frames)
+    {
+        var d = new Dictionary<string, long?>(StringComparer.Ordinal);
+        foreach (var x in st.Subjects.Values) if (x.Seq is { } o && o < seq && x.Id != id && frames.Contains(x.Id)) d[x.Id] = o;
+        return d;
+    }
 
     public async Task RunAsync(JobContext ctx)
     {
         var ct = ctx.Token; var paths = ctx.Paths; var id = ctx.BlobName; var s = settings ?? new PreCheckSettings();
         long seq = ctx.Queue?.Read(st => st.Get(id)?.Seq) ?? throw new InvalidOperationException($"group {id}: no sequence number");
         ctx.Report("group", "index");
-        var clock = Stopwatch.StartNew(); double tMember = 0, tDedup = 0, tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
+        var clock = Stopwatch.StartNew(); string joinSrc = ""; double tMember = 0, tDedup = 0, tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
         var head = await SearchData.LoadAsync(store, paths, null, ct);
         var q = ctx.Queue!;
         bool Earlier(string other) => other != id && (q.Read(st => st.Get(other)?.Seq) is not { } o || o < seq);
@@ -47,7 +63,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var inIndex = head?.Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal) ?? [];
         var fresh = q.Read(st => st.Subjects.Values.Where(x => x.Id != id && !inIndex.Contains(x.Id) && Earlier(x.Id) && (x.CentersAt != null || x.Entries.TryGetValue("process", out var pe) && pe.State == "done")).OrderBy(x => x.Seq ?? long.MaxValue).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList());
         tIdx = clock.Elapsed.TotalMilliseconds; int earlier = (idx?.Uploads.Count ?? 0) + fresh.Count;
-        string Split() => $"{earlier} earlier ({idx?.Uploads.Count ?? 0} indexed + {fresh.Count} fresh); index {tIdx:F0} ms, own frames {tOwn:F0} ms, search {tSearch:F0} ms (scan {tScan:F0}, read {tRead:F0}, score {tScore:F0}), fresh {tFresh:F0} ms, membership {tMember:F0} ms, dedup {tDedup:F0} ms, write {tWrite:F0} ms; {searched} frames searched";
+        string Split() => $"{earlier} earlier ({idx?.Uploads.Count ?? 0} indexed + {fresh.Count} fresh); index {tIdx:F0} ms, own frames {tOwn:F0} ms, search {tSearch:F0} ms (scan {tScan:F0}, read {tRead:F0}, score {tScore:F0}), fresh {tFresh:F0} ms, membership {tMember:F0} ms{joinSrc}, dedup {tDedup:F0} ms, write {tWrite:F0} ms; {searched} frames searched";
 
         if (idx == null && fresh.Count == 0) { await WriteAsync(ctx, id, seq, GroupProposal.None, [], null, 0, 0, 0, [], null, s, ct, null); return; }
         // own frames, from the node's local copy of the frames file
@@ -107,11 +123,13 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         {
             // 0.13.13: DEDUP against the group only: every earlier member of the target's group, by its FULL frames file, brute force (no global index search)
             var td = Stopwatch.StartNew();
-            var earlierSeq = q.Read(st => st.Subjects.Values.Where(x => x.Id != id && (x.Seq is not { } o || o < seq)).ToDictionary(x => x.Id, x => x.Seq, StringComparer.Ordinal));
+            var frames = ctx.Frames ?? await GroupSequencing.ListFramesAsync(store, paths, ct);   // the gate's frames set (one list per refresh), else one listing
+            var earlierSeq = q.Read(st => EarlierDramas(st, id, seq, frames));
             var known = head != null ? await dedup.KnownAsync(paths, head.Version, ct) : null;
-            var ms = await dedup.SetAsync(paths, prop.JoinUpload, earlierSeq, jid => q.Read(st => st.Get(jid) is { JoinKind: not null } js ? (js.JoinOf, js.JoinKind) : ((string?, string?)?)null), known, ct);
+            var ms = await dedup.SetAsync(paths, prop.JoinUpload, earlierSeq, jid => q.Read(st => st.Get(jid) is { JoinKind: not null } js ? (js.JoinOf, js.JoinKind) : ((string?, string?)?)null), known, ct, jid => q.Read(st => st.Get(jid)?.LastAt));
             var members = ms.Members; tMember = td.Elapsed.TotalMilliseconds;
-            Log.Info($"group {id}: membership {members.Count} of {earlierSeq.Count} earlier ({ms.FromQueue} from the queue, {ms.FromGroups} from the groups file, {ms.FromCache} cached, {ms.Reads} read from video.json) in {tMember:F0} ms");
+            joinSrc = $" ({members.Count} members of {earlierSeq.Count} earlier dramas: {ms.FromQueue} from the queue, {ms.FromGroups} from the groups file, {ms.FromCache} cached, {ms.Reads} read from video.json)";
+            Log.Info($"group {id}: membership{joinSrc} in {tMember:F0} ms");
             if (!members.Contains(prop.JoinUpload)) members.Insert(0, prop.JoinUpload);
             var (M, mem, tm, used) = await GroupDedup.LoadAsync(store, paths, members, ct);
             var dbest = GroupDedup.Best(own.Select(f => f.V).ToList(), M, mem, tm, threads, ct);
@@ -143,11 +161,10 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
             var f16 = new byte[keep.Count * CentersFile.Dim * 2]; for (int k = 0; k < keep.Count; k++) own[keep[k]].F16.CopyTo(f16, k * CentersFile.Dim * 2);
             var built = CentersStep.Build(id, f16, keep.Select(i => own[i].T).ToList(), Math.Max(1, ctx.ThreadShare()));
             var bin = FramesFile.FromCenters(built.Bin, seq); var name = paths.RetainedFile(id);
-            await store.PutAsync(name, bin, null, null, false, ct, "application/octet-stream");
-            await store.SetMetadataAsync(name, FramesFile.Metadata(bin), null, ct);
+            if (!DryRun) { await store.PutAsync(name, bin, null, null, false, ct, "application/octet-stream"); await store.SetMetadataAsync(name, FramesFile.Metadata(bin), null, ct); }
             kept = keep.Count; retained = name;
         }
-        else if (store != null) { try { await store.DeleteAsync(paths.RetainedFile(id), null, ct); } catch (Exception e) when (e is StorageException { Status: 404 } || e is FileNotFoundException) { } }   // a re-run that no longer retains removes the old file
+        else if (store != null && !DryRun) { try { await store.DeleteAsync(paths.RetainedFile(id), null, ct); } catch (Exception e) when (e is StorageException { Status: 404 } || e is FileNotFoundException) { } }   // a re-run that no longer retains removes the old file
         var rec = new JsonObject
         {
             ["v"] = 1, ["seq"] = seq, ["at"] = Protocol.NowUtc(), ["proposal"] = prop.ToJson(), ["frames"] = total,
@@ -156,8 +173,11 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
             ["dedupAgainst"] = dedupAgainst == null ? null : new JsonArray(dedupAgainst.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()), ["dedupFrames"] = dedupAgainst == null ? null : dedupFrames,
             ["retained"] = retained == null ? null : kept, ["retainedFile"] = retained, ["t"] = s.RetainT, ["f"] = s.RetainF, ["stretches"] = new JsonArray(stretches.Select(x => (JsonNode?)x).ToArray()),
         };
-        await VideoJson.UpdateAsync(store, paths, id, root => root["grouping"] = rec, ct);
-        Log.Info($"group {id}: seq {seq}, {prop.Kind}{(prop.JoinUpload != null ? " " + prop.JoinUpload : "")}, {(covered == null ? $"{sampleCovered}/{sampled} sampled frames covered" : $"{covered}/{total} frames covered")}, {(retained == null ? "all kept" : kept + " retained")}" + (split == null ? "" : "; " + split().Replace("write 0 ms", $"write {wsw.Elapsed.TotalMilliseconds:F0} ms")));
+        LastRecord = rec; LastRetained = retained == null ? null : (kept, total);
+        if (!DryRun) await VideoJson.UpdateAsync(store, paths, id, root => root["grouping"] = rec, ct);
+        LastSplit = split?.Invoke().Replace("write 0 ms", $"write {wsw.Elapsed.TotalMilliseconds:F0} ms");
+        LastLine = $"group {id}: seq {seq}, {prop.Kind}{(prop.JoinUpload != null ? " " + prop.JoinUpload : "")}, {(covered == null ? $"{sampleCovered}/{sampled} sampled frames covered" : $"{covered}/{total} frames covered")}, {(retained == null ? "all kept" : kept + " retained")}" + (LastSplit == null ? "" : "; " + LastSplit);
+        Log.Info((DryRun ? "(dry run: nothing written) " : "") + LastLine);
     }
 }
 

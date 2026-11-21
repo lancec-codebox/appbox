@@ -229,16 +229,36 @@ public static class Describe
     public static readonly string[] TitleSources = ["youtube", "translated", "written"];
 
     /// <summary>A cast member the model calls main is demoted to supporting when its screen time is below this fraction of the lower-screen-time lead's (setting describe.main-min-screen; env INDEXNODE_DESCRIBE_MAIN_MIN_SCREEN overrides).</summary>
-    public static double MainMinScreen => double.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_DESCRIBE_MAIN_MIN_SCREEN"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0 ? v : 0.25;
+    public static double MainMinScreen => double.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_DESCRIBE_MAIN_MIN_SCREEN"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0 ? v : ConfigMainMinScreen ?? 0.10;
+    public static double? ConfigMainMinScreen { get; set; }
+    public static int? ConfigMainMax { get; set; }
+    /// <summary>0.13.15 (setting describe.main-max; env INDEXNODE_DESCRIBE_MAIN_MAX): at most this many main characters per drama; the ones with the most face time stay.</summary>
+    public static int MainMax => int.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_DESCRIBE_MAIN_MAX"), out var v) && v >= 0 ? v : ConfigMainMax ?? 6;
 
-    public static void DemoteLowScreenMains(JsonArray cast, DescribeInput d, double? min = null)
+    /// <summary>True when the character's English name (the whole label, or any of its words of 2+ letters: Chinese surnames are short) appears in the text (case-insensitive, whole word).</summary>
+    public static bool NamedIn(string? label, string? text)
+    {
+        if (string.IsNullOrWhiteSpace(label) || string.IsNullOrWhiteSpace(text)) return false;
+        bool Has(string w) => System.Text.RegularExpressions.Regex.IsMatch(text, @"(?<![\p{L}\p{N}])" + System.Text.RegularExpressions.Regex.Escape(w.Trim()) + @"(?![\p{L}\p{N}])", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var l = label.Trim();
+        return Has(l) || l.Split([' ', '-', '.', ','], StringSplitOptions.RemoveEmptyEntries).Where(w => w.Length >= 2).Any(Has);
+    }
+
+    /// <summary>
+    /// The main-cast gate. main = the model says main AND (face time >= min x the lesser lead's, OR the character is named in the title, teaser or synopsis: a villain or a future husband with little face time stays main);
+    /// then at most <see cref="MainMax"/> main, keeping the most face time (the rest are demoted, "main limit"). <paramref name="named"/>: the title, full title, teaser and synopsis texts.
+    /// </summary>
+    public static void DemoteLowScreenMains(JsonArray cast, DescribeInput d, double? min = null, IReadOnlyList<string?>? named = null, int? max = null)
     {
         var secs = d.Clusters.ToDictionary(c => c.Id, c => c.ScreenSeconds);
         double S(JsonNode c) => secs.GetValueOrDefault(c["cluster"]!.GetValue<int>());
         var leads = cast.Where(c => c!["role"]!.GetValue<string>() is "female lead" or "male lead").Select(c => S(c!)).ToList();
         if (leads.Count == 0) return;
         double floor = (min ?? MainMinScreen) * leads.Min();
-        foreach (var c in cast.OfType<JsonObject>().Where(c => c["role"]!.GetValue<string>() == "main" && S(c) < floor)) { c["role"] = "supporting"; c["demoted"] = "screen time"; }
+        bool Named(JsonObject c) => named != null && (c["label"] is JsonObject lb ? lb["en"]?.GetValue<string>() : null) is { } n && named.Any(t => NamedIn(n, t));
+        foreach (var c in cast.OfType<JsonObject>().Where(c => c["role"]!.GetValue<string>() == "main" && S(c) < floor && !Named(c))) { c["role"] = "supporting"; c["demoted"] = "screen time"; }
+        var mains = cast.OfType<JsonObject>().Where(c => c["role"]!.GetValue<string>() == "main").OrderByDescending(S).ThenBy(c => c["cluster"]!.GetValue<int>()).ToList();
+        foreach (var c in mains.Skip(max ?? MainMax)) { c["role"] = "supporting"; c["demoted"] = "main limit"; }
     }
 
     public static readonly string[] EndingKinds = ["complete", "cliffhanger", "truncated"];
@@ -299,7 +319,7 @@ public static class Describe
                 ["label"] = new JsonObject { ["en"] = Clean(En(c["label"])).TrimEnd('.', ' ') },
             });
         }
-        DemoteLowScreenMains(cast, d);
+        DemoteLowScreenMains(cast, d, null, [En(r["title"]), En(r["fullTitle"]), En(r["teaser"]), En(r["synopsis"])]);
         o["cast"] = cast;
         var rels = new JsonArray();
         foreach (var e in (r["relations"] as JsonArray) ?? [])

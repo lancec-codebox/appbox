@@ -225,7 +225,7 @@ public sealed partial class NodeEngine
     private JobContext NewContext(int lane, ClaimWork w, string stage, JobDescriptor job, IStore jobStore, string[] stepsDone, CancellationToken token) => new()
     {
         Job = job, Stage = stage, BlobName = w.Id, LeaseId = w.Handle.Lease, Worker = lane, Store = jobStore, Paths = paths, NodeId = o.NodeId, Token = token, Queue = queue,
-        StepsDone = stepsDone, ThreadShare = () => o.ThreadsPerWorker,
+        StepsDone = stepsDone, ThreadShare = () => o.ThreadsPerWorker, Frames = gateView?.Frames,
         Report = (step, progress) => { if (step != null && step != w.Run.Info.Step) { w.Run.Info.Step = step; w.Run.Info.StartedAt = Protocol.NowUtc(); w.Run.Timer.Enter(step); } w.Run.Info.Progress = progress; },
     };
 
@@ -340,7 +340,7 @@ public sealed partial class NodeEngine
         // 0.13.2: decided from the store only (no processing zip besides download/comments), never from the done set; the stage itself returns at once for a video.json that already has the record
         bool noProcessing = !await HasProcessingAsync(id, token);
         var vjPre = handlers.ContainsKey("precheck") && noProcessing ? (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject : null;
-        if (handlers.TryGetValue("precheck", out var pre) && noProcessing && (vjPre == null || (string?)vjPre["decision"] == PreCheckDecision.Duplicate))
+        if (handlers.TryGetValue("precheck", out var pre) && noProcessing && (vjPre == null || PreCheckDecision.IsSkip((string?)vjPre["decision"])))
         {
             ranPre = true;
             w.Run.Info.Stage = "precheck"; w.Run.Info.Step = null; RegistryChanged();
@@ -353,7 +353,7 @@ public sealed partial class NodeEngine
         if (handlers.ContainsKey("precheck")) { pcRec = (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject; pcDecision = (string?)pcRec?["decision"]; }   // 0.13.2: video.json holds the record; unreadable or missing fails the claim (retried), never a quiet null
         bool pcAi = (bool?)pcRec?["ai"]?["flag"] == true; double pcScore = (double?)pcRec?["ai"]?["score"] ?? 0;
         // 0.13.1: an AI-flagged drama that is not a duplicate (that was decided first) is held, not skipped: the pre-check's done step goes on the log and the claim is released; with aiDramas on it just goes on
-        if (noProcessing && pcAi && pcDecision != "duplicate" && !Control.Current.AiDramasOn)
+        if (noProcessing && pcAi && !PreCheckDecision.IsSkip(pcDecision) && !Control.Current.AiDramasOn)
         {
             Log.Info($"process {id}: pre-check says AI (score {pcScore:0.000}): held, aiDramas is off");
             await h.AppendAsync([new QLine { T = "done", Stage = "process", Step = "precheck", PreCheck = pcDecision, Hold = "ai", AiScore = pcScore, Why = $"ai: score {pcScore:0.000}", Pre = pcRec }], true, CancellationToken.None);
