@@ -23,18 +23,7 @@ public static class JobsCommand
                 catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 1; }
             }
             case "list": case null:
-            {
-                var q = await Load(store, paths);
-                int top = a.Get("top") is { } t ? int.Parse(t) : 20;
-                if (a.Get("held") is { } held)
-                {
-                    foreach (var (sid, e) in q.Read(s => s.Subjects.Values.SelectMany(x => x.Entries.Values.Where(e => e.Hold == held && !e.Final).Select(e => (x.Id, e))).OrderBy(x => x.Id, StringComparer.Ordinal).ToList()))
-                        Console.WriteLine($"{e.Priority,6}  {e.Added}  {e.Stage}/{sid}  held={e.Hold}{(e.HoldAiScore != null ? $" score={e.HoldAiScore:0.000}" : "")}");
-                    return 0;
-                }
-                foreach (var row in PriorityTool.List(q, a.Get("stage"), top)) Console.WriteLine($"{row.Priority,6}  {row.Added}  {row.Stage}/{row.Id}");
-                return 0;
-            }
+                return await ListAsync(a, await Load(store, paths));
             case "priority":
             {
                 var q = await Load(store, paths);
@@ -111,6 +100,23 @@ public static class JobsCommand
     }
 
     private static async Task<JobQueue> Load(IStore store, Paths paths) { var q = new JobQueue(store, paths, "cli"); await q.LoadAsync(default); return q; }
+
+/// <summary>`jobs list [--stage S] [--held ai] [--top N]`: the pending entries (best first), or the entries held for a reason. 0.13.11: a stage filter works for every stage (group included), and an empty answer says so.</summary>
+    public static Task<int> ListAsync(Args a, JobQueue q)
+    {
+        int top = a.Get("top") is { } t ? int.Parse(t) : 20; int n = 0;
+        if (a.Get("held") is { } held)
+        {
+            foreach (var (sid, e) in q.Read(s => s.Subjects.Values.SelectMany(x => x.Entries.Values.Where(e => e.Hold == held && !e.Final && (a.Get("stage") == null || e.Stage == a.Get("stage"))).Select(e => (x.Id, e))).OrderBy(x => x.Id, StringComparer.Ordinal).Take(top).ToList()))
+            { Console.WriteLine($"{e.Priority,6}  {e.Added}  {e.Stage}/{sid}  held={e.Hold}{(e.HoldAiScore != null ? $" score={e.HoldAiScore:0.000}" : "")}"); n++; }
+            if (n == 0) Console.WriteLine($"(nothing held={held})");
+            return Task.FromResult(0);
+        }
+        foreach (var row in PriorityTool.List(q, a.Get("stage"), top)) { Console.WriteLine($"{row.Priority,6}  {row.Added}  {row.Stage}/{row.Id}"); n++; }
+        if (n == 0) Console.WriteLine(a.Get("stage") is { } st ? $"(no pending {st} entries)" : "(no pending entries)");
+        return Task.FromResult(0);
+    }
+
 
     /// <summary>indexnode video &lt;id&gt;: what the queue knows about the video (entries, steps done, claim, last error).</summary>
     public static async Task<int> VideoAsync(Args a)

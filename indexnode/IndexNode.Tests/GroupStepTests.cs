@@ -96,9 +96,9 @@ public class GroupStepTests
         var again = await SeqCommand.AssignAsync(q, s, P, false, default); Assert.Equal(0, again.Assigned);
         // groups enqueue: dry run counts, then create-only
         await q.AppendLinesAsync([new QLine { T = "done", S = "x", Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }, new QLine { T = "done", S = "y", Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }], default);
-        var d2 = await SeqCommand.EnqueueGroupsAsync(q, true, default); Assert.Equal(2, d2.Added); Assert.Null(q.Read(st => st.Entry("x", "group")));
-        var r2 = await SeqCommand.EnqueueGroupsAsync(q, false, default); Assert.Equal(2, r2.Added); Assert.NotNull(q.Read(st => st.Entry("y", "group")));
-        var r3 = await SeqCommand.EnqueueGroupsAsync(q, false, default); Assert.Equal(0, r3.Added); Assert.Equal(2, r3.Existing);
+        var d2 = await SeqCommand.EnqueueGroupsAsync(q, s, P, true, default); Assert.Equal(2, d2.Added); Assert.Null(q.Read(st => st.Entry("x", "group")));
+        var r2 = await SeqCommand.EnqueueGroupsAsync(q, s, P, false, default); Assert.Equal(2, r2.Added); Assert.NotNull(q.Read(st => st.Entry("y", "group")));
+        var r3 = await SeqCommand.EnqueueGroupsAsync(q, s, P, false, default); Assert.Equal(0, r3.Added); Assert.Equal(2, r3.Existing);
     }
 
     // ---- stretches: reordered scenes at different offsets
@@ -172,6 +172,78 @@ public class GroupStepTests
         var c = new Clock(); var q = new JobQueue(s, P, "a", c.Now); await q.LoadAsync(default);
         await q.AppendLinesAsync([AddProcess(id), new QLine { T = "seq", S = id, Seq = seq }], default); return q;
     }
+
+    // ---- 0.13.11: numbering every drama, claim order, jobs list
+    static async Task<SearchData> HeadWith(FakeStore s, params string[] ids)
+    {
+        var ups = await SearchIndexBuild.ListCentersAsync(s, P, default); var head = await SearchIndexBuild.BuildAsync(s, P, ups.Where(u => ids.Contains(u.Id)).OrderBy(u => Array.IndexOf(ids, u.Id)).ToList(), null, null, 1, 1, 2, _ => { }, default);
+        head.BuiltAt = DateTimeOffset.UtcNow.AddMinutes(-5); await head.PublishAsync(s, P, default); return head;
+    }
+
+    [Fact]
+    public async Task Seq_assign_numbers_every_drama_with_frames_pre_log_ones_first_in_head_row_order_then_the_log_ones_and_a_rerun_adds_nothing()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        foreach (var id in new[] { "p1", "p2", "p3", "l1", "l2" }) await PutFrames(s, id, Make(20, 4, id.GetHashCode()), 20);
+        await HeadWith(s, "p3", "p1", "p2");                                         // head rows: p3, p1, p2 (no log line for any of them)
+        await q.AppendLinesAsync([AddProcess("l1"), AddProcess("l2")], default);
+        await VideoJsonSeed.PutAsync(s, P, "l1", 300, precheck: new JsonObject { ["at"] = "2026-01-02T00:00:00Z", ["decision"] = "new" });
+        await VideoJsonSeed.PutAsync(s, P, "l2", 300, precheck: new JsonObject { ["at"] = "2026-01-01T00:00:00Z", ["decision"] = "new" });
+        var dry = await SeqCommand.AssignAsync(q, s, P, true, default); Assert.Equal(5, dry.Assigned); Assert.Equal(3, dry.PreLog); Assert.Equal(0, q.Read(st => st.Subjects.Values.Count(x => x.Seq != null)));
+        await SeqCommand.AssignAsync(q, s, P, false, default);
+        Assert.Equal([1L, 2L, 3L, 4L, 5L], new[] { "p3", "p1", "p2", "l2", "l1" }.Select(id => q.Read(st => st.Get(id)!.Seq!.Value)));   // pre-log in head order, then log by first pre-check
+        var again = await SeqCommand.AssignAsync(q, s, P, false, default); Assert.Equal(0, again.Assigned); Assert.Equal(5, again.Already);
+        // groups enqueue now covers every numbered drama that has frames, pre-log ones included
+        var er = await SeqCommand.EnqueueGroupsAsync(q, s, P, false, default); Assert.Equal(5, er.Added); Assert.Equal(0, er.NoSeq);
+        Assert.NotNull(q.Read(st => st.Entry("p1", "group"))); Assert.Equal(0, (await SeqCommand.EnqueueGroupsAsync(q, s, P, false, default)).Added);
+    }
+
+    [Fact]
+    public async Task Seq_assign_renumber_renumbers_everyone_by_the_rule_is_idempotent_and_is_refused_once_a_group_step_has_finished()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        foreach (var id in new[] { "p1", "p2", "l1" }) await PutFrames(s, id, Make(20, 4, id.GetHashCode()), 20);
+        await HeadWith(s, "p2", "p1");
+        await q.AppendLinesAsync([AddProcess("l1"), new QLine { T = "seq", S = "l1", Seq = 1 }, new QLine { T = "seq", S = "p1", Seq = 2 }], default);   // the old (log-only) numbering
+        var r = await SeqCommand.AssignAsync(q, s, P, false, default, renumber: true);
+        Assert.Equal(3, r.Assigned); Assert.Equal(2, r.Renumbered);
+        Assert.Equal([1L, 2L, 3L], new[] { "p2", "p1", "l1" }.Select(id => q.Read(st => st.Get(id)!.Seq!.Value)));
+        Assert.Equal(3, q.Read(st => st.Subjects.Values.Select(x => x.Seq).Distinct().Count()));
+        await SeqCommand.AssignAsync(q, s, P, false, default, renumber: true);
+        Assert.Equal([1L, 2L, 3L], new[] { "p2", "p1", "l1" }.Select(id => q.Read(st => st.Get(id)!.Seq!.Value)));   // same rule, same numbers
+        Assert.Equal(3, q.Read(st => st.MaxSeq));
+        // a group step has finished: refused, nothing changes
+        await q.AppendLinesAsync([QLine.Add("p2", "group", GroupSequencing.NewJob("p2", 0), "2026-11-21T08:00:00Z")], default);
+        var h = (await q.TryClaimAsync("p2", st => ["group"], default))!; await h.AppendAsync([new QLine { T = "done", Stage = "group" }], true, default);
+        var e = await Assert.ThrowsAsync<InvalidOperationException>(() => SeqCommand.AssignAsync(q, s, P, false, default, renumber: true));
+        Assert.Contains("refused", e.Message); Assert.Equal(1L, q.Read(st => st.Get("p2")!.Seq!.Value));
+    }
+
+    [Fact]
+    public async Task One_lane_with_50_older_process_entries_and_10_due_group_entries_claims_the_group_entries_first_but_after_search_index()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        var older = Enumerable.Range(0, 50).Select(i => QLine.Add("pr" + i.ToString("D2"), "process", new JobDescriptor { Stage = "process", JobId = "pr" + i.ToString("D2"), AddedAt = "2026-11-20T08:00:00Z" }, "2026-11-20T08:00:00Z"));
+        await q.AppendLinesAsync(older, default); c.T = c.T.AddHours(24);
+        await q.AppendLinesAsync(Enumerable.Range(0, 10).Select(i => QLine.Add("gr" + i, "group", GroupSequencing.NewJob("gr" + i, 0), Protocol.Utc(c.T))), default);
+        await q.AppendLinesAsync([QLine.Add("search-index", "search-index", new JobDescriptor { Stage = "search-index", JobId = "search-index", AddedAt = Protocol.Utc(c.T) }, Protocol.Utc(c.T))], default);
+        var order = q.Read(st => st.Candidates(Protocol.Utc(c.T), _ => true)).Select(x => x.Subject.Id).ToList();
+        Assert.Equal("search-index", order[0]);
+        Assert.All(order.Skip(1).Take(10), id => Assert.StartsWith("gr", id));      // the due group entries, then
+        Assert.All(order.Skip(11), id => Assert.StartsWith("pr", id));              // the 50 older process entries
+    }
+
+    [Fact]
+    public async Task Jobs_list_prints_the_pending_entries_of_a_stage_and_the_held_ones()
+    {
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
+        await q.AppendLinesAsync([AddProcess("v1"), QLine.Add("g1", "group", GroupSequencing.NewJob("g1", 0), "2026-11-21T08:00:00Z")], default);
+        var rows = PriorityTool.List(q, "group", 20); Assert.Single(rows); Assert.Equal(("group", "g1"), (rows[0].Stage, rows[0].Id));
+        var o = new StringWriter(); var old = Console.Out; Console.SetOut(o);
+        try { Assert.Equal(0, await JobsCommand.ListAsync(Args.Parse(["list", "--stage", "group"]), q)); Assert.Equal(0, await JobsCommand.ListAsync(Args.Parse(["list", "--held", "ai"]), q)); } finally { Console.SetOut(old); }
+        Assert.Contains("group/g1", o.ToString()); Assert.DoesNotContain("process/v1", o.ToString());
+    }
+
 
     [Fact]
     public async Task The_index_job_only_folds_records_a_drama_without_one_stays_ungrouped_and_no_frames_are_read()

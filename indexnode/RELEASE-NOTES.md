@@ -1,3 +1,16 @@
+## 0.13.11
+
+**Group bootstrap fixes** (live on 0.13.10, 2026-11-21). On top of 0.13.10.
+
+- **`seq assign` numbers EVERY drama with a frames file (or a row in the head index).** 0.13.10 numbered only the dramas with a process line in the queue log (325 of ~1,138): most were processed before the log existed (migration 2026-11-20 18:12Z) and have no pre-check or centers line. Now the dramas with no log line are numbered first, in the head index's row order (deterministic, no blob times; frames files not in the head follow, by id), then the log-ordered ones by their first pre-check, else centers, else last queue activity. Numbers continue after the highest; a rerun adds nothing.
+- **`seq assign --renumber`** renumbers everyone by that rule (from 1; a numbered subject outside the set is renumbered too, so no two share a number). It refuses, changing nothing, if any group step has finished (their grouping records depend on the old numbers). Use `--dry-run` first.
+- **`groups enqueue`** now covers every numbered drama that has a frames file and no group entry (before: only those with a done process entry or a centers line), in sequence order; frames files with no number are counted as "no sequence number".
+- **Group steps are claimed ahead of process work.** A due `group` entry (priority 0, added today) sat behind ~200 older pending process entries and none was claimed in 30 minutes on 2 lanes. As search-index already does, a due group entry now goes before drama work (still behind search-index): group steps are short.
+- **`jobs list --stage group` and `--held ai`** work as documented (shared `JobsCommand.ListAsync`; `--held` also takes `--stage`/`--top`); an empty answer prints "(no pending group entries)" / "(nothing held=ai)" instead of nothing.
+- **Still not built:** publishing pre-check samples for in-flight predecessors.
+- **Tests.** `GroupStepTests`: numbering with pre-log dramas, idempotence, `--renumber` (renumbers, idempotent, refused once a group step is done), one lane with 50 older process entries and 10 due group entries claims the group entries first (search-index before them), `jobs list`.
+
+
 ## 0.13.10
 
 **Per-drama sequencing, the group step and retained vectors** (owner, 2026-11-21). On top of 0.13.9 (frames files and the local cache), so every group step reads frames from the node's disk.

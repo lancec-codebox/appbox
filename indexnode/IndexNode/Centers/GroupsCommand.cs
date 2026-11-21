@@ -65,8 +65,8 @@ public static class GroupsCommand
             var (_, es, ep, _) = CentersCommands.OpenStore(a, remote);
             await JobQueue.RequireSnapshotAsync(es, ep, default);
             var eq = new JobQueue(es, ep, "cli"); await eq.LoadAsync(default);
-            var er = await SeqCommand.EnqueueGroupsAsync(eq, a.Has("dry-run"), default);
-            Console.WriteLine($"groups enqueue{(a.Has("dry-run") ? " (dry run)" : "")}: {er.Candidates} processed dramas, {er.Existing} already have a group entry, {er.NoSeq} have no sequence number (run: indexnode seq assign), {er.Added} {(a.Has("dry-run") ? "would be " : "")}added");
+            var er = await SeqCommand.EnqueueGroupsAsync(eq, es, ep, a.Has("dry-run"), default);
+            Console.WriteLine($"groups enqueue{(a.Has("dry-run") ? " (dry run)" : "")}: {er.Candidates} dramas with frames, {er.Existing} already have a group entry, {er.NoSeq} have no sequence number (run: indexnode seq assign), {er.Added} {(a.Has("dry-run") ? "would be " : "")}added");
             return 0;
         }
         if (a.Positional.FirstOrDefault() != "build") throw new ArgumentException("groups build [--dry-run] [--threads N] [--check-pairs <file>] [--top 20]");
