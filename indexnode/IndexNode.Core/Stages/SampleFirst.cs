@@ -8,7 +8,7 @@ namespace IndexNode;
 /// </summary>
 public static class SampleFirst
 {
-    public sealed record Report(int Downloads, int Checks, int Claimed, int AlreadyDone, int Batches, int Pubs = 0);
+    public sealed record Report(int Downloads, int Checks, int Claimed, int AlreadyDone, int Batches, int Pubs = 0, string PubSources = "");
 
     public static List<QLine> Plan(QueueState st, string at, out int downloads, out int checks, out int claimed, out int already, IReadOnlyDictionary<string, (string Pub, string Source)>? pubs = null)
     {
@@ -46,18 +46,31 @@ public static class SampleFirst
     public static async Task<Dictionary<string, (string Pub, string Source)>> FindPubsAsync(JobQueue q, IStore store, Paths paths, CancellationToken ct)
     {
         var need = q.Read(st => st.Subjects.Values.Where(s => s.Pub == null && s.Entries.Values.Any(e => e.State == "pending" && e.Stage is "sample" or "check" or "download" or "process" && e.Job?.Pub == null))
-            .Select(s => (s.Id, Src: s.Entries.Values.Select(e => e.Job?.Source).FirstOrDefault(x => x != null), Dl: s.Entries.ContainsKey("process") && !s.Entries.ContainsKey("download"))).OrderBy(x => x.Id, StringComparer.Ordinal).ToList());
+            .Select(s => (s.Id, Src: s.Entries.Values.Select(e => e.Job?.Source).FirstOrDefault(x => x != null), Dl: s.Entries.ContainsKey("process") && !(s.Entries.TryGetValue("download", out var de) && de.State == "pending"))).OrderBy(x => x.Id, StringComparer.Ordinal).ToList());
         var res = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
-        var members = new Dictionary<string, Dictionary<string, SourceMember>>(StringComparer.Ordinal);
+        var ests = new Dictionary<string, Dictionary<string, (string Pub, string Source)>>(StringComparer.Ordinal); int orphan = 0;
         foreach (var n in need)
         {
             ct.ThrowIfCancellationRequested();
-            var j = new JobDescriptor();
-            await PubTime.StampAsync(store, paths, n.Id, j, j, ct);   // info.json (video, then sample): pubSource info
-            if (j.Pub != null) { res[n.Id] = (j.Pub, j.PubSource!); continue; }
-            if (n.Src == null) continue;
-            if (!members.TryGetValue(n.Src, out var m)) members[n.Src] = m = (await SourceMembers.ReadAsync(store, paths, n.Src, ct)).Members.GroupBy(x => x.Id, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
-            if (m.TryGetValue(n.Id, out var mem) && mem.Pub != null) res[n.Id] = (mem.Pub, mem.PubSource ?? PubTime.Listing);
+            // 0.13.19: the source comes from the queue state, never from probing. Only a downloaded drama (download done, process pending) has an info.json: read it ONCE, from download.zip through the step-zip store.
+            if (n.Dl)
+            {
+                try
+                {
+                    if (await store.GetAsync(paths.Video(n.Id, "info.json"), ct) is { } b && PubTime.FromInfo(System.Text.Json.Nodes.JsonNode.Parse(b.Data)) is { } ip) { res[n.Id] = (ip, PubTime.Info); continue; }
+                }
+                catch (System.Text.Json.JsonException) { }
+            }
+            if (n.Src == null) { res[n.Id] = (Protocol.Utc(DateTimeOffset.UtcNow.AddMinutes(-(++orphan))), PubTime.Estimate); continue; }   // no source known: still gets an estimate, in id order
+            if (!ests.TryGetValue(n.Src, out var m))
+            {
+                var doc = await SourceMembers.ReadAsync(store, paths, n.Src, ct);
+                var list = doc.Members.GroupBy(x => x.Id, StringComparer.Ordinal).Select(g => g.First()).ToList();
+                // listing order is newest first: a member's own time, else its firstSeen, else an estimate that keeps the order
+                var filled = PubTime.Fill(list.Select(x => x.Pub != null ? (x.Pub, x.PubSource ?? PubTime.Listing) : x.FirstSeen != null ? (x.FirstSeen, PubTime.Estimate) : ((string?)null, (string?)null)).ToList(), DateTimeOffset.UtcNow);
+                ests[n.Src] = m = list.Select((x, i) => (x.Id, filled[i])).ToDictionary(x => x.Id, x => x.Item2, StringComparer.Ordinal);
+            }
+            res[n.Id] = m.TryGetValue(n.Id, out var f) ? f : (Protocol.Utc(DateTimeOffset.UtcNow.AddMinutes(-(++orphan))), PubTime.Estimate);
         }
         return res;
     }
@@ -77,6 +90,7 @@ public static class SampleFirst
                 int n = Math.Min(JobQueue.BatchChunk, lines.Count - i); if (i + n < lines.Count && lines[i + n - 1].T == "add") n++;
                 await q.AppendLinesAsync(lines.GetRange(i, n), ct); batches++; i += n - JobQueue.BatchChunk;
             }
-        return new Report(d, c, cl, al, batches, nPubs);
+        var bySrc = string.Join(", ", lines.Where(l => l.T == "pub").GroupBy(l => l.PubSrc).OrderBy(g => g.Key).Select(g => g.Key + " " + g.Count()));
+        return new Report(d, c, cl, al, batches, nPubs, bySrc);
     }
 }

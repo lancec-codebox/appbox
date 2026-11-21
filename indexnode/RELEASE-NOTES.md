@@ -1,3 +1,7 @@
+## 0.13.19
+
+**sample-first no longer probes per video.** `jobs sample-first` tripped the 0.13.18 breaker: `PubTime.StampAsync` probed sample/info.json, download.zip tags and properties of every pending download (404s). Now the source is chosen from the queue state: a pending download takes its publish time only from its source's members.json (listing data or estimate) and touches no per-video blob; a downloaded drama (process pending, no download entry) reads info.json ONCE. The migration costs at most sources + downloaded dramas ops and prints "store ops of this migration: N (F failed)" at the end. Test: a pending download makes 0 per-video ops.
+
 ## 0.13.18
 
 **Storage circuit breaker and per-site attribution.** Every store call is counted per call site (the first frame outside the storage layer: member, file, line, or an explicit `StoreMeter.Tag`) and per op type (get, range, head, list, put, append, delete, lease, meta), with the failures (404, 409, 412, 304) counted apart per site, with an example blob name. The meter sits at RestStore's HTTP layer (so retries count as the requests they are) and in a MeteredStore wrapper for stores without one. Status shows each node's top five sites and its failed count; `indexnode status --ops` prints the per-site list; a step's log line ends with its own op count and top sites.

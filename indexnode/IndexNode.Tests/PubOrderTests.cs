@@ -85,4 +85,21 @@ public class PubOrderTests
         var again = await SampleFirst.RunAsync(q, false, default, s, P);
         Assert.Equal((0, 0, 0), (again.Downloads, again.Checks, again.Pubs));
     }
+
+    [Fact]
+    public async Task Pending_download_makes_no_per_video_store_op_and_a_downloaded_drama_one_read()
+    {
+        var s = new FakeStore();
+        await s.AddJob(P, "download", "dl1", Protocol.Utc(T0.AddDays(-1)));
+        await s.AddJob(P, "process", "pr1", Protocol.Utc(T0.AddDays(-1)));
+        await s.PutAsync(P.Video("pr1", "info.json"), System.Text.Encoding.UTF8.GetBytes("{\"timestamp\":1772600767}"), null, null, false, default);
+        var q = new JobQueue(s, P, "t", () => T0); await q.LoadAsync(default);
+        await q.AppendLinesAsync([new QLine { T = "add", S = "dl1", Stage = "download", At = Protocol.Utc(T0), Pri = 0, Job = new JobDescriptor { Stage = "download", JobId = "dl1", Source = "src1", AddedAt = Protocol.Utc(T0), Url = "https://www.youtube.com/watch?v=dl1xxxxxxxx" }, Force = true }], default);
+        await s.PutAsync(P.SourceMembers("src1"), System.Text.Encoding.UTF8.GetBytes("{\"v\":2,\"members\":[{\"id\":\"dl1\",\"pub\":\"2026-11-15T00:00:00Z\",\"pubSource\":\"estimate\"}]}"), null, null, false, default);
+        var meter = new StoreMeter(); var m = new MeteredStore(s, meter);
+        var pubs = await SampleFirst.FindPubsAsync(q, m, P, default);
+        Assert.Equal("2026-11-15T00:00:00Z", pubs["dl1"].Pub);
+        Assert.Equal(2, meter.Total);   // members.json once + pr1's info.json once; nothing for dl1's own blobs
+        Assert.Equal(0, meter.TotalFailed);
+    }
 }

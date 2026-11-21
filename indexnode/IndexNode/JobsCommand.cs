@@ -48,8 +48,10 @@ public static class JobsCommand
             {
                 bool dry = a.Has("dry-run");
                 var q = await Load(store, paths);
+                var ops0 = StoreMeter.Current.Total;
                 var rep = await SampleFirst.RunAsync(q, dry, default, store, paths);
-                Console.WriteLine($"{rep.Downloads} pending download(s) {(dry ? "would become" : "became")} sample entries (priority and due kept), {rep.Checks} pending process entr(ies) {(dry ? "would get" : "got")} a check entry ahead of the process step, {rep.AlreadyDone} already sample-first, {rep.Claimed} under a claim left alone, {rep.Pubs} publish time(s) {(dry ? "would be" : "were")} filled in (info.json, else the source's members.json){(dry ? " (dry run: nothing written)" : $", {rep.Batches} batched append(s)")}");
+                Console.WriteLine($"store ops of this migration: {StoreMeter.Current.Total - ops0} ({StoreMeter.Current.TotalFailed} failed)");
+                Console.WriteLine($"{rep.Downloads} pending download(s) {(dry ? "would become" : "became")} sample entries (priority and due kept), {rep.Checks} pending process entr(ies) {(dry ? "would get" : "got")} a check entry ahead of the process step, {rep.AlreadyDone} already sample-first, {rep.Claimed} under a claim left alone, {rep.Pubs} publish time(s) {(dry ? "would be" : "were")} filled in [{rep.PubSources}] (info.json, else the source's members.json, else an estimate from its listing order){(dry ? " (dry run: nothing written)" : $", {rep.Batches} batched append(s)")}");
                 if (!dry) Console.WriteLine("lift the process hold with: indexnode control run --stage process");
                 return 0;
             }
