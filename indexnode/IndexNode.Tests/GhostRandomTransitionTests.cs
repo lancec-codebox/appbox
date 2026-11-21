@@ -97,13 +97,14 @@ public class GhostRandomTransitionTests
     {
         var name = "index/videos/RND" + seed + "/centers.zip"; var (store, sim) = Rig(name, 60_000, seed); var data = sim.Data;
         using var stop = new CancellationTokenSource(); var errors = new System.Collections.Concurrent.ConcurrentBag<string>(); int reads = 0;
-        var nexis = Task.Run(async () => { var rng = new Random(seed * 77); while (!stop.IsCancellationRequested) { sim.NexisStep(rng); if (rng.Next(4) == 0) await Task.Delay(1); else await Task.Yield(); } });
+        var clock = System.Diagnostics.Stopwatch.StartNew(); var overall = TimeSpan.FromSeconds(90);   // the readers run until Nexis has flipped enough, however slow the machine; only this timeout ends it early, and then the test fails loudly
+        var nexis = Task.Factory.StartNew(async () => { var rng = new Random(seed * 77); while (!stop.IsCancellationRequested) { sim.NexisStep(rng); if (rng.Next(4) == 0) await Task.Delay(1); else await Task.Yield(); } }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();   // its own thread: a busy pool of blocked readers cannot starve it
         var old = new System.Collections.Concurrent.ConcurrentBag<string>();
         async Task Reader(int id)
         {
             var rng = new Random(seed * 1000 + id); var tmp = Path.Combine(Path.GetTempPath(), $"gr-{seed}-{id}-{Guid.NewGuid():N}");
             string? held = null;   // an ETag this reader got once and keeps using (the pinned reads of a zip view)
-            for (int i = 0; i < 120 || (sim.Flips < 15 && i < 4000); i++)
+            for (int i = 0; i < 120 || (sim.Flips < 15 && clock.Elapsed < overall); i++)
             {
                 try
                 {
@@ -128,6 +129,7 @@ public class GhostRandomTransitionTests
         }
         await Task.WhenAll(Enumerable.Range(0, 8).Select(i => Task.Run(() => Reader(i))));
         stop.Cancel(); await nexis;
+        Assert.True(sim.Flips >= 10, "the simulated Nexis must really have flipped the blob (" + sim.Flips + " flips after " + clock.Elapsed.TotalSeconds.ToString("F0") + " s, timeout " + overall.TotalSeconds + " s)");
         Assert.True(errors.IsEmpty, $"{errors.Count} failed reads of {reads + errors.Count}; first: {errors.FirstOrDefault()}; flips {sim.Flips}, snapshots deleted {sim.SnapshotsDeleted}, hydrates {sim.Hydrates}");
         Assert.True(sim.Flips >= 10, "the simulated Nexis must really have flipped the blob (" + sim.Flips + ")");
     }
