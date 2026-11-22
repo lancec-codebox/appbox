@@ -258,4 +258,68 @@ public class InlineCheckTests
         Assert.Contains("--bind", read_usage());
         static string read_usage() => File.ReadAllText(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../IndexNode/Program.cs")));
     }
+
+    // ----------------------------------------------------------------------------------------- 0.13.23: the AI hold in the sample flow
+    static PreCheckAnalysis NewAi() => New() with { AiScore = 0.99 };
+    static string HeldLog(Action a) { var w = new StringWriter(); var old = Log.Out; Log.Out = w; try { a(); } finally { Log.Out = old; } return w.ToString(); }
+
+    [Fact]
+    public async Task Inline_check_of_an_AI_drama_adds_the_download_held_and_a_duplicate_stays_metadata_only()
+    {
+        await using var s = await StartAsync(NewAi); var node = new FakeStore(); var local = new FakeAnalyzer(New);
+        await PutSample(s.Store, "aivideo001"); Copy(s.Store, node);
+        var w = new StringWriter(); var old = Log.Out; Log.Out = w; QueueState q;
+        try { q = await RunSample(node, "aivideo001", Client(s), local); } finally { Log.Out = old; }
+        var d = q.Entry("aivideo001", "download")!; Assert.Equal("ai", d.Hold); Assert.Equal("pending", d.State); Assert.Equal(7, d.Priority); Assert.True(d.HoldAiScore > 0.9);
+        Assert.Contains("sample aivideo001: check ", w.ToString()); Assert.Contains("AI (score 0.990): held, aiDramas is off", w.ToString());
+        Assert.Equal("done", q.Entry("aivideo001", "check")!.State);
+        // not AI: claimable as before
+        await using var n = await StartAsync(New); var node2 = new FakeStore(); await PutSample(n.Store, "plainvid01"); Copy(n.Store, node2);
+        var q2 = await RunSample(node2, "plainvid01", Client(n), local); Assert.Null(q2.Entry("plainvid01", "download")!.Hold);
+        // a duplicate that is AI-flagged stays metadata-only (no download, no hold)
+        await using var dd = await StartAsync(() => Dup() with { AiScore = 0.99 }); var node3 = new FakeStore(); await PutSample(dd.Store, "dupai00001"); Copy(dd.Store, node3);
+        var q3 = await RunSample(node3, "dupai00001", Client(dd), local); Assert.Equal("duplicate", q3.Entry("dupai00001", "check")!.State); Assert.Null(q3.Entry("dupai00001", "download"));
+    }
+
+    [Fact]
+    public async Task Check_stage_of_an_AI_drama_adds_the_download_held()
+    {
+        var node = new FakeStore(); var an = new FakeAnalyzer(NewAi);
+        var q = await RunSample(node, "aicheck001", null, an);   // no inline client: the sample adds the check entry, the check stage runs it
+        Assert.Equal(1, an.Calls); var d = q.Entry("aicheck001", "download")!; Assert.Equal("ai", d.Hold); Assert.Equal(7, d.Priority);
+        var node2 = new FakeStore(); var q2 = await RunSample(node2, "plaincheck1", null, new FakeAnalyzer(New)); Assert.Null(q2.Entry("plaincheck1", "download")!.Hold);
+    }
+
+    [Fact]
+    public async Task A_held_download_is_not_claimed_until_aiDramas_is_on()
+    {
+        var store = new FakeStore(); int ran = 0;
+        await store.AddJob(P, "download", "heldvideo01", T(0), priority: 5);
+        var q0 = new JobQueue(store, P, "t"); await q0.LoadAsync(default);
+        await q0.AppendLinesAsync([new QLine { T = "hold", S = "heldvideo01", Stage = "download", Hold = "ai", AiScore = 0.9, At = T(1) }], default);
+        var h = new Dictionary<string, IStageHandler> { ["download"] = new Fn(_ => { Interlocked.Increment(ref ran); return Task.CompletedTask; }) };
+        await new NodeEngine(store, P, Opts("download"), h).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(0, ran); Assert.Equal("pending", store.Replay(P.Prefix).Entry("heldvideo01", "download")!.State);
+        await store.PutAsync(P.Control, Encoding.UTF8.GetBytes("{\"v\":1,\"aiDramas\":\"on\"}"), null, null, false, default, "application/json");
+        await new NodeEngine(store, P, Opts("download"), h).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(1, ran);
+    }
+
+    [Fact]
+    public async Task Jobs_hold_ai_holds_pending_flagged_entries_with_and_without_dry_run_and_is_idempotent()
+    {
+        var store = new FakeStore();
+        foreach (var (id, stage) in new[] { ("aidl000001", "download"), ("aipr000001", "process"), ("plain00001", "download"), ("descr00001", "download"), ("nojson0001", "download") }) await store.AddJob(P, stage, id, T(0), priority: 3);
+        async Task Ai(string id, bool flag, string src) => await VideoJson.UpdateAsync(store, P, id, r => VideoJson.SetAi(r, 0.97, flag, src), default);
+        await Ai("aidl000001", true, "precheck"); await Ai("aipr000001", true, "precheck"); await Ai("plain00001", false, "precheck"); await Ai("descr00001", true, "describe");
+        var q = new JobQueue(store, P, "t"); await q.LoadAsync(default);
+        var dry = await AiHold.HoldPendingAsync(q, store, P, true, default);
+        Assert.Equal(1, dry.Download); Assert.Equal(1, dry.Process); Assert.Equal(2, dry.Skipped); Assert.Equal(1, dry.Unreadable); Assert.Equal(0, dry.Batches);
+        Assert.All(store.Replay(P.Prefix).Subjects.Values.SelectMany(s => s.Entries.Values), e => Assert.Null(e.Hold));   // dry run wrote nothing
+        var real = await AiHold.HoldPendingAsync(q, store, P, false, default);
+        Assert.Equal(1, real.Download); Assert.Equal(1, real.Process); Assert.Equal(1, real.Batches);
+        var st = store.Replay(P.Prefix); Assert.Equal("ai", st.Entry("aidl000001", "download")!.Hold); Assert.Equal("ai", st.Entry("aipr000001", "process")!.Hold); Assert.Equal(3, st.Entry("aidl000001", "download")!.Priority);
+        Assert.Null(st.Entry("plain00001", "download")!.Hold); Assert.Null(st.Entry("descr00001", "download")!.Hold);
+        var again = await AiHold.HoldPendingAsync(q, store, P, false, default); Assert.Equal(0, again.Download + again.Process); Assert.Equal(0, again.Batches);
+    }
 }

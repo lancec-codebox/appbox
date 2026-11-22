@@ -74,7 +74,8 @@ public sealed class InlineCheckClient(HttpClient http, string url, string? token
         }
         ctx.FollowUps.Add(new QLine { T = "done", Stage = "check", Job = c });
         var d = new JobDescriptor { Stage = "download", JobId = id, Url = c.Url, MaxHeight = ctx.Job.MaxHeight, Format = ctx.Job.Format, Subs = ctx.Job.Subs, MaxComments = ctx.Job.MaxComments, Priority = ctx.Job.Priority, AddedAt = at, Pub = ctx.Job.Pub, PubSource = ctx.Job.PubSource };
-        ctx.FollowUps.Add(QLine.Add(id, "download", d, at));
-        Log.Info($"sample {id}: inline check {decision}: the full download is queued");
+        var dl = QLine.Add(id, "download", d, at); bool held = AiHold.Apply(ctx, rec, dl);
+        ctx.FollowUps.Add(dl);
+        if (!held) Log.Info($"sample {id}: inline check {decision}: the full download is queued");
     }
 }

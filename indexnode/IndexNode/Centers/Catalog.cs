@@ -14,7 +14,10 @@ public sealed record CatalogAi(double? Score, bool? Flag);
 public sealed record CatalogUpload(string Id, double? DurationSeconds, string? Title, string? Channel, string? SpeechLanguage, bool? Dubbed, CatalogAi? Ai,
     string? GroupId, bool Canonical, bool Mixed, double? GroupOffset, string State,
     string? CheckedBy = null, string? Held = null, string? Decision = null, string? MatchUpload = null, double? MatchShare = null, double? MatchOffset = null, double? MatchCosine = null,
-    string? Data = null, double? GroupDuration = null, double? MemberCovered = null, double? CanonicalCovered = null, string? RelationKind = null);
+    string? Data = null, double? GroupDuration = null, double? MemberCovered = null, double? CanonicalCovered = null, string? RelationKind = null, string? VideoEtag = null);
+
+/// <summary>0.13.23: a video.json the catalog build read and left out (downloaded, not pre-checked, not indexed), with the ETag it was read at: not read again until the ETag changes.</summary>
+public sealed record CatalogSeen(string Id, string VideoEtag);
 
 /// <summary>Per-group section: empty in 0.13.1.</summary>
 public sealed record CatalogGroup(string Id, string? Canonical, IReadOnlyList<string> Members);
@@ -27,6 +30,7 @@ public sealed class Catalog
     public int Version { get; set; }
     public List<CatalogUpload> Uploads { get; set; } = [];
     public List<CatalogGroup> Groups { get; set; } = [];
+    public List<CatalogSeen> NotCataloged { get; set; } = [];
     /// <summary>0.13.3: the uploads whose video.json was missing or unreadable at this build (their entries say Data "missing"); not serialized.</summary>
     [JsonIgnore] public List<string> Missing { get; set; } = [];
     Dictionary<string, CatalogUpload>? by;
@@ -98,10 +102,15 @@ public static class CatalogBuild
     public static async Task<Catalog> BuildAsync(IStore store, Paths paths, int version, IReadOnlyList<SearchUpload> processed, Catalog? prev, double aiFlag, Action<string>? say, CancellationToken ct)
     {
         var have = processed.Select(u => u.Id).ToHashSet(StringComparer.Ordinal); var metaOnly = new List<string>(); var pre = paths.Prefix + "videos/";
+        var etags = new Dictionary<string, string>(StringComparer.Ordinal);   // 0.13.23: the one listing's ETags: a video.json whose ETag is the one the previous catalog read is not read again
+        var skipped = prev?.NotCataloged.ToDictionary(s => s.Id, s => s.VideoEtag, StringComparer.Ordinal) ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        var notCataloged = new System.Collections.Concurrent.ConcurrentBag<CatalogSeen>();
         foreach (var b in await store.ListAsync(pre, false, false, ct))
         {
             if (!b.Name.EndsWith("/video.json", StringComparison.Ordinal)) continue;
-            var id = b.Name[pre.Length..^"/video.json".Length]; if (id.Contains('/') || have.Contains(id)) continue;
+            var id = b.Name[pre.Length..^"/video.json".Length]; if (id.Contains('/')) continue;
+            if (b.ETag is { Length: > 0 } et0) etags[id] = et0;
+            if (have.Contains(id)) continue;
             if (b.Size > 0) metaOnly.Add(id);   // an upload with no centers.zip (the index holds only processed ones): the pre-check's short circuit, read below
         }
         metaOnly.Sort(StringComparer.Ordinal);
@@ -110,7 +119,10 @@ public static class CatalogBuild
         await Parallel.ForEachAsync(Enumerable.Range(0, work.Count), new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (i, t) =>
         {
             var (id, lang0, dub0, state) = work[i];
-            if (prev?.Find(id) is { } old && old.CheckedBy != null && old.Data != null && old.State == state && old.DurationSeconds != null && (old.Ai?.Score != null || state == Catalog.MetadataOnly) && (old.SpeechLanguage != null || lang0 == null)) { res[i] = old with { GroupId = null, Canonical = false, Mixed = false, GroupOffset = null }; return; }
+            etags.TryGetValue(id, out var etag);
+            if (etag != null && prev?.Find(id) is { } same && same.VideoEtag == etag && same.State == state && same.Data != null && same.Data != Catalog.DataMissing) { res[i] = same with { GroupId = null, Canonical = false, Mixed = false, GroupOffset = null }; return; }
+            if (etag != null && state == Catalog.MetadataOnly && skipped.TryGetValue(id, out var se) && se == etag) { notCataloged.Add(new CatalogSeen(id, etag)); return; }
+            if (etag == null && prev?.Find(id) is { } old && old.CheckedBy != null && old.Data != null && old.State == state && old.DurationSeconds != null && (old.Ai?.Score != null || state == Catalog.MetadataOnly) && (old.SpeechLanguage != null || lang0 == null)) { res[i] = old with { GroupId = null, Canonical = false, Mixed = false, GroupOffset = null }; return; }
             Pre pc;
             try { pc = await ReadPrecheckAsync(store, paths, id, t); }
             catch (Exception e) when (e is not OperationCanceledException)
@@ -118,7 +130,7 @@ public static class CatalogBuild
                 lock (failed) failed.Add(id); Log.Info($"catalog: WARNING {id}: {e.Message}");
                 res[i] = new CatalogUpload(id, null, null, null, lang0, dub0, null, null, false, false, null, state, state == Catalog.Processed ? Catalog.ByIndex : Catalog.ByPrecheck, null, Data: Catalog.DataMissing); return;
             }
-            if (state == Catalog.MetadataOnly && !pc.Exists) return;   // downloaded, not pre-checked yet (and not indexed): not in the catalog
+            if (state == Catalog.MetadataOnly && !pc.Exists) { if (etag != null) notCataloged.Add(new CatalogSeen(id, etag)); return; }   // downloaded, not pre-checked yet (and not indexed): not in the catalog
             string? held = null;
             if (state == Catalog.MetadataOnly && pc.AiFlag == true && !PreCheckDecision.IsSkip(pc.Decision)) held = Catalog.HeldAi;   // the AI hold: short-circuited, not processed (yet); state stays metadata-only
             var dur = pc.Duration;
@@ -127,10 +139,10 @@ public static class CatalogBuild
             res[i] = new CatalogUpload(id, dur, pc.Title, pc.Channel, lang, dub, score == null ? null : new CatalogAi(Math.Round(score.Value, 4), flag), null, false, false, null, state,
                 state == Catalog.Processed ? Catalog.ByIndex : Catalog.ByPrecheck, held,
                 state == Catalog.Processed ? null : pc.Decision, state == Catalog.Processed ? null : pc.MatchUpload, state == Catalog.Processed ? null : pc.MatchShare, state == Catalog.Processed ? null : pc.MatchOffset, state == Catalog.Processed ? null : pc.MatchCosine,
-                state == Catalog.Processed ? Catalog.DataFull : Catalog.DataPrecheck);
+                state == Catalog.Processed ? Catalog.DataFull : Catalog.DataPrecheck, VideoEtag: etag);
             int d = Interlocked.Increment(ref done); if (d % 100 == 0) say?.Invoke($"  catalog: {d} uploads");
         });
         failed.Sort(StringComparer.Ordinal);
-        return new Catalog { Version = version, Uploads = res.Where(r => r != null).Select(r => r!).ToList(), Missing = failed };
+        return new Catalog { Version = version, Uploads = res.Where(r => r != null).Select(r => r!).ToList(), Missing = failed, NotCataloged = notCataloged.OrderBy(s => s.Id, StringComparer.Ordinal).ToList() };
     }
 }

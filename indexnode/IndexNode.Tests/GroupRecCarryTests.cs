@@ -99,4 +99,32 @@ public class GroupRecCarryTests
         await VideoJsonSeed.PutAsync(f, P, "x3", precheck: pc);
         var r6 = await Run(); Assert.Contains("published v2", r6.Log);
     }
+
+    [Fact]
+    public async Task Catalog_pre_check_reads_per_build_before_after_and_after_one_change()
+    {
+        const int N = 5, M = 20; var (f, s, m) = await Seed(N);
+        var pc = new System.Text.Json.Nodes.JsonObject { ["decision"] = "skip", ["at"] = "2026-01-01T00:00:00Z", ["group"] = GroupProposal.None.ToJson() };
+        for (int i = 0; i < M; i++) await VideoJsonSeed.PutAsync(f, P, "x" + i, precheck: i % 2 == 0 ? pc : null);   // half pre-checked (in the catalog), half downloaded only (left out)
+        var ups = await SearchIndexBuild.ListCentersAsync(s, P, default);
+        var idx = await SearchIndexBuild.BuildAsync(s, P, ups, null, null, 1, 1, 2, _ => { }, default);
+        async Task<(Catalog C, long Reads)> Build(Catalog? prev)
+        {
+            VideoJson.ClearCache(s); long r0 = Gets(m, "ReadPrecheckAsync");
+            var c = await CatalogBuild.BuildAsync(s, P, 2, idx.Uploads, prev, 0.5, null, default);
+            return (c, Gets(m, "ReadPrecheckAsync") - r0);
+        }
+        var first = await Build(null);                                              // BEFORE: no carried fields (a 0.13.22 catalog has none): everything is read
+        var legacy = new Catalog { Uploads = first.C.Uploads.Select(u => u with { VideoEtag = null }).ToList() };
+        var before = await Build(legacy);
+        var after = await Build(first.C);                                           // AFTER: carried by ETag: nothing is read
+        await VideoJsonSeed.PutAsync(f, P, "x2", title: "changed", precheck: pc);   // one pre-checked subject changes
+        await VideoJsonSeed.PutAsync(f, P, "x5", title: "changed");                 // and one left-out one
+        var changed = await Build(first.C);
+        Assert.Equal(N + M, before.Reads); Assert.Equal(0, after.Reads); Assert.Equal(2, changed.Reads);
+        Assert.Equal(N + M / 2, first.C.Uploads.Count); Assert.Equal(M / 2, first.C.NotCataloged.Count);
+        Assert.Equal(first.C.Uploads.Select(u => u.Id), after.C.Uploads.Select(u => u.Id)); Assert.Equal("changed", changed.C.Find("x2")!.Title);
+        Console.WriteLine($"catalog pre-check reads per build over {N + M} video.json: before {before.Reads}, after {after.Reads}, two changed {changed.Reads}");
+        var back = Catalog.FromGzip(first.C.ToGzip()); Assert.Equal(first.C.NotCataloged, back.NotCataloged); Assert.Equal(first.C.Uploads.Select(u => u.VideoEtag), back.Uploads.Select(u => u.VideoEtag));
+    }
 }

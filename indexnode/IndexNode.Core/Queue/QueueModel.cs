@@ -135,11 +135,14 @@ public sealed class QueueState
                     sub.Entries.TryGetValue(stage, out var old);
                     if (old != null && l.Force != true) return;   // create-only
                     var at = l.At ?? "";
-                    sub.Entries[stage] = new QEntry { Stage = stage, State = l.State ?? "pending", Priority = l.Pri ?? l.Job?.Priority ?? 0, Added = old != null && l.Force == true && old.Added.Length > 0 ? old.Added : at, Due = l.Due ?? at, Job = l.Job };
+                    sub.Entries[stage] = new QEntry { Stage = stage, State = l.State ?? "pending", Priority = l.Pri ?? l.Job?.Priority ?? 0, Added = old != null && l.Force == true && old.Added.Length > 0 ? old.Added : at, Due = l.Due ?? at, Job = l.Job, Hold = l.Hold, HoldAiScore = l.Hold != null ? l.AiScore : null };   // 0.13.23: an entry can be added held
                     sub.LastAt = at;
                     if (l.Job?.Pub is { Length: > 0 } pub) sub.Pub = pub;
                     break;
                 }
+            case "hold":   // 0.13.23 (jobs hold-ai): a pending entry gets the hold
+                if (Get(l.S)?.Entries.GetValueOrDefault(l.Stage ?? "") is { Final: false } he && he.State == "pending" && l.Hold != null) { he.Hold = l.Hold; he.HoldAiScore = l.AiScore; }
+                break;
             case "pub":
                 if (Get(l.S) is { } pubSub && l.PubTime != null) pubSub.Pub = l.PubTime;
                 break;

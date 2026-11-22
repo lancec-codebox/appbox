@@ -50,7 +50,8 @@ public sealed partial class NodeEngine
     private GroupSequencing.Gate? gate; private volatile GroupSequencing.Gate.View? gateView;
 
     private bool CanRunEntry(QSubject s, QEntry e) =>
-        e.Stage == "process" && s.Entries.TryGetValue("check", out var ck0) && !ck0.Final ? false   // 0.13.16: the check comes first (a process entry never runs the pre-check itself while a check is pending)
+        e.Hold == "ai" && !Control.Current.AiDramasOn ? false   // 0.13.23: an AI-held entry of any stage (a download too) waits for control aiDramas=on
+        : e.Stage == "process" && s.Entries.TryGetValue("check", out var ck0) && !ck0.Final ? false   // 0.13.16: the check comes first (a process entry never runs the pre-check itself while a check is pending)
         : e.Stage == "group" ? gateView is not { } gv || gv.Runnable_(s)   // a blocked group step is never claimed and nothing is appended for it (the claim-time BlockersAsync stays as the race safety net)
         : e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
    // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
@@ -284,7 +285,7 @@ public sealed partial class NodeEngine
     private JobContext NewContext(int lane, ClaimWork w, string stage, JobDescriptor job, IStore jobStore, string[] stepsDone, CancellationToken token) => new()
     {
         Job = job, Stage = stage, BlobName = w.Id, LeaseId = w.Handle.Lease, Worker = lane, Store = jobStore, Paths = paths, NodeId = o.NodeId, Token = token, Queue = queue,
-        StepsDone = stepsDone, ThreadShare = () => o.ThreadsPerWorker, Frames = gateView?.Frames,
+        StepsDone = stepsDone, ThreadShare = () => o.ThreadsPerWorker, Frames = gateView?.Frames, AiDramasOn = () => Control.Current.AiDramasOn,
         Report = (step, progress) => { if (step != null && step != w.Run.Info.Step) { w.Run.Info.Step = step; w.Run.Info.StartedAt = Protocol.NowUtc(); w.Run.Timer.Enter(step); } w.Run.Info.Progress = progress; },
     };
 

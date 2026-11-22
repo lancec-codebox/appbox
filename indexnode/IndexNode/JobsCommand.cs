@@ -44,6 +44,15 @@ public static class JobsCommand
                 Console.WriteLine($"{lines.Count} job(s) moved back to pending");
                 return 0;
             }
+            case "hold-ai":
+            {
+                bool dry = a.Has("dry-run"); var q = await Load(store, paths); var ops0 = StoreMeter.Current.Total;
+                var r = await AiHold.HoldPendingAsync(q, store, paths, dry, default, Console.WriteLine);
+                Console.WriteLine($"{r.Download} download and {r.Process} process entr(ies) {(dry ? "would be" : "were")} held (ai); {r.Skipped} pending subject(s) not AI-flagged by a pre-check or sample check, {r.Unreadable} without a readable video.json; {r.Batches} append(s){(dry ? " (dry run: nothing written)" : "")}");
+                Console.WriteLine($"store ops of this migration: {StoreMeter.Current.Total - ops0} ({StoreMeter.Current.TotalFailed} failed)");
+                if (!dry) Console.WriteLine("release them with: indexnode control ai-dramas on");
+                return 0;
+            }
             case "sample-first":
             {
                 bool dry = a.Has("dry-run");

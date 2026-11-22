@@ -33,6 +33,8 @@ public sealed class JobContext
     /// <summary>0.13.15 (group step): the node's frames-file set (the gate's), so membership never lists the store.</summary>
     public IReadOnlySet<string>? Frames { get; init; }
     public string? GroupJoinKind { get; set; }
+    /// <summary>0.13.23: control aiDramas (off unless the engine says otherwise): a sample check that finds AI adds the full download held while it is off.</summary>
+    public Func<bool> AiDramasOn { get; init; } = () => false;
 }
 
 /// <summary>The node cannot do this job (e.g. a step it does not know): it is released without counting an attempt.</summary>
