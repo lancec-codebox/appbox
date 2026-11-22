@@ -62,9 +62,9 @@ public sealed class PreCheckSettings
     public int GroupMinHits { get; set; } = 5;
     /// <summary>0.13.6 (config groups.check-frames): the full check of an upload searches at most this many of its frames, evenly spaced over the upload; 0 = all.</summary>
     public int GroupCheckFrames { get; set; } = 240;
-    /// <summary>0.13.10 (config retain.enabled / retain.t / retain.f): a drama whose frames are covered (best cosine >= T against earlier dramas) for at least F of them, and that joins a group, keeps only its uncovered frames in index/search/retained/.</summary>
+    /// <summary>0.13.10 (config retain.enabled / retain.t / retain.f): a drama whose frames are covered (best cosine >= T against earlier dramas) for at least F of them, and that joins a group, keeps only its uncovered frames in index/search/retained/. 0.13.22: T defaults to 0.80 (was 0.90): real screenshots score about 0.62 against their own frame and at most about 0.49 against another drama, so a frame with a >= 0.80 match in its group is a duplicate.</summary>
     public bool RetainEnabled { get; set; } = true;
-    public double RetainT { get; set; } = 0.90;
+    public double RetainT { get; set; } = 0.80;
     public double RetainF { get; set; } = 0.8;
     /// <summary>0.13.6 (config groups.cache-mb): byte cap of the member-block cache the groups checks share (LRU; a dropped block is read again).</summary>
     public int GroupCacheMb { get; set; } = 2048;

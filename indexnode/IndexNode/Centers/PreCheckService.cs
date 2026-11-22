@@ -76,7 +76,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             var run = await stage.AnalyzeSampleAsync(ctx, null, ct, strict: true);
             var rec = run!.Record;
             var rows = meter.StepTable();
-            var ops = new JsonObject { ["total"] = meter.StepOps, ["failed"] = rows.Sum(r => r.Failed), ["top"] = new JsonArray(rows.OrderByDescending(r => r.Count).Take(5).Select(r => (JsonNode?)new JsonObject { ["site"] = r.Site, ["op"] = r.Op, ["count"] = r.Count, ["failed"] = r.Failed }).ToArray()) };
+            var ops = new JsonObject { ["total"] = meter.StepOps, ["failed"] = rows.Sum(r => r.Failed), ["notModified"] = rows.Sum(r => r.NotModified), ["top"] = new JsonArray(rows.OrderByDescending(r => r.Count).Take(5).Select(r => (JsonNode?)new JsonObject { ["site"] = r.Site, ["op"] = r.Op, ["count"] = r.Count, ["failed"] = r.Failed }).ToArray()) };
             Interlocked.Increment(ref checks);
             Log.Info($"serve: check {id} {(string?)rec["decision"]} {sw.Elapsed.TotalSeconds:0.0}s, {meter.StepOps} store ops");
             return new JsonObject { ["decision"] = (string?)rec["decision"], ["record"] = rec, ["ops"] = ops, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds, 3), ["version"] = version };

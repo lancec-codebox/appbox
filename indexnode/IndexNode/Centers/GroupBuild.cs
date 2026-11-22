@@ -11,15 +11,48 @@ public static class GroupBuild
     sealed record Rec(GroupProposal? Proposal, string? At, double? Duration, bool HasPrecheck = false, GroupProposal? Grouped = null, double? CoveredShare = null, IReadOnlyList<RelStretch>? Stretches = null);
 
     /// <summary>The group proposal, time and duration of an upload from its video.json (0.13.2: no precheck.json, no downloaded.json). A missing or unreadable video.json throws: the group build fails loudly and is retried.</summary>
-    static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say)
+    static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say) => (await ReadRecJsonAsync(store, paths, id, ct, say)).Rec;
+
+    static async Task<(Rec Rec, string Json)> ReadRecJsonAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say)
     {
         JsonObject root;
         try { root = (await VideoJson.ReadAsync(store, paths, id, ct))?.Root ?? new JsonObject(); }   // 0.13.3: a missing or bad video.json places the upload with no hint (the catalog marks it missing), it does not fail the build
         catch (InvalidDataException) { root = new JsonObject(); }
+        return (FromRoot(root), RecJson(root));
+    }
+
+    static Rec FromRoot(JsonObject root)
+    {
         var pc = root["precheck"] as JsonObject;
         var gr = root["grouping"] as JsonObject;   // 0.13.10: the per-drama group step's record
         return new Rec(pc == null ? null : GroupProposal.FromJson(pc["group"] as JsonObject), (string?)pc?["at"], VideoJson.Duration(root), pc != null, gr == null ? null : GroupProposal.FromJson(gr["proposal"] as JsonObject),
             (double?)gr?["coveredShare"], gr?["stretches"] is JsonArray sa ? sa.OfType<JsonObject>().Select(x => new RelStretch((double?)x["from"] ?? 0, (double?)x["to"] ?? 0, (string?)x["upload"] ?? "", (double?)x["offset"] ?? 0)).ToList() : null);
+    }
+
+    /// <summary>0.13.23: the grouping record of a video.json as a compact JSON string, kept in uploads.yaml (next to videoEtag) so the next build reads video.json only when its ETag changed.</summary>
+    public static string RecJson(JsonObject root)
+    {
+        var r = FromRoot(root);
+        var o = new JsonObject { ["hp"] = r.HasPrecheck };
+        if (r.Proposal != null) o["pc"] = r.Proposal.ToJson();
+        if (r.At != null) o["at"] = r.At;
+        if (r.Duration != null) o["dur"] = r.Duration;
+        if (r.Grouped != null) o["gr"] = r.Grouped.ToJson();
+        if (r.CoveredShare != null) o["cs"] = r.CoveredShare;
+        if (r.Stretches != null) o["st"] = new JsonArray(r.Stretches.Select(x => (JsonNode?)new JsonObject { ["from"] = x.From, ["to"] = x.To, ["upload"] = x.Source, ["offset"] = x.Offset }).ToArray());
+        return o.ToJsonString();
+    }
+
+    static Rec? RecFromJson(string? json)
+    {
+        if (json == null) return null;
+        try
+        {
+            if (JsonNode.Parse(json) is not JsonObject o) return null;
+            return new Rec(GroupProposal.FromJson(o["pc"] as JsonObject), (string?)o["at"], (double?)o["dur"], (bool?)o["hp"] ?? false, GroupProposal.FromJson(o["gr"] as JsonObject), (double?)o["cs"],
+                o["st"] is JsonArray sa ? sa.OfType<JsonObject>().Select(x => new RelStretch((double?)x["from"] ?? 0, (double?)x["to"] ?? 0, (string?)x["upload"] ?? "", (double?)x["offset"] ?? 0)).ToList() : null);
+        }
+        catch (Exception e) when (e is System.Text.Json.JsonException or FormatException or InvalidOperationException) { return null; }
     }
 
     public const int ChunkFrames = 30;
@@ -89,7 +122,7 @@ public static class GroupBuild
         return $"groups: checked {done} of {total} ({rate:F1}/min, ETA {(int)eta.TotalHours:D2}:{eta.Minutes:D2})";
     }
 
-    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true, bool requireGroups = false, bool foldOnly = false)
+    public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true, bool requireGroups = false, bool foldOnly = false, bool speechFresh = false)
     {
         var s = settings ?? new PreCheckSettings();
         var prior = head == null ? null : await GroupStore.LoadAsync(store, paths, head.Version, ct);
@@ -110,13 +143,22 @@ public static class GroupBuild
         var speech = new System.Collections.Concurrent.ConcurrentDictionary<string, (string? Lang, bool? Dub)>(StringComparer.Ordinal);
         await Parallel.ForEachAsync(next.Uploads, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (u, t) =>
         {
+            if (speechFresh && u.VideoEtag != null) { speech[u.Id] = (u.SpeechLanguage, u.Dubbed); return; }   // 0.13.22: the index build just carried these forward or read them (video.json's ETag unchanged): no second read
             try { speech[u.Id] = await SearchIndexBuild.ReadSpeechAsync(store, paths, u.Id, t); } catch (Exception e) when (e is not OperationCanceledException) { }
         });
         (string? Lang, bool? Dub) Sp(SearchUpload u) => speech.TryGetValue(u.Id, out var x) && x.Lang != null ? x : (u.SpeechLanguage, u.Dubbed);
         var unknown = next.Uploads.Where(u => !known.ContainsKey(u.Id)).ToList();
         // 0.13.6: a build full-checks at most GroupMaxNewPerBuild new uploads; the rest stay unplaced and are the next build's (a bootstrap checks them all)
         // 0.13.10: the index job (foldOnly) never runs the full check: a drama with a group record is folded from it, a drama without one is left out of the set (its own group in the catalog) until its group step has run
-        if (foldOnly) { var recs = new Dictionary<string, Rec>(StringComparer.Ordinal); foreach (var u in unknown) { var rr = await ReadRecAsync(store, paths, u.Id, ct, say); if (rr.Grouped != null) recs[u.Id] = rr; } ungrouped = unknown.Count(u => !recs.ContainsKey(u.Id)); unknown = unknown.Where(u => recs.ContainsKey(u.Id)).ToList(); }
+        var allRecs = new System.Collections.Concurrent.ConcurrentDictionary<string, Rec>(StringComparer.Ordinal);
+        // 0.13.23: the record the index build kept for an upload whose video.json ETag it just checked (speechFresh); else one read, once per build
+        async Task<Rec> RecOf(SearchUpload u, CancellationToken t)
+        {
+            if (allRecs.TryGetValue(u.Id, out var c)) return c;
+            var r = (speechFresh && u.VideoEtag != null ? RecFromJson(u.GroupRec) : null) ?? await ReadRecAsync(store, paths, u.Id, t, say);
+            allRecs[u.Id] = r; return r;
+        }
+        if (foldOnly) { var recs = new Dictionary<string, Rec>(StringComparer.Ordinal); foreach (var u in unknown) { var rr = await RecOf(u, ct); if (rr.Grouped != null) recs[u.Id] = rr; } ungrouped = unknown.Count(u => !recs.ContainsKey(u.Id)); unknown = unknown.Where(u => recs.ContainsKey(u.Id)).ToList(); }
         else if (!bootstrap && unknown.Count > s.GroupMaxNewPerBuild) { say?.Invoke($"groups: {unknown.Count} new uploads, checking {s.GroupMaxNewPerBuild} now (groups.max-new-per-build); the rest wait for the next build"); unknown = unknown.Take(s.GroupMaxNewPerBuild).ToList(); }
         int done = 0, todo = unknown.Count; var clock = Stopwatch.StartNew();
         var cache = new BlockCache(s.GroupCacheMb * 1024L * 1024L);
@@ -127,7 +169,7 @@ public static class GroupBuild
         await Parallel.ForEachAsync(Enumerable.Range(0, unknown.Count), new ParallelOptions { MaxDegreeOfParallelism = par, CancellationToken = ct }, async (k, t) =>
         {
             var u = unknown[k];
-            var r = await ReadRecAsync(store, paths, u.Id, t, say);
+            var r = await RecOf(u, t);
             // 0.13.10: a drama the group step has done is folded from its record: no frames are read or searched here
             var prop = r.Grouped ?? (foldOnly ? null : await FullCheckAsync(store, paths, next, u, set, s, inner, t, cache, cstats)); cstats.Done();
             if (r.Grouped != null) Interlocked.Increment(ref folded);
@@ -138,12 +180,19 @@ public static class GroupBuild
         });
         news.AddRange(placed.Select(x => x!)); full += fullN; foldedTotal = folded; hinted += hintN;
         // the uploads the pre-check short-circuited (record, no centers.zip) with a proposal in it
-        var shorts = new HashSet<string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/";
+        var shorts = new HashSet<string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/"; var others = new Dictionary<string, OtherRec>(StringComparer.Ordinal);
         foreach (var b in await store.ListAsync(pre, false, false, ct))
         {
             if (!b.Name.EndsWith("/video.json", StringComparison.Ordinal)) continue;
             var id = b.Name[pre.Length..^"/video.json".Length]; if (id.Contains('/') || byId.ContainsKey(id)) continue;
-            var r = await ReadRecAsync(store, paths, id, ct, say);
+            // 0.13.23: the record of a video.json that is no indexed upload is kept in uploads.yaml (others:) with its ETag, read again only when the ETag changed
+            Rec r;
+            if (b.ETag is { Length: > 0 } et)
+            {
+                if (head != null && head.Others.TryGetValue(id, out var o) && o.Etag == et && RecFromJson(o.Rec) is { } cr) { r = cr; others[id] = o; }
+                else { var (rr, json) = await ReadRecJsonAsync(store, paths, id, ct, say); r = rr; others[id] = new OtherRec(et, json); }
+            }
+            else r = await ReadRecAsync(store, paths, id, ct, say);
             if (!r.HasPrecheck) continue;   // downloaded, not pre-checked: not short-circuited
             shorts.Add(id); if (known.ContainsKey(id)) continue;
             if (r.Proposal == null) continue;   // nothing to place it by
@@ -152,6 +201,7 @@ public static class GroupBuild
             try { pc = await CatalogBuild.ReadPrecheckAsync(store, paths, id, ct); } catch (Exception e) when (e is VideoJsonMissingException or InvalidDataException) { continue; }
             news.Add(new NewUpload(id, pc.Language ?? lang, pc.Language != null ? pc.Dubbed : dub, r.Duration, r.At, r.Proposal, true));
         }
+        next.Others = others;
         var before = set.Groups.ToDictionary(g => g.Id, g => g.Canonical, StringComparer.Ordinal);
         set.Apply(news, id => byId.TryGetValue(id, out var u) ? (Sp(u).Lang, Sp(u).Dub, null) : null, bootstrap);   // the language of a known member may have been measured since
         // an upload no longer in the index (and not short-circuited) leaves its group; an emptied group goes

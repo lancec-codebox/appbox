@@ -147,7 +147,7 @@ public sealed partial class NodeEngine
         public string Line(string device) { lock (done) { Close(); return done.Count == 0 ? "" : string.Join(", ", done.GroupBy(d => d.Step).Select(g => $"{g.Key} {g.Sum(x => x.Time.TotalSeconds):F1}s")) + $" [{device}]"; } }
     }
 
-    private OpsReport WithTop(OpsReport r) { var m = o_Meter; r.TopSites = m.Table().Take(30).Select(x => $"{x.Site} {x.Op} x{x.Count}" + (x.Failed > 0 ? $" ({x.Failed} failed)" : "")).ToList(); r.Failed = m.TotalFailed; r.Tripped = m.Tripped; return r; }
+    private OpsReport WithTop(OpsReport r) { var m = o_Meter; r.TopSites = m.Table().Take(30).Select(x => $"{x.Site} {x.Op} x{x.Count}" + (x.Failed > 0 ? $" ({x.Failed} failed)" : "") + (x.NotModified > 0 ? $" ({x.NotModified} not modified)" : "")).ToList(); r.Failed = m.TotalFailed; r.NotModified = m.TotalNotModified; r.Tripped = m.Tripped; return r; }
     private StoreMeter o_Meter => o.Meter;
 
     private readonly IStore store;

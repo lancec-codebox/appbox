@@ -27,7 +27,7 @@ public class StorageSitesTests
         Assert.Contains(t, r => r.Site.Contains("ReadVideoJson") && r.Op == "get");
         Assert.Contains(t, r => r.Op == "get!404" && r.Example == "gone"); Assert.Contains(t, r => r.Op == "head!404");
         Assert.Contains(t, r => r.Op == "get!304"); Assert.Contains(t, r => r.Op == "put!412");
-        Assert.Equal(5, m.Total); Assert.Equal(4, m.TotalFailed);
+        Assert.Equal(5, m.Total); Assert.Equal(3, m.TotalFailed); Assert.Equal(1, m.TotalNotModified);   // 0.13.22: the 304 is a success: in the totals, not in the failures
     }
 
     [Fact]

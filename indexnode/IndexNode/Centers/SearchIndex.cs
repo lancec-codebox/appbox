@@ -8,7 +8,10 @@ using System.Text.Json;
 namespace IndexNode;
 
 /// <summary>One upload in the global search table: where its centers.zip is and which rows of bits.bin/refs.bin are its centers.</summary>
-public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null, string? Group = null, string? File = null, long TableOff = 0);
+/// <summary>0.13.23: the grouping record (compact JSON) of a video.json that is no indexed upload, with the ETag it was read at.</summary>
+public sealed record OtherRec(string Etag, string Rec);
+
+public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null, string? Group = null, string? File = null, long TableOff = 0, string? VideoEtag = null, string? GroupRec = null);
 
 /// <summary>The global search table, as published under index/search/vN/: mean.f32 (512 f32), bits.bin (64-byte sign codes of center - mean), refs.bin (per row: u32 upload index, u32 center index), uploads.yaml.</summary>
 public sealed class SearchData
@@ -27,6 +30,8 @@ public sealed class SearchData
     public DateTimeOffset? BuiltAt { get; set; }
     /// <summary>0.13.1: catalog.json.gz of this version (duration, language, AI per upload); null on a version published before it.</summary>
     public Catalog? Catalog { get; set; }
+    /// <summary>0.13.23: records of the non-indexed video.json files (uploads.yaml others:), by upload id.</summary>
+    public Dictionary<string, OtherRec> Others { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>Bit d of a code (byte d/8, bit d%8, least significant first) is 1 when center[d] - mean[d] &gt; 0.</summary>
     public static void Code(ReadOnlySpan<float> center, ReadOnlySpan<float> mean, Span<byte> code)
@@ -192,8 +197,37 @@ public sealed class SearchData
         foreach (var u in Uploads)
             sb.Append("  - id: ").Append(Q(u.Id)).Append("\n    sha: ").Append(Q(u.Sha)).Append("\n    etag: ").Append(Q(u.ETag)).Append("\n    zipSize: ").Append(u.ZipSize).Append("\n    dataStart: ").Append(u.DataStart)
               .Append("\n    dataLength: ").Append(u.DataLength).Append("\n    frames: ").Append(u.Frames).Append("\n    k: ").Append(u.K).Append("\n    rowStart: ").Append(u.RowStart).Append('\n')
-              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n").Append(u.Group == null ? "" : "    group: " + Q(u.Group) + "\n").Append(u.File == null ? "" : "    file: " + Q(u.File) + "\n    tableOff: " + u.TableOff + "\n");
+              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n").Append(u.Group == null ? "" : "    group: " + Q(u.Group) + "\n").Append(u.File == null ? "" : "    file: " + Q(u.File) + "\n    tableOff: " + u.TableOff + "\n").Append(u.VideoEtag == null ? "" : "    videoEtag: " + Q(u.VideoEtag) + "\n").Append(u.GroupRec == null ? "" : "    groupRec: " + Q(u.GroupRec) + "\n");
+        if (Others.Count > 0) { sb.Append("others:\n"); foreach (var (id, o) in Others.OrderBy(k => k.Key, StringComparer.Ordinal)) sb.Append("  - id: ").Append(Q(id)).Append("\n    etag: ").Append(Q(o.Etag)).Append("\n    rec: ").Append(Q(o.Rec)).Append('\n'); }
         return sb.ToString();
+    }
+
+    public static Dictionary<string, OtherRec> ParseOthersYaml(string yaml)
+    {
+        var r = new Dictionary<string, OtherRec>(StringComparer.Ordinal); bool on = false; string? id = null, et = null, rec = null;
+        void Flush() { if (id != null && et != null && rec != null) r[id] = new OtherRec(et, rec); id = et = rec = null; }
+        foreach (var raw in yaml.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r'); if (line == "others:") { on = true; continue; }
+            if (!on || line.Length == 0) continue;
+            var t = line.TrimStart(); if (t.StartsWith("- ")) { Flush(); t = t[2..]; }
+            int c = t.IndexOf(':'); if (c < 0) continue; var key = t[..c].Trim(); var v = Val(t[(c + 1)..]);
+            if (key == "id") id = v; else if (key == "etag") et = v; else if (key == "rec") rec = v;
+        }
+        Flush(); return r;
+    }
+
+    /// <summary>0.13.23: true when building <paramref name="next"/> would publish what the head already is: same mean, same uploads in the same order with the same centers file (ETag, sha, retained file), speech and group records, same codes, same group table (version and build time aside). A video.json ETag that moved with the same records, and a non-indexed video.json that changed outside the grouping record, do not count.</summary>
+    public static bool Unchanged(SearchData head, SearchData next, GroupSet groups, GroupSet? prior)
+    {
+        if (head.Catalog == null || head.MeanVersion != next.MeanVersion || !head.Mean.AsSpan().SequenceEqual(next.Mean)) return false;
+        if (head.Uploads.Count != next.Uploads.Count || head.Count != next.Count) return false;
+        if (next.Uploads.Any(u => u.VideoEtag == null || u.GroupRec == null)) return false;   // nothing to prove it by: publish as before
+        for (int i = 0; i < head.Uploads.Count; i++) if (head.Uploads[i] with { VideoEtag = null } != next.Uploads[i] with { VideoEtag = null }) return false;
+        if (!head.Bits.AsSpan().SequenceEqual(next.Bits)) return false;
+        if (head.Others.Count != next.Others.Count || next.Others.Any(o => !head.Others.TryGetValue(o.Key, out var h) || h.Rec != o.Value.Rec)) return false;
+        static string J(GroupSet? g) { if (g == null) return ""; var o = g.ToJson(); o["indexVersion"] = 0; o["builtAt"] = null; return o.ToJsonString(); }
+        return prior != null && J(prior) == J(groups);
     }
 
     public static DateTimeOffset? ParseBuiltAt(string yaml)
@@ -206,10 +240,11 @@ public sealed class SearchData
     public static (int Version, int MeanVersion, long MeanFrames, List<SearchUpload> Uploads) ParseUploadsYaml(string yaml)
     {
         int version = 0, meanVersion = 0; long meanFrames = 0; var ups = new List<SearchUpload>(); Dictionary<string, string>? cur = null;
-        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null, cur.GetValueOrDefault("group") is { Length: > 0 } gr && gr != "null" ? gr : null, cur.GetValueOrDefault("file") is { Length: > 0 } ff && ff != "null" ? ff : null, cur.TryGetValue("tableOff", out var to) ? long.Parse(to) : 0)); cur = null; }
+        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null, cur.GetValueOrDefault("group") is { Length: > 0 } gr && gr != "null" ? gr : null, cur.GetValueOrDefault("file") is { Length: > 0 } ff && ff != "null" ? ff : null, cur.TryGetValue("tableOff", out var to) ? long.Parse(to) : 0, cur.GetValueOrDefault("videoEtag") is { Length: > 0 } ve && ve != "null" ? ve : null, cur.GetValueOrDefault("groupRec") is { Length: > 0 } grr && grr != "null" ? grr : null)); cur = null; }
         foreach (var raw in yaml.Split('\n'))
         {
             var line = raw.TrimEnd('\r'); if (line.Length == 0 || line.StartsWith('#')) continue;
+            if (line == "others:") break;   // 0.13.23: the non-indexed records follow the uploads
             var t = line.TrimStart(); bool item = t.StartsWith("- ");
             if (item) { Flush(); cur = []; t = t[2..]; }
             int c = t.IndexOf(':'); if (c < 0) continue; var key = t[..c].Trim(); var val = t[(c + 1)..];
@@ -271,7 +306,7 @@ public sealed class SearchData
         int n = refs.Length / 8; if (bits.Length != n * CodeBytes) throw new InvalidDataException($"bits.bin has {bits.Length / CodeBytes} codes, refs.bin {n}");
         var ru = new int[n]; var rc = new int[n]; for (int i = 0; i < n; i++) { ru[i] = BinaryPrimitives.ReadInt32LittleEndian(refs.AsSpan(i * 8)); rc[i] = BinaryPrimitives.ReadInt32LittleEndian(refs.AsSpan(i * 8 + 4)); }
         Catalog? cat = null; try { cat = await IndexNode.Catalog.ReadAsync(store, paths, version.Value, ct); } catch (InvalidDataException) { }   // an unreadable catalog counts as none
-        return new SearchData { Version = version.Value, MeanVersion = mv, MeanFrames = mf, Mean = mean, Bits = bits, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = builtAt, Catalog = cat };
+        return new SearchData { Version = version.Value, MeanVersion = mv, MeanFrames = mf, Mean = mean, Bits = bits, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = builtAt, Catalog = cat, Others = ParseOthersYaml(yaml) };
     }
 
     /// <summary>Writes vN (files created only if new: a second builder of the same version loses), then moves head.yaml (If-Match on a rewrite, If-None-Match on the first).</summary>
@@ -331,18 +366,33 @@ public static class SearchIndexBuild
         if (need > buf.Length) buf = await z.ReadAsync(0, need, ct);
         var centers = CentersFile.ParseCenters(buf.AsSpan(CentersFile.HeaderSize, h.K * CentersFile.Dim * 2), h.K);
         var sha = z.Sha ?? "";   // 0.13.18: from the frames LIST (FramesReader keeps it); 0.13.15 HEADed the file again for it
-        var (sl, db) = await ReadSpeechAsync(raw, paths, id, ct);
-        return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, 0, z.DataLength, h.Frames, h.K, 0, sl, db, null, z.Blob, h.TableOff), centers, h.Sum);
+        var (sl, db, ve, gr) = await ReadSpeechEtagAsync(raw, paths, id, ct);
+        return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, 0, z.DataLength, h.Frames, h.K, 0, sl, db, null, z.Blob, h.TableOff, ve, gr), centers, h.Sum);
     }
 
     /// <summary>The upload's speech language and dubbed from its video.json (0.13.2; the transcribe.zip range reads are gone). Null/null when the descriptor has no speech yet; a missing or unreadable video.json THROWS (the caller's entry fails and is retried).</summary>
-    public static async Task<(string? Language, bool? Dubbed)> ReadSpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct)
+    public static async Task<(string? Language, bool? Dubbed)> ReadSpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct) { var (l, d, _, _) = await ReadSpeechEtagAsync(raw, paths, id, ct); return (l, d); }
+
+    /// <summary>0.13.22: as <see cref="ReadSpeechAsync"/>, and the ETag of the video.json the values came from (null when there is none or the store gives none): kept in the index so the next build can carry the values forward while the ETag is unchanged.</summary>
+    public static async Task<(string? Language, bool? Dubbed, string? ETag, string? GroupRec)> ReadSpeechEtagAsync(IStore raw, Paths paths, string id, CancellationToken ct)
     {
         // 0.13.3: the centers index does not need video.json: a missing or unreadable one gives no language (the catalog marks the upload data:"missing"), it never stops the build
-        System.Text.Json.Nodes.JsonObject? sp;
-        try { sp = (await VideoJson.ReadAsync(raw, paths, id, ct))?.Root["speech"] as System.Text.Json.Nodes.JsonObject; }
-        catch (InvalidDataException e) { Log.Info($"search-index: WARNING {id}: {e.Message}"); sp = null; }
-        return ((string?)sp?["language"] is { Length: > 0 } l ? l : null, (bool?)sp?["dubbed"]);
+        System.Text.Json.Nodes.JsonObject? sp = null; string? etag = null, rec = null;
+        try { var doc = await VideoJson.ReadAsync(raw, paths, id, ct); sp = doc?.Root["speech"] as System.Text.Json.Nodes.JsonObject; etag = doc?.ETag; if (doc != null) rec = GroupBuild.RecJson(doc.Root); }   // 0.13.23: the grouping record from the same read
+        catch (InvalidDataException e) { Log.Info($"search-index: WARNING {id}: {e.Message}"); }
+        return ((string?)sp?["language"] is { Length: > 0 } l ? l : null, (bool?)sp?["dubbed"], etag, rec);
+    }
+
+    /// <summary>0.13.22: the ETag of every upload's video.json from ONE listing of index/videos/ (a LIST per build instead of a GET per upload). Empty ETags (a store that does not report them) are left out: those uploads are read.</summary>
+    public static async Task<Dictionary<string, string>> ListVideoEtagsAsync(IStore raw, Paths paths, CancellationToken ct)
+    {
+        var r = new Dictionary<string, string>(StringComparer.Ordinal); var pre = paths.Prefix + "videos/";
+        foreach (var b in await raw.ListAsync(pre, false, false, ct))
+        {
+            if (b.ETag is not { Length: > 0 } et || !b.Name.EndsWith("/video.json", StringComparison.Ordinal)) continue;
+            var id = b.Name[pre.Length..^"/video.json".Length]; if (!id.Contains('/')) r[id] = et;
+        }
+        return r;
     }
 
     /// <summary>Builds the table of <paramref name="uploads"/>. <paramref name="keep"/>: rows of the previous version to copy for unchanged uploads (update); everything else is read from the store. <paramref name="mean"/> null: computed from the uploads' sums (frozen afterwards).</summary>
@@ -350,6 +400,7 @@ public static class SearchIndexBuild
     {
         var loaded = new Loaded?[uploads.Count]; var reuse = new bool[uploads.Count]; int done = 0;
         var old = keep?.Uploads.ToDictionary(u => u.Id, StringComparer.Ordinal);
+        var etags = old != null && old.Count > 0 ? await ListVideoEtagsAsync(raw, paths, ct) : new Dictionary<string, string>();   // 0.13.22: one LIST tells which video.json changed since the head
         for (int i = 0; i < uploads.Count; i++)
             if (old != null && mean != null && old.TryGetValue(uploads[i].Id, out var ou) && ou.Sha == uploads[i].Zip.Metadata.GetValueOrDefault("idx_sha256", "?") && ou.Sha != "") reuse[i] = true;
         await Parallel.ForEachAsync(Enumerable.Range(0, uploads.Count).Where(i => !reuse[i]), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, async (i, t) =>
@@ -373,8 +424,9 @@ public static class SearchIndexBuild
             if (reuse[i])
             {
                 var ou = old![uploads[i].Id];
-                var (sl, db) = ou.SpeechLanguage != null ? (ou.SpeechLanguage, ou.Dubbed) : await ReadSpeechAsync(raw, paths, ou.Id, ct);   // a reused upload is read again only while its language is unknown
-                ups.Add(ou with { RowStart = row, SpeechLanguage = sl, Dubbed = db });
+                // 0.13.22: carried forward while video.json's ETag is the one the head recorded (no read at all, even when the language is still unknown); read again when it changed, or when the head has no ETag for it (an older index)
+                var (sl, db, ve, gr) = ou.VideoEtag != null && ou.GroupRec != null && etags.TryGetValue(ou.Id, out var cur) && cur == ou.VideoEtag ? (ou.SpeechLanguage, ou.Dubbed, ou.VideoEtag, ou.GroupRec) : await ReadSpeechEtagAsync(raw, paths, ou.Id, ct);   // 0.13.23: the grouping record rides with the ETag (an older head without it is read once)
+                ups.Add(ou with { RowStart = row, SpeechLanguage = sl, Dubbed = db, VideoEtag = ve, GroupRec = gr });
                 var chunk = new byte[ou.K * SearchData.CodeBytes]; Array.Copy(keep!.Bits, (long)ou.RowStart * SearchData.CodeBytes, chunk, 0, chunk.Length); bits.Add(chunk);
                 for (int c = 0; c < ou.K; c++) { ru.Add(ui); rc.Add(c); }
                 row += ou.K;

@@ -165,7 +165,13 @@ public static class CentersCommands
             if (!newMean) next.MeanFrames = head!.MeanFrames;
         }
         next.BuiltAt = startedAt;
-        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, cts.Token, Console.WriteLine, threads, cfg.PreCheck);
+        var groups = await GroupBuild.ApplyAsync(store, paths, head, next, cts.Token, Console.WriteLine, threads, cfg.PreCheck, speechFresh: true, write: false);
+        // 0.13.23: nothing changed since the head: no new version, nothing written
+        if (sub == "update" && head != null && SearchData.Unchanged(head, next, groups, await GroupStore.LoadAsync(store, paths, head.Version, cts.Token)))
+        {
+            Console.WriteLine($"search-index: up to date (v{head.Version})"); return 0;
+        }
+        await GroupStore.WriteAsync(store, paths, groups, next.Version, cts.Token);
         next.Catalog = await CatalogBuild.BuildAsync(store, paths, next.Version, next.Uploads, head?.Catalog, new PreCheckSettings().AiFlag, Console.WriteLine, cts.Token);
         Console.WriteLine($"catalog: {next.Catalog.Uploads.Count} uploads, {next.Catalog.ToGzip().Length / 1024.0:F1} KB gzipped");
         next.Catalog.ApplyGroups(groups);

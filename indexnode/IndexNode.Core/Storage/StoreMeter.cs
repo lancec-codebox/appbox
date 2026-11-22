@@ -7,7 +7,8 @@ namespace IndexNode;
 public sealed class StorageBudgetExceeded(string message) : InvalidOperationException(message);
 
 /// <summary>0.13.18: one line of the per-site table.</summary>
-public sealed record SiteRow(string Site, string Op, long Count, long Failed, string? Example);
+/// <summary>One line of the per-site table. <c>Failed</c> counts real failures (404, 409, 412 ...); <c>NotModified</c> counts 304s of conditional reads, which are successes (not in <c>Failed</c>, not in the breaker). <c>Blobs</c>: distinct blobs behind the row in the breaker's one-minute window (0 = not tracked, e.g. the all-time table).</summary>
+public sealed record SiteRow(string Site, string Op, long Count, long Failed, string? Example, long NotModified = 0, int Blobs = 0);
 
 /// <summary>0.13.18 settings (config storage.*). Defaults: warn 3,000 / max 10,000 per minute, 20,000 per step, 300 failures per minute, 5 minutes cooldown.</summary>
 public sealed class StorageLimits
@@ -36,7 +37,10 @@ public sealed class StoreMeter
     int winOps, winFails; long lastWarnMin = -1; DateTimeOffset? trippedAt; string? tripMessage;
     public StoreMeter(Func<DateTimeOffset>? clock = null) { now = clock ?? (() => DateTimeOffset.UtcNow); }
 
-    sealed class Cell { public long Count, Failed; public string? Example; }
+    sealed class Cell { public long Count, Failed, NotModified; public string? Example; }
+    /// <summary>One full stack sample per call site, refreshed at most once a minute (what the breaker logs on a warn or a trip).</summary>
+    readonly ConcurrentDictionary<string, (DateTimeOffset At, string Stack)> samples = new();
+    public static readonly TimeSpan SampleEvery = TimeSpan.FromMinutes(1);
 
     // ------------------------------------------------------------ the step scope
     sealed class StepScope { public long Ops; public int Max; public ConcurrentDictionary<(string, string), Cell> Cells = new(); public string? Tripped; }
@@ -56,11 +60,13 @@ public sealed class StoreMeter
     public IReadOnlyList<SiteRow> StepTable() => Rows(step.Value?.Cells);
 
     // ------------------------------------------------------------ the call site
-    /// <summary>The first frame outside the storage layer, "Member (File.cs:line)"; an explicit tag (<see cref="Tag"/>) wins.</summary>
-    public static string SiteOf([CallerMemberName] string? _ = null)
+    /// <summary>Type names of helpers that many callers share: a site that starts in one of them also names its callers.</summary>
+    static readonly HashSet<string> SharedHelpers = new(StringComparer.Ordinal) { "VideoJson", "FramesReader", "CentersBlob", "CentersFile", "Catalog", "CatalogBuild", "ZipOpen", "FramesFile" };
+    /// <summary>0.13.22: the call chain outside the storage layer, "A.m (A.cs:1) <- B.n (B.cs:2) <- ...": the first frame, and while the frame just taken is a shared helper (<see cref="SharedHelpers"/>) its caller too, up to 3 frames. An explicit tag (<see cref="Tag"/>) wins.</summary>
+    public static string SiteOf([CallerMemberName] string? _ = null) => tag.Value is { } t ? t : SiteFrom(new System.Diagnostics.StackTrace(2, true));
+    public static string SiteFrom(System.Diagnostics.StackTrace st)
     {
-        if (tag.Value is { } t) return t;
-        var st = new System.Diagnostics.StackTrace(2, true);
+        var labels = new List<string>(3); string? curTop = null;
         for (int i = 0; i < st.FrameCount; i++)
         {
             var f = st.GetFrame(i); var m = f?.GetMethod(); var type = m?.DeclaringType; if (m == null || type == null) continue;
@@ -68,11 +74,15 @@ public sealed class StoreMeter
             if (type == typeof(StoreMeter) || ns.StartsWith("System.", StringComparison.Ordinal) || ns.StartsWith("Microsoft.", StringComparison.Ordinal)) continue;
             // the storage plumbing is not a call site: the caller of the store is
             if (IsPlumbing(type)) continue;
+            var top = (type.DeclaringType ?? type).Name;
+            if (top == curTop) continue;   // another frame of the helper already taken (an overload, its async state machine): the chain goes on with ITS caller
             var file = f!.GetFileName(); var name = type.DeclaringType != null && type.Name.StartsWith('<') ? type.DeclaringType.Name : type.Name;
             var member = m.Name; if (type.Name.StartsWith('<')) { var s = type.Name; var a = s.IndexOf('<') + 1; var b = s.IndexOf('>'); if (b > a) member = s[a..b]; }
-            return $"{name}.{member}" + (file != null ? $" ({Path.GetFileName(file)}:{f.GetFileLineNumber()})" : "");
+            labels.Add($"{name}.{member}" + (file != null ? $" ({Path.GetFileName(file)}:{f.GetFileLineNumber()})" : ""));
+            curTop = top;
+            if (labels.Count >= 3 || !SharedHelpers.Contains(top)) break;
         }
-        return "(unknown)";
+        return labels.Count == 0 ? "(unknown)" : string.Join(" <- ", labels);
     }
     static bool IsPlumbing(Type t) { var n = t.FullName ?? ""; var top = t.DeclaringType ?? t; var tn = top.Name; return tn is "RestStore" or "LocalCacheStore" or "StageZipStore" or "RecordingStore" or "RedirectStore" or "SplitStore" or "MeteredStore" or "GhostSafeRead" or "NexisAccess" or "RestGhostBlob" or "ZipOpen" && n.Length > 0; }
     static readonly AsyncLocal<string?> tag = new();
@@ -82,13 +92,14 @@ public sealed class StoreMeter
 
     // ------------------------------------------------------------ counting and the breaker
     long Minute() => now().ToUnixTimeSeconds();
-    void Roll(long nowSec) { while (window.Count > 0 && window.Peek().Tick <= nowSec - 60) { var o = window.Dequeue(); winOps--; if (o.Failed) winFails--; } }
+    void Roll(long nowSec) { while (window.Count > 0 && window.Peek().Tick <= nowSec - 60) { var o = window.Dequeue(); if (o.Failed) winFails--; else winOps--; } }
 
     /// <summary>Called before a store call: throws when the breaker is open or the step's budget is spent; otherwise counts the op and returns the site. <paramref name="name"/> is only for the example.</summary>
     public string Before(string op, string? name) => Before(op, name, null);
     public string Before(string op, string? name, string? site)
     {
-        site ??= SiteOf();
+        bool computed = site == null; site ??= SiteOf();
+        if (computed) Sample(site);
         var sc = step.Value;
         lock (gate)
         {
@@ -108,39 +119,60 @@ public sealed class StoreMeter
             Count(total, site, op, name, false); if (sc != null) { sc.Ops++; Count(sc.Cells, site, op, name, false); }
             window.Enqueue((sec, false, site, op, name)); winOps++;
             if (winOps >= Limits.MaxPerMin) Trip($"{winOps} store ops in the last minute (max-per-min {Limits.MaxPerMin})");
-            else if (winOps >= Limits.WarnPerMin && sec / 60 != lastWarnMin) { lastWarnMin = sec / 60; Log.Info($"storage: {winOps} ops in the last minute (warn {Limits.WarnPerMin}). Top sites: {Top(WindowRows(), 5)}"); }
+            else if (winOps >= Limits.WarnPerMin && sec / 60 != lastWarnMin) { lastWarnMin = sec / 60; { var wr = WindowRows(); Log.Info($"storage: {winOps} ops in the last minute (warn {Limits.WarnPerMin}). Top sites: {Top(wr, 5, true)}\n{Stacks(wr, 3)}"); } }
         }
         return site;
     }
 
-    /// <summary>Records that the call at <paramref name="site"/> failed (404, 409, 412, 304 and so on), with the blob name as an example.</summary>
+    /// <summary>
+    /// Records an answer that was not a plain success, with the blob name as an example. 0.13.22: a 304 (a conditional read answered "not modified") is a SUCCESS: it is kept in its own column (<c>NotModified</c>, row op "get!304"),
+    /// is already in the op totals (the read was counted when it was sent) and never counts toward the failure breaker. The other statuses stay failures, each under its own "op!status" row: 404 (a probe of a name that may be absent: get, head, tags, lease, range),
+    /// 409 (lease held, append blob sealed) and 412 (a conditional write or an append position lost a race and its caller retries). They are not excluded from the breaker: a burst of them is a loop worth tripping on.
+    /// </summary>
     public void Failed(string site, string op, string? name, int status)
     {
         var sc = step.Value;
         lock (gate)
         {
+            if (status == 304) { CountNotModified(total, site, op, name); if (sc != null) CountNotModified(sc.Cells, site, op, name); return; }
             var sec = Minute(); Roll(sec);
             Count(total, site, op + "!" + status, name, true); if (sc != null) Count(sc.Cells, site, op + "!" + status, name, true);
             window.Enqueue((sec, true, site, op + "!" + status, name)); winFails++;
-            if (trippedAt == null && winFails >= Limits.MaxFailuresPerMin) Trip($"{winFails} failed store ops in the last minute (max-failures-per-min {Limits.MaxFailuresPerMin}); failing sites: {Top(WindowRows().Where(r => r.Op.Contains('!')).ToList(), 5, true)}");
+            if (trippedAt == null && winFails >= Limits.MaxFailuresPerMin) { var wr = WindowRows(); Trip($"{winFails} failed store ops in the last minute (max-failures-per-min {Limits.MaxFailuresPerMin}; 304 not-modified answers are not failures); failing sites: {Top(wr.Where(r => r.Op.Contains('!')).ToList(), 5, true)}", wr.Where(r => r.Op.Contains('!')).ToList()); }
         }
     }
 
-    void Trip(string why)
+    void Sample(string site)
+    {
+        var n = now();
+        if (samples.TryGetValue(site, out var s) && n - s.At < SampleEvery) return;
+        var lines = new System.Diagnostics.StackTrace(true).ToString().Split('\n').Select(l => l.TrimEnd('\r')).Where(l => l.Length > 0 && !l.Contains(" IndexNode.StoreMeter.") && !l.TrimStart().StartsWith("at System.", StringComparison.Ordinal)).Take(25);
+        samples[site] = (n, string.Join("\n", lines));
+    }
+    /// <summary>The sampled stacks of the top <paramref name="n"/> sites (at most one sample a minute each).</summary>
+    string Stacks(IReadOnlyList<SiteRow> rows, int n) => string.Join("\n", rows.Select(r => r.Site).Distinct().Take(n).Select(s => samples.TryGetValue(s, out var x) ? $"  stack of {s} (sampled {x.At:HH:mm:ss}):\n{string.Join("\n", x.Stack.Split('\n').Select(l => "    " + l.TrimStart()))}" : $"  {s}: no stack sampled"));
+
+    void Trip(string why, IReadOnlyList<SiteRow>? rows = null)
     {
         if (trippedAt != null) return;
-        trippedAt = now(); tripMessage = $"storage breaker OPEN: {why}. Top sites: {Top(WindowRows(), 5)}. It closes after {Limits.Cooldown.TotalMinutes:0.#} min.";
-        Log.Info(tripMessage);
+        var wr = rows ?? WindowRows();
+        trippedAt = now(); tripMessage = $"storage breaker OPEN: {why}. Top sites: {Top(wr, 5, true)}. It closes after {Limits.Cooldown.TotalMinutes:0.#} min.";
+        Log.Info(tripMessage + "\n" + Stacks(wr, 3));
     }
 
     static void Count(ConcurrentDictionary<(string, string), Cell> d, string site, string op, string? name, bool failed)
     {
-        var c = d.GetOrAdd((site, op), _ => new Cell()); Interlocked.Increment(ref c.Count); if (failed) { Interlocked.Increment(ref c.Failed); c.Example ??= name; }
+        var c = d.GetOrAdd((site, op), _ => new Cell()); Interlocked.Increment(ref c.Count); if (failed) Interlocked.Increment(ref c.Failed); c.Example ??= name;
+    }
+    static void CountNotModified(ConcurrentDictionary<(string, string), Cell> d, string site, string op, string? name)
+    {
+        var c = d.GetOrAdd((site, op + "!304"), _ => new Cell()); Interlocked.Increment(ref c.Count); Interlocked.Increment(ref c.NotModified); c.Example ??= name;
     }
 
-    static IReadOnlyList<SiteRow> Rows(ConcurrentDictionary<(string, string), Cell>? d) => d == null ? [] : d.Select(kv => new SiteRow(kv.Key.Item1, kv.Key.Item2, kv.Value.Count, kv.Value.Failed, kv.Value.Example)).OrderByDescending(r => r.Count).ToList();
-    List<SiteRow> WindowRows() => window.GroupBy(o => (o.Site, o.Op)).Select(g => new SiteRow(g.Key.Site, g.Key.Op, g.Count(), g.Count(x => x.Failed), g.Select(x => x.Name).FirstOrDefault(n => n != null))).OrderByDescending(r => r.Count).ToList();
-    static string Top(IReadOnlyList<SiteRow> rows, int n, bool withExample = false) => string.Join("; ", rows.Take(n).Select(r => $"{r.Site} {r.Op} x{r.Count}" + (withExample && r.Example != null ? $" e.g. {r.Example}" : "")));
+    static IReadOnlyList<SiteRow> Rows(ConcurrentDictionary<(string, string), Cell>? d) => d == null ? [] : d.Select(kv => new SiteRow(kv.Key.Item1, kv.Key.Item2, kv.Value.Count, kv.Value.Failed, kv.Value.Example, kv.Value.NotModified)).OrderByDescending(r => r.Count).ToList();
+    List<SiteRow> WindowRows() => window.GroupBy(o => (o.Site, o.Op)).Select(g => new SiteRow(g.Key.Site, g.Key.Op, g.Count(), g.Count(x => x.Failed), g.Select(x => x.Name).FirstOrDefault(n => n != null), 0, g.Select(x => x.Name).Where(n => n != null).Distinct().Count())).OrderByDescending(r => r.Count).ToList();
+    /// <summary>"site op xN" per row; with examples: how many distinct blobs and one of them ("295 blobs, e.g. ..."), or "all on one blob" when it really is one: never a lone path that reads like a loop on one file.</summary>
+    static string Top(IReadOnlyList<SiteRow> rows, int n, bool withExample = false) => string.Join("; ", rows.Take(n).Select(r => $"{r.Site} {r.Op} x{r.Count}" + (!withExample || r.Example == null ? "" : r.Blobs > 1 ? $" ({r.Blobs} blobs, e.g. {r.Example})" : r.Blobs == 1 && r.Count > 1 ? $" (all on one blob: {r.Example})" : $" (e.g. {r.Example})")));
 
     // ------------------------------------------------------------ reports
     public bool Tripped { get { lock (gate) { Roll(Minute()); if (trippedAt is { } t && now() - t >= Limits.Cooldown) { trippedAt = null; tripMessage = null; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); } return trippedAt != null; } } }
@@ -148,6 +180,8 @@ public sealed class StoreMeter
     public long OpsLastMinute { get { lock (gate) { Roll(Minute()); return winOps; } } }
     public long Total => total.Where(kv => !kv.Key.Op.Contains('!')).Sum(kv => kv.Value.Count);   // the "op!404" rows are failures of ops already counted
     public long TotalFailed => total.Values.Sum(c => c.Failed);
+    /// <summary>Conditional reads answered 304: successes, kept out of <see cref="TotalFailed"/> and the failure breaker.</summary>
+    public long TotalNotModified => total.Values.Sum(c => c.NotModified);
     public IReadOnlyList<SiteRow> Table() => Rows(total);
     /// <summary>"top 5: Site op xN, ..." for the time split and status.</summary>
     public string TopLine(int n = 5) => Total == 0 ? "no store ops" : Top(Table(), n);
@@ -156,15 +190,15 @@ public sealed class StoreMeter
     public string TableText(int max = 40)
     {
         var rows = Table(); var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"storage ops: {Total} total, {TotalFailed} failed (404/409/412/304); {OpsLastMinute} in the last minute{(Tripped ? "; BREAKER OPEN" : "")}");
-        sb.AppendLine($"{"count",8} {"failed",7}  {"op",-10} site{"",-0}");
-        foreach (var r in rows.Take(max)) sb.AppendLine($"{r.Count,8} {r.Failed,7}  {r.Op,-10} {r.Site}{(r.Example != null ? "  e.g. " + r.Example : "")}");
+        sb.AppendLine($"storage ops: {Total} total, {TotalFailed} failed (404/409/412), {TotalNotModified} not modified (304, a success); {OpsLastMinute} in the last minute{(Tripped ? "; BREAKER OPEN" : "")}");
+        sb.AppendLine($"{"count",8} {"failed",7} {"304",7}  {"op",-10} site{"",-0}");
+        foreach (var r in rows.Take(max)) sb.AppendLine($"{r.Count,8} {r.Failed,7} {r.NotModified,7}  {r.Op,-10} {r.Site}{(r.Example != null ? "  e.g. " + r.Example : "")}");
         if (rows.Count > max) sb.AppendLine($"  ... {rows.Count - max} more sites");
         return sb.ToString().TrimEnd();
     }
 
     /// <summary>Clears the counters and the breaker (tests; a new write-free command).</summary>
-    public void Reset() { lock (gate) { total.Clear(); window.Clear(); winOps = winFails = 0; trippedAt = null; tripMessage = null; lastWarnMin = -1; } }
+    public void Reset() { lock (gate) { total.Clear(); samples.Clear(); window.Clear(); winOps = winFails = 0; trippedAt = null; tripMessage = null; lastWarnMin = -1; } }
 
     // ------------------------------------------------------------ the negative cache
     /// <summary>A 404 for a name is remembered until something says the name exists (a listing, a put, a queue line); asking again within <see cref="NegativeTtl"/> is answered "missing" with no request.</summary>

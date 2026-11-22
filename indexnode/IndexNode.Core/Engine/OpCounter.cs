@@ -47,6 +47,8 @@ public sealed class OpsReport
     /// <summary>0.13.18: the node's top call sites by count (site, op, count, failed) and the failures in total.</summary>
     public List<string>? TopSites { get; set; }
     public long Failed { get; set; }
+    /// <summary>0.13.22: conditional reads answered 304 (successes, not in <see cref="Failed"/>).</summary>
+    public long NotModified { get; set; }
     public bool Tripped { get; set; }
     public override string ToString() => $"{ReadsPerMin:0.#} reads/min, {WritesPerMin:0.#} writes/min, {ListsPerMin:0.#} lists/min";
 }

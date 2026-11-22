@@ -113,7 +113,7 @@ public sealed class FakeStore : IStore
     }
 
     private static BlobEntry Entry(string name, Blob b) =>
-        new(name, new Dictionary<string, string>(b.Tags), new Dictionary<string, string>(b.Meta), b.Lease != null ? "leased" : "available", b.Data.Length, b.Created);
+        new(name, new Dictionary<string, string>(b.Tags), new Dictionary<string, string>(b.Meta), b.Lease != null ? "leased" : "available", b.Data.Length, b.Created, "\"v" + b.Version + "\"");
 
     public Task<IReadOnlyList<BlobEntry>> FindByTagsAsync(string where, CancellationToken ct)
     {
