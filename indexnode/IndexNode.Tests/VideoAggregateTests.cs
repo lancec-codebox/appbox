@@ -235,4 +235,21 @@ public class VideoAggregateTests
         Assert.Equal("OLD", (string)agg.Root["speech"]!); Assert.Equal(3, agg.Rev); Assert.Equal(3, file.Rev);
         var again = await VideosAggregateCommand.BuildAsync(s, P, false, 2, null, default); Assert.Equal(0, again.StaleFixed); Assert.Equal(1, again.AlreadyCurrent);
     }
+
+    [Fact]
+    public async Task The_migration_commits_once_per_500_uploads_and_the_result_equals_per_upload_writes()
+    {
+        var s = new FakeStore(); var ids = Enumerable.Range(0, 2000).Select(i => "bulk" + i.ToString("D7")).ToList();
+        foreach (var id in ids) await s.PutAsync(VideoJson.Name(P, id), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new JsonObject { ["v"] = 1, ["id"] = id, ["speech"] = "zh-" + id, ["youtube"] = new JsonObject { ["title"] = "t" + id } }), null, null, false, default);
+        var rep = await VideosAggregateCommand.BuildAsync(s, P, false, 8, null, default, commitEvery: 500);
+        Assert.Equal(2000, rep.Blocks); Assert.Equal(4, rep.Commits); Assert.Equal(0, rep.StaleFixed); Assert.Empty(s.StagedIds(Agg));   // 4 commits of 500 uploads; nothing left for a final one
+        var viaBatch = await All(s); Assert.Equal(2000, viaBatch.Count);
+        // the same uploads through per-upload writes (the live path)
+        var ref2 = new FakeStore();
+        foreach (var id in ids.Take(300)) { var doc = (await VideoJson.ReadAsync(s, P, id, default, fresh: true))!; await ref2.PutAsync(VideoJson.Name(P, id), System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(doc.Root), null, null, false, default); await VideoAggregate.WriteAsync(ref2, P, id, 1, doc.Root, default); }
+        var viaEach = await All(ref2);
+        foreach (var id in ids.Take(300)) { Assert.True(VideoAggregate.SameContent(viaBatch[id].Root, viaEach[id].Root)); Assert.Equal(viaEach[id].Rev, viaBatch[id].Rev); }
+        Assert.Equal(ids.Take(300).ToList(), ids.Take(300).Where(id => VideoAggregate.SameContent(viaBatch[id].Root, (JsonObject)JsonNode.Parse((s.GetAsync(VideoJson.Name(P, id), default).Result!).Data)!)).ToList());
+        var again = await VideosAggregateCommand.BuildAsync(s, P, false, 8, null, default, commitEvery: 500); Assert.Equal(0, again.Blocks); Assert.Equal(0, again.Commits);
+    }
 }

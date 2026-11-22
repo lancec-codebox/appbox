@@ -6,24 +6,27 @@ namespace IndexNode;
 /// <summary>indexnode videos aggregate [--dry-run]: builds index/data/videos.agg once from the per-upload video.json files (one block per upload, stretches left out) and writes index/videos/&lt;id&gt;/stretches.json for every join that has stretches. The per-upload files are never changed or deleted.</summary>
 public static class VideosAggregateCommand
 {
-    public sealed record Report(int Videos, int Blocks, int Stretches, int Skipped, int AlreadyCurrent, IReadOnlyList<string> Notes, int MetadataSets = 0, int StaleFixed = 0);
+    public sealed record Report(int Videos, int Blocks, int Stretches, int Skipped, int AlreadyCurrent, IReadOnlyList<string> Notes, int MetadataSets = 0, int StaleFixed = 0, int Commits = 0, int CommitRetries = 0, long Ops = 0);
 
     public static async Task<int> RunAsync(Args a)
     {
         var (_, store, paths, http) = Commands.Open(a); using var _h = http;
-        var rep = await BuildAsync(store, paths, a.Has("dry-run"), a.Get("threads") is { } t ? int.Parse(t) : 8, Console.WriteLine, default);
-        Console.WriteLine($"{(a.Has("dry-run") ? "dry run, nothing written: " : "")}{rep.Videos} upload(s) with a video.json: {rep.Blocks} block(s) {(a.Has("dry-run") ? "would be " : "")}in videos.agg, {rep.AlreadyCurrent} already current, {rep.MetadataSets} rev metadata-only call(s), {rep.StaleFixed} stale blocks fixed, {rep.Stretches} stretches.json {(a.Has("dry-run") ? "would be " : "")}written, {rep.Skipped} skipped");
+        var rep = await BuildAsync(store, paths, a.Has("dry-run"), a.Get("threads") is { } t ? int.Parse(t) : 8, Console.WriteLine, default, a.Get("commit-every") is { } ce ? int.Parse(ce) : 500);
+        Console.WriteLine($"{(a.Has("dry-run") ? "dry run, nothing written: " : "")}{rep.Videos} upload(s) with a video.json: {rep.Blocks} block(s) {(a.Has("dry-run") ? "would be " : "")}in videos.agg, {rep.AlreadyCurrent} already current, {rep.MetadataSets} rev metadata-only call(s), {rep.StaleFixed} stale blocks fixed, {rep.Commits} commit(s) ({rep.CommitRetries} 412 retries), {rep.Ops} store ops in the build, {rep.Stretches} stretches.json {(a.Has("dry-run") ? "would be " : "")}written, {rep.Skipped} skipped");
         foreach (var n in rep.Notes.Take(20)) Console.WriteLine("  " + n);
         return 0;
     }
 
-    public static async Task<Report> BuildAsync(IStore store, Paths paths, bool dry, int threads, Action<string>? say, CancellationToken ct)
+    public static async Task<Report> BuildAsync(IStore store, Paths paths, bool dry, int threads, Action<string>? say, CancellationToken ct, int commitEvery = 500)
     {
         var pre = paths.Prefix + "videos/"; var ids = new SortedSet<string>(StringComparer.Ordinal);
         foreach (var b in await store.ListAsync(pre, false, false, ct)) if (b.Name.EndsWith("/video.json", StringComparison.Ordinal)) { var rest = b.Name[pre.Length..]; if (rest.IndexOf('/') is var s and > 0 && rest.IndexOf('/', s + 1) < 0) ids.Add(rest[..s]); }
         var current = await VideoAggregate.ReadManyAsync(store, paths, null, ct) ?? [];
         int stretches = 0, skipped = 0, already = 0, blocks = 0, metaSets = 0, stale = 0; var notes = new System.Collections.Concurrent.ConcurrentBag<string>();
-        await Parallel.ForEachAsync(ids, new ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = ct }, async (id, t) =>
+        var batch = new VideoAggregate.Batch(store, paths); long ops0 = StoreMeter.Current.Total;
+        foreach (var chunk in ids.Chunk(Math.Max(1, commitEvery)))
+        {   // Put Block for the chunk in parallel, then ONE commit (never a Put Block while a commit runs)
+        await Parallel.ForEachAsync(chunk, new ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = ct }, async (id, t) =>
         {
             try
             {
@@ -61,10 +64,12 @@ public static class VideosAggregateCommand
                     }
                 }
                 Interlocked.Increment(ref blocks);
-                if (!dry) await VideoAggregate.WriteAsync(store, paths, id, rev, doc.Root, t);
+                if (!dry) await batch.PutAsync(id, rev, doc.Root, t);
             }
             catch (Exception e) when (e is InvalidDataException or JsonException) { Interlocked.Increment(ref skipped); notes.Add($"{id}: {e.Message}"); }
         });
-        return new Report(ids.Count, blocks, stretches, skipped, already, notes.OrderBy(n => n, StringComparer.Ordinal).ToList(), metaSets, stale);
+        if (!dry) await batch.CommitAsync(ct);
+        }
+        return new Report(ids.Count, blocks, stretches, skipped, already, notes.OrderBy(n => n, StringComparer.Ordinal).ToList(), metaSets, stale, batch.Commits, batch.Conflicts, StoreMeter.Current.Total - ops0);
     }
 }

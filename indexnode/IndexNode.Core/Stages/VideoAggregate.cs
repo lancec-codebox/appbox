@@ -106,6 +106,48 @@ public static class VideoAggregate
         catch (NotSupportedException) { unsupported.AddOrUpdate(Identity(store), new object()); return false; }
     }
 
+    /// <summary>
+    /// 0.13.25, for the migration only (live writers use <see cref="WriteAsync"/>): Put Block for many uploads, then ONE commit for all of them (Get Block List, Put Block List of the highest rev per upload, If-Match, 412 looks again).
+    /// Nothing may Put Block while a commit runs (a list discards the uncommitted blocks it does not name): the caller commits between its parallel rounds.
+    /// </summary>
+    public sealed class Batch(IStore store, Paths paths)
+    {
+        readonly Dictionary<string, (long Rev, byte[] Bytes)> pending = new(StringComparer.Ordinal); readonly object gate = new();
+        public int Commits, Conflicts;
+        /// <summary>Put Block of one upload (parallel-safe). False when the store has no aggregate or the id cannot be a block.</summary>
+        public async Task<bool> PutAsync(string id, long rev, JsonObject root, CancellationToken ct)
+        {
+            if (Off(store) || !Supports(id) || rev <= 0 || rev > 9_999_999_999) return false;
+            var bytes = BlockBytes(root);
+            try { await store.PutBlockAsync(Name(paths), BlockId(id, rev), bytes, ct); }
+            catch (NotSupportedException) { unsupported.AddOrUpdate(Identity(store), new object()); return false; }
+            Interlocked.Increment(ref Stats.BlocksPut); lock (gate) pending[id] = (rev, bytes); return true;
+        }
+        /// <summary>One commit for everything put since the last one (nothing pending: nothing to do).</summary>
+        public async Task CommitAsync(CancellationToken ct)
+        {
+            Dictionary<string, (long Rev, byte[] Bytes)> mine; lock (gate) { if (pending.Count == 0) return; mine = new(pending, StringComparer.Ordinal); }
+            var name = Name(paths);
+            for (int attempt = 1; attempt <= Attempts; attempt++)
+            {
+                var bl = await store.GetBlockListAsync(name, ct); Interlocked.Increment(ref Stats.ListGets);
+                var com = ParseAll(bl?.Committed ?? [], "committed"); var unc = ParseAll(bl?.Uncommitted ?? [], "uncommitted");
+                var best = new Dictionary<string, Parsed>(StringComparer.Ordinal); var order = new List<string>();
+                foreach (var p in com.Concat(unc)) { if (!best.TryGetValue(p.Id, out var o)) { best[p.Id] = p; order.Add(p.Id); } else if (p.Rev > o.Rev) best[p.Id] = p; }
+                foreach (var (id, m) in mine)
+                {   // my block must be in the list at my rev or higher (a higher rev is a newer write: that one stays); one that was discarded is put again
+                    if (best.TryGetValue(id, out var b) && b.Rev >= m.Rev) continue;
+                    await store.PutBlockAsync(name, BlockId(id, m.Rev), m.Bytes, ct); Interlocked.Increment(ref Stats.BlocksPut); Interlocked.Increment(ref Stats.Reputs);
+                    if (!best.ContainsKey(id)) order.Add(id); best[id] = new Parsed(id, m.Rev, BlockId(id, m.Rev));
+                }
+                if (order.Count > MaxBlocks) throw new IOException($"videos.agg would hold {order.Count} blocks (limit {MaxBlocks}): shard by id prefix");
+                if (await store.PutBlockListAsync(name, order.Select(i => best[i].BlockId).ToList(), bl?.ETag, ct)) { Interlocked.Increment(ref Stats.Commits); Commits++; lock (gate) pending.Clear(); return; }
+                Interlocked.Increment(ref Stats.CommitConflicts); Conflicts++; await Task.Delay(Backoff(attempt), ct);
+            }
+            throw new IOException($"videos.agg batch commit kept losing (412) after {Attempts} tries");
+        }
+    }
+
     static async Task<bool> CommittedEqualsAsync(IStore store, string name, string id, byte[] bytes, CancellationToken ct)
     {
         var got = await ReadManyAsync(store, new Paths(name[..^"data/videos.agg".Length]), [id], ct);
