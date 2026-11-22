@@ -12,7 +12,12 @@ public sealed class SplitStore(IStore input, IStore output, string videosPrefix)
     public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => output.ReadAppendAsync(name, offset, maxLen, ct);
     public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => output.SealAppendBlobAsync(name, appendPos, ct);
     public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => output.PutIfMatchAsync(name, data, etag, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, IReadOnlyDictionary<string, string> meta, CancellationToken ct) => output.PutIfMatchAsync(name, data, etag, meta, ct);
     public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => output.GetAppendInfoAsync(name, ct);
+    public Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct) => output.PutBlockAsync(name, blockId, data, ct);
+    public Task<BlockList?> GetBlockListAsync(string name, CancellationToken ct) => output.GetBlockListAsync(name, ct);
+    public Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct) => output.PutBlockListAsync(name, blockIds, etag, ct);
+    public Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct) => output.PutIfMatchWithETagAsync(name, data, etag, ct);
     /// <summary>True for a blob that belongs to the input side.</summary>
     bool In(string name) => name.StartsWith(videosPrefix, StringComparison.Ordinal) && !name.EndsWith("/centers.zip", StringComparison.Ordinal);
     IStore R(string name) => In(name) ? input : output;

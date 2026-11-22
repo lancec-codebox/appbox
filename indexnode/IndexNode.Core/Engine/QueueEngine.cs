@@ -23,7 +23,9 @@ public sealed partial class NodeEngine
         {
             "process" => o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s)),
             "search-index" => handlers.ContainsKey("search-index") && (o.Stages.Contains("search-index") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.1: standard (non-AI) work of any processor node
+            "actors-index" => handlers.ContainsKey("actors-index") && (o.Stages.Contains("actors-index") || o.Stages.Contains("actors") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.23: standard work of any process node, the single writer of the actor index
             "group" => handlers.ContainsKey("group") && (o.Stages.Contains("group") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.10: standard work of any process node
+            "actors" => handlers.ContainsKey("actors") && (o.Stages.Contains("actors") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // standard work of any process node (needs the cast step's files and the r50 model)
             "sample" => handlers.ContainsKey("sample") && (o.Stages.Contains("sample") || o.Stages.Contains("download")),   // 0.13.16: downloader nodes only (it needs YouTube)
             "check" => handlers.ContainsKey("check") && (o.Stages.Contains("check") || o.Stages.Contains("process") || StandardSteps.Any(s => s != "sync" && o.Stages.Contains(s))),   // 0.13.16: any processor, no YouTube
             "describe" or "translate" => o.AiStages,   // opt-in: only a node started with the AI stages and an endpoint
@@ -185,7 +187,7 @@ public sealed partial class NodeEngine
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: automatic retry failed ({e.Message})"); }
     }
 
-    private static IEnumerable<string> QueueStages() => new[] { "sample", "check", "download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index" };
+    private static IEnumerable<string> QueueStages() => new[] { "sample", "check", "download", "process", "group", "actors", "describe", "translate", "refresh", "classify", "availability", "search-index", "actors-index" };
 
     /// <summary>Claims one candidate subject (limits, per-IP cap, then the protocol's claim) and runs it. False when nothing was claimed.</summary>
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
@@ -326,6 +328,8 @@ public sealed partial class NodeEngine
                         await handlers["group"].RunAsync(ctx);
                         var gl = new List<QLine> { new() { T = "done", Stage = "group", Join = ctx.GroupJoin, JoinKind = ctx.GroupJoinKind } };
                         if (handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } gsi) gl.Add(gsi);
+                        // the actors stage follows the group step (an AI-flagged upload is never queued to it; the stage checks the flag again when it runs)
+                        if (handlers.ContainsKey("actors") && queue.Read(st => st.Entry(id, "actors") == null) && !AiHold.Flagged((await VideoJson.ReadAsync(store, paths, id, token))?.Root)) gl.Add(QLine.Add(id, "actors", NewFollow("actors", id, entry.Priority), queue.NowUtc()));
                         await h.AppendAsync(gl, !WillContinue(id, "group", gl), CancellationToken.None);
                         return (Outcome.Done, null, ClaimEnded(id), ctx);
                     }

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -14,7 +15,10 @@ public sealed class VideoJsonMissingException(string id) : InvalidOperationExcep
 public static class VideoJson
 {
     public const int Version = 1;
-    public sealed record Doc(string? ETag, JsonObject Root);
+    /// <summary>Rev: the upload's revision, from the blob metadata x-ms-meta-rev (never the body; a file with none is 0, an older file with a body "rev" counts that).</summary>
+    public sealed record Doc(string? ETag, JsonObject Root, long Rev = 0, bool HasRevMeta = false);
+    public const string RevMeta = "rev";
+    static long RevFrom(IReadOnlyDictionary<string, string>? meta, JsonObject? root) => meta != null && meta.TryGetValue(RevMeta, out var v) && long.TryParse(v, out var r) ? r : VideoAggregate.RevOf(root);
 
     public static string Name(Paths p, string id) => p.Video(id, "video.json");
 
@@ -22,7 +26,7 @@ public static class VideoJson
     public static async Task<Doc?> ReadAsync(IStore store, Paths paths, string id, CancellationToken ct) => await ReadAsync(store, paths, id, ct, fresh: false);
 
     // 0.13.18: video.json is cached on the node by ETag (a conditional GET: 304 costs one request and no bytes, and a read in the same step costs none). Docs are handed out as deep copies, so a caller's edits never leak.
-    sealed record Cached(string? ETag, byte[] Data, DateTimeOffset At);
+    sealed record Cached(string? ETag, byte[] Data, DateTimeOffset At, IReadOnlyDictionary<string, string>? Meta = null);
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, System.Collections.Concurrent.ConcurrentDictionary<string, Cached>> caches = new();
     static System.Collections.Concurrent.ConcurrentDictionary<string, Cached> CacheOf(IStore s) => caches.GetValue(StoreIdentity(s), _ => new(StringComparer.Ordinal));
     /// <summary>The store under the wrappers that do not change what a name means (metering, recording, local cache), so a node's lanes share one cache.</summary>
@@ -35,23 +39,23 @@ public static class VideoJson
     public static async Task<Doc?> ReadAsync(IStore store, Paths paths, string id, CancellationToken ct, bool fresh)
     {
         var name = Name(paths, id); var key = name; var cache = CacheOf(store);
-        if (!fresh && cache.TryGetValue(key, out var hit) && Now() - hit.At < Fresh) return Parse(name, hit.ETag, hit.Data);
+        if (!fresh && cache.TryGetValue(key, out var hit) && Now() - hit.At < Fresh) return Parse(name, hit.ETag, hit.Data, hit.Meta);
         if (cache.TryGetValue(key, out var old) && old.ETag != null)
         {
             var r = await store.GetIfChangedAsync(name, old.ETag, ct);
             if (!r.Exists) { cache.TryRemove(key, out _); return null; }
-            if (!r.Changed) { cache[key] = old with { At = Now() }; return Parse(name, old.ETag, old.Data); }
-            cache[key] = new Cached(r.ETag, r.Data!, Now()); return Parse(name, r.ETag, r.Data!);
+            if (!r.Changed) { cache[key] = old with { At = Now() }; return Parse(name, old.ETag, old.Data, old.Meta); }
+            cache[key] = new Cached(r.ETag, r.Data!, Now(), r.Meta); return Parse(name, r.ETag, r.Data!, r.Meta);
         }
         var c = await store.GetAsync(name, ct);
         if (c == null) return null;
-        cache[key] = new Cached(c.ETag, c.Data, Now());
-        return Parse(name, c.ETag, c.Data);
+        cache[key] = new Cached(c.ETag, c.Data, Now(), c.Meta);
+        return Parse(name, c.ETag, c.Data, c.Meta);
     }
 
-    static Doc Parse(string name, string? etag, byte[] data)
+    static Doc Parse(string name, string? etag, byte[] data, IReadOnlyDictionary<string, string>? meta = null)
     {
-        try { return JsonNode.Parse(data) is JsonObject o ? new Doc(etag, o) : throw new InvalidDataException($"{name} is not a JSON object"); }
+        try { return JsonNode.Parse(data) is JsonObject o ? new Doc(etag, o, RevFrom(meta, o), meta != null && meta.ContainsKey(RevMeta)) : throw new InvalidDataException($"{name} is not a JSON object"); }
         catch (JsonException e) { throw new InvalidDataException($"{name} is unreadable: {e.Message}", e); }
     }
 
@@ -68,12 +72,60 @@ public static class VideoJson
             var cache = CacheOf(store);
             var cur = await ReadAsync(store, paths, id, ct, fresh: attempt > 0);
             var root = cur?.Root ?? new JsonObject();
+            var before = StretchesOf(root);
             root["v"] = Version; root["id"] = id;
             merge(root);
+            long rev = (cur?.Rev ?? 0) + 1;   // monotonic per upload, kept in the blob METADATA (x-ms-meta-rev, set by the same put: no extra op): the If-Match below is what serialises the writers of one upload
+            root.Remove("rev");
             var bytes = JsonSerializer.SerializeToUtf8Bytes(root);
-            if (await store.PutIfMatchAsync(Name(paths, id), bytes, cur?.ETag, ct)) { cache.TryRemove(Name(paths, id), out _); return root; }   // the new ETag is not known: the next read asks (once)
+            if (await store.PutIfMatchAsync(Name(paths, id), bytes, cur?.ETag, new Dictionary<string, string> { [RevMeta] = rev.ToString(System.Globalization.CultureInfo.InvariantCulture) }, ct))
+            {
+                cache.TryRemove(Name(paths, id), out _);   // the new ETag is not known: the next read asks (once)
+                var st = StretchesOf(root);
+                if (st != null && st != before && st != "[]") await store.PutAsync(StretchesName(paths, id), Encoding.UTF8.GetBytes(st), null, null, false, ct);
+                root["rev"] = rev;   // the aggregate block carries it too (a copy; the per-upload body has none)
+                var mine = rev;
+                await VideoAggregate.WriteAsync(store, paths, id, rev, root, ct, async (nr, t) =>
+                {   // a committed rev >= mine that is not my content: an old node wrote without the metadata. Still my put (its metadata rev is mine)? then raise the metadata to nr and re-put my block at nr
+                    var h = await store.HeadAsync(Name(paths, id), t);
+                    if (h == null || !h.Metadata.TryGetValue(RevMeta, out var cur) || cur != mine.ToString(System.Globalization.CultureInfo.InvariantCulture)) return false;
+                    await store.SetMetadataAsync(Name(paths, id), new Dictionary<string, string>(h.Metadata, StringComparer.OrdinalIgnoreCase) { [RevMeta] = nr.ToString(System.Globalization.CultureInfo.InvariantCulture) }, null, t);
+                    cache.TryRemove(Name(paths, id), out _); mine = nr; root["rev"] = nr; return true;
+                });   // dual write: the per-upload file above stays (always), the aggregate follows
+                return root;
+            }
         }
         throw new IOException($"{id}: video.json kept changing (is another node writing it without the lease?)");
+    }
+
+    public static string StretchesName(Paths p, string id) => p.Video(id, "stretches.json");
+    public static bool HasStretches(JsonNode? st) => st is JsonArray { Count: > 0 };
+    static string? StretchesOf(JsonObject root) => (root["grouping"] as JsonObject)?["stretches"] is JsonNode s ? s.ToJsonString() : null;
+
+    /// <summary>The stretches of one upload's grouping record: stretches.json, else (an upload written before the split) the array inside video.json. Null when it has none.</summary>
+    public static async Task<JsonArray?> ReadStretchesAsync(IStore store, Paths paths, string id, CancellationToken ct)
+    {
+        if (await store.GetAsync(StretchesName(paths, id), ct) is { } c && JsonNode.Parse(c.Data) is JsonArray a) return a;
+        return ((await ReadAsync(store, paths, id, ct))?.Root["grouping"] as JsonObject)?["stretches"] as JsonArray;
+    }
+
+    /// <summary>Many uploads at once: the aggregate (one Get Block List + one GET for the whole blob), and only the uploads it does not hold are read one by one. Readers of every upload (the AI checks, the catalog, the search index) use this.</summary>
+    public static async Task<Dictionary<string, Doc?>> ReadManyAsync(IStore store, Paths paths, IReadOnlyCollection<string> ids, CancellationToken ct, int threads = 8, bool all = false)
+    {
+        if (all) { var whole = await VideoAggregate.ReadManyAsync(store, paths, null, ct); return whole == null ? new() : whole.ToDictionary(kv => kv.Key, kv => (Doc?)kv.Value, StringComparer.Ordinal); }
+        var res = new System.Collections.Concurrent.ConcurrentDictionary<string, Doc?>(StringComparer.Ordinal);
+        var agg = await VideoAggregate.ReadManyAsync(store, paths, ids.Count < 50 ? ids : null, ct);
+        foreach (var id in ids) if (agg != null && agg.TryGetValue(id, out var d)) res[id] = d;
+        var rest = ids.Where(i => !res.ContainsKey(i)).Distinct(StringComparer.Ordinal).ToList();
+        await Parallel.ForEachAsync(rest, new ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = ct }, async (id, t) => { try { res[id] = await ReadAsync(store, paths, id, t); } catch (InvalidDataException) { } });   // an unreadable file is left out: the caller's own read reports it
+        return new Dictionary<string, Doc?>(res, StringComparer.Ordinal);
+    }
+
+    /// <summary>One upload for a bulk job: from the job's aggregate view when it holds the upload (one shared GET for the whole job), else the per-upload file (the aggregate lacks it yet).</summary>
+    public static async Task<Doc?> ReadViaAsync(VideoAggregate.AggView? view, IStore store, Paths paths, string id, CancellationToken ct)
+    {
+        if (view != null && view.Has(id) && await view.DocAsync(id, ct) is { } d) return d;
+        return await ReadAsync(store, paths, id, ct);
     }
 
     public static JsonObject Section(JsonObject root, string name) => root[name] as JsonObject ?? (JsonObject)(root[name] = new JsonObject());

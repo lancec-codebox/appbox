@@ -14,7 +14,8 @@ public static class VideosBackfill
     public static async Task<int> RunAsync(Args a)
     {
         var sub = a.Positional.FirstOrDefault();
-        if (sub != "backfill") throw new ArgumentException("videos backfill [--dry-run]");
+        if (sub == "aggregate") return await VideosAggregateCommand.RunAsync(a);
+        if (sub != "backfill") throw new ArgumentException("videos backfill [--dry-run] | videos aggregate [--dry-run]");
         var (_, store, paths, http) = Commands.Open(a); using var _h = http;
         bool dry = a.Has("dry-run");
         var rep = await BackfillAsync(store, paths, dry, new PreCheckSettings().AiFlag, a.Get("threads") is { } t ? int.Parse(t) : 4, Console.WriteLine, default);

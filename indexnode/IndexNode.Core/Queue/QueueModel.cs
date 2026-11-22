@@ -115,7 +115,7 @@ public sealed class QueueState
 {
     public Dictionary<string, QSubject> Subjects { get; set; } = new(StringComparer.Ordinal);
     /// <summary>The order a claim runs a subject's stages in.</summary>
-    public static readonly string[] StageOrder = ["sample", "check", "download", "process", "group", "describe", "translate", "refresh", "classify", "availability", "search-index"];
+    public static readonly string[] StageOrder = ["sample", "check", "download", "process", "group", "actors", "describe", "translate", "refresh", "classify", "availability", "search-index", "actors-index"];
     public static int Rank(string stage) { var i = Array.IndexOf(StageOrder, stage); return i < 0 ? 99 : i; }
 
     /// <summary>The highest sequence number handed out so far (kept in the snapshot, so dropping an old subject never lowers it).</summary>
@@ -257,7 +257,7 @@ public sealed class QueueState
         }
         // 0.13.2: a due search-index entry goes before any drama work (a singleton added today must not wait behind a backlog of older priority-0 entries); then priority, added, id as before
         // 0.13.11: a due group entry goes right behind search-index and before process work: group steps are short, and a group entry added today must not wait behind a backlog of older priority-0 process entries
-        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage == "search-index") ? 2 : x.Item2.Any(e => e.Stage == "group") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage == "group") && !x.Item2.Any(e => e.Stage == "search-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.12: group entries lowest sequence number first
+        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? 2 : x.Item2.Any(e => e.Stage == "group") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage == "group") && !x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.12: group entries lowest sequence number first
             .ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenByDescending(x => PubKey(x.Item1, x.Item2), StringComparer.Ordinal).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
     }
 

@@ -26,11 +26,12 @@ public static class AiHold
     {
         var cand = q.Read(st => st.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => e.State == "pending" && !e.Final && e.Hold == null && e.Stage is "download" or "process").Select(e => (s.Id, e.Stage))).OrderBy(x => x.Id, StringComparer.Ordinal).ToList());
         var found = new System.Collections.Concurrent.ConcurrentBag<(string Id, string Stage, double? Score)>(); int skipped = 0, unreadable = 0;
+        var allDocs = await VideoJson.ReadManyAsync(store, paths, cand.Select(c => c.Id).Distinct(StringComparer.Ordinal).ToList(), ct);   // the aggregate, not one video.json per candidate
         await Parallel.ForEachAsync(cand.Select(c => c.Id).Distinct(StringComparer.Ordinal), new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, t) =>
         {
             try
             {
-                var doc = await VideoJson.ReadAsync(store, paths, id, t); if (doc == null) { Interlocked.Increment(ref unreadable); return; }
+                var doc = allDocs.GetValueOrDefault(id); if (doc == null) { Interlocked.Increment(ref unreadable); return; }
                 var ai = doc.Root["ai"] as JsonObject;
                 if (ai != null && (bool?)ai["flag"] == true && (string?)ai["source"] == "precheck") { foreach (var c in cand.Where(c => c.Id == id)) found.Add((id, c.Stage, (double?)ai["score"])); }
                 else Interlocked.Increment(ref skipped);

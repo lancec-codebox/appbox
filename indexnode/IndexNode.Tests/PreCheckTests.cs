@@ -808,7 +808,8 @@ public class PreCheckTests : IDisposable
         try { await stage.RunAsync(Ctx(rig.Fs, job)); } catch (DuplicateFound d) { ex = d; }
         Assert.NotNull(ex); Assert.Equal("b2", ex!.Upload); Assert.False(string.IsNullOrEmpty(ex.Why));
         foreach (var kv in before.Where(k => !k.Key.EndsWith("/video.json", StringComparison.Ordinal))) Assert.Equal(kv.Value, rig.Fs[kv.Key].Data);   // nothing changed, nothing deleted (video.json gains the record)
-        Assert.Equal(before.Count, rig.Fs.Blobs.Count); Assert.False(rig.Fs.Exists(P.Video(id, "precheck.json"))); Assert.NotNull(Json(rig.Fs, P.Video(id, "precheck.json")));   // 0.13.2: video.json (already there) gains the record; no new blob
+        var added = rig.Fs.Blobs.Keys.Except(before.Keys).ToList(); Assert.All(added, k => Assert.Equal(VideoAggregate.Name(P), k));   // a skip may add only the aggregate (the dual write of video.json's new record): never precheck.json, never a stretches.json
+        Assert.False(rig.Fs.Exists(P.Video(id, "precheck.json"))); Assert.NotNull(Json(rig.Fs, P.Video(id, "precheck.json")));   // 0.13.2: video.json (already there) gains the record; no new blob
         Assert.Empty(rig.Calls);   // no yt-dlp: the window came from the stored video
     }
 

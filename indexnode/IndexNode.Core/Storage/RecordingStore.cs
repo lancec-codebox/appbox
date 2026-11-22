@@ -8,7 +8,12 @@ public sealed class RecordingStore(IStore inner) : IStore
     public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => inner.ReadAppendAsync(name, offset, maxLen, ct);
     public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => inner.SealAppendBlobAsync(name, appendPos, ct);
     public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchAsync(name, data, etag, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, IReadOnlyDictionary<string, string> meta, CancellationToken ct) => inner.PutIfMatchAsync(name, data, etag, meta, ct);
     public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => inner.GetAppendInfoAsync(name, ct);
+    public Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct) => inner.PutBlockAsync(name, blockId, data, ct);
+    public Task<BlockList?> GetBlockListAsync(string name, CancellationToken ct) => inner.GetBlockListAsync(name, ct);
+    public Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct) => inner.PutBlockListAsync(name, blockIds, etag, ct);
+    public Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchWithETagAsync(name, data, etag, ct);
     public IStore Inner => inner;
     readonly HashSet<string> written = new(StringComparer.Ordinal); readonly object gate = new();
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(name, ct);

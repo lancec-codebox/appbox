@@ -18,9 +18,10 @@ public static class SeqCommand
             if (GroupSequencing.StartedInQueue(s)) started.Add(s.Id); else if (s.Entries.ContainsKey("process")) rest.Add(s.Id);
         }
         // the rest: precheck.at in video.json
+        var view1 = await VideoAggregate.OpenViewAsync(store, paths, ct);
         await Parallel.ForEachAsync(rest, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, c) =>
         {
-            string? at = null; try { at = (string?)(await VideoJson.ReadAsync(store, paths, id, c))?.Root["precheck"]?["at"]; } catch (Exception e) when (e is not OperationCanceledException) { }
+            string? at = null; try { at = (string?)(await VideoJson.ReadViaAsync(view1, store, paths, id, c))?.Root["precheck"]?["at"]; } catch (Exception e) when (e is not OperationCanceledException) { }
             if (at != null) lock (started) started.Add(id);
         });
         return started;
@@ -38,12 +39,13 @@ public static class SeqCommand
         var all = q.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue("group", out var g) && g.State == "done").Select(s => (s.Id, Has: s.JoinKind != null)).ToList());
         var missing = all.Where(x => !x.Has).Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList();
         var found = new System.Collections.Concurrent.ConcurrentDictionary<string, (string? Join, string Kind)>(StringComparer.Ordinal); int reads = 0;
+        var view2 = await VideoAggregate.OpenViewAsync(store, paths, ct);
         await Parallel.ForEachAsync(missing, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, c) =>
         {
             Interlocked.Increment(ref reads);
             try
             {
-                var g = (await VideoJson.ReadAsync(store, paths, id, c))?.Root["grouping"] as System.Text.Json.Nodes.JsonObject; var pr = GroupProposal.FromJson(g?["proposal"] as System.Text.Json.Nodes.JsonObject);
+                var g = (await VideoJson.ReadViaAsync(view2, store, paths, id, c))?.Root["grouping"] as System.Text.Json.Nodes.JsonObject; var pr = GroupProposal.FromJson(g?["proposal"] as System.Text.Json.Nodes.JsonObject);
                 if (g != null && pr != null) found[id] = (pr.Kind == GroupProposal.JoinKind ? pr.JoinUpload : null, pr.Kind);
             }
             catch (Exception e) when (e is not OperationCanceledException) { }
@@ -73,9 +75,10 @@ public static class SeqCommand
         await q.PollAsync(ct);
         var cand = q.Read(st => st.Subjects.Values.Where(s => s.Seq != null && s.Entries.TryGetValue("group", out var g) && g.State == "done").Select(s => s.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
         var joins = new List<string>();
+        var view3 = await VideoAggregate.OpenViewAsync(store, paths, ct);
         await Parallel.ForEachAsync(cand, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (id, c) =>
         {
-            try { var g = (await VideoJson.ReadAsync(store, paths, id, c))?.Root["grouping"] as System.Text.Json.Nodes.JsonObject; if (GroupProposal.FromJson(g?["proposal"] as System.Text.Json.Nodes.JsonObject)?.Kind == GroupProposal.JoinKind) lock (joins) joins.Add(id); }
+            try { var g = (await VideoJson.ReadViaAsync(view3, store, paths, id, c))?.Root["grouping"] as System.Text.Json.Nodes.JsonObject; if (GroupProposal.FromJson(g?["proposal"] as System.Text.Json.Nodes.JsonObject)?.Kind == GroupProposal.JoinKind) lock (joins) joins.Add(id); }
             catch (Exception e) when (e is not OperationCanceledException) { }
         });
         joins.Sort(StringComparer.Ordinal);
@@ -141,10 +144,11 @@ int Dramas, int Assigned, int Already, long First, long Last, int PreLog = 0, in
         var noLine = headRows.Where(id => !inLog.ContainsKey(id) && started.Contains(id)).ToList(); noLine.AddRange(frames.Where(id => !inLog.ContainsKey(id) && !headRows.Contains(id) && started.Contains(id)).OrderBy(x => x, StringComparer.Ordinal));
         foreach (var id in noLine) Add(id);
         var keyed = new List<(string Key, string Id)>();
+        var view4 = await VideoAggregate.OpenViewAsync(store, paths, ct);
         await Parallel.ForEachAsync(inLog, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (t, c) =>
         {
             string? at = null;
-            try { at = (string?)(await VideoJson.ReadAsync(store, paths, t.Key, c))?.Root["precheck"]?["at"]; } catch (Exception e) when (e is not OperationCanceledException) { }
+            try { at = (string?)(await VideoJson.ReadViaAsync(view4, store, paths, t.Key, c))?.Root["precheck"]?["at"]; } catch (Exception e) when (e is not OperationCanceledException) { }
             lock (keyed) keyed.Add((at ?? t.Value.CentersAt ?? t.Value.LastAt ?? "\uffff", t.Key));
         });
         foreach (var k in keyed.OrderBy(k => k.Key, StringComparer.Ordinal).ThenBy(k => k.Id, StringComparer.Ordinal)) Add(k.Id);

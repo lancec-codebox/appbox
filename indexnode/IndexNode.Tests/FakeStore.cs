@@ -16,6 +16,8 @@ public sealed class FakeStore : IStore
         public int Version;
         public bool Append, Sealed;
         public int Blocks;
+        /// <summary>Committed blocks of a block blob built by Put Block List (null for a blob written whole).</summary>
+        public List<(string Id, byte[] Data)>? BlockList;
         public DateTimeOffset Created = DateTimeOffset.UtcNow;
     }
 
@@ -33,6 +35,8 @@ public sealed class FakeStore : IStore
     public readonly Dictionary<string, int> Renews = new();
     public readonly Dictionary<string, int> Puts = new();
     public readonly List<string> Calls = new();
+    /// <summary>Every blob name read by GetAsync / GetRangeAsync (a test asserts what was never read).</summary>
+    public readonly List<string> Gets = new();
     public readonly Dictionary<string, int> LeaseSeconds = new();
     public readonly List<(string Name, int Seconds)> LeaseLog = new();
     public readonly System.Collections.Concurrent.ConcurrentQueue<string> Trace = new();
@@ -148,7 +152,7 @@ public sealed class FakeStore : IStore
 
     public Task<BlobContent?> GetAsync(string name, CancellationToken ct)
     {
-        lock (gate) { Op("get"); if (Blobs.TryGetValue(name, out var g) && g.GhostData != null) { g.Data = g.GhostData; g.GhostData = null; g.Version++; } return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"") : null); }
+        lock (gate) { Op("get"); Gets.Add(name); if (Blobs.TryGetValue(name, out var g) && g.GhostData != null) { g.Data = g.GhostData; g.GhostData = null; g.Version++; } return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"", new Dictionary<string, string>(b.Meta)) : null); }
     }
 
     /// <summary>Nexis dehydrates the blob: 0 bytes committed and a new ETag, the content kept aside until a whole read hydrates it (same bytes, another ETag).</summary>
@@ -160,7 +164,7 @@ public sealed class FakeStore : IStore
         {
             if (!Blobs.TryGetValue(name, out var b)) return Task.FromResult(new ConditionalResult(true, false, null, null));
             var cur = "\"v" + b.Version + "\"";
-            return Task.FromResult(cur == etag ? new ConditionalResult(false, true, null, etag) : new ConditionalResult(true, true, b.Data, cur));
+            return Task.FromResult(cur == etag ? new ConditionalResult(false, true, null, etag) : new ConditionalResult(true, true, b.Data, cur, new Dictionary<string, string>(b.Meta)));
         }
     }
 
@@ -216,9 +220,10 @@ public sealed class FakeStore : IStore
     }
     RangeRead GetRangeCore(string name, long off, int len, string? ifMatch)
     {
+        Action<string>? rh; lock (gate) { rh = BeforeRange; BeforeRange = null; } rh?.Invoke(name);
         lock (gate)
         {
-            if (!Blobs.TryGetValue(name, out var b)) return new RangeRead(null, false);
+            Gets.Add(name); if (!Blobs.TryGetValue(name, out var b)) return new RangeRead(null, false);
             // the one ghost-aware reader, as RestStore does it: a ghost is hydrated, and an ETag that moved with the same content (length + idx_sha256) is not an error
             if (b.GhostData != null) { b.Data = b.GhostData; b.GhostData = null; b.Version++; }
             if (ifMatch != null && "\"v" + b.Version + "\"" != ifMatch)
@@ -242,14 +247,15 @@ public sealed class FakeStore : IStore
                 if (b.Lease != null && b.Lease != leaseId) throw new StorageException(412, "LeaseIdMismatchWithBlobOperation", "lease mismatch on put");
             }
             else b = Blobs[name] = new Blob { Created = Now };
-            b.Data = data; b.Tags = tags == null ? new() : new(tags); b.Meta = new(); b.Version++;
+            b.Data = data; b.BlockList = null; staged.Remove(name); b.Tags = tags == null ? new() : new(tags); b.Meta = new(); b.Version++;
             return Task.FromResult(true);
         }
     }
 
     /// <summary>Set to change the named blob (a concurrent writer) right before the next PutIfMatchAsync is checked (single use; runs outside the lock).</summary>
     public Action<string>? BeforePutIfMatch;
-    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => PutIfMatchAsync(name, data, etag, (IReadOnlyDictionary<string, string>?)null, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, IReadOnlyDictionary<string, string>? meta, CancellationToken ct)
     {
         Action<string>? hook; lock (gate) { hook = BeforePutIfMatch; BeforePutIfMatch = null; }
         hook?.Invoke(name);
@@ -258,11 +264,11 @@ public sealed class FakeStore : IStore
             if (!Blobs.TryGetValue(name, out var b))
             {
                 if (etag != null) return Task.FromResult(false);
-                Blobs[name] = new Blob { Created = Now, Data = data, Version = 1 }; Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
+                Blobs[name] = new Blob { Created = Now, Data = data, Version = 1, Meta = meta == null ? new() : new(meta) }; Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
                 return Task.FromResult(true);
             }
             if (etag == null || "\"v" + b.Version + "\"" != etag) return Task.FromResult(false);
-            b.Data = data; b.Version++; Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
+            b.Data = data; b.BlockList = null; b.Version++; if (meta != null) b.Meta = new(meta); Puts[name] = Puts.GetValueOrDefault(name) + 1; Op("put");
             return Task.FromResult(true);
         }
     }
@@ -413,4 +419,80 @@ public sealed class FakeStore : IStore
 
     /// <summary>The whole text of an append blob (for assertions).</summary>
     public string AppendText(string name) { lock (gate) return System.Text.Encoding.UTF8.GetString(Blobs[name].Data); }
+
+    // ---------------------------------------------------------------- block blobs (real semantics: staged blocks are invisible until a Put Block List with Latest; the ETag moves only on commit)
+    /// <summary>Staged (uncommitted) blocks by blob, in staging order.</summary>
+    readonly Dictionary<string, List<(string Id, byte[] Data)>> staged = new();
+    public const int MaxCommittedBlocks = 50000;
+    /// <summary>Test hooks (single use, run outside the lock right before the call is checked): a racing writer gets in first.</summary>
+    public Action<string>? BeforePutBlockList, BeforeGetBlockList;
+    /// <summary>Test hook: runs after a ranged read's ETag check passed is not needed; this one runs right before a ranged read is served (a commit can land between a reader's block list and its read).</summary>
+    public Action<string>? BeforeRange;
+    public int BlockPuts, BlockListGets, BlockListPuts, BlockListConflicts;
+    public IReadOnlyList<string> StagedIds(string name) { lock (gate) return staged.TryGetValue(name, out var l) ? l.Select(x => x.Id).ToList() : []; }
+    public void Drop(string name) { lock (gate) staged.Remove(name); }
+
+    public Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct)
+    {
+        lock (gate)
+        {
+            Op("put"); BlockPuts++; T("putblock", name, blockId);
+            if (Blobs.TryGetValue(name, out var b)) { Lapse(b); if (b.Lease != null) throw new StorageException(412, "LeaseIdMissing", "blob is leased"); }
+            var ids = (b?.BlockList?.Select(x => x.Id) ?? []).Concat(staged.TryGetValue(name, out var s0) ? s0.Select(x => x.Id) : []).ToList();
+            if (ids.Any(i => i.Length != blockId.Length)) throw new StorageException(400, "InvalidBlobOrBlock", "block ids of one blob must have the same length");
+            if (!staged.TryGetValue(name, out var l)) staged[name] = l = new();
+            l.RemoveAll(x => x.Id == blockId); l.Add((blockId, data));
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task<BlockList?> GetBlockListAsync(string name, CancellationToken ct)
+    {
+        Action<string>? hook; lock (gate) { hook = BeforeGetBlockList; BeforeGetBlockList = null; }
+        hook?.Invoke(name);
+        lock (gate)
+        {
+            Op("get"); BlockListGets++;
+            Blobs.TryGetValue(name, out var b); staged.TryGetValue(name, out var st);
+            if (b == null && (st == null || st.Count == 0)) return Task.FromResult<BlockList?>(null);
+            // a blob written whole is one committed block (Azure shows it as one, named by its content)
+            var com = b == null ? [] : b.BlockList != null ? b.BlockList.Select(x => new BlockItem(x.Id, x.Data.Length)).ToList() : b.Data.Length == 0 ? [] : new List<BlockItem> { new("whole", b.Data.Length) };
+            return Task.FromResult<BlockList?>(new BlockList(b == null ? null : "\"v" + b.Version + "\"", com, (st ?? []).Select(x => new BlockItem(x.Id, x.Data.Length)).ToList()));
+        }
+    }
+
+    public Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct)
+    {
+        Action<string>? hook; lock (gate) { hook = BeforePutBlockList; BeforePutBlockList = null; }
+        hook?.Invoke(name);
+        lock (gate)
+        {
+            Op("put"); BlockListPuts++; T("putblocklist", name, blockIds.Count + " ids");
+            Blobs.TryGetValue(name, out var b); if (b != null) Lapse(b);
+            if (b != null && b.Lease != null) throw new StorageException(412, "LeaseIdMissing", "blob is leased");
+            if (etag == null ? b != null : b == null || "\"v" + b.Version + "\"" != etag) { BlockListConflicts++; return Task.FromResult(false); }
+            staged.TryGetValue(name, out var st);
+            var list = new List<(string Id, byte[] Data)>(); var seen = new HashSet<string>();
+            foreach (var id in blockIds)
+            {
+                // Latest: the uncommitted block of that id, else the committed one; neither: 400
+                var hit = st?.FirstOrDefault(x => x.Id == id); byte[]? data = hit is { Id: not null } h ? h.Data : null;
+                data ??= b?.BlockList?.FirstOrDefault(x => x.Id == id) is { Id: not null } c ? c.Data : null;
+                if (data == null) throw new StorageException(400, "InvalidBlockList", "block " + id + " is neither committed nor uncommitted");
+                list.Add((id, data)); seen.Add(id);
+            }
+            if (list.Count > MaxCommittedBlocks) throw new StorageException(409, "BlockCountExceedsLimit", "more than 50,000 committed blocks");
+            staged.Remove(name);   // uncommitted blocks not in the list are discarded
+            if (b == null) b = Blobs[name] = new Blob { Created = Now };
+            b.BlockList = list; b.Data = list.SelectMany(x => x.Data).ToArray(); b.Version++; b.GhostData = null;
+            Puts[name] = Puts.GetValueOrDefault(name) + 1;
+            return Task.FromResult(true);
+        }
+    }
+
+    public async Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    {
+        if (!await PutIfMatchAsync(name, data, etag, ct)) return (false, null);
+        lock (gate) return (true, Blobs.TryGetValue(name, out var b) ? "\"v" + b.Version + "\"" : null);
+    }
 }

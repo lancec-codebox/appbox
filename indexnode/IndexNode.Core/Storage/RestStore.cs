@@ -36,7 +36,7 @@ public sealed class RestStore : IStore
         else
         {
             Ops.Write();
-            op = req.Method == HttpMethod.Delete ? "delete" : q.Contains("comp=lease") ? "lease" : q.Contains("comp=appendblock") ? "append" : q.Contains("comp=metadata") || q.Contains("comp=tags") ? "meta" : "put";
+            op = req.Method == HttpMethod.Delete ? "delete" : q.Contains("comp=lease") ? "lease" : q.Contains("comp=appendblock") ? "append" : q.Contains("comp=block") ? "put" : q.Contains("comp=metadata") || q.Contains("comp=tags") ? "meta" : "put";
         }
         if (site == null) site = Meter.Before(op, name); else Meter.Before(op, name, site);
         return (site, op, name);
@@ -123,12 +123,14 @@ public sealed class RestStore : IStore
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> etagAlias = new();  // name|etag a caller holds -> the current ETag of the same content
     private static string K(string name, string? etag) => name + "|" + etag;
     private void Know(string name, string? etag, long length, string? sha) { if (etag != null && length >= 0) { if (idents.Count > 20000) idents.Clear(); idents[K(name, etag)] = new Ident(length, string.IsNullOrEmpty(sha) ? null : sha); } }
+    private static IReadOnlyDictionary<string, string> MetaOf(HttpResponseMessage r) { var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); foreach (var h in r.Headers) if (h.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase)) d[h.Key[10..]] = h.Value.FirstOrDefault() ?? ""; return d; }
     private static string? ShaOf(HttpResponseMessage r) => r.Headers.TryGetValues("x-ms-meta-idx_sha256", out var v) ? v.FirstOrDefault() : null;
     private static long? TotalOf(HttpResponseMessage r) => r.Content.Headers.ContentRange?.Length;
 
     /// <summary>The state of a blob that a read found odd (empty, short, gone, changed): look at it and make it readable. True when the read is worth repeating (hydrated, snapshot set, or the blob is simply active now).</summary>
     private async Task<bool> SettleAsync(string name, CancellationToken ct)
     {
+        if (VideoAggregate.IsAggregate(name)) return false;   // the aggregate is never ghosted and never hydrated through the nexis cache
         for (int i = 1; ; i++)
         {
             try { return await HydrateGhostAsync(name, ct) || (await (GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(this, name)).ReadAsync(ct)) is { Length: > 0 }; }
@@ -136,7 +138,7 @@ public sealed class RestStore : IStore
         }
     }
 
-    public Task PrepareReadAsync(string name, CancellationToken ct) => NexisAccess.PrepareAsync(this, name, ct);
+    public Task PrepareReadAsync(string name, CancellationToken ct) => VideoAggregate.IsAggregate(name) ? Task.CompletedTask : NexisAccess.PrepareAsync(this, name, ct);   // no nexis touch/hydrate for videos.agg
 
     private Uri ReadUri(string name) => BlobUri(name, ReadSnapshots.TryGetValue(name, out var snap) ? "snapshot=" + Uri.EscapeDataString(snap) : null);
 
@@ -261,7 +263,7 @@ public sealed class RestStore : IStore
         var body = await r.Content.ReadAsByteArrayAsync(ct);
         if (body.Length == 0 && depth < 5 && await SettleAsync(name, ct)) return await GetAsync(name, ct, depth + 1);   // a ghost: hydrated, read again
         Know(name, r.Headers.ETag?.Tag, body.Length, ShaOf(r));
-        return new BlobContent(body, r.Headers.ETag?.Tag);
+        return new BlobContent(body, r.Headers.ETag?.Tag, MetaOf(r));
     }
 
     /// <summary>Bytes off..off+len of a blob (a ghost is hydrated first, like any read).</summary>
@@ -288,7 +290,7 @@ public sealed class RestStore : IStore
         var body = await r.Content.ReadAsByteArrayAsync(ct);
         if (body.Length == 0 && depth < 5 && await SettleAsync(name, ct)) return await GetIfChangedAsync(name, null, ct, depth + 1);
         Know(name, r.Headers.ETag?.Tag, body.Length, ShaOf(r));
-        return new(true, true, body, r.Headers.ETag?.Tag);
+        return new(true, true, body, r.Headers.ETag?.Tag, MetaOf(r));
     }
 
     public async Task<IReadOnlyDictionary<string, string>?> GetTagsAsync(string name, CancellationToken ct)
@@ -318,12 +320,14 @@ public sealed class RestStore : IStore
     }
 
     /// <summary>Put Blob with If-Match (or If-None-Match: * for a null etag): false on 412/409/404.</summary>
-    public async Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => PutIfMatchAsync(name, data, etag, null, ct);
+    public async Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, IReadOnlyDictionary<string, string>? meta, CancellationToken ct)
     {
         using var r = await SendAsync(() =>
         {
             var q = Req(HttpMethod.Put, BlobUri(name));
             q.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            if (meta != null) foreach (var kv in meta) q.Headers.TryAddWithoutValidation("x-ms-meta-" + kv.Key, kv.Value);   // the metadata rides the same request
             q.Headers.TryAddWithoutValidation(etag == null ? "If-None-Match" : "If-Match", etag ?? "*");
             q.Content = new ByteArrayContent(data);
             q.Content.Headers.TryAddWithoutValidation("Content-Type", "application/json");
@@ -682,5 +686,61 @@ public sealed class RestStore : IStore
         }, ct);
         if (r.StatusCode == HttpStatusCode.NotFound) return;
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Delete Blob");
+    }
+
+    // ---------------------------------------------------------------- block blobs (the aggregate video.json)
+
+    public async Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name, "comp=block&blockid=" + Uri.EscapeDataString(blockId)));
+            q.Content = new ByteArrayContent(data);
+            return q;
+        }, ct);
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Put Block");
+    }
+
+    public async Task<BlockList?> GetBlockListAsync(string name, CancellationToken ct)
+    {
+        using var r = await SendAsync(() => Req(HttpMethod.Get, BlobUri(name, "comp=blocklist&blocklisttype=all")), ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return null;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Block List");
+        var doc = XDocument.Parse(await r.Content.ReadAsStringAsync(ct));
+        static List<BlockItem> Items(XElement? e) => (e?.Elements("Block") ?? []).Select(b => new BlockItem(b.Element("Name")!.Value, long.Parse(b.Element("Size")!.Value, System.Globalization.CultureInfo.InvariantCulture))).ToList();
+        return new BlockList(r.Headers.ETag?.Tag, Items(doc.Root?.Element("CommittedBlocks")), Items(doc.Root?.Element("UncommittedBlocks")));
+    }
+
+    public async Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct)
+    {
+        var xml = BlockListXml(blockIds);
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name, "comp=blocklist"));
+            q.Headers.TryAddWithoutValidation(etag == null ? "If-None-Match" : "If-Match", etag ?? "*");
+            q.Content = new StringContent(xml, Encoding.UTF8, "application/xml");
+            q.Headers.TryAddWithoutValidation("x-ms-blob-content-type", "application/json");
+            return q;
+        }, ct);
+        if (r.StatusCode is HttpStatusCode.PreconditionFailed or HttpStatusCode.Conflict or HttpStatusCode.NotFound) return false;
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Put Block List");
+        return true;
+    }
+
+    /// <summary>Put Blob with If-Match (or If-None-Match: *), answering the ETag the write produced (from the response header; no extra request).</summary>
+    public async Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    {
+        using var r = await SendAsync(() =>
+        {
+            var q = Req(HttpMethod.Put, BlobUri(name));
+            q.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            q.Headers.TryAddWithoutValidation(etag == null ? "If-None-Match" : "If-Match", etag ?? "*");
+            q.Content = new ByteArrayContent(data);
+            q.Content.Headers.TryAddWithoutValidation("Content-Type", "application/json");
+            return q;
+        }, ct);
+        if (r.StatusCode is HttpStatusCode.PreconditionFailed or HttpStatusCode.Conflict or HttpStatusCode.NotFound) return (false, null);
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Put Blob");
+        return (true, r.Headers.ETag?.Tag);
     }
 }

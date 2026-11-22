@@ -356,7 +356,7 @@ public static class SearchIndexBuild
     public sealed record Loaded(SearchUpload Up, float[] Centers, float[] Sum);
 
     /// <summary>Reads one upload's header and center vectors (a few range requests).</summary>
-    public static async Task<Loaded> LoadUploadAsync(IStore raw, Paths paths, string id, CancellationToken ct, string? blob = null)
+    public static async Task<Loaded> LoadUploadAsync(IStore raw, Paths paths, string id, CancellationToken ct, string? blob = null, VideoAggregate.AggView? view = null)
     {
         blob ??= paths.FramesFile(id);
         var z = await FramesReader.OpenAsync(raw, blob, ct, whole: false) ?? throw new FileNotFoundException(blob);   // a small part of the file (header + centers): ranges
@@ -366,19 +366,19 @@ public static class SearchIndexBuild
         if (need > buf.Length) buf = await z.ReadAsync(0, need, ct);
         var centers = CentersFile.ParseCenters(buf.AsSpan(CentersFile.HeaderSize, h.K * CentersFile.Dim * 2), h.K);
         var sha = z.Sha ?? "";   // 0.13.18: from the frames LIST (FramesReader keeps it); 0.13.15 HEADed the file again for it
-        var (sl, db, ve, gr) = await ReadSpeechEtagAsync(raw, paths, id, ct);
+        var (sl, db, ve, gr) = await ReadSpeechEtagAsync(raw, paths, id, ct, view);
         return new Loaded(new SearchUpload(id, sha, z.ETag ?? "", z.ZipSize, 0, z.DataLength, h.Frames, h.K, 0, sl, db, null, z.Blob, h.TableOff, ve, gr), centers, h.Sum);
     }
 
     /// <summary>The upload's speech language and dubbed from its video.json (0.13.2; the transcribe.zip range reads are gone). Null/null when the descriptor has no speech yet; a missing or unreadable video.json THROWS (the caller's entry fails and is retried).</summary>
-    public static async Task<(string? Language, bool? Dubbed)> ReadSpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct) { var (l, d, _, _) = await ReadSpeechEtagAsync(raw, paths, id, ct); return (l, d); }
+    public static async Task<(string? Language, bool? Dubbed)> ReadSpeechAsync(IStore raw, Paths paths, string id, CancellationToken ct, VideoAggregate.AggView? view = null) { var (l, d, _, _) = await ReadSpeechEtagAsync(raw, paths, id, ct, view); return (l, d); }
 
     /// <summary>0.13.22: as <see cref="ReadSpeechAsync"/>, and the ETag of the video.json the values came from (null when there is none or the store gives none): kept in the index so the next build can carry the values forward while the ETag is unchanged.</summary>
-    public static async Task<(string? Language, bool? Dubbed, string? ETag, string? GroupRec)> ReadSpeechEtagAsync(IStore raw, Paths paths, string id, CancellationToken ct)
+    public static async Task<(string? Language, bool? Dubbed, string? ETag, string? GroupRec)> ReadSpeechEtagAsync(IStore raw, Paths paths, string id, CancellationToken ct, VideoAggregate.AggView? view = null)
     {
         // 0.13.3: the centers index does not need video.json: a missing or unreadable one gives no language (the catalog marks the upload data:"missing"), it never stops the build
         System.Text.Json.Nodes.JsonObject? sp = null; string? etag = null, rec = null;
-        try { var doc = await VideoJson.ReadAsync(raw, paths, id, ct); sp = doc?.Root["speech"] as System.Text.Json.Nodes.JsonObject; etag = doc?.ETag; if (doc != null) rec = GroupBuild.RecJson(doc.Root); }   // 0.13.23: the grouping record from the same read
+        try { var doc = await VideoJson.ReadViaAsync(view, raw, paths, id, ct); sp = doc?.Root["speech"] as System.Text.Json.Nodes.JsonObject; etag = view != null && view.Has(id) ? view.EtagFor(id) : doc?.ETag; if (doc != null) rec = GroupBuild.RecJson(doc.Root); }   // 0.13.23: the grouping record from the same read
         catch (InvalidDataException e) { Log.Info($"search-index: WARNING {id}: {e.Message}"); }
         return ((string?)sp?["language"] is { Length: > 0 } l ? l : null, (bool?)sp?["dubbed"], etag, rec);
     }
@@ -400,12 +400,13 @@ public static class SearchIndexBuild
     {
         var loaded = new Loaded?[uploads.Count]; var reuse = new bool[uploads.Count]; int done = 0;
         var old = keep?.Uploads.ToDictionary(u => u.Id, StringComparer.Ordinal);
+        var view = await VideoAggregate.OpenViewAsync(raw, paths, ct);   // ONE Get Block List: the revs; the whole aggregate is read (one GET) only if an upload really needs reading
         var etags = old != null && old.Count > 0 ? await ListVideoEtagsAsync(raw, paths, ct) : new Dictionary<string, string>();   // 0.13.22: one LIST tells which video.json changed since the head
         for (int i = 0; i < uploads.Count; i++)
             if (old != null && mean != null && old.TryGetValue(uploads[i].Id, out var ou) && ou.Sha == uploads[i].Zip.Metadata.GetValueOrDefault("idx_sha256", "?") && ou.Sha != "") reuse[i] = true;
         await Parallel.ForEachAsync(Enumerable.Range(0, uploads.Count).Where(i => !reuse[i]), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, async (i, t) =>
         {
-            loaded[i] = await LoadUploadAsync(raw, paths, uploads[i].Id, t, uploads[i].Zip.Name);
+            loaded[i] = await LoadUploadAsync(raw, paths, uploads[i].Id, t, uploads[i].Zip.Name, view);
             int d = Interlocked.Increment(ref done); if (d % 100 == 0) say($"  read {d} uploads");
         });
         double total = 0; long frames = 0;
@@ -425,7 +426,7 @@ public static class SearchIndexBuild
             {
                 var ou = old![uploads[i].Id];
                 // 0.13.22: carried forward while video.json's ETag is the one the head recorded (no read at all, even when the language is still unknown); read again when it changed, or when the head has no ETag for it (an older index)
-                var (sl, db, ve, gr) = ou.VideoEtag != null && ou.GroupRec != null && etags.TryGetValue(ou.Id, out var cur) && cur == ou.VideoEtag ? (ou.SpeechLanguage, ou.Dubbed, ou.VideoEtag, ou.GroupRec) : await ReadSpeechEtagAsync(raw, paths, ou.Id, ct);   // 0.13.23: the grouping record rides with the ETag (an older head without it is read once)
+                string? cur = null; var (sl, db, ve, gr) = ou.VideoEtag != null && ou.GroupRec != null && (view != null && view.Has(ou.Id) ? (cur = view.EtagFor(ou.Id)) != null : etags.TryGetValue(ou.Id, out cur)) && cur == ou.VideoEtag ? (ou.SpeechLanguage, ou.Dubbed, ou.VideoEtag, ou.GroupRec) : await ReadSpeechEtagAsync(raw, paths, ou.Id, ct, view);   // 0.13.23: the grouping record rides with the ETag (an older head without it is read once)
                 ups.Add(ou with { RowStart = row, SpeechLanguage = sl, Dubbed = db, VideoEtag = ve, GroupRec = gr });
                 var chunk = new byte[ou.K * SearchData.CodeBytes]; Array.Copy(keep!.Bits, (long)ou.RowStart * SearchData.CodeBytes, chunk, 0, chunk.Length); bits.Add(chunk);
                 for (int c = 0; c < ou.K; c++) { ru.Add(ui); rc.Add(c); }

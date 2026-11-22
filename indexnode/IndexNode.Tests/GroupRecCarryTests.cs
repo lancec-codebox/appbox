@@ -110,11 +110,11 @@ public class GroupRecCarryTests
         var idx = await SearchIndexBuild.BuildAsync(s, P, ups, null, null, 1, 1, 2, _ => { }, default);
         async Task<(Catalog C, long Reads)> Build(Catalog? prev)
         {
-            VideoJson.ClearCache(s); long r0 = Gets(m, "ReadPrecheckAsync");
+            VideoJson.ClearCache(s); long r0 = (Gets(m, "ReadPrecheckAsync") + Gets(m, "ReadManyAsync (VideoJson"));
             var c = await CatalogBuild.BuildAsync(s, P, 2, idx.Uploads, prev, 0.5, null, default);
-            return (c, Gets(m, "ReadPrecheckAsync") - r0);
+            return (c, (Gets(m, "ReadPrecheckAsync") + Gets(m, "ReadManyAsync (VideoJson")) - r0);
         }
-        var first = await Build(null);                                              // BEFORE: no carried fields (a 0.13.22 catalog has none): everything is read
+        var first = await Build(null);
         var legacy = new Catalog { Uploads = first.C.Uploads.Select(u => u with { VideoEtag = null }).ToList() };
         var before = await Build(legacy);
         var after = await Build(first.C);                                           // AFTER: carried by ETag: nothing is read

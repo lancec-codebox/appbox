@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -43,6 +43,8 @@ public static class Program
     public const string Usage = """
         indexnode run [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
+        indexnode cast recluster <id>|--ids <file> [--merge-at D] [--split [--split-sim S] [--split-min N]] [--threshold T] [--min-faces N] [--local <root>] [--out-local <dir>]   (0.13.23: re-clusters a drama's stored faces (cast.zip), read-only; old against new groups, merges with distances, proposed splits)
+        indexnode cast reembed <id>|--ids <file> --rec w600k_mbf|w600k_r50|glintr100 [--rec-path <file.onnx>] [--decoder libjpeg|ffmpeg] [--fp32] [--out-local <dir>] [--threads N] [--local <root>]   (0.13.23, a dev tool; --fp32 also writes faces_<model>.f32, unrounded: re-embeds a drama's stored faces from the stored frames and landmarks with another recognizer; writes faces_<model>.f16 + json locally, read-only on the store)
         indexnode sources add <url> [--every 1d|6h|daily@03:00] [--backfill N] [--follow-channels] [--tabs videos|videos,shorts (default videos)] [--max-height 480] [--priority N]
         indexnode sources migrate-seen [--dry-run]   (0.13.2: seen.json ids become members of members.json, then seen.json goes; a refresh does it for its own source on first touch)
         indexnode sources set-tabs videos|videos,shorts --all [--dry-run]   (0.13.2: the tabs of every followed source; the default is videos only)
@@ -78,6 +80,7 @@ public static class Program
         indexnode jobs repair-steps [--dry-run]   (0.13.2: steps in a done list whose output is not on the store are taken out; a finished subject missing an output is re-opened with only the missing steps)
         indexnode jobs list [--stage S] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>   (the queue)
         indexnode video <id>   (what the queue knows about one video)
+        indexnode videos aggregate [--dry-run] [--threads N]   (builds index/data/videos.agg, one block per upload, from the per-upload video.json files, and writes videos/<id>/stretches.json; per-upload files are never changed)
         indexnode videos backfill [--dry-run] [--threads N]   (0.13.2: create index/videos/<id>/video.json for every upload that has none, from idx_summary, info.json, precheck.json, transcribe.zip and the AI probe; create-only; a video under an active claim is skipped and reported. Run once, from a westus2 node, before the search-index job relies on it)
         (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
         indexnode repack [--videos <id>,<id>] [--dry] [--delete-loose] [--parallel <cores>]   one-off 0.9 -> 0.10.0 layout conversion (run on a node with all nodes stopped)
@@ -174,6 +177,8 @@ public static class Program
                 "ai" => a.Positional.FirstOrDefault() == "score" ? await CentersCommands.AiScoreAsync(a) : await Commands.AiAsync(a),
                 "publish" => await SiteCommands.PublishAsync(a),
                 "cast-candidates" => await CastCandidates.RunAsync(a),
+                "cast" => a.Positional.FirstOrDefault() == "recluster" ? await CastRecluster.RunAsync(a) : a.Positional.FirstOrDefault() == "reembed" ? await CastReembed.Main2(a) : Fail("cast: recluster <id>|--ids <file> [--merge-at D] [--split] [--out-local <dir>]"),
+                "actors" => await ActorsCommand.RunAsync(a),
                 "thumbs-bench" => await ThumbsBench.RunAsync(a),
                 "dino-bench" => await DinoBench.RunAsync(a),
                 "describe" => await SiteCommands.DescribeAsync(a),
@@ -266,6 +271,8 @@ public static class Commands
             ["availability"] = new AvailabilityStage(tools, store),
             ["group"] = new GroupStage(store, cfg.PreCheck),
             ["search-index"] = new SearchIndexStage(store, cfg.Search?.KeepVersions ?? 3, cfg.PreCheck),
+            ["actors"] = ActorsCommand.NewStage(store, http, a, false, null),
+            ["actors-index"] = new ActorsIndexStage(store),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step

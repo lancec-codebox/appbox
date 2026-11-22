@@ -68,9 +68,9 @@ public static class CatalogBuild
     public sealed record Pre(bool Exists, string? Language, bool? Dubbed, double? AiScore, bool? AiFlag, string? Title, string? Channel, double? Duration, string? Decision = null, string? MatchUpload = null, double? MatchShare = null, double? MatchOffset = null, double? MatchCosine = null);
 
     /// <summary>The facts of one upload from its video.json. A missing or unreadable video.json THROWS (the entry fails and is retried at the next build): never a quiet null.</summary>
-    public static async Task<Pre> ReadPrecheckAsync(IStore store, Paths paths, string id, CancellationToken ct)
+    public static async Task<Pre> ReadPrecheckAsync(IStore store, Paths paths, string id, CancellationToken ct, IReadOnlyDictionary<string, VideoJson.Doc?>? bulk = null)
     {
-        var root = (await VideoJson.RequireAsync(store, paths, id, ct)).Root;
+        var root = (bulk != null && bulk.TryGetValue(id, out var bd) && bd != null ? bd : await VideoJson.RequireAsync(store, paths, id, ct)).Root;
         var sp = root["speech"] as JsonObject; var ai = root["ai"] as JsonObject; var yt = root["youtube"] as JsonObject; var pc = root["precheck"] as JsonObject;
         var top = (pc?["top"] as JsonArray)?.OfType<JsonObject>().ToList() ?? []; var mu = (string?)pc?["matchUpload"];
         var m = (mu == null ? null : top.FirstOrDefault(x => (string?)x["upload"] == mu)) ?? top.FirstOrDefault();
@@ -116,6 +116,8 @@ public static class CatalogBuild
         metaOnly.Sort(StringComparer.Ordinal);
         var work = processed.Select(u => (u.Id, u.SpeechLanguage, u.Dubbed, Catalog.Processed)).Concat(metaOnly.Select(i => (i, (string?)null, (bool?)null, Catalog.MetadataOnly))).ToList();
         var res = new CatalogUpload?[work.Count]; int done = 0; var failed = new List<string>();
+        // the uploads whose video.json is read this build come from the aggregate in one go (one block list + one GET), not one request each
+        var bulk = await VideoJson.ReadManyAsync(store, paths, work.Where(w => !(etags.TryGetValue(w.Item1, out var e0) && e0 != null && ((prev?.Find(w.Item1) is { } s0 && s0.VideoEtag == e0) || (skipped.TryGetValue(w.Item1, out var se0) && se0 == e0)))).Select(w => w.Item1).ToList(), ct);
         await Parallel.ForEachAsync(Enumerable.Range(0, work.Count), new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (i, t) =>
         {
             var (id, lang0, dub0, state) = work[i];
@@ -124,7 +126,7 @@ public static class CatalogBuild
             if (etag != null && state == Catalog.MetadataOnly && skipped.TryGetValue(id, out var se) && se == etag) { notCataloged.Add(new CatalogSeen(id, etag)); return; }
             if (etag == null && prev?.Find(id) is { } old && old.CheckedBy != null && old.Data != null && old.State == state && old.DurationSeconds != null && (old.Ai?.Score != null || state == Catalog.MetadataOnly) && (old.SpeechLanguage != null || lang0 == null)) { res[i] = old with { GroupId = null, Canonical = false, Mixed = false, GroupOffset = null }; return; }
             Pre pc;
-            try { pc = await ReadPrecheckAsync(store, paths, id, t); }
+            try { pc = await ReadPrecheckAsync(store, paths, id, t, bulk); }
             catch (Exception e) when (e is not OperationCanceledException)
             {   // 0.13.3: the build goes on: the entry is marked data:"missing" and named in a warning (the centers index does not need video.json)
                 lock (failed) failed.Add(id); Log.Info($"catalog: WARNING {id}: {e.Message}");

@@ -44,7 +44,12 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => inner.ReadAppendAsync(name, offset, maxLen, ct);
     public Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => inner.SealAppendBlobAsync(name, appendPos, ct);
     public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchAsync(name, data, etag, ct);
+    public Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, IReadOnlyDictionary<string, string> meta, CancellationToken ct) => inner.PutIfMatchAsync(name, data, etag, meta, ct);
     public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => inner.GetAppendInfoAsync(name, ct);
+    public Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct) => inner.PutBlockAsync(name, blockId, data, ct);
+    public Task<BlockList?> GetBlockListAsync(string name, CancellationToken ct) => inner.GetBlockListAsync(name, ct);
+    public Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct) => inner.PutBlockListAsync(name, blockIds, etag, ct);
+    public Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchWithETagAsync(name, data, etag, ct);
     public IStore Inner => inner;
     public static IStore? Find(IStore s) { for (int i = 0; i < 8 && s != null; i++) { if (s is StageZipStore z) return z; s = s switch { LocalCacheStore l => l.Inner, RecordingStore r => r.Inner, RedirectStore d => d.Inner, _ => null! }; } return null; }
     public static IStageStore? Stage(IStore s) => Find(s) as IStageStore;
@@ -252,7 +257,25 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public Task SetTagsAsync(string name, IReadOnlyDictionary<string, string> tags, string? leaseId, CancellationToken ct) => inner.SetTagsAsync(name, tags, leaseId, ct);
     public Task<bool> SetTagsIfAsync(string name, IReadOnlyDictionary<string, string> tags, IReadOnlyDictionary<string, string> expect, CancellationToken ct) => inner.SetTagsIfAsync(name, tags, expect, ct);
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => inner.HeadAsync(name, ct);
-    public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => inner.GetRangeAsync(name, off, len, ifMatch, ct);
+    /// <summary>A range of a member that lives in a stage zip (frames/0005.mjpeg inside frames.zip): a stored member is range-read inside the zip (only those bytes are fetched), a deflated one is read whole and sliced. Not-a-member names go to the store as before.</summary>
+    public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
+    {
+        if (!Resolve(name, out _, out _, out var member, out var blob) || member == "downloaded.json") return await inner.GetRangeAsync(name, off, len, ifMatch, ct);
+        if (pending.TryGetValue(blob, out var p) && p.Files.TryGetValue(member, out var path) && File.Exists(path))
+        { var all = await File.ReadAllBytesAsync(path, ct); return off >= all.Length ? new RangeRead([], false) : new RangeRead(all.AsSpan((int)off, (int)Math.Min(len, all.Length - off)).ToArray(), false); }
+        var data = await WithViewAsync<byte[]>(blob, async v =>
+        {
+            if (!v.Entries.TryGetValue(member, out var e)) return null;
+            if (off >= e.Size) return [];
+            int n = (int)Math.Min(len, e.Size - off);
+            if (e.Method != 0) return (await ZipFormat.ReadMemberAsync(v.Src, e, ct)).AsSpan((int)off, n).ToArray();
+            var lh = await v.Src.ReadAsync(e.LocalOffset, 30, ct);
+            if (lh.Length < 30 || BitConverter.ToUInt32(lh, 0) != 0x04034b50) throw new InvalidDataException($"bad local header for {e.Name}");
+            long start = e.LocalOffset + 30 + BitConverter.ToUInt16(lh, 26) + BitConverter.ToUInt16(lh, 28);
+            return await v.Src.ReadAsync(start + off, n, ct);   // stored: the member's bytes are the file's bytes (the whole-member CRC is not checked for a part)
+        }, ct);
+        return new RangeRead(data, false);
+    }
     public async Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct)
     {
         var ok = await inner.PutZipIfMatchAsync(name, path, metadata, tags, etag, ct);

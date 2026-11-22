@@ -21,7 +21,7 @@ public sealed record AppendResult(AppendOutcome Outcome, long Length = 0, int Bl
 
 public sealed record AppendInfo(long Length, bool Sealed, int Blocks);
 
-public sealed record BlobContent(byte[] Data, string? ETag);
+public sealed record BlobContent(byte[] Data, string? ETag, IReadOnlyDictionary<string, string>? Meta = null);
 
 /// <summary>A blob's size, ETag and metadata (Get Blob Properties).</summary>
 public sealed record BlobProps(long Size, string? ETag, IReadOnlyDictionary<string, string> Metadata);
@@ -29,7 +29,7 @@ public sealed record BlobProps(long Size, string? ETag, IReadOnlyDictionary<stri
 /// <summary>A range read pinned to an ETag: <see cref="Mismatch"/> when the blob changed since (412), <see cref="Data"/> null when it is gone.</summary>
 public sealed record RangeRead(byte[]? Data, bool Mismatch);
 
-public sealed record ConditionalResult(bool Changed, bool Exists, byte[]? Data, string? ETag);
+public sealed record ConditionalResult(bool Changed, bool Exists, byte[]? Data, string? ETag, IReadOnlyDictionary<string, string>? Meta = null);
 
 public class StorageException(int status, string? code, string message) : Exception(message)
 {
@@ -42,6 +42,12 @@ public sealed class LeaseLostException(string message) : StorageException(409, "
 
 /// <summary>The SAS lacks a permission (e.g. 'f' for Find Blobs by Tags).</summary>
 public sealed class ForbiddenException(string message) : StorageException(403, "AuthorizationPermissionMismatch", message);
+
+/// <summary>One block of a block blob's list: its id (base64, as Azure names it) and size in bytes.</summary>
+public sealed record BlockItem(string Id, long Size);
+
+/// <summary>Get Block List (all): the blob's ETag (null while nothing is committed) and its committed and uncommitted blocks, in list order.</summary>
+public sealed record BlockList(string? ETag, IReadOnlyList<BlockItem> Committed, IReadOnlyList<BlockItem> Uncommitted);
 
 public interface IStore
 {
@@ -113,6 +119,13 @@ public interface IStore
         return await PutAsync(name, data, null, null, false, ct);
     }
 
+    /// <summary>PutIfMatchAsync that also sets the blob's metadata IN THE SAME REQUEST (x-ms-meta-*: no extra op). The default (a store with no single-request form) puts, then sets the metadata.</summary>
+    async Task<bool> PutIfMatchAsync(string name, byte[] data, string? etag, IReadOnlyDictionary<string, string> meta, CancellationToken ct)
+    {
+        if (!await PutIfMatchAsync(name, data, etag, ct)) return false;
+        await SetMetadataAsync(name, meta, null, ct); return true;
+    }
+
     // ---- append blobs (0.13.0: the job queue log). Stores that cannot do them throw NotSupportedException.
     /// <summary>Creates an empty append blob; false when it exists (If-None-Match: *) and <paramref name="onlyIfNew"/> is set.</summary>
     Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
@@ -124,5 +137,18 @@ public interface IStore
     Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
     /// <summary>Length, sealed flag and block count of an append blob; null when it does not exist.</summary>
     Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
-}
 
+    // ---- block blobs (the aggregate video.json): Put Block never changes the blob's ETag; Put Block List does. Stores that cannot do them throw NotSupportedException.
+    /// <summary>Put Block: stages <paramref name="data"/> as an uncommitted block of <paramref name="name"/> (the blob need not exist). No lease, no ETag condition. The block id must have the same length in every block of the blob.</summary>
+    Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct) => throw new NotSupportedException("this store has no block blobs");
+    /// <summary>Get Block List (all): ETag plus committed and uncommitted blocks; null when the blob has neither.</summary>
+    Task<BlockList?> GetBlockListAsync(string name, CancellationToken ct) => throw new NotSupportedException("this store has no block blobs");
+    /// <summary>Put Block List with every id as Latest (the uncommitted block of that id wins, else the committed one); uncommitted blocks not named are discarded. Conditional on <paramref name="etag"/> (If-Match; null: only while the blob has no committed content, If-None-Match: *). False on 412/409.</summary>
+    Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct) => throw new NotSupportedException("this store has no block blobs");
+    /// <summary>PutIfMatchAsync that also says the ETag of the blob it wrote (null when it did not write). The default Puts, then Heads (racy); RestStore and FakeStore take it from the write itself.</summary>
+    async Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct)
+    {
+        if (!await PutIfMatchAsync(name, data, etag, ct)) return (false, null);
+        return (true, (await HeadAsync(name, ct))?.ETag);
+    }
+}

@@ -11,12 +11,17 @@ public static class GroupBuild
     sealed record Rec(GroupProposal? Proposal, string? At, double? Duration, bool HasPrecheck = false, GroupProposal? Grouped = null, double? CoveredShare = null, IReadOnlyList<RelStretch>? Stretches = null);
 
     /// <summary>The group proposal, time and duration of an upload from its video.json (0.13.2: no precheck.json, no downloaded.json). A missing or unreadable video.json throws: the group build fails loudly and is retried.</summary>
-    static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say) => (await ReadRecJsonAsync(store, paths, id, ct, say)).Rec;
+    static async Task<Rec> ReadRecAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say, VideoAggregate.AggView? view = null) => (await ReadRecJsonAsync(store, paths, id, ct, say, view)).Rec;
 
-    static async Task<(Rec Rec, string Json)> ReadRecJsonAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say)
+    static async Task<(Rec Rec, string Json)> ReadRecJsonAsync(IStore store, Paths paths, string id, CancellationToken ct, Action<string>? say, VideoAggregate.AggView? view = null)
     {
         JsonObject root;
-        try { root = (await VideoJson.ReadAsync(store, paths, id, ct))?.Root ?? new JsonObject(); }   // 0.13.3: a missing or bad video.json places the upload with no hint (the catalog marks it missing), it does not fail the build
+        try
+        {
+            root = (await VideoJson.ReadViaAsync(view, store, paths, id, ct))?.Root ?? new JsonObject();
+            // the aggregate record has no grouping.stretches: only a join or mixed upload has them, and only for those is stretches.json read (per-upload fallback inside)
+            if (view != null && view.Has(id) && root["grouping"] is JsonObject gj && gj["stretches"] == null && GroupProposal.FromJson(gj["proposal"] as JsonObject) is { Kind: GroupProposal.JoinKind or GroupProposal.MixedKind } && await VideoJson.ReadStretchesAsync(store, paths, id, ct) is { } st) gj["stretches"] = st;
+        }   // 0.13.3: a missing or bad video.json places the upload with no hint (the catalog marks it missing), it does not fail the build
         catch (InvalidDataException) { root = new JsonObject(); }
         return (FromRoot(root), RecJson(root));
     }
@@ -124,6 +129,7 @@ public static class GroupBuild
 
     public static async Task<GroupSet> ApplyAsync(IStore store, Paths paths, SearchData? head, SearchData next, CancellationToken ct, Action<string>? say = null, int threads = 4, PreCheckSettings? settings = null, bool bootstrap = false, bool write = true, bool requireGroups = false, bool foldOnly = false, bool speechFresh = false)
     {
+        var view = await VideoAggregate.OpenViewAsync(store, paths, ct);   // bulk job: one Get Block List, the records from one GET of videos.agg; uploads it lacks are read one by one
         var s = settings ?? new PreCheckSettings();
         var prior = head == null ? null : await GroupStore.LoadAsync(store, paths, head.Version, ct);
         // 0.13.6: with no groups file the index job does not group (a bootstrap of every upload is hours of work: `indexnode groups build` does it once); the version is published with no groups
@@ -144,7 +150,7 @@ public static class GroupBuild
         await Parallel.ForEachAsync(next.Uploads, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (u, t) =>
         {
             if (speechFresh && u.VideoEtag != null) { speech[u.Id] = (u.SpeechLanguage, u.Dubbed); return; }   // 0.13.22: the index build just carried these forward or read them (video.json's ETag unchanged): no second read
-            try { speech[u.Id] = await SearchIndexBuild.ReadSpeechAsync(store, paths, u.Id, t); } catch (Exception e) when (e is not OperationCanceledException) { }
+            try { speech[u.Id] = await SearchIndexBuild.ReadSpeechAsync(store, paths, u.Id, t, view); } catch (Exception e) when (e is not OperationCanceledException) { }
         });
         (string? Lang, bool? Dub) Sp(SearchUpload u) => speech.TryGetValue(u.Id, out var x) && x.Lang != null ? x : (u.SpeechLanguage, u.Dubbed);
         var unknown = next.Uploads.Where(u => !known.ContainsKey(u.Id)).ToList();
@@ -155,7 +161,7 @@ public static class GroupBuild
         async Task<Rec> RecOf(SearchUpload u, CancellationToken t)
         {
             if (allRecs.TryGetValue(u.Id, out var c)) return c;
-            var r = (speechFresh && u.VideoEtag != null ? RecFromJson(u.GroupRec) : null) ?? await ReadRecAsync(store, paths, u.Id, t, say);
+            var r = (speechFresh && u.VideoEtag != null ? RecFromJson(u.GroupRec) : null) ?? await ReadRecAsync(store, paths, u.Id, t, say, view);
             allRecs[u.Id] = r; return r;
         }
         if (foldOnly) { var recs = new Dictionary<string, Rec>(StringComparer.Ordinal); foreach (var u in unknown) { var rr = await RecOf(u, ct); if (rr.Grouped != null) recs[u.Id] = rr; } ungrouped = unknown.Count(u => !recs.ContainsKey(u.Id)); unknown = unknown.Where(u => recs.ContainsKey(u.Id)).ToList(); }
@@ -190,13 +196,13 @@ public static class GroupBuild
             if (b.ETag is { Length: > 0 } et)
             {
                 if (head != null && head.Others.TryGetValue(id, out var o) && o.Etag == et && RecFromJson(o.Rec) is { } cr) { r = cr; others[id] = o; }
-                else { var (rr, json) = await ReadRecJsonAsync(store, paths, id, ct, say); r = rr; others[id] = new OtherRec(et, json); }
+                else { var (rr, json) = await ReadRecJsonAsync(store, paths, id, ct, say, view); r = rr; others[id] = new OtherRec(et, json); }
             }
-            else r = await ReadRecAsync(store, paths, id, ct, say);
+            else r = await ReadRecAsync(store, paths, id, ct, say, view);
             if (!r.HasPrecheck) continue;   // downloaded, not pre-checked: not short-circuited
             shorts.Add(id); if (known.ContainsKey(id)) continue;
             if (r.Proposal == null) continue;   // nothing to place it by
-            var (lang, dub) = await SearchIndexBuild.ReadSpeechAsync(store, paths, id, ct);
+            var (lang, dub) = await SearchIndexBuild.ReadSpeechAsync(store, paths, id, ct, view);
             CatalogBuild.Pre pc;
             try { pc = await CatalogBuild.ReadPrecheckAsync(store, paths, id, ct); } catch (Exception e) when (e is VideoJsonMissingException or InvalidDataException) { continue; }
             news.Add(new NewUpload(id, pc.Language ?? lang, pc.Language != null ? pc.Dubbed : dub, r.Duration, r.At, r.Proposal, true));
