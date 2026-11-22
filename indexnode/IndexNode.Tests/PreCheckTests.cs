@@ -960,7 +960,6 @@ public class PreCheckTests : IDisposable
             var info = new List<PreCheckAnalyzer.SegInfo> { new(0.30, 540, 840, 30), new(0.70, 1260, 1560, 30) };
             var s = new PreCheckSettings();
             await an.AnalyzeFramesAsync(root, 60, BarCrop.None, null, s, 4, _ => { }, new Dictionary<string, double>(), null, default, info);   // 1st run: fills the frames cache (a GET per file)
-            await FramesCache.Current.WaitFillsAsync();
             Assert.True(FramesCache.Current.Downloads > 0);
             int downloads = FramesCache.Current.Downloads; counting.Reset();
             var secs = new Dictionary<string, double>(); var sw = System.Diagnostics.Stopwatch.StartNew();

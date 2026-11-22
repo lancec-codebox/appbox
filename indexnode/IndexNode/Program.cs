@@ -58,14 +58,14 @@ public static class Program
         indexnode enqueue --from watch-later [--max-height 480]
         indexnode browser login | status
         indexnode tools install --ytdlp-zipapp
-        indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
+        indexnode serve [--port 8080] [--bind 0.0.0.0] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local <dir>]   (0.12.0: the query service, warm and read-only on the store: POST /v1/precheck (sampled frames + audio -> the pre-check record), POST /v1/search (screenshot image or vector -> best frames), GET /v1/health; SAS from INDEXNODE_SAS_URL)
         indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--order-tolerance-seconds 120] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
         indexnode sample <id|url> --output-local <dir> [--timebox 120]   (0.13.16: ONLY the sample download (two 5-minute segments at 0.30/0.70, 360p, the first segment's audio, info, description, thumbnail) into <dir>/<id>/; writes no store or queue; prints the time split; run it on lancecl1, never the hexad host)
         indexnode check <id|url> --input-local <dir> [--exclude-self] [--output-local <dir>] [--timebox 120] [--threads N]   (0.13.16: ONLY the check on those local sample files (the search index is read from the store, read-only): record and time split; writes no store or queue; run it on the hexad host)
         indexnode jobs sample-first [--dry-run]   (0.13.16: pending downloads become sample entries, pending process entries get a check entry; priority and due kept; batched, idempotent; prints the counts)
         indexnode seq assign [--dry-run]   (0.13.10: give every existing drama its sequence number, by first pre-check)
         indexnode groups step <id> [--dry-run] [--threads N]   (0.13.15: the group step of ONE drama exactly as the node runs it (queue state, FramesCache, dedup set); --dry-run writes nothing to the store or the queue and prints the record it would write and the time split: membership with join-source counts, search, dedup, write-free total)
-        indexnode precheck whatif [--ids <file>] [--limit N] [--threads N]   (0.13.15: the two-segment pre-check on each drama's stored frames (itself excluded) against the old single window: decisions, possible false skips, AI flag changes, run time; works with --limit 1)
+        indexnode precheck whatif [--ids <file>] [--limit N] [--pairs <file: 'idA idB' lines>] [--threads N]   (0.13.15: the two-segment pre-check on each drama's stored frames (itself excluded) against the old single window: decisions, possible false skips, AI flag changes, run time; works with --limit 1)
         indexnode groups enqueue [--dry-run]   (0.13.10: add the group step for every processed drama, in sequence order; create-only)
         indexnode frames convert [--dry-run] [--threads N] [--limit N]   (0.13.9: write index/search/frames/<id>.bin for every drama from its centers.zip; create-only, skips dramas under a claim)
         indexnode centers backfill [--ids <file>] [--since <time|6h|2d>] [--threads N] [--dry] [--limit N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (build centers.zip for uploads that have sscd.zip and no current centers.zip)
@@ -99,7 +99,7 @@ public static class Program
         indexnode control --max-per-ip N|off
         indexnode --version
         indexnode config set-sas <url>
-        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port|precheck.enabled|precheck.tau|precheck.skip-share|precheck.partial-share|precheck.duration-percent|precheck.duration-min|precheck.top-centers|precheck.window-seconds|precheck.language-seconds|precheck.language-min-seconds|precheck.window-position|precheck.ai-flag|sample-budget> <value>
+        indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port|serve.token|check.url|check.token|check.timeout-seconds|precheck.enabled|precheck.tau|precheck.skip-share|precheck.partial-share|precheck.duration-percent|precheck.duration-min|precheck.top-centers|precheck.vote-uploads|precheck.window-seconds|precheck.language-seconds|precheck.language-min-seconds|precheck.window-position|precheck.ai-flag|sample-budget> <value>
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
         """;
 
@@ -259,7 +259,7 @@ public static class Commands
         {
             ["download"] = new DownloadStage(tools, store, gate),
             ["precheck"] = preStage,
-            ["sample"] = new SampleStage(tools, store, gate, cfg.PreCheck ?? new()),
+            ["sample"] = new SampleStage(tools, store, gate, cfg.PreCheck ?? new()) { Inline = InlineCheckConfig.From(cfg, http) },
             ["check"] = new CheckStage(preStage),
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
             ["refresh"] = new RefreshStage(tools, store),
@@ -732,7 +732,7 @@ public static class Commands
             foreach (var l in Models.Status()) Console.WriteLine(l);
             return 0;
         }
-        if (sub != "install") throw new ArgumentException("tools status | tools install [--all] [--ffmpeg] [--ytdlp] [--ytdlp-zipapp] [--models]");
+        if (sub != "install") throw new ArgumentException("tools status | tools install [--all] [--ffmpeg] [--ytdlp] [--ytdlp-zipapp] [--models [serve]]");
         var http = NewHttp();
         var tools = new Tools(http, cfg);
         bool all = a.Has("all");
@@ -756,7 +756,11 @@ public static class Commands
             Console.WriteLine($"ffmpeg {Tools.FfmpegVersion} installed in {NodeConfig.ToolsDir()}");
         }
         if (all || a.Has("models"))
-            foreach (var m in Models.All) { await Models.EnsureAsync(m, http, default); Console.WriteLine($"model {m.Id} ready"); }
+        {
+            var which = a.Get("models");   // --models (default pipeline, no SigLIP), --models serve (only what serve loads), --all (everything, SigLIP too)
+            var set = all ? Models.All : which == "serve" ? Models.Serve : which is null or "true" or "default" ? Models.Default : throw new ArgumentException("--models takes no value (the default pipeline, without SigLIP) or 'serve'; --all installs every model");
+            foreach (var m in set) { await Models.EnsureAsync(m, http, default); Console.WriteLine($"model {m.Id} ready"); }
+        }
         return 0;
     }
 
@@ -846,6 +850,10 @@ public static class Commands
                 case "prune.lookback": file.PruneLookback = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
 
                 case "storage.region": file.StorageRegion = val.Trim(); break;
+                case "serve.token": (file.Serve ??= new()).Token = val.Trim(); break;
+                case "check.url": (file.Check ??= new()).Url = val.Trim().Length == 0 || val.Equals("off", StringComparison.OrdinalIgnoreCase) ? null : val.Trim().TrimEnd('/'); break;
+                case "check.token": (file.Check ??= new()).Token = val.Trim(); break;
+                case "check.timeout-seconds": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("check.timeout-seconds must be 1 or more"); (file.Check ??= new()).TimeoutSeconds = n; break; }
                 case "storage.warn-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.warn-per-min must be 1 or more"); (file.StorageBreaker ??= new()).WarnPerMin = n; break; }
                 case "storage.max-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-min must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerMin = n; break; }
                 case "storage.max-per-step": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-step must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerStep = n; break; }
@@ -868,6 +876,7 @@ public static class Commands
                 case "precheck.duration-slack-percent": (file.PreCheck ??= new()).DurationSlackPercent = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.duration-slack-seconds": (file.PreCheck ??= new()).DurationSlackSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.duration-min": (file.PreCheck ??= new()).DurationMinSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
+                case "precheck.vote-uploads": { var vu = int.Parse(val); if (vu < 0) throw new ArgumentException("precheck.vote-uploads must be 0 (read every upload with a top row) or more"); (file.PreCheck ??= new()).VoteUploads = vu; break; }
                 case "precheck.top-centers": (file.PreCheck ??= new()).TopCenters = int.Parse(val); break;
                 case "precheck.window-seconds": (file.PreCheck ??= new()).WindowSeconds = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); break;
                 case "precheck.language-seconds": (file.PreCheck ??= new()).LanguageSeconds = PreCheckSettings.ParseLanguageSeconds(val); break;
@@ -895,7 +904,7 @@ public static class Commands
                 default: throw new ArgumentException("unknown config key (budget, schedule, window, ai.base-url, ai.key, ai.text-model, ai.vision-model, ai.api, jobs, threads, storage.region, model-url, model-path, node-name, ytdlp.command, ytdlp.js-runtime, browser.exe, browser.profile-dir, browser.port)");
             }
             file.Save();
-            Console.WriteLine($"{key} saved{(key == "ai.key" ? " (hidden)" : "")}");
+            Console.WriteLine($"{key} saved{(key is "ai.key" or "serve.token" or "check.token" ? " (hidden)" : "")}");
             return 0;
         }
         throw new ArgumentException("config set-sas <url> | config set <key> <value>");

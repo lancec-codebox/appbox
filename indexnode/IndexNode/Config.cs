@@ -3,6 +3,14 @@ using System.Text.Json.Serialization;
 
 namespace IndexNode;
 
+public sealed class ServeConfig { public string? Token { get; set; } }
+public sealed class InlineCheckConfig
+{
+    public string? Url { get; set; } public string? Token { get; set; } public int? TimeoutSeconds { get; set; }
+    public static InlineCheckClient? From(NodeConfig cfg, HttpClient http) =>
+        cfg.Check?.Url is { Length: > 0 } u ? new InlineCheckClient(http, u.TrimEnd('/'), cfg.Check.Token ?? Environment.GetEnvironmentVariable("INDEXNODE_CHECK_TOKEN"), TimeSpan.FromSeconds(Math.Max(1, cfg.Check.TimeoutSeconds ?? 90))) : null;
+}
+
 public sealed class NodeConfig
 {
     public string? Sas { get; set; }
@@ -31,6 +39,10 @@ public sealed class NodeConfig
     public static StorageLimits TryLoadStorageLimits() { try { return Load().StorageBreaker ?? new(); } catch (Exception e) when (e is not OperationCanceledException) { return new(); } }
     /// <summary>0.13.18 (config storage.warn-per-min, max-per-min, max-per-step, max-failures-per-min, cooldown): the storage circuit breaker; null = the defaults (3,000 / 10,000 / 20,000 / 300 / 5 min).</summary>
     public StorageLimits? StorageBreaker { get; set; }
+    /// <summary>0.13.21 (config serve.token): the bearer token POST /v1/check needs (the env INDEXNODE_SERVE_TOKEN overrides it).</summary>
+    public ServeConfig? Serve { get; set; }
+    /// <summary>0.13.21 (config check.url, check.token, check.timeout-seconds): the sample stage asks this serve instance for the check right after a sample download; null/empty url = the check entry as before.</summary>
+    public InlineCheckConfig? Check { get; set; }
     public string? ModelUrl { get; set; }
     public string? ModelPath { get; set; }
     public BrowserConfig? Browser { get; set; }
@@ -81,7 +93,7 @@ public sealed class NodeConfig
         if (!string.IsNullOrWhiteSpace(envSas)) c.Sas = envSas.Trim();
         SearchData.Configure(c.Search?.ScanMode, c.Search?.ScanRerank);
         Describe.ConfigMainMinScreen = c.DescribeMainMinScreen; Describe.ConfigMainMax = c.DescribeMainMax;
-        Redact.Register(c.Ai?.Key);
+        Redact.Register(c.Ai?.Key); Redact.Register(c.Serve?.Token); Redact.Register(c.Check?.Token); Redact.Register(Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN"));
         Redact.Register(Environment.GetEnvironmentVariable("INDEXNODE_AI_KEY"));
         return c;
     }

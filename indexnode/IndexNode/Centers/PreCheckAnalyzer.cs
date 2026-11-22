@@ -37,7 +37,8 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         catch (Exception e) when (e is not OperationCanceledException) { return new SpeechResult(null, false, 0, 0, 0, "SenseVoice unavailable: " + e.Message); }
     }
     /// <summary>`precheck --exclude-self`: the upload whose own centers are left out of the lookup (its id), and how many centers that dropped in the last analysis.</summary>
-    public string? ExcludeId { get; set; }
+    readonly AsyncLocal<string?> exclude = new();   // 0.13.21: per async flow, so concurrent /v1/check requests do not see each other's id
+    public string? ExcludeId { get => exclude.Value; set => exclude.Value = value; }
     /// <summary>0.13.1: the uploads whose centers finished after the index was built (the node: from the queue log; the argument is the index's build time, null = unknown, then every recent one). Searched by brute force; the subject itself is left out.</summary>
     public Func<DateTimeOffset?, IReadOnlyList<string>>? FreshUploads { get; set; }
     public int Excluded { get; private set; }
@@ -132,8 +133,9 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         progress("lookup");
         int ex = excludeId == null ? -1 : idx.Uploads.FindIndex(u => u.Id == excludeId);
         int excluded = ex < 0 ? 0 : idx.RefUpload.Count(u => u == ex);
-        var fc0 = FramesCache.Current is { } fcA ? (fcA.Hits, fcA.RangedMisses, fcA.FillsQueued) : (0, 0, 0);
-        var (best, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, rows, s.TopCenters, threads, ct, ex, Blocks);
+        var fc0 = FramesCache.Current is { } fcA ? (fcA.Hits, fcA.Downloads, 0) : (0, 0, 0);
+        var (best, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, rows, s.TopCenters, threads, ct, ex, Blocks, s.VoteUploads);
+        secs["votedUploads"] = st.VotedUploads; secs["readUploads"] = st.ReadUploads; secs["blocksRead"] = st.Blocks; secs["winnerVoteRank"] = st.WinnerVoteRank;   // 0.13.21: so a miss of the vote can be seen in the record
         var fresh = new List<string>();
         if (FreshUploads != null)
         {
@@ -163,7 +165,7 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         var ug = hits.Select(h => h.Upload).Distinct(StringComparer.Ordinal).ToDictionary(u => u, u => ofGroup.GetValueOrDefault(u), StringComparer.Ordinal);
         var gm = (gs?.Groups ?? []).Where(g => ug.Values.Contains(g.Id)).ToDictionary(g => g.Id, g => (IReadOnlyList<GroupCopy>)g.Members.Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration)).ToList(), StringComparer.Ordinal);
         secs["lookup"] = sw.Elapsed.TotalSeconds; secs["lookupScan"] = st.ScanMs / 1000; secs["lookupRead"] = st.ReadMs / 1000; secs["lookupScore"] = st.ScoreMs / 1000; secs["lookupRequests"] = st.Requests; secs["lookupBytes"] = st.Bytes;
-        if (FramesCache.Current is { } fc1) { secs["cacheHits"] = fc1.Hits - fc0.Item1; secs["cacheRanged"] = fc1.RangedMisses - fc0.Item2; secs["fillsQueued"] = fc1.FillsQueued - fc0.Item3; }
+        if (FramesCache.Current is { } fc1) { secs["cacheHits"] = fc1.Hits - fc0.Item1; secs["cacheFetched"] = fc1.Downloads - fc0.Item2; }
         sw.Restart();
         double ai = AiProbe.Default.Score(rows);
         secs["ai"] = sw.Elapsed.TotalSeconds; sw.Restart();

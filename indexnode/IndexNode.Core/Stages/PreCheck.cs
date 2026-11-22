@@ -23,6 +23,8 @@ public sealed class PreCheckSettings
 
     /// <summary>Centers whose member blocks are read per frame.</summary>
     public int TopCenters { get; set; } = 100;
+    /// <summary>0.13.21 (config precheck.vote-uploads): vote-first lookup: after the bit scan the uploads are ranked by how many frames have them among their top rows, and only the top this-many are read and scored exactly. 0 = read every upload with a top row (the old behaviour). Applies to the pre-check, the check and the group step.</summary>
+    public int VoteUploads { get; set; } = 20;
     public double WindowSeconds { get; set; } = 300;
     /// <summary>Centre of the sample window as a fraction of the duration (0.5 = the middle).</summary>
     public double WindowPosition { get; set; } = 0.5;

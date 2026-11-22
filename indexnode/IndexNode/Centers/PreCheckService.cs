@@ -42,13 +42,56 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         }
     }
 
+    /// <summary>0.13.21 (POST /v1/check): the bearer token (serve.token / INDEXNODE_SERVE_TOKEN); null or empty: /v1/check answers 401 to everyone.</summary>
+    public string? Token { get; init; }
+    public Tools? Tools { get; init; }
+    /// <summary>The analyzer /v1/check runs (default: the server's own); tests put a fake one.</summary>
+    public IPreCheckAnalyzer? CheckAnalyzer { get; init; }
+    PreCheckStage? checkStage; long checks;
+
+    bool TokenOk(HttpContext c)
+    {
+        var t = Token; if (string.IsNullOrEmpty(t)) return false;
+        var h = c.Request.Headers.Authorization.ToString();
+        if (!h.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
+        var a = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(h[7..].Trim())); var b = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(t));
+        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);   // constant time (both hashed to the same length)
+    }
+
+    /// <summary>The inline sample check: the sample files the sample stage uploaded (index/videos/&lt;id&gt;/sample/) read from the store, the same two-segment decision as the check stage, the full record back. WRITES NOTHING (the caller holds the lease and writes video.json and the queue lines). Runs in a step scope of the storage breaker; the answer carries its op counts.</summary>
+    public async Task<JsonObject> CheckAsync(string id, bool excludeSelf, CancellationToken ct)
+    {
+        if (!System.Text.RegularExpressions.Regex.IsMatch(id, "^[A-Za-z0-9_-]{6,40}$")) throw new ArgumentException("id is not a video id");
+        var sw = Stopwatch.StartNew();
+        var meter = StoreMeter.Current;
+        if (meter.Tripped) throw new StorageBudgetExceeded(meter.TripMessage ?? "the storage breaker is open");
+        await slots.WaitAsync(ct);
+        try
+        {
+            using var scope = meter.BeginStep(0, "serve check " + id);
+            var stage = checkStage ??= new PreCheckStage(Tools ?? throw new InvalidOperationException("no tools"), CheckAnalyzer ?? analyzer, settings, version);
+            analyzer.ExcludeId = excludeSelf ? id : null;
+            var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id, 360, null); job.JobId = id;
+            var ctx = new JobContext { Job = job, Stage = "check", Store = store, Paths = paths, NodeId = "serve", Token = ct, ThreadShare = () => threads, Report = (_, _) => { } };
+            var run = await stage.AnalyzeSampleAsync(ctx, null, ct, strict: true);
+            var rec = run!.Record;
+            var rows = meter.StepTable();
+            var ops = new JsonObject { ["total"] = meter.StepOps, ["failed"] = rows.Sum(r => r.Failed), ["top"] = new JsonArray(rows.OrderByDescending(r => r.Count).Take(5).Select(r => (JsonNode?)new JsonObject { ["site"] = r.Site, ["op"] = r.Op, ["count"] = r.Count, ["failed"] = r.Failed }).ToArray()) };
+            Interlocked.Increment(ref checks);
+            Log.Info($"serve: check {id} {(string?)rec["decision"]} {sw.Elapsed.TotalSeconds:0.0}s, {meter.StepOps} store ops");
+            return new JsonObject { ["decision"] = (string?)rec["decision"], ["record"] = rec, ["ops"] = ops, ["seconds"] = Math.Round(sw.Elapsed.TotalSeconds, 3), ["version"] = version };
+        }
+        finally { slots.Release(); }
+    }
+
     public JsonObject Health()
     {
         var b = blocks.Stats();
         return new JsonObject
         {
-            ["ok"] = true, ["name"] = "indexnode", ["version"] = version, ["indexVersion"] = indexVersion < 0 ? null : indexVersion, ["models"] = new JsonArray(analyzer.Loaded.Select(m => (JsonNode?)m).ToArray()),
+            ["ok"] = true, ["name"] = "indexnode", ["version"] = version, ["pid"] = Environment.ProcessId, ["indexVersion"] = indexVersion < 0 ? null : indexVersion, ["models"] = new JsonArray(analyzer.Loaded.Select(m => (JsonNode?)m).ToArray()),
             ["uptimeSeconds"] = Math.Round((DateTimeOffset.UtcNow - started).TotalSeconds, 1), ["threads"] = threads, ["requests"] = Interlocked.Read(ref requests), ["searches"] = Interlocked.Read(ref searches), ["failures"] = Interlocked.Read(ref failures),
+            ["framesCache"] = FramesCache.Current?.Stats(),
             ["workingSetMB"] = Process.GetCurrentProcess().WorkingSet64 / (1024 * 1024),
             ["blockCache"] = new JsonObject { ["entries"] = b.Entries, ["mb"] = b.Bytes / (1024 * 1024), ["maxMb"] = b.MaxBytes / (1024 * 1024), ["hits"] = b.Hits, ["misses"] = b.Misses },
         };
@@ -173,6 +216,23 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             catch (OperationCanceledException) { return Results.StatusCode(499); }
             catch (Exception e) { Interlocked.Increment(ref failures); Log.Info("serve: request failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
         });
+        app.MapPost("/v1/check", async (HttpContext c) =>
+        {
+            Interlocked.Increment(ref requests);
+            if (!TokenOk(c)) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
+            try
+            {
+                using var sr = new StreamReader(c.Request.Body); var body = JsonNode.Parse(await sr.ReadToEndAsync(c.RequestAborted)) as JsonObject ?? throw new ArgumentException("the body is not a JSON object");
+                var id = (string?)body["id"] ?? throw new ArgumentException("id is missing");
+                var res = await CheckAsync(id, (bool?)body["excludeSelf"] == true, c.RequestAborted);
+                return Results.Text(res.ToJsonString(), "application/json");
+            }
+            catch (Exception e) when (e is ArgumentException or JsonException or InvalidDataException or BadHttpRequestException or FormatException) { Interlocked.Increment(ref failures); return Results.BadRequest(new { error = e.Message }); }
+            catch (OperationCanceledException) { return Results.StatusCode(499); }
+            catch (StorageBudgetExceeded e) { Interlocked.Increment(ref failures); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
+            catch (InvalidOperationException e) when (e.Message.StartsWith("pre-check could not run", StringComparison.Ordinal)) { Interlocked.Increment(ref failures); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: e.Message.Contains("no sample.json", StringComparison.Ordinal) ? 404 : 422); }
+            catch (Exception e) { Interlocked.Increment(ref failures); Log.Info("serve: check failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
+        });
         app.MapPost("/v1/search", async (HttpContext c) =>
         {
             Interlocked.Increment(ref requests);
@@ -195,7 +255,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     }
 }
 
-/// <summary>`indexnode serve [--port 8080] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local dir]`.</summary>
+/// <summary>`indexnode serve [--port 8080] [--bind 0.0.0.0] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local dir]`.</summary>
 public static class ServeCommand
 {
     public static async Task<int> RunAsync(Args a)
@@ -204,24 +264,32 @@ public static class ServeCommand
         string? inL = a.Get("input-local") ?? a.Get("local");
         IStore store = inL != null ? new LocalStore(Path.GetFullPath(inL)) : !string.IsNullOrEmpty(cfg.Sas) ? new RestStore(http, cfg.Sas) : throw new InvalidOperationException("no SAS: set INDEXNODE_SAS_URL (a read-only container SAS) or use --input-local <dir>");
         store = StageZipStore.Wrap(store, null);
+        if (inL != null) store = new MeteredStore(store);   // a RestStore meters itself; a local folder is counted here, so /v1/check reports its ops either way
         int threads = Math.Max(1, a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads); int port = a.Get("port") is { } p ? int.Parse(p) : 8080;
         var st = cfg.PreCheck ?? new();
         var tools = new Tools(http, cfg);
         var cache = new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes(5));
         var blocks = new BlockCache((a.Get("block-cache-mb") is { } m ? long.Parse(m) : 512) * 1024 * 1024);
         var analyzer = new PreCheckAnalyzer(tools, cfg, http, store, paths, cache) { Blocks = blocks, InProcess = true };
-        var server = new PreCheckServer(analyzer, cache, store, paths, blocks, st, threads, Commands.VersionString, a.Get("concurrency") is { } c ? int.Parse(c) : 2) { ImageConfig = cfg, ImageHttp = http };
-        using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        var server = new PreCheckServer(analyzer, cache, store, paths, blocks, st, threads, Commands.VersionString, a.Get("concurrency") is { } c ? int.Parse(c) : 2) { ImageConfig = cfg, ImageHttp = http, Tools = tools, Token = Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN") is { Length: > 0 } et ? et.Trim() : cfg.Serve?.Token };
+        if (string.IsNullOrEmpty(server.Token)) Console.WriteLine("serve: no serve.token / INDEXNODE_SERVE_TOKEN: POST /v1/check answers 401 to everyone");
+        using var cts = new CancellationTokenSource();
+        // 0.13.21: SIGINT and SIGTERM stop serve gracefully; if the stop has not finished in 8 s the process exits anyway (a hung shutdown must not keep the port or the old binary alive)
+        void Stop(string why) { if (cts.IsCancellationRequested) return; Console.WriteLine($"serve: {why}: stopping"); cts.Cancel(); _ = Task.Run(async () => { await Task.Delay(TimeSpan.FromSeconds(8)); Console.WriteLine("serve: shutdown did not finish in 8 s: exiting"); Environment.Exit(1); }); }
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop("SIGINT"); };
+        using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, c => { c.Cancel = true; Stop("SIGTERM"); });
         Console.WriteLine($"serve: loading models and the search index ({threads} threads)...");
         var sw = Stopwatch.StartNew();
         await analyzer.WarmAsync(threads, cts.Token);
         Console.WriteLine($"serve: warm in {sw.Elapsed.TotalSeconds:0.0}s: models [{string.Join(", ", analyzer.Loaded)}], index v{(await server.IndexAsync(cts.Token))?.Version.ToString() ?? "none"}");
-        var app = server.Build($"http://0.0.0.0:{port}");
+        try { await FramesListing.For(store).EnsureAsync(store, paths, cts.Token); } catch (Exception e) when (e is not OperationCanceledException) { Console.WriteLine("serve: frames listing not loaded: " + e.Message); }   // warm: the check's lookup needs no LIST of its own
+        var bind = a.Get("bind") ?? "0.0.0.0";
+        var app = server.Build($"http://{bind}:{port}");
         _ = server.RefreshLoopAsync(TimeSpan.FromMinutes(5), cts.Token);
         await app.StartAsync(cts.Token);
-        Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/precheck, POST /v1/search, GET /v1/health)");
+        Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/health)");
         try { await Task.Delay(Timeout.Infinite, cts.Token); } catch (OperationCanceledException) { }
-        await app.StopAsync();
+        using (var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5))) { try { await app.StopAsync(stopTimeout.Token); } catch (OperationCanceledException) { } }
         return 0;
     }
 }

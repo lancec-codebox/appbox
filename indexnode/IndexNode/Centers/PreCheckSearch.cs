@@ -35,13 +35,34 @@ public sealed class BlockCache(long maxBytes)
 /// <summary>The pre-check lookup: many query frames against the global search table (0.11.0 SearchData/frames files), with member blocks read once per (upload, center) and cached for the whole pre-check.</summary>
 public static class PreCheckSearch
 {
-    public sealed record Stats(double ScanMs, double ReadMs, double ScoreMs, int Blocks, int Requests, long Bytes);
+    /// <summary>0.13.21 (vote-first): VotedUploads = uploads with at least one top row; ReadUploads = how many of them were read (all when voteUploads is 0); WinnerVoteRank = the vote rank (1 = most votes) of the upload that is best for the most frames (0 = no winner).</summary>
+    public sealed record Stats(double ScanMs, double ReadMs, double ScoreMs, int Blocks, int Requests, long Bytes, int VotedUploads = 0, int ReadUploads = 0, int WinnerVoteRank = 0);
+
+    /// <summary>
+    /// The vote: per upload, how many frames have it among their top rows (a plain count of frames, not of rows: one frame voting twice for the same upload counts once); ties go to the rank-weighted sum
+    /// (a row at rank r of its frame's list adds 1/(1+r)), then to the upload index. A drama that matches turns up in frame after frame, a scattered one in a few.
+    /// </summary>
+    public static List<(int Upload, int Frames, double Weight)> Vote(SearchData idx, int[][] rows)
+    {
+        var frames = new Dictionary<int, int>(); var weight = new Dictionary<int, double>(); var seen = new HashSet<int>();
+        foreach (var rs in rows)
+        {
+            seen.Clear();
+            for (int rank = 0; rank < rs.Length; rank++)
+            {
+                var u = idx.RefUpload[rs[rank]];
+                if (seen.Add(u)) frames[u] = frames.GetValueOrDefault(u) + 1;
+                weight[u] = weight.GetValueOrDefault(u) + 1.0 / (1 + rank);
+            }
+        }
+        return frames.Select(kv => (kv.Key, kv.Value, weight[kv.Key])).OrderByDescending(x => x.Value).ThenByDescending(x => x.Item3).ThenBy(x => x.Key).ToList();
+    }
 
     /// <summary>
     /// Per frame: the query minus the frozen mean, asymmetric bit scan of every center (top <paramref name="topCenters"/>), exact cosine against the members of those centers; the best
     /// (upload index, time, cosine) per frame (null: no candidate). <paramref name="queries"/> are normalised here.
     /// </summary>
-    public static async Task<(FrameBest?[] Best, Stats Stats)> BestPerFrameAsync(IStore raw, Paths paths, SearchData idx, IReadOnlyList<float[]> queries, int topCenters, int threads, CancellationToken ct, int excludeUpload = -1, BlockCache? shared = null)
+    public static async Task<(FrameBest?[] Best, Stats Stats)> BestPerFrameAsync(IStore raw, Paths paths, SearchData idx, IReadOnlyList<float[]> queries, int topCenters, int threads, CancellationToken ct, int excludeUpload = -1, BlockCache? shared = null, int voteUploads = 0)
     {
         int n = queries.Count; var q = new float[n][]; var rows = new int[n][];
         for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
@@ -50,8 +71,10 @@ public static class PreCheckSearch
         var scanned = idx.ScanMany(qm, topCenters, threads, excludeUpload); for (int i = 0; i < n; i++) rows[i] = scanned[i];   // frames are the parallel axis
         double scanMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
 
+        // 0.13.21: vote per upload first (no reads), then read and score only the top voteUploads uploads (0 = every upload that has a top row: the old behaviour)
+        var vote = Vote(idx, rows); var keep = voteUploads > 0 ? vote.Take(voteUploads).Select(x => x.Upload).ToHashSet() : null;
         var need = new Dictionary<int, HashSet<int>>();
-        foreach (var rs in rows) foreach (var r in rs) { var u = idx.RefUpload[r]; if (!need.TryGetValue(u, out var set)) need[u] = set = []; set.Add(idx.RefCenter[r]); }
+        foreach (var rs in rows) foreach (var r in rs) { var u = idx.RefUpload[r]; if (keep != null && !keep.Contains(u)) continue; if (!need.TryGetValue(u, out var set)) need[u] = set = []; set.Add(idx.RefCenter[r]); }
         var cache = new ConcurrentDictionary<(int Up, int Center), (float[] Vec, float[] Times)>();
         long bytes = 0; int requests = 0;
         await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>   // 0.13.8: the real bound is CentersBlob.MaxInFlight requests process-wide
@@ -84,7 +107,7 @@ public static class PreCheckSearch
             FrameBest? b = null;
             foreach (var r in rows[i])
             {
-                if (!cache.TryGetValue((idx.RefUpload[r], idx.RefCenter[r]), out var blk)) continue;
+                if (!cache.TryGetValue((idx.RefUpload[r], idx.RefCenter[r]), out var blk)) continue;   // a row of an upload that was not read (outside the vote's top) is skipped
                 for (int m = 0; m < blk.Times.Length; m++)
                 {
                     float c = Vec.Dot(q[i], blk.Vec.AsSpan(m * CentersFile.Dim, CentersFile.Dim));
@@ -93,7 +116,10 @@ public static class PreCheckSearch
             }
             best[i] = b;
         });
-        return (best, new Stats(scanMs, readMs, sw.Elapsed.TotalMilliseconds, cache.Count, requests, bytes));
+        int winnerRank = 0;
+        var wins = best.Where(b => b != null).GroupBy(b => b!.Upload).OrderByDescending(g => g.Count()).FirstOrDefault();
+        if (wins != null) { winnerRank = vote.FindIndex(x => x.Upload == wins.Key) + 1; }
+        return (best, new Stats(scanMs, readMs, sw.Elapsed.TotalMilliseconds, cache.Count, requests, bytes, vote.Count, keep?.Count ?? vote.Count, winnerRank));
     }
 
     /// <summary>

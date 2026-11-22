@@ -324,7 +324,7 @@ public static class SearchIndexBuild
     public static async Task<Loaded> LoadUploadAsync(IStore raw, Paths paths, string id, CancellationToken ct, string? blob = null)
     {
         blob ??= paths.FramesFile(id);
-        var z = await FramesReader.OpenAsync(raw, blob, ct) ?? throw new FileNotFoundException(blob);
+        var z = await FramesReader.OpenAsync(raw, blob, ct, whole: false) ?? throw new FileNotFoundException(blob);   // a small part of the file (header + centers): ranges
         int first = (int)Math.Min(z.DataLength, CentersFile.HeaderSize + 256 * CentersFile.Dim * 2);
         var buf = await z.ReadAsync(0, first, ct); var h = CentersFile.ParseHeader(buf);
         int need = CentersFile.HeaderSize + h.K * CentersFile.Dim * 2;
@@ -417,7 +417,7 @@ public static class CenterSearch
             {
                 try
                 {
-                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t);
+                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t, whole: false);   // /v1/search: a few blocks of many uploads: ranges
                     var res = await z.ReadBlocksAsync(centers, MergeGap, MaxMerged, t);
                     Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests);
                     perUpload[g] = res.Select(x => (up, x.Center, x.Members)).ToList(); return;

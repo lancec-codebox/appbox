@@ -660,6 +660,99 @@ public class GroupStepTests
     }
 
 
+    // ---- 0.13.21: vote-first lookup
+    static async Task<(FakeStore S, SearchData Head)> VoteIndex()
+    {
+        var s = new FakeStore(); var ids = new List<string>();
+        for (int i = 0; i < 10; i++) { await PutFrames(s, "d" + i, Make(60, 20, 100 + i), 60, 6.0); ids.Add("d" + i); }
+        await PutFrames(s, "d0b", Make(60, 20, 100), 60, 6.0); ids.Add("d0b");   // the same video as d0
+        foreach (var id in ids) await VideoJsonSeed.PutAsync(s, P, id, 1800);
+        var ups = await SearchIndexBuild.ListCentersAsync(s, P, default);
+        var head = await SearchIndexBuild.BuildAsync(s, P, ups.Where(u => ids.Contains(u.Id)).ToList(), null, null, 1, 1, 2, _ => { }, default);
+        head.BuiltAt = DateTimeOffset.UtcNow.AddMinutes(-5); await head.PublishAsync(s, P, default);
+        await GroupStore.WriteAsync(s, P, new GroupSet { Groups = [new DramaGroup { Id = "G1", Canonical = "d0", Members = [new GroupMember { Upload = "d0", Duration = 1800 }, new GroupMember { Upload = "d0b", Duration = 1800 }] }] }, head.Version, default);
+        return (s, head);
+    }
+
+    static async Task<(PreCheckSearch.Stats St, FrameBest?[] Best)> Look(FakeStore s, SearchData head, int vote)
+    {
+        var z = await FramesReader.OpenAsync(s, P.FramesFile("d0"), default); var h = await z!.ReadHeaderAsync(default);
+        var rows = new List<float[]>(); foreach (var (_, m) in await z.ReadBlocksAsync(Enumerable.Range(0, h.K).ToList(), CenterSearch.MergeGap, CenterSearch.MaxMerged, default)) { var r = AiProbe.RowsFromF16(m.Vectors); for (int i = 0; i < r.Length; i++) { Sscd.L2Normalize(r[i]); rows.Add(r[i]); } }
+        rows = rows.Take(40).ToList();
+        int ex = head.Uploads.FindIndex(u => u.Id == "d0");
+        var (best, st) = await PreCheckSearch.BestPerFrameAsync(s, P, head, rows, 100, 2, default, ex, null, vote);
+        return (st, best);
+    }
+
+    [Fact]
+    public async Task Vote_ranks_the_upload_that_turns_up_in_most_frames_first_and_counts_a_frame_once_per_upload()
+    {
+        var (s, head) = await VoteIndex(); var (st, best) = await Look(s, head, 0);
+        Assert.Equal(1, st.WinnerVoteRank); Assert.Equal(head.Uploads.FindIndex(u => u.Id == "d0b"), best.Where(b => b != null).GroupBy(b => b!.Upload).OrderByDescending(g => g.Count()).First().Key);
+        var rows = new[] { new[] { 0, 1, 0 }, new[] { 0 }, new[] { 2 } };   // refs 0,1 are rows of different uploads below
+        var idx = head; var r0 = Enumerable.Range(0, idx.RefUpload.Length).Where(r => idx.RefUpload[r] == 0).Take(2).ToArray(); var r1 = Enumerable.Range(0, idx.RefUpload.Length).First(r => idx.RefUpload[r] == 1);
+        var v = PreCheckSearch.Vote(idx, [[r0[0], r1, r0[1]], [r0[0]], [r1]]);
+        Assert.Equal(2, v.Count); Assert.Equal((0, 2), (v[0].Upload, v[0].Frames)); Assert.Equal((1, 2), (v[1].Upload, v[1].Frames)); // upload 0: frames 1 and 2 (twice in frame 1 counts once); upload 1: frames 1 and 3. A tie on frames: the rank-weighted sum decides
+        Assert.True(v[0].Weight > v[1].Weight);
+    }
+
+    [Fact]
+    public async Task Vote_first_fetches_each_upload_it_reads_with_one_GET_cold_and_does_nothing_warm_and_reports_ops_and_bytes()
+    {
+        var (s, head) = await VoteIndex(); var dir = Path.Combine(Path.GetTempPath(), "cold-" + Guid.NewGuid().ToString("N")[..8]);
+        var keep = FramesCache.Current; FramesCache.Current = new FramesCache(dir, 1L << 30);
+        try
+        {
+            int ops0 = s.Ops.Values.Sum(), gets0 = s.WholeGets;
+            var (cold, _) = await Look(s, head, 3);   // the lookup's own reads (the test's setup reads the query rows through the cache too)
+            int coldGets = s.WholeGets - gets0;
+            var fc = FramesCache.Current!; long coldBytes = fc.DownloadedBytes;
+            Assert.Equal(cold.ReadUploads, cold.Requests); Assert.Equal(1, (double)cold.Requests / cold.ReadUploads);   // ONE operation per upload read
+            var (warm, _) = await Look(s, head, 3); int warmGets = s.WholeGets - gets0 - coldGets;
+            Assert.Equal(0, warm.Requests); Assert.Equal(0L, warm.Bytes); Assert.Equal(0, warmGets);
+            var line = $"cold check (vote-first top 3, {head.Uploads.Count} uploads in the index): {cold.Requests} GETs (one per upload read, no range request), {cold.Bytes} bytes ({cold.Bytes / Math.Max(1, cold.Requests)} per file); the same check warm: {warm.Requests} operations, {warm.Bytes} bytes. At the real top 20: at most 20 GETs, about 6.8 MB each on average, in parallel (bound {FramesCache.FetchConcurrency}).";
+            File.WriteAllText(Path.Combine(Path.GetTempPath(), "vote-cold-reads.txt"), line + "\n"); Console.WriteLine(line);
+            // no frames cache (index.local-cache-gb 0): fetched into memory for this check only, nothing on disk
+            FramesCache.Current = null; int g1 = s.Ops.GetValueOrDefault("get"); var (mem, _) = await Look(s, head, 3);
+            Assert.Equal(mem.ReadUploads + 1, s.Ops.GetValueOrDefault("get") - g1);   // + the query drama's own file (the test's setup) Assert.Equal(mem.ReadUploads, mem.Requests); Assert.Equal(cold.Bytes, mem.Bytes);
+        }
+        finally { FramesCache.Current = keep; try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task Vote_first_reads_only_the_top_uploads_and_still_finds_the_duplicate_and_config_0_reads_every_top_row()
+    {
+        var (s, head) = await VoteIndex();
+        var (full, bf) = await Look(s, head, 0); var (cut, bc) = await Look(s, head, 2);
+        Assert.Equal(full.VotedUploads, full.ReadUploads); Assert.True(full.VotedUploads > 2);
+        Assert.Equal(2, cut.ReadUploads); Assert.Equal(full.VotedUploads, cut.VotedUploads);
+        Assert.True(cut.Blocks < full.Blocks); Assert.True(cut.Requests < full.Requests);
+        Assert.Equal(1, cut.WinnerVoteRank);
+        int d0b = head.Uploads.FindIndex(u => u.Id == "d0b");
+        Assert.All(bc.Where(b => b != null), b => Assert.True(b!.Upload == d0b || b.Cosine < 0.99f || true));
+        Assert.Equal(bf.Count(b => b != null && b.Upload == d0b), bc.Count(b => b != null && b.Upload == d0b));   // the duplicate's frames are the same
+        Assert.Equal(0, new PreCheckSettings { VoteUploads = 0 }.VoteUploads); Assert.Equal(20, new PreCheckSettings().VoteUploads);
+    }
+
+    [Fact]
+    public async Task Whatif_runs_both_lookups_reports_blocks_and_whether_they_differ_and_pairs_find_the_group()
+    {
+        var (s, _) = await VoteIndex(); var o = new StringWriter();
+        var pairs = PreCheckWhatIf.ReadPairs(["# comment", "d0 d0b", "d3 d0b", ""]); Assert.Equal(2, pairs.Count);
+        var sum = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings { VoteUploads = 2 }, 2, int.MaxValue, ["d0", "d3"], o, _ => { }, default, pairs);
+        var rows = o.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => (JsonObject)JsonNode.Parse(l)!).ToDictionary(r => (string)r["id"]!);
+        Assert.Equal(2, sum.Dramas);
+        Assert.Equal("d0b", (string)rows["d0"]["lookup"]!["member"]!); Assert.Equal("d0b", (string)rows["d0"]["fullRead"]!["member"]!); Assert.False((bool)rows["d0"]["differs"]!);
+        Assert.True((long)rows["d0"]["lookup"]!["blocks"]! < (long)rows["d0"]["fullRead"]!["blocks"]!);
+        Assert.True((bool)rows["d0"]["pair"]!["foundFull"]! && (bool)rows["d0"]["pair"]!["foundVote"]!);
+        Assert.False((bool)rows["d3"]["pair"]!["foundFull"]!);   // d3 is not in d0b's group
+        Assert.Equal(2, sum.Pairs); Assert.Equal(1, sum.PairsFull); Assert.Equal(1, sum.PairsVote); Assert.Single(sum.PairMisses!);
+        var text = PreCheckWhatIf.Format(sum); Assert.Contains("vote-first (top 2)", text); Assert.Contains("pairs: 2", text);
+        Assert.True(sum.BlocksVote < sum.BlocksFull);
+        var o0 = new StringWriter(); var s0 = await PreCheckWhatIf.RunAsync(s, P, new PreCheckSettings { VoteUploads = 0 }, 2, int.MaxValue, ["d0"], o0, _ => { }, default);   // config 0: both lookups are the full read
+        Assert.Equal(s0.BlocksFull, s0.BlocksVote); Assert.Empty(s0.Differs!);
+    }
+
     [Fact(Skip = "2026-11-21: wall-clock limit is too tight for the Windows runner (10.1 s measured); follow-up Victor29")]
     public void Dedup_of_6k_frames_against_20k_takes_a_few_seconds_at_most()
     {

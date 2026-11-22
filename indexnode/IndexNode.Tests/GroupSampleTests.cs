@@ -182,9 +182,9 @@ public class GroupSampleTests
         Assert.Equal("groups: checked 10 of 50 (5.0/min, ETA 00:08)", GroupBuild.Progress(10, 50, TimeSpan.FromMinutes(2)));
     }
 
-    /// <summary>0.13.8: on a store where every ranged read is a round trip, the check runs --threads uploads at once, reads of one centers.zip go out together (not one after the other), the in-flight reads stay under the cap, and the progress line says where the time went.</summary>
+    /// <summary>0.13.8 / 0.13.21: the check runs --threads uploads at once; since 0.13.21 each upload read is ONE whole-file GET (no range reads), and the progress line says where the time went.</summary>
     [Fact]
-    public async Task With_latency_per_read_uploads_run_in_parallel_reads_overlap_and_the_progress_line_has_the_breakdown()
+    public async Task Uploads_run_in_parallel_each_is_one_whole_file_GET_no_range_reads_and_the_progress_line_has_the_breakdown()
     {
         var cache = Tmp(); var ids = Enumerable.Range(0, 8).Select(k => "u" + k).ToArray();
         try
@@ -195,10 +195,7 @@ public class GroupSampleTests
             var sw = System.Diagnostics.Stopwatch.StartNew();
             await GroupBuild.ApplyAsync(fs, P, null, idx, default, say.Add, 8, new PreCheckSettings { GroupCheckFrames = 60 }, bootstrap: true, write: false);
             var wall = sw.Elapsed;
-            Assert.True(fs.RangeInFlightPeak >= 8, "reads of different uploads overlap: peak " + fs.RangeInFlightPeak);
-            Assert.True(fs.RangeInFlightPeak <= CentersZip.MaxInFlight, "bounded by the in-flight cap: peak " + fs.RangeInFlightPeak);
-            // serial reads would take reads x 20 ms; the overlap must beat that clearly
-            Assert.True(wall.TotalMilliseconds < fs.RangeReads * 20 / 3.0, $"{fs.RangeReads} reads of 20 ms took {wall.TotalMilliseconds:F0} ms: not overlapped");
+            Assert.Equal(0, fs.RangeReads); Assert.True(fs.Ops.GetValueOrDefault("get") > 0);   // whole-file GETs, no ranged read
             var line = say.FirstOrDefault(m => m.Contains("avg per upload"));
             Assert.NotNull(line); Assert.Contains("scan", line); Assert.Contains("read", line); Assert.Contains("score", line); Assert.Contains("requests", line); Assert.Contains("MB", line); Assert.Contains("in flight", line); Assert.Contains("8 uploads at once", line);
         }

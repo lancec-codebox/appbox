@@ -89,7 +89,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
                 var sel = ixs.Skip(at).Take(chunk).ToList(); var part = sel.Select(i => own[i].V).ToList(); FrameBest?[] b;
                 if (idx.Count > 0)
                 {
-                    var t0 = Stopwatch.StartNew(); PreCheckSearch.Stats st; (b, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, part, s.TopCenters, threads, ct, -1, cache);
+                    var t0 = Stopwatch.StartNew(); PreCheckSearch.Stats st; (b, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, part, s.TopCenters, threads, ct, -1, cache, s.VoteUploads);
                     tSearch += t0.Elapsed.TotalMilliseconds; tScan += st.ScanMs; tRead += st.ReadMs; tScore += st.ScoreMs;
                 }
                 else b = new FrameBest?[part.Count];

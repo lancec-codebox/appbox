@@ -134,17 +134,17 @@ public class FramesFileTests
             var q = xs[2].AsSpan(5 * D, D).ToArray();
             var remote = await Query(fs, q);   // no local cache: range requests
             var size = (await fs.GetAsync(P.FramesFile("l0"), default))!.Data.Length;
-            FramesCache.Current = new FramesCache(dir, size * 10L);   // room for all three
+            FramesCache.Current = new FramesCache(dir, size * 10L) { ProtectSeconds = 0 };   // room for all three
             try
             {
+                for (int i = 0; i < 3; i++) await FramesReader.OpenAsync(fs, P.FramesFile("l" + i), default);   // a lookup fetches the whole file (one GET each); /v1/search's reads then come from disk
                 var local = await Query(fs, q); Assert.Equal(remote, local);
-                await FramesCache.Current.WaitFillsAsync();
                 Assert.Equal(3, FramesCache.Current.Downloads);   // one GET per file, however many reads follow
                 var again = await Query(fs, q); Assert.Equal(remote, again);
                 Assert.Equal(3, FramesCache.Current.Downloads);   // warm: nothing more fetched
                 Assert.Empty(Directory.GetFiles(dir, "*.part"));
                 // bounded: a cache with room for two evicts the least recently used
-                var small = new FramesCache(Tmp(), size * 5L / 2);
+                var small = new FramesCache(Tmp(), size * 5L / 2) { ProtectSeconds = 0 };
                 var trace = new List<string>(); foreach (var id in new[] { "l0", "l1", "l2" }) { await small.EnsureAsync(fs, P.FramesFile(id), null, size, default); trace.Add(string.Join('|', Directory.GetFiles(small.Dir).Select(Path.GetFileName))); }
                 var sizes = string.Join(',', Directory.GetFiles(small.Dir, "*.bin").Select(f => new FileInfo(f).Length)); Assert.True(Directory.GetFiles(small.Dir, "*.bin").Length == 2, $"{string.Join(';', trace)} max {small.MaxBytes}"); Assert.False(File.Exists(small.PathOf(P.FramesFile("l0"), null, size)));
                 Directory.Delete(small.Dir, true);
@@ -155,7 +155,7 @@ public class FramesFileTests
     }
 
     [Fact]
-    public async Task A_cold_lookup_reads_by_range_with_no_whole_file_GET_then_the_background_fill_makes_the_next_lookup_all_hits()
+    public async Task A_cold_lookup_does_one_whole_file_GET_per_upload_read_and_the_same_lookup_warm_does_none()
     {
         var cache = Tmp(); var dir = Tmp();
         try
@@ -164,19 +164,18 @@ public class FramesFileTests
             for (int i = 0; i < 6; i++) { var x = Make(300, 12, 200 + i); all.Add(x); (fs, wr) = await Drama("k" + i, F16(x), 300, cache + i, fs); await Centers(wr, "k" + i); }
             var ups = await SearchIndexBuild.ListCentersAsync(fs, P, default); var idx = await SearchIndexBuild.BuildAsync(fs, P, ups, null, null, 1, 1, 4, _ => { }, default);
             var qs = Enumerable.Range(0, 20).Select(i => all[5].AsSpan(i * 10 * D, D).ToArray()).ToList();
-            FramesCache.Current = new FramesCache(dir, 1L << 30) { PauseMs = 100 };
+            FramesCache.Current = new FramesCache(dir, 1L << 30);
             try
             {
-                int gets0 = fs.WholeGets;
+                int gets0 = fs.WholeGets; int ops0 = fs.Ops.Values.Sum();
                 var (b1, st1) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, -1);
-                Assert.Equal(gets0, fs.WholeGets);   // the lookup returned with no whole-file GET
-                Assert.True(st1.Requests > 0); Assert.True(FramesCache.Current.RangedMisses > 0); Assert.True(FramesCache.Current.FillsQueued > 0);
-                await FramesCache.Current.WaitFillsAsync();
-                Assert.Equal(FramesCache.Current.FillsQueued, FramesCache.Current.Downloads);
-                int hits0 = FramesCache.Current.Hits, miss0 = FramesCache.Current.RangedMisses;
+                int coldGets = fs.WholeGets - gets0;
+                Assert.True(coldGets > 0); Assert.Equal(coldGets, st1.ReadUploads); Assert.Equal(coldGets, st1.Requests); Assert.Equal(FramesCache.Current.DownloadedBytes, st1.Bytes);   // ONE GET per upload read, no range request
+                Assert.Equal(coldGets, FramesCache.Current.Downloads);
+                int hits0 = FramesCache.Current.Hits;
                 var (b2, st2) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, -1);
-                Assert.Equal(0, st2.Requests); Assert.Equal(miss0, FramesCache.Current.RangedMisses); Assert.True(FramesCache.Current.Hits > hits0);
-                Assert.Equal(b1.Length, b2.Length);
+                Assert.Equal(coldGets, fs.WholeGets - gets0); Assert.Equal(0, st2.Requests); Assert.Equal(0L, st2.Bytes); Assert.True(FramesCache.Current.Hits >= hits0 + coldGets);   // warm: no operation at all
+                Assert.Equal(b1.Length, b2.Length); for (int i = 0; i < b1.Length; i++) Assert.Equal(b1[i]?.Upload, b2[i]?.Upload);
             }
             finally { FramesCache.Current = null; }
         }
@@ -199,10 +198,10 @@ public class FramesFileTests
             {
                 int g0 = fs.WholeGets; var sw = System.Diagnostics.Stopwatch.StartNew();
                 await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 64, 4, default, -1);
-                Assert.Equal(g0, fs.WholeGets);
-                var t = sw.Elapsed.TotalSeconds; Console.WriteLine($"BENCH cold lookup, 300 uncached uploads: {t:F2}s, {FramesCache.Current.RangedMisses} ranged misses, {FramesCache.Current.FillsQueued} fills queued");
+                Assert.Equal(FramesCache.Current.Downloads, fs.WholeGets - g0);
+                var t = sw.Elapsed.TotalSeconds; Console.WriteLine($"BENCH cold lookup, 300 uncached uploads: {t:F2}s, {FramesCache.Current.Downloads} whole-file GETs");
                 Assert.True(t < 5, $"{t:F2}s");
-                Assert.True(FramesCache.Current.RangedMisses >= 100);
+                Assert.True(FramesCache.Current.Downloads >= 100);
             }
             finally { FramesCache.Current = null; }
         }
@@ -222,8 +221,7 @@ public class FramesFileTests
             FramesCache.Current = new FramesCache(dir, 1L << 30);
             try
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew(); await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var cold = sw.Elapsed.TotalSeconds; await FramesCache.Current.WaitFillsAsync();
-                sw.Restart(); var (best, st) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var warm = sw.Elapsed.TotalSeconds;
+                var sw = System.Diagnostics.Stopwatch.StartNew(); await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var cold = sw.Elapsed.TotalSeconds;                sw.Restart(); var (best, st) = await PreCheckSearch.BestPerFrameAsync(fs, P, idx, qs, 8, 4, default, 11); var warm = sw.Elapsed.TotalSeconds;
                 Console.WriteLine($"BENCH frames-cache: 12 dramas x 1500 frames, 60-frame group check: cold {cold:F2}s ({FramesCache.Current.Downloads} GETs, {FramesCache.Current.DownloadedBytes / 1024} KB), warm {warm:F3}s, {st.Requests} range requests");
                 Assert.Equal(0, st.Requests); Assert.True(warm < 10);
             }

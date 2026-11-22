@@ -114,6 +114,8 @@ public abstract class CentersBlob
 
     /// <summary>0.13.9: a whole local copy of the file (the node's frames cache): reads come from it, no range request goes to the store.</summary>
     public string? LocalPath { get; set; }
+    /// <summary>0.13.21: the whole file held in memory for this reader only (no frames cache, or a file larger than the cache).</summary>
+    public byte[]? Memory { get; set; }
     public int Requests; public long BytesRead; public int LocalReads;
 
     /// <summary>0.13.8: at most this many ranged reads of centers.zip members are in flight in the whole process (the bound is on requests, not threads: a read is a round trip, not CPU).</summary>
@@ -152,15 +154,20 @@ public abstract class CentersBlob
     /// <summary>Bytes off..off+len of centers.bin (one HTTP range request), pinned to the zip's ETag.</summary>
     public async Task<byte[]> ReadAsync(long off, int len, CancellationToken ct)
     {
+        if (Memory != null)
+        {
+            Interlocked.Increment(ref LocalReads);
+            if (off < 0 || off + len > Memory.Length) throw new InvalidDataException($"{Blob}: asked for {len} bytes at {off}, the copy has {Memory.Length}");
+            return Memory.AsSpan((int)off, len).ToArray();
+        }
         if (LocalPath != null)
         {
-            Interlocked.Increment(ref LocalReads); FramesCache.Current?.NoteLookup();
+            Interlocked.Increment(ref LocalReads);
             using var fh = File.OpenHandle(LocalPath); var lb = new byte[len]; int got = 0;
             while (got < len) { int n = RandomAccess.Read(fh, lb.AsSpan(got), off + got); if (n <= 0) break; got += n; }
             if (got != len) throw new InvalidDataException($"{Blob}: asked for {len} bytes at {off}, the local copy has {got}");
             return lb;
         }
-        FramesCache.Current?.NoteLookup();
         Interlocked.Increment(ref Requests); Interlocked.Add(ref BytesRead, len);
         await InFlightGate.WaitAsync(ct); int now = Interlocked.Increment(ref inFlight); int pk; while (now > (pk = peakInFlight)) Interlocked.CompareExchange(ref peakInFlight, now, pk);
         RangeRead r; var pin = new BlobPin(Blob, ETag, ZipSize, Sha);
@@ -202,30 +209,42 @@ public sealed class CentersZip : CentersBlob
 public sealed class FramesReader : CentersBlob
 {
     /// <summary>0.13.18: size, ETag and idx_sha256 come from the node's cached frames LIST (one LIST per relist, no HEAD per file). <paramref name="fresh"/> (a stale read, or a name the listing lacks) does one HEAD and refreshes the entry.</summary>
-    public static async Task<FramesReader?> OpenAsync(IStore store, string blob, CancellationToken ct, bool fresh = false)
+    public static async Task<FramesReader?> OpenAsync(IStore store, string blob, CancellationToken ct, bool fresh = false, bool whole = true)
     {
         var list = FramesListing.For(store); BlobProps? h = null;
         if (!fresh) { try { var pf = blob[..(blob.LastIndexOf('/') + 1)]; await list.EnsureAsync(store, new Paths(pf[..^"search/frames/".Length]), ct); } catch (Exception e) when (e is StorageException or NotSupportedException) { } h = list.Get(blob); }
         if (h == null) { h = await store.HeadAsync(blob, ct); if (h != null) list.Set(blob, h); }
         if (h == null || h.Size < CentersFile.HeaderSize) return null;
-        return await LocalAsync(new FramesReader { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = 0, DataLength = h.Size }, ct);
+        return await LocalAsync(new FramesReader { Store = store, Blob = blob, ETag = h.ETag, Sha = h.Metadata.GetValueOrDefault("idx_sha256"), ZipSize = h.Size, DataStart = 0, DataLength = h.Size }, ct, whole);
     }
 
     /// <summary>The place the index recorded (file, size, ETag, table offset): no HEAD, no header read. Null when the version records none (built before 0.13.9).</summary>
-    /// <summary>With the node's frames cache on, the whole file is fetched once (one GET) and kept; every later read is from disk.</summary>
-    static async Task<FramesReader> LocalAsync(FramesReader r, CancellationToken ct)
+    /// <summary>0.13.21: a lookup reads the WHOLE file: the cached copy when there is one, otherwise ONE GET now (kept in the LRU cache; held in memory for this reader when there is no cache or the file is larger than it). <paramref name="whole"/> false (a reader that needs a small part: the index build's centers, /v1/search): the cached copy if present, else ranges.</summary>
+    static async Task<FramesReader> LocalAsync(FramesReader r, CancellationToken ct, bool whole = true)
     {
-        // 0.13.16: never wait for a whole-file download: a hit reads the local copy, a miss reads by range and queues the file for a background fill
-        if (FramesCache.Current is { } c) r.LocalPath = c.TryLocalOrQueue(r.Store, r.Blob, r.Sha, r.ZipSize);
-        await Task.CompletedTask;
+        var c = FramesCache.Current;
+        if (!whole) { if (c != null) r.LocalPath = c.TryLocal(r.Blob, r.Sha, r.ZipSize); return r; }
+        if (c != null)
+        {
+            var (p, fetched) = await c.LocalOrFetchAsync(r.Store, r.Blob, r.Sha, r.ZipSize, ct);
+            if (p != null) { r.LocalPath = p; if (fetched) { r.Requests = 1; r.BytesRead = r.ZipSize; } return r; }
+        }
+        await FramesCache.FetchGate.WaitAsync(ct);
+        try
+        {
+            var got = await r.Store.GetAsync(r.Blob, ct) ?? throw new FileNotFoundException(r.Blob + " is gone");
+            if (r.ZipSize > 0 && got.Data.Length != r.ZipSize) throw new StaleZipException(r.Blob);
+            r.Memory = got.Data; r.Requests = 1; r.BytesRead = got.Data.Length;
+        }
+        finally { FramesCache.FetchGate.Release(); }
         return r;
     }
 
     public static FramesReader? FromIndex(IStore store, SearchUpload u) => u.File == null ? null : new FramesReader { Store = store, Blob = u.File, ETag = u.ETag.Length == 0 ? null : u.ETag, Sha = u.Sha, ZipSize = u.ZipSize, DataStart = 0, DataLength = u.DataLength, KnownTableOff = u.TableOff, KnownK = u.K };
 
     /// <summary>The recorded place on the first attempt, a fresh open after a stale read (or when the version records none).</summary>
-    public static async Task<FramesReader> ForAsync(IStore store, Paths paths, SearchUpload u, int attempt, CancellationToken ct) =>
-        (attempt == 0 && FromIndex(store, u) is { } fr ? await LocalAsync(fr, ct) : null) ?? await OpenAsync(store, paths.FramesFile(u.Id), ct, fresh: attempt > 0) ?? throw new FileNotFoundException(paths.FramesFile(u.Id));
+    public static async Task<FramesReader> ForAsync(IStore store, Paths paths, SearchUpload u, int attempt, CancellationToken ct, bool whole = true) =>
+        (attempt == 0 && FromIndex(store, u) is { } fr ? await LocalAsync(fr, ct, whole) : null) ?? await OpenAsync(store, paths.FramesFile(u.Id), ct, fresh: attempt > 0, whole: whole) ?? throw new FileNotFoundException(paths.FramesFile(u.Id));
 }
 
 /// <summary>The frames file's bytes and the conversion from a centers.bin (same layout, new magic, the sequence number).</summary>

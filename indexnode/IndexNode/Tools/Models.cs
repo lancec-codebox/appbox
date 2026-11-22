@@ -55,6 +55,10 @@ public static class Models
     public static readonly ModelFile[] Asr = [AsrModel, AsrTokens, Vad];
     /// <summary>Everything a node needs for every step (the default face models included).</summary>
     public static readonly ModelFile[] All = [SscdInt8, SscdFp32, ClipVisionFp16, .. Clip, .. Ocr, .. Asr, .. FaceDefault];
+    /// <summary>0.13.21: what `tools install --models` installs: the default pipeline (SSCD, OCR, ASR, faces). SigLIP (clip) is opt-in since 2026-11-14 and only the old CastStage path and the dev search command use it: `--all` installs it.</summary>
+    public static readonly ModelFile[] Default = [SscdInt8, SscdFp32, .. Ocr, .. Asr, .. FaceDefault];
+    /// <summary>0.13.21 (`tools install --models serve`): only what `indexnode serve` loads: SSCD int8 and SenseVoice with its tokens (the AI probe is built in).</summary>
+    public static readonly ModelFile[] Serve = [SscdInt8, AsrModel, AsrTokens];
 
     /// <summary>The steps a node can run with the model files it has: a node never claims a job that needs a step it cannot run.</summary>
     public static readonly Dictionary<string, ModelFile[]> ByStep = new() { ["clip"] = Clip, ["dino"] = [DinoSmall], ["ocrsubs"] = Ocr, ["transcribe"] = Asr, ["cast"] = FaceDefault };

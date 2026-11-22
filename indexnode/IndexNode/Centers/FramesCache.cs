@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json.Nodes;
 
 namespace IndexNode;
 
@@ -6,12 +7,17 @@ namespace IndexNode;
 /// A file is named by drama, content hash and size, so a replaced frames file is a new local file and the old one ages out.</summary>
 public sealed class FramesCache(string dir, long maxBytes)
 {
-    /// <summary>Set once at start-up by a node; null = no local copy (every read is a range request).</summary>
+    /// <summary>Set once at start-up by a node; null = no local copy (a lookup fetches each file into memory for that check only).</summary>
     public static FramesCache? Current { get; set; }
 
     public string Dir { get; } = dir;
     public long MaxBytes { get; } = maxBytes;
     public int Downloads; public long DownloadedBytes;
+    /// <summary>Files deleted by the LRU eviction; test hooks: called with the local path when a file is evicted / lands in the cache.</summary>
+    /// <summary>Eviction never deletes a file used in the last this-many seconds (a check's own files are in use while it reads them).</summary>
+    public int ProtectSeconds = 60;
+    public int Evicted; public Action<string>? OnEvicted, OnAdded;
+    public JsonObject Stats() => new() { ["files"] = Directory.Exists(Dir) ? Directory.GetFiles(Dir, "*.bin").Length : 0, ["maxMb"] = MaxBytes / (1024 * 1024), ["hits"] = Hits, ["downloads"] = Downloads, ["evicted"] = Evicted };
     readonly ConcurrentDictionary<string, Lazy<Task<string>>> inflight = new(StringComparer.Ordinal);
     readonly object evictGate = new();
 
@@ -37,76 +43,38 @@ public sealed class FramesCache(string dir, long maxBytes)
         var tmp = path + "." + Guid.NewGuid().ToString("N")[..6] + ".part";
         try
         {
-            await store.DownloadToFileAsync(blob, tmp, CancellationToken.None);
+            await FetchGate.WaitAsync();
+            try { await store.DownloadToFileAsync(blob, tmp, CancellationToken.None); } finally { FetchGate.Release(); }
             var len = new FileInfo(tmp).Length;
             if (size > 0 && len != size) throw new StaleZipException(blob);
             File.Move(tmp, path, true);
-            Interlocked.Increment(ref Downloads); Interlocked.Add(ref DownloadedBytes, len);
+            Interlocked.Increment(ref Downloads); Interlocked.Add(ref DownloadedBytes, len); OnAdded?.Invoke(path);
         }
         finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
         Evict(path);
         return path;
     }
 
-    // 0.13.16: lookups never wait for a whole-file download. A miss is read by range and the file is queued here; two workers fill the queue in the background, pausing while any lookup reads.
-    public const int FillConcurrency = 2;
-    public int Hits, RangedMisses, FillsQueued, FillsDone, FillsFailed;
-    long lastLookupTicks; int fillWorkers;
-    readonly ConcurrentQueue<(IStore Store, string Blob, string? Sha, long Size)> fillQueue = new();
-    readonly ConcurrentDictionary<string, byte> queued = new(StringComparer.Ordinal);
-    /// <summary>Test hook: how long (ms) a lookup counts as active after its last read.</summary>
-    public int PauseMs = 750;
+    /// <summary>0.13.21: at most this many whole-file GETs are in flight in the process (a vote-first check fetches up to 20 files at once).</summary>
+    public const int FetchConcurrency = 20;
+    public static readonly SemaphoreSlim FetchGate = new(FetchConcurrency, FetchConcurrency);
+    public int Hits;
 
-    /// <summary>Marks a lookup read in progress (FramesReader opens and reads call it): background fills wait until none has happened for PauseMs.</summary>
-    public void NoteLookup() => Interlocked.Exchange(ref lastLookupTicks, Environment.TickCount64);
-    bool LookupActive => Environment.TickCount64 - Interlocked.Read(ref lastLookupTicks) < PauseMs;
-
-    /// <summary>The local path when the whole file is here (a hit); otherwise null, the miss is counted and the file queued for a background fill.</summary>
-    public string? TryLocalOrQueue(IStore store, string blob, string? sha, long size)
+    /// <summary>The local path when the whole file is here (no fetch, no wait); otherwise null. For readers that only need a small part of a file and read it by range.</summary>
+    public string? TryLocal(string blob, string? sha, long size)
     {
-        NoteLookup();
         var path = PathOf(blob, sha, size);
         if (File.Exists(path)) { Touch(path); Interlocked.Increment(ref Hits); return path; }
-        Interlocked.Increment(ref RangedMisses);
-        if (size > MaxBytes) return null;
-        if (queued.TryAdd(path, 0)) { Interlocked.Increment(ref FillsQueued); fillQueue.Enqueue((store, blob, sha, size)); StartWorkers(); }
         return null;
     }
 
-    void StartWorkers()
+    /// <summary>0.13.21 (a lookup): the local path of the whole file, or ONE GET now (concurrent callers share it) and the file is kept in the LRU cache. Path null when the file is larger than the whole cache (the caller then holds it in memory).</summary>
+    public async Task<(string? Path, bool Fetched)> LocalOrFetchAsync(IStore store, string blob, string? sha, long size, CancellationToken ct)
     {
-        while (true)
-        {
-            int n = Volatile.Read(ref fillWorkers); if (n >= FillConcurrency) return;
-            if (Interlocked.CompareExchange(ref fillWorkers, n + 1, n) == n) { _ = Task.Run(FillLoopAsync); }
-        }
-    }
-
-    async Task FillLoopAsync()
-    {
-        try
-        {
-            while (fillQueue.TryDequeue(out var j))
-            {
-                var path = PathOf(j.Blob, j.Sha, j.Size);
-                try
-                {
-                    while (LookupActive) await Task.Delay(50);
-                    if (!File.Exists(path)) await EnsureAsync(j.Store, j.Blob, j.Sha, j.Size, CancellationToken.None);
-                    Interlocked.Increment(ref FillsDone);
-                }
-                catch (Exception) { Interlocked.Increment(ref FillsFailed); }
-                finally { queued.TryRemove(path, out _); }
-            }
-        }
-        finally { Interlocked.Decrement(ref fillWorkers); if (!fillQueue.IsEmpty) StartWorkers(); }
-    }
-
-    /// <summary>Waits until the background fill queue is empty and idle (tests, shutdown).</summary>
-    public async Task WaitFillsAsync(int timeoutMs = 60000)
-    {
-        var end = Environment.TickCount64 + timeoutMs;
-        while ((!fillQueue.IsEmpty || Volatile.Read(ref fillWorkers) > 0 || !queued.IsEmpty) && Environment.TickCount64 < end) await Task.Delay(20);
+        var path = PathOf(blob, sha, size);
+        if (File.Exists(path)) { Touch(path); Interlocked.Increment(ref Hits); return (path, false); }
+        if (size > MaxBytes) return (null, false);
+        return (await EnsureAsync(store, blob, sha, size, ct), true);
     }
 
     static void Touch(string path) { try { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); } catch { } }
@@ -119,7 +87,7 @@ public sealed class FramesCache(string dir, long maxBytes)
             try
             {
                 var files = new DirectoryInfo(Dir).GetFiles("*.bin").OrderBy(f => f.LastWriteTimeUtc).ToList(); long total = files.Sum(f => f.Length);
-                foreach (var f in files) { if (total <= MaxBytes) break; if (f.FullName == keep) continue; { long len = f.Length; try { f.Delete(); total -= len; } catch { } } }
+                foreach (var f in files) { if (total <= MaxBytes) break; if (f.FullName == keep || DateTime.UtcNow - f.LastWriteTimeUtc < TimeSpan.FromSeconds(ProtectSeconds)) continue; { long len = f.Length; try { f.Delete(); total -= len; Interlocked.Increment(ref Evicted); OnEvicted?.Invoke(f.FullName); } catch { } } }
             }
             catch (DirectoryNotFoundException) { }
         }

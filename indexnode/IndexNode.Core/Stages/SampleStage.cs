@@ -12,6 +12,8 @@ namespace IndexNode;
 public sealed class SampleStage(ITools tools, IStore store, DownloadGate gate, PreCheckSettings settings) : IStageHandler
 {
     public const string Dir = "sample/";
+    /// <summary>0.13.21: the inline check (config check.url); null = the check entry is added as before.</summary>
+    public InlineCheckClient? Inline { get; init; }
 
     /// <summary>What one sample download produced; the workspace holds the files until it is disposed.</summary>
     public sealed class Result : IAsyncDisposable
@@ -119,7 +121,19 @@ public sealed class SampleStage(ITools tools, IStore store, DownloadGate gate, P
             await store.PutAsync(paths.Video(id, Dir + "sample.json"), JsonSerializer.SerializeToUtf8Bytes(Marker(res, ctx.NodeId)), null, null, false, ct, "application/json");   // last: its presence says the sample is complete
             Log.Info($"sample {id}: {res.Segments.Count} segment(s) uploaded ({string.Join(", ", res.Seconds.Select(x => x.Key + " " + x.Value.ToString("0.0", CultureInfo.InvariantCulture) + "s"))})");
         }
+        if (Inline != null && await TryInlineAsync(ctx)) return;
         await AddCheck(ctx);
+    }
+
+    /// <summary>The inline check: true when the serve instance answered and its record and the finished check entry are in (the engine appends them with the sample's done line, in ONE append); false: fall back to the check entry.</summary>
+    async Task<bool> TryInlineAsync(JobContext ctx)
+    {
+        var id = ctx.Job.JobId;
+        if (await Inline!.TryAsync(id, ctx.Token) is not { } ans) return false;
+        try { await InlineCheckClient.RecordAsync(ctx.Store, ctx.Paths, id, ans.Record, ctx.Token); }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"sample {id}: inline check record not written ({e.Message}); adding the check entry"); return false; }
+        InlineCheckClient.AddOutcome(ctx, ans.Record);
+        return true;
     }
 
     /// <summary>The follow-up: a `check` entry at the sample's priority (create-only).</summary>
