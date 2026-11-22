@@ -186,14 +186,54 @@ public class InlineCheckTests
         finally { InlineCheckClient.Now = () => DateTimeOffset.UtcNow; }
     }
 
-    [Fact(Skip = "2026-11-21: fails on the Windows runner (bash -n on a Windows path; passes on Ubuntu); follow-up Victor29")]
+    /// <summary>
+    /// The script goes to <c>bash -n</c> (and <c>shellcheck -</c>) on STDIN, LF line endings: no path form (a Windows path, a WSL /mnt path) matters, and nothing passes through Windows command-line quoting (the script has embedded double quotes).
+    /// On the Windows runner "bash" is often WSL's System32\bash.exe with no distribution installed (it prints its complaint as UTF-16 on stdout and exits non-zero): a bash is used only when it runs a probe and answers; with none usable the test returns early (nothing to check with), it does not fail.
+    /// </summary>
+    [Fact]
     public async Task The_bootstrap_script_parses_with_bash_n_and_shellcheck_when_present()
     {
         var f = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../sandbox/bootstrap.sh"));
         Assert.True(File.Exists(f), f);
-        var bash = await Proc.RunAsync("bash", ["-n", f], default); Assert.True(bash.ExitCode == 0, bash.Stderr);
-        ProcResult? sc = null; try { sc = await Proc.RunAsync("shellcheck", ["-S", "warning", f], default); } catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException) { }
+        var text = File.ReadAllText(f).Replace("\r\n", "\n");
+        string? bash = null;
+        foreach (var cand in BashCandidates())
+        {
+            try { var probe = await RunWithStdinAsync(cand, [], "echo bootstrap-probe-ok\n"); if (probe.ExitCode == 0 && probe.Stdout.Contains("bootstrap-probe-ok")) { bash = cand; break; } }
+            catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException or IOException) { }
+        }
+        if (bash == null) { Console.WriteLine("bootstrap.sh parse test: no usable bash on this machine, nothing checked"); Assert.True(OperatingSystem.IsWindows(), "no usable bash on a non-Windows machine"); return; }
+        var r = await RunWithStdinAsync(bash, ["-n"], text);
+        Assert.True(r.ExitCode == 0, $"bash -n ({bash}) exit {r.ExitCode}: {r.Stderr}{r.Stdout}");
+        ProcResult? sc = null; try { sc = await RunWithStdinAsync("shellcheck", ["-S", "warning", "-"], text); } catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException) { }
         if (sc != null) Assert.True(sc.ExitCode == 0, sc.Stdout + sc.Stderr);
+    }
+
+    /// <summary>Runs a program with the given text on its stdin (then closes it); 60 s limit.</summary>
+    static async Task<ProcResult> RunWithStdinAsync(string file, string[] args, string stdin)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(file) { RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        var o = p.StandardOutput.ReadToEndAsync(); var e = p.StandardError.ReadToEndAsync();
+        try { await p.StandardInput.WriteAsync(stdin); p.StandardInput.Close(); } catch (IOException) { }   // the program may exit before reading it all
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        try { await p.WaitForExitAsync(cts.Token); } catch (OperationCanceledException) { try { p.Kill(true); } catch { } throw new TimeoutException(file + " did not finish in 60 s"); }
+        return new ProcResult(p.ExitCode, await o, await e);
+    }
+
+    /// <summary>Bash programs to try, best first: on Windows Git Bash (not WSL's System32 stub) before whatever "bash" resolves to.</summary>
+    static IEnumerable<string> BashCandidates()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            foreach (var env in new[] { "ProgramFiles", "ProgramFiles(x86)", "LocalAppData" })
+            {
+                var root = Environment.GetEnvironmentVariable(env); if (string.IsNullOrEmpty(root)) continue;
+                foreach (var rel in new[] { @"Git\bin\bash.exe", @"Git\usr\bin\bash.exe", @"Programs\Git\bin\bash.exe" }) { var c = Path.Combine(root, rel); if (File.Exists(c)) yield return c; }
+            }
+        }
+        yield return "bash";
     }
 
     [Fact]
