@@ -13,9 +13,18 @@ public sealed record SiteRow(string Site, string Op, long Count, long Failed, st
 /// <summary>0.13.18 settings (config storage.*). Defaults (0.13.26, the normal budget is low: a 2-lane processor measured a median of ~41 ops/min): warn 150 / max 200 per minute, 1,000 per step, 100 failures per minute, 5 minutes cooldown. One-off commands widen it with --storage-max N.</summary>
 public sealed class StorageLimits
 {
-    public int WarnPerMin { get; set; } = 150;
-    public int MaxPerMin { get; set; } = 200;
-    public int MaxPerStep { get; set; } = 1000;
+    /// <summary>0.13.30: the per-minute cap is per lane (config storage.max-per-min-per-lane); the node's cap is this times its lanes. A 2-lane node may do 400 a minute.</summary>
+    public int MaxPerMinPerLane { get; set; } = 200;
+    /// <summary>The lanes of the node (set by the engine): the node-wide cap is MaxPerMinPerLane x Lanes.</summary>
+    public int Lanes { get; set; } = 1;
+    public int MaxPerMin { get => MaxPerMinPerLane * Math.Max(1, Lanes); set => MaxPerMinPerLane = Math.Max(1, (value + Math.Max(1, Lanes) - 1) / Math.Max(1, Lanes)); }
+    int? warn; /// <summary>Warn at 75% of the node-wide cap unless set.</summary>
+    public int WarnPerMin { get => warn ?? MaxPerMin * 3 / 4; set => warn = value; }
+    /// <summary>0.13.30: a hard limit on the store ops of ONE job step (storage.max-per-step): the runaway signal. Over it the step fails Transient with the per-site report and the node stops claiming.</summary>
+    public int MaxPerStep { get; set; } = 25;
+    /// <summary>Named larger limits for singleton builds that legitimately read many files (stage name -> ops).</summary>
+    public Dictionary<string, int> StepLimits { get; set; } = new() { ["actors-index"] = 250, ["search-index"] = 400 };
+    public int StepLimitFor(string? stage) => stage != null && StepLimits.TryGetValue(stage, out var n) ? n : MaxPerStep;
     public int MaxFailuresPerMin { get; set; } = 100;
     public TimeSpan Cooldown { get; set; } = TimeSpan.FromMinutes(5);
 }
@@ -34,6 +43,7 @@ public sealed class StoreMeter
     readonly object gate = new();
     readonly ConcurrentDictionary<(string Site, string Op), Cell> total = new();
     readonly Queue<(long Tick, bool Failed, string Site, string Op, string? Name)> window = new();
+    DateTimeOffset? stepHaltAt; string? stepHaltMessage;
     int winOps, winFails; long lastWarnMin = -1; DateTimeOffset? trippedAt; string? tripMessage;
     public StoreMeter(Func<DateTimeOffset>? clock = null) { now = clock ?? (() => DateTimeOffset.UtcNow); }
 
@@ -114,6 +124,8 @@ public sealed class StoreMeter
             if (sc != null && sc.Ops >= sc.Max)
             {
                 sc.Tripped = $"storage: this step made {sc.Ops} store ops (max-per-step {sc.Max}). Top sites: {Top(Rows(sc.Cells), 5)}";
+                stepHaltAt = now(); stepHaltMessage = $"storage: a step made {sc.Ops} store ops (max-per-step {sc.Max}); the node stops claiming for {Limits.Cooldown.TotalMinutes:0.#} min. Top sites: {Top(Rows(sc.Cells), 5, true)}";   // 0.13.30: the node stops claiming (store calls stay open, so the step's failure line can still be written)
+                Log.Info(stepHaltMessage);
                 throw new StorageBudgetExceeded(sc.Tripped);
             }
             Count(total, site, op, name, false); if (sc != null) { sc.Ops++; Count(sc.Cells, site, op, name, false); }
@@ -175,8 +187,8 @@ public sealed class StoreMeter
     static string Top(IReadOnlyList<SiteRow> rows, int n, bool withExample = false) => string.Join("; ", rows.Take(n).Select(r => $"{r.Site} {r.Op} x{r.Count}" + (!withExample || r.Example == null ? "" : r.Blobs > 1 ? $" ({r.Blobs} blobs, e.g. {r.Example})" : r.Blobs == 1 && r.Count > 1 ? $" (all on one blob: {r.Example})" : $" (e.g. {r.Example})")));
 
     // ------------------------------------------------------------ reports
-    public bool Tripped { get { lock (gate) { Roll(Minute()); if (trippedAt is { } t && now() - t >= Limits.Cooldown) { trippedAt = null; tripMessage = null; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); } return trippedAt != null; } } }
-    public string? TripMessage { get { lock (gate) return tripMessage; } }
+    public bool Tripped { get { lock (gate) { Roll(Minute()); if (stepHaltAt is { } sh && now() - sh >= Limits.Cooldown) { stepHaltAt = null; stepHaltMessage = null; } if (stepHaltAt != null) return true; if (trippedAt is { } t && now() - t >= Limits.Cooldown) { trippedAt = null; tripMessage = null; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); } return trippedAt != null; } } }
+    public string? TripMessage { get { lock (gate) return tripMessage ?? stepHaltMessage; } }
     public long OpsLastMinute { get { lock (gate) { Roll(Minute()); return winOps; } } }
     public long Total => total.Where(kv => !kv.Key.Op.Contains('!')).Sum(kv => kv.Value.Count);   // the "op!404" rows are failures of ops already counted
     public long TotalFailed => total.Values.Sum(c => c.Failed);
@@ -198,7 +210,7 @@ public sealed class StoreMeter
     }
 
     /// <summary>Clears the counters and the breaker (tests; a new write-free command).</summary>
-    public void Reset() { lock (gate) { total.Clear(); samples.Clear(); window.Clear(); winOps = winFails = 0; trippedAt = null; tripMessage = null; lastWarnMin = -1; } }
+    public void Reset() { lock (gate) { total.Clear(); samples.Clear(); window.Clear(); winOps = winFails = 0; trippedAt = null; tripMessage = null; stepHaltAt = null; stepHaltMessage = null; lastWarnMin = -1; } }
 
     // ------------------------------------------------------------ the negative cache
     /// <summary>A 404 for a name is remembered until something says the name exists (a listing, a put, a queue line); asking again within <see cref="NegativeTtl"/> is answered "missing" with no request.</summary>

@@ -73,7 +73,8 @@ public class StorageBreakerTests
             Assert.Contains("max-per-step 7", e.Message); Assert.Contains("HeadAsync", e.Message + "HeadAsync");
             Assert.Equal(7, m.StepTable().Where(r => !r.Op.Contains('!')).Sum(r => r.Count));
         }
-        Assert.False(m.Tripped);   // a step budget does not open the node's breaker
+        Assert.True(m.Tripped);   // 0.13.30: a runaway step opens the node's breaker: the node stops claiming
+        m.Reset();
         using (m.BeginStep()) { await s.HeadAsync("x", default); Assert.Equal(1, m.StepOps); }
     }
 
@@ -95,7 +96,7 @@ public class StorageBreakerTests
         var h = new Dictionary<string, IStageHandler> { ["download"] = new Fn(async ctx => { for (int i = 0; i < 50; i++) await ctx.Store.HeadAsync("x", ctx.Token); }) };
         await new NodeEngine(s, P, Opts(m), h).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
         var e = f.Replay(P.Prefix).Entry("v1", "download")!;
-        Assert.NotEqual("done", e.State); Assert.True(e.Attempts > 1); Assert.Contains("max-per-step", e.LastError);   // an ordinary failure: counted as an attempt and retried (zero backoff here, so the attempts run out)
+        Assert.NotEqual("done", e.State); Assert.True(e.Attempts >= 1, "attempts " + e.Attempts); Assert.Contains("max-per-step", e.LastError); Assert.True(m.Tripped, "tripped");   // an ordinary failure: counted as an attempt and retried (zero backoff here, so the attempts run out)
     }
 
     [Fact]

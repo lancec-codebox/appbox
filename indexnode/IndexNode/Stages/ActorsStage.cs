@@ -32,7 +32,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         var io = new ActorsIO(ctx.Store, ctx.Paths, dry, outLocal); ctx.Report("actors", "units");
         var q = ctx.Queue; List<string>? qpreds = q?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me && PredKindOf(st, x.Id) != PredKind.Skip).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
         // 0.13.27: predecessors (a) and which are AI (b) come from the queue this node holds; its own grouping record (c) from its own video.json. No read of the aggregate.
-        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q?.Read(GroupOfQueue), q?.Read(st => st.ActorsIndexVer), q == null ? null : up => q.Read(st => PredKindOf(st, up))); Last = r;
+        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q?.Read(GroupOfQueue), q?.Read(st => st.ActorsIndexVer), q == null ? null : up => q.Read(st => PredKindOf(st, up)), createOnly: q != null && ctx.Job.Reason != ManualReason); Last = r;
         Log.Info($"actors {r.Id}: " + (r.Skipped ?? $"{r.Units} units ({r.FacesUsed} faces, {r.ChildUnits} child), {r.Links} links ({r.BandLinked}/{r.Band} band), predecessors {r.Predecessors}, index {r.IndexRouted}; {r.Timing}"));
     }
 
@@ -118,11 +118,11 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         return b2;
     }
 
-    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null, Dictionary<string, string>? queueGroups = null, int? announcedIndex = null, Func<string, PredKind>? queuePred = null)
+    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null, Dictionary<string, string>? queueGroups = null, int? announcedIndex = null, Func<string, PredKind>? queuePred = null, bool createOnly = false)
     {
         var paths = io.Paths; var now = Protocol.NowUtc(); var sw = System.Diagnostics.Stopwatch.StartNew(); long msOwn = 0, msPred = 0, msRoute = 0, msR50 = 0; int predComputed = 0, predReused = 0, predCached = 0, predWritten = 0;
         var vj = await VideoJson.ReadAsync(io.Store, paths, id, ct); var uf = ActorsData.UnitFile(paths, id);
-        var ex = await io.GetAsync(uf, ct); var exDoc = ex == null ? null : UnitDoc.FromBytes(ex.Data, uf); manual |= exDoc?.Manual == true;   // 0.13.27: no listing: the unit file's own record says whether it was added by hand
+        var ex = createOnly && !manual ? null : await io.GetAsync(uf, ct); var exDoc = ex == null ? null : UnitDoc.FromBytes(ex.Data, uf); manual |= exDoc?.Manual == true;   // 0.13.27: no listing: the unit file's own record says whether it was added by hand
         if (!manual && AiFlag(vj?.Root))
         {
             var w = new List<string>(); if (ex != null) { await io.DeleteAsync(uf, ct); w.Add("delete " + uf); }
@@ -131,7 +131,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         var rec = vj?.Root["grouping"] as JsonObject ?? throw new InvalidOperationException($"{id}: no grouping record in video.json (the group step has not run)");
         var groupOf = new Dictionary<string, string>(queueGroups ?? await GroupOfAsync(io, ct), StringComparer.Ordinal);   // 0.13.27: the search head and the group store are read once a minute per process, not per job
         preds ??= await PredecessorsAsync(io.Store, paths, id, SeqOf(rec), extraPreds, ct);
-        var me = await BuildUnitsAsync(io, id, rec, groupOf, ct); msOwn = sw.ElapsedMilliseconds; var d = me.D; var mine = me.Units; var kind = me.Kind; var prod = me.Prod; int dim = me.Dim;
+        Built me; using (StageZipStore.WholeZips()) me = await BuildUnitsAsync(io, id, rec, groupOf, ct); msOwn = sw.ElapsedMilliseconds; var d = me.D; var mine = me.Units; var kind = me.Kind; var prod = me.Prod; int dim = me.Dim;
         // candidates: the actor index for everything in it, and the predecessors that are not in it yet, computed right here from their cast files (their own stage run is never waited for or read)
         var idx = await ActorsIndex.ForAnnouncedAsync(io, announcedIndex ?? 0, ct); var indexed = idx?.Ids ?? [];   // 0.13.28: whole files once per version (under 32 MB), whether announced or a cold start
         var manualIds = new HashSet<string>(StringComparer.Ordinal);   // 0.13.27: no units/ listing per job; a predecessor is checked for "added by hand" only when its video.json is AI-flagged (below), from its own unit doc
@@ -196,7 +196,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
                 if (ok) nLinks++;
             }
         var doc = new UnitDoc { Id = id, Prod = prod, Kind = kind, At = now, Manual = manual, Dim = dim, FacesUsed = me.FacesUsed, Units = mine, Links = links };
-        if (!await io.PutAsync(uf, doc.ToBytes(), ex?.ETag, ex == null, manual, ct)) throw new IOException($"{uf} changed while this run wrote it (two writers for one upload?)");
+        if (!await io.PutAsync(uf, doc.ToBytes(), ex?.ETag, ex == null, manual, ct)) { if (createOnly) return await RunAsync(io, id, manual, threads, ct, preds, extraPreds, queueAi, queueGroups, announcedIndex, queuePred, false); throw new IOException($"{uf} changed while this run wrote it (two writers for one upload?)"); }
         Remember(io, uf, doc);
         return Last = new RunResult(id, null, doc.FacesUsed, mine.Count, d.ChildUnits, nLinks, band, bandOk, r50New, pend.Count, aiSkipped + aiIdx.Count, routed, kind, prod, [], io.Log.ToList()) { Timing = $"time own units {msOwn / 1000.0:F1}s, predecessors {msPred / 1000.0:F1}s (computed {predComputed}, reused from units files {predReused}, from process cache {predCached}, units files written {predWritten}), routing {msRoute / 1000.0:F1}s, r50 {msR50 / 1000.0:F1}s" };
     }
@@ -213,6 +213,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
             var units = own ?? UnitDoc.FromBytes((await io.GetAsync(ActorsData.UnitFile(paths, up), ct) ?? throw new FileNotFoundException(ActorsData.UnitFile(paths, up))).Data, ActorsData.UnitFile(paths, up)).Units;
             var pick = todo.ToDictionary(k => k, k => units.First(u => u.Key == k).Pick); var all = pick.Values.SelectMany(x => x).Distinct().OrderBy(x => x).ToArray();
             if (MakeR50 == null) throw new InvalidOperationException("the r50 tiebreaker is not available (no model)");
+            using var whole = StageZipStore.WholeZips();   // 0.13.30: cast.zip / frames.zip come down whole in one GET, then everything is local
             var res = (await CastReembed.RunManyAsync(io.Store, paths, up, [new("w600k_r50", MakeR50)], Decode, threads, ct, onlyFaces: all))[0];
             var row = new Dictionary<int, int>(); for (int k = 0; k < res.Idx!.Length; k++) row[res.Idx[k]] = k; doc.Dim = res.Dim;
             foreach (var (k, fs) in pick) { var vs = fs.Select(f => { var v = new float[res.Dim]; for (int d = 0; d < res.Dim; d++) v[d] = BitConverter.ToSingle(res.F32, (row[f] * res.Dim + d) * 4); return v; }).ToList(); if (vs.Count > 0) { doc.Units[k] = CastLogic.Centroid(vs); into[(up, k)] = doc.Units[k]; } }

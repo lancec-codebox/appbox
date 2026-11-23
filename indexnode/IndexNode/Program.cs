@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -41,7 +41,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--shadow --out-local <dir>] [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode cast recluster <id>|--ids <file> [--merge-at D] [--split [--split-sim S] [--split-min N]] [--threshold T] [--min-faces N] [--local <root>] [--out-local <dir>]   (0.13.23: re-clusters a drama's stored faces (cast.zip), read-only; old against new groups, merges with distances, proposed splits)
         indexnode cast reembed <id>|--ids <file> --rec w600k_mbf|w600k_r50|glintr100 [--rec-path <file.onnx>] [--decoder libjpeg|ffmpeg] [--fp32] [--out-local <dir>] [--threads N] [--local <root>]   (0.13.23, a dev tool; --fp32 also writes faces_<model>.f32, unrounded: re-embeds a drama's stored faces from the stored frames and landmarks with another recognizer; writes faces_<model>.f16 + json locally, read-only on the store)
@@ -202,12 +202,16 @@ public static class Commands
         return h;
     }
 
+    /// <summary>The shadow store of a --shadow run (its append overlay is saved at the end).</summary>
+    internal static ShadowStore? Shadow;
     internal static (NodeConfig Cfg, IStore Store, Paths Paths, HttpClient Http) Open(Args a)
     {
         var cfg = NodeConfig.Load();
         if (string.IsNullOrEmpty(cfg.Sas)) throw new InvalidOperationException("no SAS: run 'indexnode config set-sas <url>' or set INDEXNODE_SAS_URL");
         var http = NewHttp();
-        return (cfg, StageZipStore.Wrap(new RestStore(http, cfg.Sas)), new Paths(a.Get("prefix") ?? "index/"), http);
+        IStore rest = new RestStore(http, cfg.Sas);
+        if (a.Has("shadow")) { var od = a.Get("out-local") ?? throw new ArgumentException("--shadow needs --out-local <dir>: the run reads the real store and writes only there"); rest = Shadow = new ShadowStore(rest, od); Console.Error.WriteLine($"indexnode: SHADOW run: reads the real store, writes nothing to it; every write goes under {od}"); }
+        return (cfg, StageZipStore.Wrap(rest), new Paths(a.Get("prefix") ?? "index/"), http);
     }
 
     public static string VersionString => typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
@@ -295,7 +299,7 @@ public static class Commands
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
-            MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
+            Shadow = a.Has("shadow"), MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");
@@ -323,7 +327,7 @@ public static class Commands
                 }
             });
         }
-        await engine.RunAsync(cts.Token);
+        try { await engine.RunAsync(cts.Token); } finally { if (Shadow != null) { Shadow.Flush(); Console.Error.WriteLine($"indexnode: shadow run: {Shadow.BlockedWrites} aggregate writes dropped; the overlay is saved under {a.Get("out-local")}"); } }
         cts.Cancel();
         if (statusLoop != null) await statusLoop;
         Log.Info("node stopped");
@@ -892,6 +896,7 @@ public static class Commands
                 case "check.token": (file.Check ??= new()).Token = val.Trim(); break;
                 case "check.timeout-seconds": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("check.timeout-seconds must be 1 or more"); (file.Check ??= new()).TimeoutSeconds = n; break; }
                 case "storage.warn-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.warn-per-min must be 1 or more"); (file.StorageBreaker ??= new()).WarnPerMin = n; break; }
+                case "storage.max-per-min-per-lane": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-min-per-lane must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerMinPerLane = n; break; }
                 case "storage.max-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-min must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerMin = n; break; }
                 case "storage.max-per-step": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-per-step must be 1 or more"); (file.StorageBreaker ??= new()).MaxPerStep = n; break; }
                 case "storage.max-failures-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.max-failures-per-min must be 1 or more"); (file.StorageBreaker ??= new()).MaxFailuresPerMin = n; break; }

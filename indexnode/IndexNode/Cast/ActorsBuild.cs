@@ -87,9 +87,9 @@ public static class ActorsBuild
     {
         var d = new Drama { Id = id, Prod = groupOf.TryGetValue(id, out var g) ? g : id };
         if (!manual && await VideoJson.ReadAsync(store, paths, id, ct) is { } vj && (vj.Root["ai"] as JsonObject)?["flag"]?.GetValue<bool>() == true) { d.Ai = true; d.Skip = "AI"; return d; }   // AI dramas are skipped completely
-        var fj = StoredJson.Object(await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.json"), ct) ?? throw new InvalidOperationException($"{id}: no cast/faces.json (cast has not run)"), $"{id}/cast/faces.json");
+        var fj = StoredJson.Object(await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.json"), ct, false) ?? throw new InvalidOperationException($"{id}: no cast/faces.json (cast has not run)"), $"{id}/cast/faces.json");
         var f16 = await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.f16"), ct, true);
-        _ = await FrameChunks.ReadAsync(store, paths.Video(id, "cast/clusters.json"), ct) ?? throw new InvalidOperationException($"{id}: no cast/clusters.json");
+        _ = await FrameChunks.ReadAsync(store, paths.Video(id, "cast/clusters.json"), ct, false) ?? throw new InvalidOperationException($"{id}: no cast/clusters.json");
         d.Faces = CastCandidates.LoadFaces(fj, f16, null, 360, $"{id}/cast/faces.f16"); d.StoredCluster = d.Faces.Select(f => f.Cluster).ToArray();
         var index = d.Faces.Select((f, i) => (f, i)).ToDictionary(x => x.f, x => x.i);
         double thr = fj["threshold"]?.GetValue<double>() ?? CastLogic.BuffaloS.Threshold; int n = 0;

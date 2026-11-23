@@ -9,9 +9,9 @@ public class QueueEngineTests
     sealed class Fn(Func<JobContext, Task> f) : IStageHandler { public Task RunAsync(JobContext ctx) => f(ctx); }
     static string T(int minute) => $"2026-11-20T08:{minute:D2}:00Z";
 
-    static EngineOptions Opts(string[] stages, int lanes = 1, bool ai = false, int? maxJobs = null, Func<int, TimeSpan>? backoff = null, TimeSpan? bot = null, string[]? steps = null, bool once = true, int pollMs = 30) => new()
+    static EngineOptions Opts(string[] stages, int lanes = 1, bool ai = false, int? maxJobs = null, Func<int, TimeSpan>? backoff = null, TimeSpan? bot = null, string[]? steps = null, bool once = true, int pollMs = 30, bool shadow = false) => new()
     {
-        NodeId = "test-node", Name = "test", Stages = stages, Workers = lanes, Threads = 8, Once = once, MaxJobs = maxJobs, AiStages = ai, Steps = steps,
+        NodeId = "test-node", Name = "test", Stages = stages, Workers = lanes, Threads = 8, Once = once, MaxJobs = maxJobs, Shadow = shadow, AiStages = ai, Steps = steps,
         PollInterval = TimeSpan.FromMilliseconds(pollMs), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
         BotBackoff = bot ?? TimeSpan.FromHours(1), TransientBackoff = backoff ?? (_ => TimeSpan.Zero), Ops = new OpCounter(),
     };
@@ -52,6 +52,16 @@ public class QueueEngineTests
         var log = s.AppendText("index-test/jobs/queue.log").Split('\n', StringSplitOptions.RemoveEmptyEntries);
         Assert.Contains("\"t\":\"claim\"", log[1]); Assert.Contains("\"t\":\"done\"", log[2]); Assert.Contains("\"t\":\"add\"", log[3]);
         Assert.Equal(3, s.Ops.GetValueOrDefault("append"));   // the test's add, the claim, and ONE append for done + add
+    }
+
+[Fact]
+    public async Task A_shadow_run_with_two_lanes_takes_each_job_once_and_stops_at_max_jobs_failures_included()
+    {
+        var s = new FakeStore(); for (int i = 0; i < 10; i++) await s.AddJob(P, "download", "sh" + i, T(i));
+        var ran = new ConcurrentQueue<string>();
+        await Run(Engine(s, Opts(["download"], lanes: 2, maxJobs: 8, shadow: true, once: false), stage: async ctx => { ran.Enqueue(ctx.Job.JobId); await Task.Delay(30); if (ctx.Job.JobId is "sh0" or "sh1") throw new InvalidOperationException("boom"); }));
+        Assert.Equal(8, ran.Count);
+        Assert.Equal(ran.Count, ran.Distinct().Count());   // none twice, the failed ones included
     }
 
     [Fact]

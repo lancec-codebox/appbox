@@ -58,6 +58,10 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
 
     /// <summary>A zip at most this big is downloaded whole into the cache; a bigger one is range-read.</summary>
     public long WholeZipLimit { get; set; } = 64L << 20;
+    static readonly AsyncLocal<bool> wholeAlways = new();
+    /// <summary>0.13.30: inside the returned scope every zip this store opens is fetched whole in one GET (cast.zip, frames.zip) and then read locally: no range-read series. For jobs that read most of a zip anyway.</summary>
+    public static IDisposable WholeZips() { var was = wholeAlways.Value; wholeAlways.Value = true; return new Scope(() => wholeAlways.Value = was); }
+    sealed class Scope(Action done) : IDisposable { public void Dispose() => done(); }
 
     public const int CropChunkSeconds = 600;
 
@@ -89,7 +93,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
         var h = await ZipOpen.HeadReadableAsync(inner, blob, ct, mustBeZip: false);
         if (h == null) return null;
         IZipSource src;
-        if (h.Size <= WholeZipLimit)
+        if (h.Size <= WholeZipLimit || wholeAlways.Value)
         {
             var local = Path.Combine(cacheDir, "zips", H(blob) + "-" + H(h.ETag ?? h.Size.ToString() + h.Metadata.GetValueOrDefault("idx_sha256", "")) + ".zip");
             if (!File.Exists(local)) { Directory.CreateDirectory(Path.GetDirectoryName(local)!); var tmp = local + "." + Guid.NewGuid().ToString("N")[..6]; await inner.DownloadToFileAsync(blob, tmp, ct); File.Move(tmp, local, true); }

@@ -12,6 +12,7 @@ public sealed partial class NodeEngine
     private JobQueue queue = null!;
     public JobQueue Queue => queue;
     private readonly ConcurrentDictionary<string, DateTimeOffset> ignoreSubject = new();
+    private readonly ConcurrentDictionary<string, byte> shadowTaken = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> stageBackoff = new();
     private readonly string instanceTag = Guid.NewGuid().ToString("N")[..6];
     private OpCounter ops => o.Ops ?? OpCounter.Current;
@@ -68,8 +69,7 @@ public sealed partial class NodeEngine
         {
             while (!ct.IsCancellationRequested)
             {
-                if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
-                await PaceAsync(ct);
+                if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
                 bool worked = false; IdleEnd();
                 if (QueueStages().Any(StageEnabled))
                 {
@@ -223,6 +223,7 @@ public sealed partial class NodeEngine
         var id = subject.Id;
         if (StorageHalted()) return false;   // 0.13.18: the breaker is open or control.json says storage: stop
         if (ignoreSubject.TryGetValue(id, out var until) && until > DateTimeOffset.UtcNow) return false;
+        if (o.Shadow && shadowTaken.ContainsKey(id)) return false;   // 0.13.30: shadow claims are in-process: a subject is taken once per run, by one lane
         var first = runnable[0].Stage;
         if (o.Limits != null && !o.Limits.TryAcquire(first)) return false;
         if (runnable.Any(e => e.Stage is "download" or "sample"))
@@ -234,6 +235,7 @@ public sealed partial class NodeEngine
             if (!allowed) { o.Limits?.Release(first, false); return false; }
         }
         if (!TryReserve()) { o.Limits?.Release(first, false); return false; }
+        if (o.Shadow && !shadowTaken.TryAdd(id, 0)) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); return false; }
         ClaimHandle? h;
         try { h = await queue.TryClaimAsync(id, (st, s) => ClaimableStages(st, s), ct); }
         catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); throw; }
@@ -278,8 +280,7 @@ public sealed partial class NodeEngine
         {
             // the stages of the subject this node runs, in order; follow-ups the stages add (process -> describe) join the same claim when this node runs them
             for (int guard = 0; guard < 16 && !cts.IsCancellationRequested; guard++)
-            {
-                if (guard > 0) await PaceAsync(cts.Token);
+            {
                 var entry = queue.Read(s => s.Get(id)?.Entries.Values.Where(e => (e.Runnable(Protocol.Utc(NowUtc)) || (pulled && e.Stage == SearchIndexJobs.Stage && e.State == "pending")) && StageEnabled(e.Stage) && CanRunEntry(s.Get(id)!, e)).OrderBy(e => QueueState.Rank(e.Stage)).FirstOrDefault());
                 if (entry == null) break;
                 var (outcome, error, last, ctx) = await RunStageAsync(lane, work, entry, cts.Token);
@@ -334,7 +335,7 @@ public sealed partial class NodeEngine
         var id = w.Id; var stage = entry.Stage; var h = w.Handle;
         var job = BodyOf(entry, id);
         JobContext? ctx = null;
-        using var budget = o.Meter.BeginStep(0, $"[{stage}#{lane}] {id}");   // 0.13.18: this step's own store budget (max-per-step) and its own site table
+        using var budget = o.Meter.BeginStep(o.Meter.Limits.StepLimitFor(stage), $"[{stage}#{lane}] {id}");   // 0.13.18: this step's own store budget (max-per-step) and its own site table
         try
         {
             w.Run.Info.Stage = stage; w.Run.Info.Step = null; w.Run.Info.StartedAt = Protocol.NowUtc(); RegistryChanged();
@@ -463,7 +464,6 @@ public sealed partial class NodeEngine
         {
             if (token.IsCancellationRequested) return (h.Lost ? Outcome.LeaseLost : Outcome.Released, null, false, ctx);
             if (Control.Effective(step) != Level.Run) continue;
-            if (ran.Count > 0) await PaceAsync(token);   // 0.13.27: between steps of one claim
             // inputs: made earlier in this claim, or already stored; a step whose producer is not ours and is not done yet is not ready for this node
             foreach (var need in Protocol.NormalizeNeeds(Protocol.NeedsOf(step)))
             {

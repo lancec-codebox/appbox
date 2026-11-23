@@ -72,6 +72,8 @@ public sealed class EngineOptions
     public int Threads { get; init; } = 1;
     public bool Once { get; init; }
     public int? MaxJobs { get; init; }
+    /// <summary>0.13.30: a shadow run records claims in-process: a subject taken once (done or failed) is never claimed again in this run, by any lane.</summary>
+    public bool Shadow { get; init; }
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan RenewInterval { get; init; } = TimeSpan.FromSeconds(30);
     /// <summary>How long renewals may keep failing before the job counts as lost and is cancelled (the lease itself lasts this long).</summary>
@@ -112,8 +114,6 @@ public sealed class EngineOptions
     public OpCounter? Ops { get; init; }
     /// <summary>0.13.18: the store meter and breaker (default: the process-wide one).</summary>
     public StoreMeter Meter { get; init; } = StoreMeter.Current;
-    /// <summary>0.13.27: claims and steps wait while the ops of the last 60 s exceed 80% of the breaker's max-per-min (null: built from <see cref="Meter"/>).</summary>
-    public OpPacer? Pacer { get; init; }
     // ---- accepted and ignored since 0.13.0 (old callers and tests set them)
     [Obsolete("0.13.0: a node runs one claim per lane; there are no per-stage job counts")] public Dictionary<string, int>? Jobs { get; init; }
     [Obsolete("0.13.0: batches are gone; --lanes is the number of concurrent claims")] public int Lanes { get => Workers; init => Workers = value; }
@@ -172,16 +172,7 @@ public sealed partial class NodeEngine
     private readonly EngineOptions o;
     private readonly IReadOnlyDictionary<string, IStageHandler> handlers;
     private readonly ConcurrentDictionary<Running, byte> running = new();
-    private string? lastControl; private OpPacer? pacer; private int pacing; private long pacedMs;
-    internal OpPacer Pacer => pacer ??= o.Pacer ?? new OpPacer(() => o.Meter.Total, () => o.Meter.Limits.MaxPerMin);
-    public long PacingWaits => Pacer.Waits; public bool IsPacing => Volatile.Read(ref pacing) > 0;
-    /// <summary>0.13.27: wait while this node's ops in the last minute are over 80% of max-per-min (before a look/claim and between steps). The breaker stays the guard for runaways.</summary>
-    internal async Task PaceAsync(CancellationToken ct)
-    {
-        long w0 = Pacer.Waits; Interlocked.Increment(ref pacing);
-        try { await Pacer.WaitAsync(ct); }
-        finally { Interlocked.Decrement(ref pacing); if (Pacer.Waits != w0 && Environment.TickCount64 - Interlocked.Exchange(ref pacedMs, Environment.TickCount64) > 30000) Log.Info("pacing: ops are over 80% of max-per-min, waiting before the next claim/step"); }
-    }
+    private string? lastControl;
     private readonly SemaphoreSlim registryGate = new(1, 1);
     private readonly DateTimeOffset startedAt = DateTimeOffset.UtcNow;
     private int reserved;
@@ -230,7 +221,6 @@ public sealed partial class NodeEngine
         var stages = o.Stages.ToList();
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) == Level.Stop)) return "stopped";
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) >= Level.Drain)) return "draining";
-        if (Volatile.Read(ref pacing) > 0) return "pacing";
         if (!running.IsEmpty) return "working";
         if (o.Limits?.Status() is { } limited) return limited;
         if (stageBackoff.Any(b => b.Value > DateTimeOffset.UtcNow)) return "backoff";
@@ -408,8 +398,7 @@ public sealed partial class NodeEngine
         var loops = new[] { RegistryLoop(loopsCts.Token), IdleLoop(runCts, loopsCts.Token) };
         try
         {
-            var rt = runCts.Token;
-            if (store is MeteredStore ms) ms.Pacer ??= Pacer; if (store is RestStore rs) rs.Pacer ??= Pacer;   // 0.13.28: per-op pacing, a safety valve
+            var rt = runCts.Token; o.Meter.Limits.Lanes = Math.Max(1, o.Workers);   // 0.13.30: the per-minute cap is per lane
             queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now, o.DownloaderOnly);
             await queue.LoadAsync(rt);
             await EnsureSearchIndexAsync(rt);

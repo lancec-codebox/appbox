@@ -16,17 +16,17 @@ public class StorageBudgetTests
     public void The_defaults_are_the_low_normal_budget()
     {
         var l = new StorageLimits();
-        Assert.Equal((150, 200, 1000, 100, TimeSpan.FromMinutes(5)), (l.WarnPerMin, l.MaxPerMin, l.MaxPerStep, l.MaxFailuresPerMin, l.Cooldown));
+        Assert.Equal((150, 200, 25, 100, TimeSpan.FromMinutes(5)), (l.WarnPerMin, l.MaxPerMin, l.MaxPerStep, l.MaxFailuresPerMin, l.Cooldown));   // 0.13.30: 200 a minute a lane (one lane here), 25 ops a step
     }
 
 
     [Fact]
-    public async Task Storage_max_and_a_step_over_1000_throw()
+    public async Task Storage_max_and_a_step_over_its_limit_throw()
     {
         var m = new StoreMeter { CliMax = 5, Limits = new StorageLimits { MaxFailuresPerMin = 100000 } }; var fs = new MeteredStore(new FakeStore(), m);
         for (int i = 0; i < 5; i++) await fs.HeadAsync("b" + i, default);
         await Assert.ThrowsAsync<StorageBudgetExceeded>(() => fs.HeadAsync("c", default));   // the 6th op passes --storage-max 5
-        var m2 = new StoreMeter { Limits = new StorageLimits { MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } }; var f2 = new MeteredStore(new FakeStore(), m2);
+        var m2 = new StoreMeter { Limits = new StorageLimits { MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000, MaxPerStep = 1000 } }; var f2 = new MeteredStore(new FakeStore(), m2);
         using (m2.BeginStep())
         {
             for (int i = 0; i < 1000; i++) await f2.HeadAsync("s" + i, default);

@@ -43,7 +43,7 @@ public static class NexisAccess
     {
         try { await TouchAsync(store, name, ct); }
         catch (StorageException e) { Log.Info($"nexis: could not touch {name} ({e.Message})"); }
-        var read = await EnsureReadableAsync(new RestGhostBlob(store, name), ct);
+        var read = await EnsureReadableAsync(store.GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(store, name), ct);
         if (read.Snapshot != null) store.ReadSnapshots[name] = read.Snapshot; else store.ReadSnapshots.TryRemove(name, out _);
         return read;
     }
