@@ -70,8 +70,7 @@ public sealed partial class NodeEngine
             {
                 if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
                 await PaceAsync(ct);
-                await Control.RefreshAsync(ct);
-                bool worked = false;
+                bool worked = false; IdleEnd();
                 if (QueueStages().Any(StageEnabled))
                 {
                     QueueLook? look = null;
@@ -87,6 +86,7 @@ public sealed partial class NodeEngine
                                 if (gate.Summary(gv, queue.Now) is { } gsum) Log.Info(gsum);
                             }
                             look = await queue.LookAsync(StageEnabled, CanRunEntry, ct, o.Ready);
+                            await Control.RefreshIfAnnouncedAsync(queue.Read(st => st.ControlETag), ct);   // 0.13.28: control.json is read only when a "ctl" line says it changed
                         }
 
                         catch (OperationCanceledException) { throw; }
@@ -107,7 +107,7 @@ public sealed partial class NodeEngine
                     if (await TryPullForwardSearchIndexAsync(lane, ct)) continue;
                     RegistryChanged();
                     if (o.Once) return;
-                    await Wait(o.PollInterval < o.ControlInterval ? o.PollInterval : o.ControlInterval, ct);
+                    IdleBegin(); try { await Wait(NextTailWait(), ct); } finally { IdleEnd(); }
                 }
             }
         }
@@ -380,7 +380,7 @@ public sealed partial class NodeEngine
                         ctx = NewContext(lane, w, stage, job, store, [], token);
                         await handlers[stage].RunAsync(ctx);
                         var lines = new List<QLine>();
-                        var done = new QLine { T = "done", Stage = stage, Job = ctx.Job };
+                        var done = new QLine { T = "done", Stage = stage, Job = ctx.Job, Ver = ctx.PublishedVersion };
                         job.FinishedAt = Protocol.NowUtc(); job.NodeId = o.NodeId;
                         if (ctx.NextDue is { } nd) { done.State = "pending"; done.Due = nd; }   // a source, the classifier, the sweep: pending again, due later
                         lines.Add(done); lines.AddRange(ctx.FollowUps);

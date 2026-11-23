@@ -58,6 +58,10 @@ public sealed class QLine
     /// <summary>0.13.26 "enter" (the handoff into the processing queue): what the upload is to processing. "full" = downloaded (process is ready on its own), "precheck" = settled by the check without a download (a catalog and group member only).</summary>
     [JsonPropertyName("data")] public string? Data { get; set; }
 
+    /// <summary>0.13.28 done (actors-index / search-index): the version it published (the queue is the change feed: nodes load the new immutable version once, never poll head.json / head.yaml) and the ETag of the head file it moved.</summary>
+    [JsonPropertyName("ver")] public int? Ver { get; set; }
+    [JsonPropertyName("ets")] public string? Ets { get; set; }
+
     public string ToJson() => JsonSerializer.Serialize(this, Protocol.Json);
     public static QLine? Parse(string line) { try { return JsonSerializer.Deserialize<QLine>(line, Protocol.Json); } catch (JsonException) { return null; } }
 
@@ -125,14 +129,23 @@ public sealed class QueueState
 
     /// <summary>The highest sequence number handed out so far (kept in the snapshot, so dropping an old subject never lowers it).</summary>
     public long MaxSeq { get; set; }
+    /// <summary>0.13.28: newest actor-index / search-index version a done line announced (0: none seen), and the ETag the last "ctl" line announced for control.json.</summary>
+    [JsonIgnore] public int ActorsIndexVer { get; set; }
+    [JsonIgnore] public int SearchIndexVer { get; set; }
+    [JsonIgnore] public string? ControlETag { get; set; }
+    /// <summary>How many log lines this node has applied since it loaded (the queue tail's "something changed" counter).</summary>
+    [JsonIgnore] public long Lines { get; set; }
     public long NextSeq() => MaxSeq + 1;
     public QSubject? Get(string subject) => Subjects.GetValueOrDefault(subject);
     public QEntry? Entry(string subject, string stage) => Get(subject)?.Entries.GetValueOrDefault(stage);
 
     public void Apply(QLine l)
     {
+        Lines++;
+        if (l.T == "done" && l.Ver is { } pv) { if (l.Stage == "actors-index") ActorsIndexVer = Math.Max(ActorsIndexVer, pv); else if (l.Stage == "search-index") SearchIndexVer = Math.Max(SearchIndexVer, pv); }
         switch (l.T)
         {
+            case "ctl": ControlETag = l.Ets; break;   // 0.13.28: control.json changed: the line names its new ETag, so no node polls the file
             case "add":
                 {
                     var stage = l.Stage ?? l.Job?.Stage ?? "";

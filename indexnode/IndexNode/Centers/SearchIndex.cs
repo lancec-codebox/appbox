@@ -270,6 +270,10 @@ public sealed class SearchData
             foreach (var f in g) await store.DeleteAsync(f.Name, ct);
             removed.Add(g.Key);
         }
+        // 0.13.28: index/groups/v<N>.json goes with the search version of the same number: the same window (current + keep back), after the head moved
+        var groot = paths.Prefix + "groups/v";
+        foreach (var b2 in (await store.ListAsync(groot, false, false, ct)).ToList())
+            if (b2.Name.StartsWith(groot, StringComparison.Ordinal) && b2.Name.EndsWith(".json", StringComparison.Ordinal) && int.TryParse(b2.Name[groot.Length..^5], NumberStyles.None, CultureInfo.InvariantCulture, out var gv) && gv < n - keep) await store.DeleteAsync(b2.Name, ct);
         return removed;
     }
     static int? VersionOf(string root, string name)

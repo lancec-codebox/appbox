@@ -43,7 +43,7 @@ public class ActorsStageTests
         var (i1, _) = await ActorsIndex.LoadAsync(io, default); string Act(ActorsIndex x, string k) => x.Uploads.SelectMany(u => u.Units).First(u => u.Key == k).Actor;
         var xa = Act(i1!, "dA#0"); var xf = Act(i1!, "dF#0"); Assert.Equal(xa, Act(i1!, "dB#0")); Assert.Equal(xa, Act(i1!, "dC#0")); Assert.NotEqual(xa, xf);
         var again = await ActorsIndex.BuildAsync(io, default); Assert.True(again.UpToDate); Assert.Contains("up to date", again.Note);
-        var rE = await st.RunAsync(io, "dE", false, 2, default, []);   // links A's and F's actors through the index: hamming routing, then the exact re-check
+        ActorsIndex.ForgetCache(); var rE = await st.RunAsync(io, "dE", false, 2, default, []);   // links A's and F's actors through the index: hamming routing, then the exact re-check
         Assert.True(rE.IndexRouted >= 2); Assert.Equal(0, rE.Predecessors); Assert.True(rE.Links >= 2);
         fs.Gets.Clear(); var rep2 = await ActorsIndex.BuildAsync(io, default); Assert.Equal((2, 4, 1), (rep2.Version, rep2.Reused, rep2.Read));   // four uploads carried forward by ETag, one file read
         Assert.DoesNotContain(ActorsData.UnitFile(P, "dA"), fs.Gets);

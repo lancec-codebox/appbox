@@ -34,6 +34,25 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         finally { gate.Release(); }
     }
 
+    private string? announced;
+    /// <summary>0.13.28: control changes arrive as a "ctl" line on the processing queue (its etag names the new control.json): the file is read only when the queue says it changed, never on a timer.</summary>
+    public async Task RefreshIfAnnouncedAsync(string? queueEtag, CancellationToken ct)
+    {
+        if (queueEtag == announced) return; announced = queueEtag; await RefreshAsync(ct, force: true);
+    }
+
+    /// <summary>After a control write: one "ctl" line on the processing queue (a node reading the queue learns of it at its next tail).</summary>
+    public static async Task AnnounceAsync(IStore store, Paths paths, string by, CancellationToken ct)
+    {
+        try
+        {
+            var et = (await store.HeadAsync(paths.Control, ct))?.ETag ?? Guid.NewGuid().ToString("N");
+            var q = await JobQueue.OpenAsync(store, paths, by, false, ct);
+            await q.AppendLinesAsync([new QLine { T = "ctl", S = "control", Ets = et, By = by }], ct);
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Info("control: written, but the queue line failed (" + e.Message + "); nodes pick it up at their next start"); }
+    }
+
     public Level Effective(string stage) => Current.Effective(stage);
 
     /// <summary>indexnode control gpu-hold &lt;duration&gt;|off: turns GPU routing on for every CPU node (and gpu-ready markers on), or off (no "gpu" entry).</summary>
@@ -43,7 +62,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         if (value.Equals("off", StringComparison.OrdinalIgnoreCase)) cur.Gpu = null;
         else { var d = RefreshStage.ParseEvery(value); if (d <= TimeSpan.Zero) throw new ArgumentException("gpu-hold must be a positive duration or off"); cur.Gpu = new GpuControl { Hold = value }; }
         cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -53,7 +72,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         var v = value.Trim().ToLowerInvariant(); if (v is not ("stop" or "run")) throw new ArgumentException("control storage stop|run");
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         cur.Storage = v == "stop" ? "stop" : null; cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -64,7 +83,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         if (string.IsNullOrWhiteSpace(value)) throw new ArgumentException("control region <name like westus2>|off");
         cur.Region = value.Equals("off", StringComparison.OrdinalIgnoreCase) ? null : Placement.NormRegion(value);
         cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -74,7 +93,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         if (!value.Equals("on", StringComparison.OrdinalIgnoreCase) && !value.Equals("off", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("ai-dramas must be on or off");
         cur.AiDramas = value.ToLowerInvariant(); cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -84,7 +103,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         if (!value.Equals("on", StringComparison.OrdinalIgnoreCase) && !value.Equals("off", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("classify must be on or off");
         cur.Classify = value.ToLowerInvariant(); cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -94,7 +113,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         if (!value.Equals("on", StringComparison.OrdinalIgnoreCase) && !value.Equals("off", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("dynamic-refresh must be on or off");
         cur.DynamicRefresh = value.ToLowerInvariant(); cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -106,7 +125,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         else if (int.TryParse(value, out var n) && n > 0) cur.Downloads = new DownloadsControl { MaxPerIp = n };
         else throw new ArgumentException("--max-per-ip must be a positive number or off");
         cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 
@@ -130,7 +149,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         if (message != null) cur.Message = message;
         cur.ChangedAt = Protocol.NowUtc();
         cur.ChangedBy = changedBy;
-        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct);
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }
 }

@@ -67,13 +67,15 @@ public static class ActorsCommand
         var stage = NewStage(store, http, a, dry, outLocal, probe); int rc = 0; Func<string, IReadOnlyList<string>?> predsOf = _ => null;   // null: the stage reads every upload with a lower grouping.seq from the aggregate
         var predsMode = a.Get("preds"); if (predsMode is not (null or "all" or "listed")) throw new ArgumentException("--preds is all (default) or listed");
         // test option "listed": only the ids on the command line that have a lower seq, in seq order (AI predecessors are still skipped by the stage)
+        // 0.13.28: the CLI runs the node's code path: the processing queue (snapshot + tail) is loaded once, read-only, and feeds predecessors, AI flags and groups; --preds listed keeps its test behaviour
+        var pq = await JobQueue.OpenAsync(store, paths, "cli", false, ct);
          int threads = a.Get("threads") is { } th ? int.Parse(th) : cfg.EffectiveThreads;
         foreach (var id in ids)
         {
             try
             {
                 var preds = predsMode == "listed" ? await ActorsCommandSupport.ListedAsync(store, paths, id, ids, ct) : predsOf(id);
-                var r = await stage.RunAsync(io, id, a.Has("manual"), threads, ct, preds);
+                var r = predsMode == "listed" ? await stage.RunAsync(io, id, a.Has("manual"), threads, ct, preds, null, up => pq.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), pq.Read(ActorsStage.GroupOfQueue), pq.Read(st => st.ActorsIndexVer)) : await stage.RunWithQueueAsync(io, pq, id, a.Has("manual"), threads, ct);
                 Console.WriteLine(r.Skipped != null ? $"  {id}: skipped: {r.Skipped}" : $"  {id}: {r.Kind} (production {r.Prod}); {r.FacesUsed} faces, {r.Units} units ({r.ChildUnits} child units left out); {r.Links} links ({r.BandLinked}/{r.Band} band pairs linked, {r.R50Units} r50 units computed); {r.Predecessors} predecessor upload(s) read, {r.PredecessorsAi} AI-flagged ignored; actors {string.Join(",", r.Actors)}");
             }
             catch (Exception e) when (e is InvalidOperationException or InvalidDataException or IOException or System.Text.Json.JsonException) { Console.Error.WriteLine($"  {id}: {e.Message}"); rc = 1; }

@@ -19,12 +19,20 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
 
     public static bool AiFlag(JsonObject? root) => (root?["ai"] as JsonObject)?["flag"] is JsonNode f && (bool?)f == true;
 
+    /// <summary>0.13.28: the one path the node and `actors run` share: predecessors, AI flags, groups and the announced index version all come from the processing queue's state (snapshot + tail, loaded once). No groups file, no head.yaml, no aggregate.</summary>
+    public async Task<RunResult> RunWithQueueAsync(ActorsIO io, JobQueue q, string id, bool manual, int threads, CancellationToken ct)
+    {
+        long? mySeq = q.Read(st => st.Get(id)?.Seq); if (mySeq == null) mySeq = SeqOf((await VideoJson.ReadAsync(io.Store, io.Paths, id, ct))?.Root["grouping"] as JsonObject);   // the queue has no seq for it yet: its own video.json says
+        List<string> qpreds = q.Read(st => mySeq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
+        return await RunAsync(io, id, manual, threads, ct, qpreds, null, up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q.Read(GroupOfQueue), q.Read(st => st.ActorsIndexVer));
+    }
+
     public async Task RunAsync(JobContext ctx)
     {
         var io = new ActorsIO(ctx.Store, ctx.Paths, dry, outLocal); ctx.Report("actors", "units");
         var q = ctx.Queue; List<string>? qpreds = q?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
         // 0.13.27: predecessors (a) and which are AI (b) come from the queue this node holds; its own grouping record (c) from its own video.json. No read of the aggregate.
-        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai")); Last = r;
+        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q?.Read(GroupOfQueue), q?.Read(st => st.ActorsIndexVer)); Last = r;
         Log.Info($"actors {r.Id}: " + (r.Skipped ?? $"{r.Units} units ({r.FacesUsed} faces, {r.ChildUnits} child), {r.Links} links ({r.BandLinked}/{r.Band} band), predecessors {r.Predecessors}, index {r.IndexRouted}; {r.Timing}"));
     }
 
@@ -52,28 +60,26 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, object> storeIds = new(); static long nextStoreId;
     static string SeenKey(ActorsIO io, string name) => storeIds.GetValue(io.Store, _ => (object)Interlocked.Increment(ref nextStoreId)) + "|" + name;
     static void Remember(ActorsIO io, string name, UnitDoc d) { if (!io.Writes) return; if (seenUnits.Count > 2000) seenUnits.Clear(); seenUnits[SeenKey(io, name)] = d; }
-    public static void ForgetSeen() { seenUnits.Clear(); lock (groupCache) groupCache.Clear(); }
+    public static void ForgetSeen() { seenUnits.Clear(); ActorsIndex.ForgetCache(); }
 
-    // 0.13.27: the group map is keyed by the search head's version: head.yaml (a few bytes) is read at most once a minute, the groups file only when the version moved. Cached on every path (--out-local too).
-    static readonly Dictionary<string, (DateTime At, string Version, Dictionary<string, string> Map)> groupCache = new(StringComparer.Ordinal);
-    public static Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
+    /// <summary>0.13.28: an upload's group comes from the queue state (the join record the group step's done line put there): each upload maps to the root of its join chain. No groups file, no head.yaml.</summary>
+    public static Dictionary<string, string> GroupOfQueue(QueueState st)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var s in st.Subjects.Values)
+        {
+            if (s.JoinKind == null) continue; string cur = s.Id; var seen = 0;
+            while (seen++ < 64 && st.Get(cur) is { JoinKind: "join", JoinOf: { Length: > 0 } up } && up != cur) cur = up;
+            map[s.Id] = cur;
+        }
+        return map;
+    }
+    /// <summary>Without a queue (the CLI, a dry run): the search head's group store, read once for the call.</summary>
     internal static async Task<Dictionary<string, string>> GroupOfAsync(ActorsIO io, CancellationToken ct)
     {
-        var key = SeenKey(io, "group"); (DateTime At, string Version, Dictionary<string, string> Map) c = default; bool have;
-        lock (groupCache) have = groupCache.TryGetValue(key, out c);
-        if (have && Clock() - c.At < TimeSpan.FromSeconds(60)) return c.Map;
-        var map = new Dictionary<string, string>(StringComparer.Ordinal); string ver = "";
-        try
-        {
-            if (await io.Store.GetAsync(SearchData.HeadName(io.Paths), ct) is { } hc)
-            {
-                var head = SearchData.ParseHead(hc.Data); ver = head.ToString() ?? "";
-                if (have && c.Version == ver) { lock (groupCache) groupCache[key] = (Clock(), ver, c.Map); return c.Map; }
-                if (await GroupStore.LoadAsync(io.Store, io.Paths, head, ct) is { } gs) map = gs.GroupOf();
-            }
-        }
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        try { if (await io.Store.GetAsync(SearchData.HeadName(io.Paths), ct) is { } hc && await GroupStore.LoadAsync(io.Store, io.Paths, SearchData.ParseHead(hc.Data), ct) is { } gs) map = gs.GroupOf(); }
         catch (Exception e) when (e is FileNotFoundException or InvalidDataException) { }
-        lock (groupCache) groupCache[key] = (Clock(), ver, map);
         return map;
     }
 
@@ -100,7 +106,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         return b2;
     }
 
-    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null)
+    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null, Dictionary<string, string>? queueGroups = null, int? announcedIndex = null)
     {
         var paths = io.Paths; var now = Protocol.NowUtc(); var sw = System.Diagnostics.Stopwatch.StartNew(); long msOwn = 0, msPred = 0, msRoute = 0, msR50 = 0; int predComputed = 0, predReused = 0, predCached = 0, predWritten = 0;
         var vj = await VideoJson.ReadAsync(io.Store, paths, id, ct); var uf = ActorsData.UnitFile(paths, id);
@@ -111,11 +117,11 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
             return Last = new RunResult(id, "AI-flagged (ai.flag): no units, no links, no index entry", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", "", [], w);
         }
         var rec = vj?.Root["grouping"] as JsonObject ?? throw new InvalidOperationException($"{id}: no grouping record in video.json (the group step has not run)");
-        var groupOf = new Dictionary<string, string>(await GroupOfAsync(io, ct), StringComparer.Ordinal);   // 0.13.27: the search head and the group store are read once a minute per process, not per job
+        var groupOf = new Dictionary<string, string>(queueGroups ?? await GroupOfAsync(io, ct), StringComparer.Ordinal);   // 0.13.27: the search head and the group store are read once a minute per process, not per job
         preds ??= await PredecessorsAsync(io.Store, paths, id, SeqOf(rec), extraPreds, ct);
         var me = await BuildUnitsAsync(io, id, rec, groupOf, ct); msOwn = sw.ElapsedMilliseconds; var d = me.D; var mine = me.Units; var kind = me.Kind; var prod = me.Prod; int dim = me.Dim;
         // candidates: the actor index for everything in it, and the predecessors that are not in it yet, computed right here from their cast files (their own stage run is never waited for or read)
-        var (idx, _) = await ActorsIndex.LoadAsync(io, ct); var indexed = idx?.Ids ?? [];
+        var idx = await ActorsIndex.ForAnnouncedAsync(io, announcedIndex ?? 0, ct); var indexed = idx?.Ids ?? [];   // 0.13.28: whole files once per version (under 32 MB), whether announced or a cold start
         var manualIds = new HashSet<string>(StringComparer.Ordinal);   // 0.13.27: no units/ listing per job; a predecessor is checked for "added by hand" only when its video.json is AI-flagged (below), from its own unit doc
         var aiCache = new Dictionary<string, bool>(StringComparer.Ordinal);
         var qmode = queueAi != null; var predDocs = qmode ? new Dictionary<string, VideoJson.Doc?>(StringComparer.Ordinal) : await VideoJson.ReadManyAsync(io.Store, paths, (preds ?? []).Where(p => p != id).Distinct(StringComparer.Ordinal).ToList(), ct);   // the aggregate: one block-list + one GET for every predecessor's video.json, no per-upload reads
@@ -143,7 +149,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         }
         msPred = sw.ElapsedMilliseconds - msOwn;
         var pendUnits = pend.ToDictionary(p => p.Id, p => p.Units, StringComparer.Ordinal);
-        var aiIdx = new HashSet<string>(StringComparer.Ordinal); var cands = new Dictionary<string, List<Cand>>(StringComparer.Ordinal); int routed = 0;
+        int reads0 = idx?.RowReads ?? 0; var aiIdx = new HashSet<string>(StringComparer.Ordinal); var cands = new Dictionary<string, List<Cand>>(StringComparer.Ordinal); int routed = 0;
         foreach (var u in mine)
         {
             var list = new List<Cand>();
@@ -153,6 +159,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
                 var rt2 = idx.Route(u.Vec[0], Top, up => up != id && !aiIdx.Contains(up), iu => iu.Prod != prod);
                 var survive = new List<(int Upload, int Unit, int Dist)>(); foreach (var rr in rt2) { var upId = idx.Uploads[rr.Upload].Id; if (aiIdx.Contains(upId)) continue; if (await Ai(upId)) { aiIdx.Add(upId); continue; } survive.Add(rr); }   // only the routed survivors are checked, never the whole index
                 routed += survive.Count;
+                if (idx.Vec == null) await idx.PrefetchAsync(io, survive.Select(x => idx.Uploads[x.Upload].Units[x.Unit].Row), ct, ActorsIndex.MaxRangeReads - (idx.RowReads - reads0));   // 0.13.28: over 32 MB, vec.f16 is not read whole: coalesced ranges, at most 8 reads
                 foreach (var (iu, ik, cos) in await idx.ExactAsync(io, u.Vec[0], survive, ct)) { var x = idx.Uploads[iu].Units[ik]; if (cos >= ActorsBuild.BandLow) list.Add(new Cand(idx.Uploads[iu].Id, x.Key, "", x.Prod, cos, null)); }
             }
             cands[u.Key] = list;

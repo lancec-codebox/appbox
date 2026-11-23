@@ -19,6 +19,9 @@ public sealed class ActorsIndex
     public int[] RowUpload = [], RowUnit = []; public int Count => RowUpload.Length; public string Dir = "";
     public HashSet<string> Ids => Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal);
     public int RowReads;
+    readonly Dictionary<int, byte[]> rows = new();
+    /// <summary>0.13.28: files over this size (vec.f16 of a 60k-actor index) are not read whole: a shortlist from codes.bin (in memory), then coalesced range reads.</summary>
+    public static long MaxWholeVec = 32L << 20; public static long MaxRangeBytes = 4L << 20; public const int MaxRangeReads = 8;
     /// <summary>The linked unit-key pairs of every upload's units file (links.json of the version): what the next build folds into actors without re-reading carried-forward files.</summary>
     public Dictionary<string, List<(string Unit, string Other)>> Links = new(StringComparer.Ordinal);
     /// <summary>The 64-byte sign code of v - mean (bit d set when v[d] &gt; mean[d]); vectors shorter than 512 dims leave the rest 0.</summary>
@@ -26,19 +29,21 @@ public sealed class ActorsIndex
 
     void Index() { RowUpload = new int[Uploads.Sum(u => u.Units.Sum(x => x.Rows))]; RowUnit = new int[RowUpload.Length]; for (int i = 0; i < Uploads.Count; i++) for (int k = 0; k < Uploads[i].Units.Count; k++) { var u = Uploads[i].Units[k]; for (int r = 0; r < u.Rows; r++) { RowUpload[u.Row + r] = i; RowUnit[u.Row + r] = k; } } }
 
-    public static async Task<(ActorsIndex? Idx, string? HeadETag)> LoadAsync(ActorsIO io, CancellationToken ct, bool withVec = false)
+    public static async Task<(ActorsIndex? Idx, string? HeadETag)> LoadAsync(ActorsIO io, CancellationToken ct, bool withVec = false, BlobContent? head = null, long vecCap = long.MaxValue, bool links = true, int? announced = null, int dim = 512)
     {
-        var paths = io.Paths; var hc = await io.GetAsync(ActorsData.HeadFile(paths), ct); if (hc == null) return (null, null);
-        var h = JsonNode.Parse(Encoding.UTF8.GetString(hc.Data)) as JsonObject ?? throw new InvalidDataException("actors/head.json: not an object"); int v = (int?)h["version"] ?? 0; var dir = ActorsData.VersionDir(paths, v);
+        var paths = io.Paths; BlobContent? hc = null; JsonObject h;
+        if (announced is > 0) h = new JsonObject { ["version"] = announced, ["dim"] = dim };   // 0.13.28: the queue announced the version: its immutable files are read directly, head.json is not
+        else { hc = head ?? await io.GetAsync(ActorsData.HeadFile(paths), ct); if (hc == null) return (null, null); h = JsonNode.Parse(Encoding.UTF8.GetString(hc.Data)) as JsonObject ?? throw new InvalidDataException("actors/head.json: not an object"); }
+        int v = (int?)h["version"] ?? 0; var dir = ActorsData.VersionDir(paths, v);
         var up = JsonNode.Parse(Encoding.UTF8.GetString((await io.GetAsync(dir + "uploads.json", ct) ?? throw new FileNotFoundException(dir + "uploads.json")).Data)) as JsonArray ?? [];
         var x = new ActorsIndex { Version = v, Dim = (int?)h["dim"] ?? 512, Dir = dir };
         foreach (var o in up.OfType<JsonObject>()) x.Uploads.Add(((string)o["id"]!, (string?)o["etag"] ?? "", (o["units"] as JsonArray)!.OfType<JsonObject>().Select(u => new IUnit((string)u["key"]!, (string)u["actor"]!, (string?)u["prod"] ?? "", (int)u["n"]!, (int)u["row"]!, (int)u["rows"]!)).ToList()));
-        if (withVec && await io.GetAsync(dir + "links.json", ct) is { } lk && JsonNode.Parse(Encoding.UTF8.GetString(lk.Data)) is JsonObject lo) foreach (var kv in lo) x.Links[kv.Key] = (kv.Value as JsonArray ?? []).OfType<JsonArray>().Select(p => ((string)p[0]!, (string)p[1]!)).ToList();
+        if (withVec && links && await io.GetAsync(dir + "links.json", ct) is { } lk && JsonNode.Parse(Encoding.UTF8.GetString(lk.Data)) is JsonObject lo) foreach (var kv in lo) x.Links[kv.Key] = (kv.Value as JsonArray ?? []).OfType<JsonArray>().Select(p => ((string)p[0]!, (string)p[1]!)).ToList();
         var mean = (await io.GetAsync(dir + "mean.f32", ct) ?? throw new FileNotFoundException(dir + "mean.f32")).Data; x.Mean = new float[mean.Length / 4]; Buffer.BlockCopy(mean, 0, x.Mean, 0, mean.Length);
         x.Codes = (await io.GetAsync(dir + "codes.bin", ct) ?? throw new FileNotFoundException(dir + "codes.bin")).Data; x.Index();
         if (x.Codes.Length != (long)x.Count * SearchData.CodeBytes) throw new InvalidDataException("actors index: codes.bin does not match uploads.json");
-        if (withVec) { x.Vec = (await io.GetAsync(dir + "vec.f16", ct) ?? throw new FileNotFoundException(dir + "vec.f16")).Data; if (x.Vec.Length != (long)x.Count * x.Dim * 2) throw new InvalidDataException("actors index: vec.f16 does not match uploads.json"); }
-        return (x, hc.ETag);
+        if (withVec && (long)x.Count * x.Dim * 2 <= vecCap) { x.Vec = (await io.GetAsync(dir + "vec.f16", ct) ?? throw new FileNotFoundException(dir + "vec.f16")).Data; if (x.Vec.Length != (long)x.Count * x.Dim * 2) throw new InvalidDataException("actors index: vec.f16 does not match uploads.json"); }
+        return (x, hc?.ETag);
     }
 
     /// <summary>Hamming routing: the best <paramref name="top"/> distinct units (by their closest row) for a centre, after the allow filters (run on the routed candidates only, never on the whole index).</summary>
@@ -55,6 +60,45 @@ public sealed class ActorsIndex
         return best.OrderBy(kv => kv.Value).ThenBy(kv => kv.Key).Where(kv => Ok(kv.Key.Item1) && (unitOk == null || unitOk(Uploads[kv.Key.Item1].Units[kv.Key.Item2]))).Take(top).Select(kv => (kv.Key.Item1, kv.Key.Item2, kv.Value)).ToList();
     }
 
+
+    /// <summary>The vector rows of a shortlist when vec.f16 is not in memory: sorted rows are merged into ranges (gap grown until at most <see cref="MaxRangeReads"/> reads, each at most <see cref="MaxRangeBytes"/>), read once; rows left out by the cap are dropped from the candidates.</summary>
+    public async Task PrefetchAsync(ActorsIO io, IEnumerable<int> wanted, CancellationToken ct, int budget = MaxRangeReads)
+    {
+        if (budget <= 0) return;
+        if (Vec != null) return; var want = wanted.Where(r => !rows.ContainsKey(r)).Distinct().OrderBy(r => r).ToList(); if (want.Count == 0) return;
+        int rowBytes = Dim * 2, maxRows = (int)Math.Max(1, MaxRangeBytes / rowBytes); List<(int From, int To, int N)> chunks = [];
+        for (int gap = 0; ; gap = gap == 0 ? 1 : gap * 2)
+        {
+            chunks = []; int s = want[0], e = want[0], n = 1;
+            for (int i = 1; i < want.Count; i++) { int r = want[i]; if (r - e - 1 <= gap && r - s + 1 <= maxRows) { e = r; n++; } else { chunks.Add((s, e, n)); s = e = r; n = 1; } }
+            chunks.Add((s, e, n));
+            if (chunks.Count <= budget || gap > Count) break;
+        }
+        foreach (var (from, to, _) in chunks.OrderByDescending(c => c.N).Take(budget))
+        {
+            var rr = await io.GetRangeAsync(Dir + "vec.f16", (long)from * rowBytes, (to - from + 1) * rowBytes, null, ct); RowReads++;
+            if (rr.Data is not { Length: > 0 } || rr.Data.Length < (to - from + 1) * rowBytes) continue;
+            foreach (var r in want) if (r >= from && r <= to) rows[r] = rr.Data.AsSpan((r - from) * rowBytes, rowBytes).ToArray();
+        }
+    }
+
+    // ---- 0.13.28: one copy per process per store. The queue is the change feed: the actors-index done line announces the version, and the immutable files of that version are read whole, once. head.json is read only on a cold start (no announcement seen yet). No timer.
+    sealed class Cached { public readonly SemaphoreSlim Gate = new(1, 1); public ActorsIndex? Idx; public int Ver = -1; }
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, Cached> cache = new();
+    public static void ForgetCache() { foreach (var kv in cache) { kv.Value.Ver = -1; kv.Value.Idx = null; } }
+    /// <summary>The index for the announced version (0 = none announced since this node started: one cold read of head.json, kept until an announcement arrives).</summary>
+    public static async Task<ActorsIndex?> ForAnnouncedAsync(ActorsIO io, int announced, CancellationToken ct)
+    {
+        var c = cache.GetValue(io.Writes ? io.Store : io, _ => new Cached()); await c.Gate.WaitAsync(ct);
+        try
+        {
+            if (c.Ver >= 0 && (announced == 0 || c.Ver >= announced)) return c.Idx;   // already holding this version (or newer): nothing is read
+            var idx = (await LoadAsync(io, ct, withVec: true, vecCap: MaxWholeVec, links: false, announced: announced > 0 ? announced : null)).Idx;
+            c.Idx = idx; c.Ver = idx?.Version ?? Math.Max(announced, 0); return idx;
+        }
+        finally { c.Gate.Release(); }
+    }
+
     /// <summary>The exact cosine of a centre against each routed unit's centre row (one ranged read of dim x 2 bytes each, or from memory after a build).</summary>
     public async Task<List<(int Upload, int Unit, double Cos)>> ExactAsync(ActorsIO io, float[] centre, List<(int Upload, int Unit, int Dist)> routed, CancellationToken ct)
     {
@@ -63,7 +107,8 @@ public sealed class ActorsIndex
         {
             int row = Uploads[u].Units[k].Row; var v = new float[Dim];
             if (Vec != null) for (int d = 0; d < Dim; d++) v[d] = (float)BitConverter.ToHalf(Vec, (row * Dim + d) * 2);
-            else { var rr = await io.GetRangeAsync(Dir + "vec.f16", (long)row * Dim * 2, Dim * 2, null, ct); if (rr.Data is not { Length: > 0 }) continue; RowReads++; for (int d = 0; d < Dim; d++) v[d] = (float)BitConverter.ToHalf(rr.Data, d * 2); }
+            else if (rows.TryGetValue(row, out var rb)) { for (int d = 0; d < Dim; d++) v[d] = (float)BitConverter.ToHalf(rb, d * 2); }
+            else continue;   // 0.13.28: a row outside the prefetched ranges (the per-job read cap) is not a candidate
             res.Add((u, k, CastLogic.Cosine(centre, v)));
         }
         return res.OrderByDescending(x => x.Item3).ToList();

@@ -33,6 +33,8 @@ public sealed class JobContext
     /// <summary>0.13.15 (group step): the node's frames-file set (the gate's), so membership never lists the store.</summary>
     public IReadOnlySet<string>? Frames { get; init; }
     public string? GroupJoinKind { get; set; }
+    /// <summary>0.13.28: set by actors-index / search-index when they published a new version: the done line carries it (the queue is the change feed).</summary>
+    public int? PublishedVersion { get; set; }
     /// <summary>0.13.23: control aiDramas (off unless the engine says otherwise): a sample check that finds AI adds the full download held while it is off.</summary>
     public Func<bool> AiDramasOn { get; init; } = () => false;
 }
@@ -74,7 +76,9 @@ public sealed class EngineOptions
     public TimeSpan RenewInterval { get; init; } = TimeSpan.FromSeconds(30);
     /// <summary>How long renewals may keep failing before the job counts as lost and is cancelled (the lease itself lasts this long).</summary>
     public TimeSpan LeaseLimit { get; init; } = TimeSpan.FromSeconds(Protocol.LeaseSeconds);
-    public TimeSpan ControlInterval { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan ControlInterval { get; init; } = TimeSpan.FromSeconds(30);   // 0.13.28: unused by the engine (control changes are "ctl" queue lines); kept so hosts and tests still compile
+    /// <summary>0.13.28: the queue tail is the one periodic read: this often while lines flow, doubling to <see cref="TailMax"/> when idle, back to this on any new line (both are capped by PollInterval).</summary>
+    public TimeSpan TailMin { get; init; } = TimeSpan.FromSeconds(2); public TimeSpan TailMax { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan RegistryInterval { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan BotBackoff { get; init; } = TimeSpan.FromHours(1);
     public Func<int, TimeSpan> TransientBackoff { get; init; } = attempts => TimeSpan.FromMinutes(Math.Pow(2, attempts));
@@ -189,6 +193,18 @@ public sealed partial class NodeEngine
     private readonly SemaphoreSlim networkGate = new(1, 1);
     private string? firstSeen;
     private Traffic traffic => o.Traffic ?? Traffic.Current;
+    long tailLines = -1; TimeSpan tailWait; long idleOps, idleMs; long idleOps0 = -1; long idleT0;
+    /// <summary>0.13.28: how long the idle lane waits before the next tail read: TailMin while the log is moving, doubling to TailMax (and never above PollInterval) while it is not.</summary>
+    internal TimeSpan NextTailWait()
+    {
+        var cap = o.PollInterval < o.TailMax ? o.PollInterval : o.TailMax; var min = o.TailMin < cap ? o.TailMin : cap;
+        var lines = queue.Read(st => st.Lines);
+        lock (this) { if (lines != tailLines || tailWait == TimeSpan.Zero) { tailLines = lines; tailWait = min; } else tailWait = tailWait * 2 > cap ? cap : tailWait * 2; return tailWait; }
+    }
+    /// <summary>Idle accounting: store ops spent while no job ran (the tail reads), per minute.</summary>
+    internal void IdleBegin() { lock (this) if (idleOps0 < 0 && running.IsEmpty) { idleOps0 = o.Meter.Total; idleT0 = Environment.TickCount64; } }
+    internal void IdleEnd() { lock (this) if (idleOps0 >= 0) { idleOps += o.Meter.Total - idleOps0; idleMs += Environment.TickCount64 - idleT0; idleOps0 = -1; } }
+    public double IdleOpsPerMin { get { lock (this) { var ops = idleOps + (idleOps0 >= 0 ? o.Meter.Total - idleOps0 : 0); var ms = idleMs + (idleOps0 >= 0 ? Environment.TickCount64 - idleT0 : 0); return ms <= 0 ? 0 : ops * 60000.0 / ms; } } }
     private Task Wait(TimeSpan t, CancellationToken ct) => (o.Delay ?? Task.Delay)(t, ct);
     private volatile bool recordLoaded; // no registry write before the previous record's traffic is loaded, or it would be counted twice
     private readonly string instance;
@@ -359,27 +375,16 @@ public sealed partial class NodeEngine
             while (true)
             {
                 await Task.Delay(o.RegistryInterval, ct);
-                if (!DateTimeOffset.TryParse(placement?.CheckedAt, out var chk) || DateTimeOffset.UtcNow - chk > Placement.Refresh) await RefreshPlacementAsync(ct);
-                if (!DateTimeOffset.TryParse(network?.CheckedAt, out var nchk) || NowUtc - nchk >= NetworkProbe.Refresh) await RefreshNetworkAsync(ct);
-                await WriteRegistryAsync(ct: ct);
+                bool changed = false;
+                if (!DateTimeOffset.TryParse(placement?.CheckedAt, out var chk) || DateTimeOffset.UtcNow - chk > Placement.Refresh) { await RefreshPlacementAsync(ct); changed = true; }
+                if (!DateTimeOffset.TryParse(network?.CheckedAt, out var nchk) || NowUtc - nchk >= NetworkProbe.Refresh) { await RefreshNetworkAsync(ct); changed = true; }
+                if (changed) await WriteRegistryAsync(ct: ct);   // 0.13.28: the registry is written on start, stop and a stage/config change (here: a placement or network refresh), never on a timer; liveness is the leases and claims
             }
         }
         catch (OperationCanceledException) { }
     }
 
-    private async Task ControlLoop(CancellationToken ct)
-    {
-        try
-        {
-            while (true)
-            {
-                await Wait(o.ControlInterval, ct);
-                await Control.RefreshAsync(ct, force: true);
-            }
-        }
-        catch (OperationCanceledException) { }
-    }
-
+    
     private void OnControlChanged()
     {
         o.Limits?.Apply(Control.Current);
@@ -400,10 +405,11 @@ public sealed partial class NodeEngine
 
         using var loopsCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var loops = new[] { RegistryLoop(loopsCts.Token), ControlLoop(loopsCts.Token), IdleLoop(runCts, loopsCts.Token) };
+        var loops = new[] { RegistryLoop(loopsCts.Token), IdleLoop(runCts, loopsCts.Token) };
         try
         {
             var rt = runCts.Token;
+            if (store is MeteredStore ms) ms.Pacer ??= Pacer;   // 0.13.28: per-op pacing, a safety valve
             queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now, o.DownloaderOnly);
             await queue.LoadAsync(rt);
             await EnsureSearchIndexAsync(rt);

@@ -36,7 +36,7 @@ public sealed class SearchIndexStage(IStore store, int keepVersions = 3, PreChec
         var missing = next.Catalog.Missing;
         if (missing.Count > 0) Log.Info($"search-index: WARNING {missing.Count} upload(s) have no readable video.json (catalog data \"missing\"; run: indexnode videos backfill, the next build fills them in): {string.Join(", ", missing.Take(20))}{(missing.Count > 20 ? ", ..." : "")}");
         ctx.Report("search-index", $"publishing v{next.Version}");
-        await next.PublishAsync(store, paths, ct);
+        await next.PublishAsync(store, paths, ct); ctx.PublishedVersion = next.Version;
         try { var gone = await SearchData.PruneAsync(store, paths, keepVersions, ct); if (gone.Count > 0) Log.Info($"search-index: removed old versions {string.Join(", ", gone.Select(g => "v" + g))} (keeping {keepVersions} back)"); }
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"search-index: pruning old versions failed ({e.Message})"); }
         Log.Info($"search-index: published v{next.Version}: {next.Uploads.Count} uploads, {next.Count} centers, {sw.Elapsed.TotalSeconds:F1}s (head {(head == null ? "none" : "v" + head.Version)}, {ups.Count} centers.zip{(missing.Count > 0 ? $", {missing.Count} with video.json missing" : "")})");
