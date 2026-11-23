@@ -353,8 +353,8 @@ public sealed class QueueState
             if (!allDone && s.ClaimBy == null && s.Entries.Values.All(e => e.Final) && !s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(SlimFinished(s)); continue; }   // finished, some failed for good: ids, states, priority and the reason are enough
             if (!allDone) { list.Add(s); continue; }
             if (s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(s); continue; }   // a trash mark is kept until `trash empty` has acted on it
-            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Data = s.Data, StepVer = s.StepVer, Entries = { ["download"] = d } }));
-            else if (s.Entries.TryGetValue("check", out var ck)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Entries = { ["check"] = ck } }));   // 0.13.16: a sample-first duplicate has no download entry
+            // 0.13.35: a finished subject keeps EVERY entry in slim form (state, version, steps done, hold, priority, times, reason): the readiness checks, whatif, the actors predecessor set and the claim path read the process, group and step data of a done subject; dropping them made imported done records vanish at the next rollover
+            if (s.Entries.ContainsKey("download") || s.Entries.ContainsKey("check")) list.Add(SlimFinished(s));
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
         return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { V = version, Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, Subjects = list }, Protocol.Json);
@@ -369,9 +369,9 @@ public sealed class QueueState
             var j = e.Job; var keepsJob = k is "download" or "sample" or "check" or "refresh" or "classify" or "availability";
             o.Entries[k] = new QEntry
             {
-                Stage = e.Stage, State = e.State, Priority = e.Priority, Added = e.Added, FinishedAt = e.FinishedAt, Permanent = e.Permanent, Ver = e.Ver,
+                Stage = e.Stage, State = e.State, Priority = e.Priority, Added = e.Added, FinishedAt = e.FinishedAt, Permanent = e.Permanent, Ver = e.Ver, StepsDone = e.StepsDone, Hold = e.Hold, HoldAiScore = e.HoldAiScore,
                 LastError = e.LastError is { Length: > 160 } le ? le[..160] : e.LastError, Trash = e.Trash, TrashWhy = e.TrashWhy, TrashDeletedAt = e.TrashDeletedAt,
-                Job = j == null || !keepsJob ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Url = j.Url, Reason = j.Reason, DuplicateOf = j.DuplicateOf, DuplicateShare = j.DuplicateShare, Permanent = j.Permanent, MaxHeight = j.MaxHeight, Format = j.Format, Kind = j.Kind, Id = j.Id, Name = j.Name, Every = j.Every, Schedule = j.Schedule, AddedAt = j.AddedAt },
+                Job = j == null ? null : !keepsJob ? (j.Reason == null && j.Pub == null ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Reason = j.Reason, Pub = j.Pub }) : new JobDescriptor { Pub = j.Pub, Stage = j.Stage, JobId = j.JobId, Url = j.Url, Reason = j.Reason, DuplicateOf = j.DuplicateOf, DuplicateShare = j.DuplicateShare, Permanent = j.Permanent, MaxHeight = j.MaxHeight, Format = j.Format, Kind = j.Kind, Id = j.Id, Name = j.Name, Every = j.Every, Schedule = j.Schedule, AddedAt = j.AddedAt },
             };
         }
         return o;

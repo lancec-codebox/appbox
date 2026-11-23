@@ -100,6 +100,7 @@ public static class Program
         indexnode control gpu-hold <duration like 30m>|off
         indexnode control version <cast|actors> <n>|off   (0.13.32: the version a step must have finished at; raising it makes every done upload's step ready again in its repair mode, in seq order)
         indexnode queue whatif --stage <stage or step> [--set versions.cast=2] [--set stage.actors=run] [--top N] [--ids]   (0.13.32: read-only: what would be ready, and the blockers)
+        indexnode queue rebuild-snapshot [--dry-run]   (0.13.35: replays the sealed log segments and puts back the done entries an older snapshot compaction dropped; writes only if the snapshot is unchanged)
         indexnode control ai-dramas on|off
         indexnode region [--stages a,b]   (0.13.17: read-only: what this machine detects (IMDS, placement, env), control.json's region, and whether a node here could run the region-only stages)
         indexnode control region <name like westus2>|off   (0.13.17: check, process and its steps, group and search-index run only on nodes in this Azure region; run --allow-out-of-region for a one-item test)

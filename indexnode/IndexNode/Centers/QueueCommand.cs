@@ -117,6 +117,11 @@ public static class QueueCommand
         bool dry = a.Has("dry-run"); using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         if (a.Positional.FirstOrDefault() == "split") return await SplitAsync(a, store, paths, dry, cts.Token);
         if (a.Positional.FirstOrDefault() == "whatif") return await WhatIfAsync(a, store, paths, cts.Token);
+        if (a.Positional.FirstOrDefault() == "rebuild-snapshot")
+        {   // 0.13.35: replay the sealed segments and put back the done entries the old compaction dropped (conditional on the snapshot's ETag)
+            long rbOps = StoreMeter.Current.Total; var rb = await QueueRebuild.RunAsync(store, paths, !dry, cts.Token);
+            Console.Write(rb.Text(dry)); Console.WriteLine($"store ops {StoreMeter.Current.Total - rbOps}"); return rb.SegmentsOk && (dry || rb.Written || rb.EntriesRestored == 0) ? 0 : 1;
+        }
         if (a.Positional.FirstOrDefault() == "import-done" && a.Positional.Skip(1).FirstOrDefault() == "process")
         {
             await JobQueue.RequireSnapshotAsync(store, paths, cts.Token); var pq = new JobQueue(store, paths, "cli"); await pq.LoadAsync(cts.Token); long pops = StoreMeter.Current.Total;
