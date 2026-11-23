@@ -54,6 +54,39 @@ public class ActorsStageTests
         Assert.True((await ActorsIndex.BuildAsync(io, default)).UpToDate);
     }
 
+    static Task Repair(ActorsStage st, ActorsIO io, string id) => st.RepairAsync(io, id, false, 2, default, null, new Dictionary<string, string>());
+
+    [Fact]
+    public async Task The_index_build_carries_r50_rows_and_a_tiebreak_against_an_indexed_partner_reads_only_the_index_no_zip_no_partner_file()
+    {
+        var fs = new FakeStore(); var st = StageOn(fs); var io = new ActorsIO(fs, P);
+        await Drama(fs, "dA", WithCos(1, 1), (200, 150, 100), seed: 1); await Drama(fs, "dC", WithCos(0.72, 2), (200, 150, 100), seed: 4); foreach (var id in new[] { "dA", "dC" }) await Group(fs, id);
+        await Repair(st, io, "dA"); await st.RunAsync(io, "dA", false, 2, default, []);
+        var rep = await ActorsIndex.BuildAsync(io, default); Assert.Equal(1, rep.R50Rows); Assert.Equal(1, rep.R50Read);   // a r50 row per unit that has a vector, own file read once
+        var (idx, _) = await ActorsIndex.LoadAsync(io, default, withVec: true); Assert.Equal(3, idx!.R50Dim); Assert.NotNull(idx.R50Vec); Assert.NotNull(idx.R50Of(0, 0)); Assert.Equal(1, idx.Uploads[0].Units[0].R50 + 1);
+        Assert.True(await fs.GetAsync(idx.Dir + "r50.f16", default) is { });   // its own file next to vec.f16, a row map in uploads.json
+        var again = await ActorsIndex.BuildAsync(io, default); Assert.True(again.UpToDate);
+        await Repair(st, io, "dC"); ActorsIndex.ForgetCache(); ActorsStage.ForgetSeen(); fs.Gets.Clear();
+        var r = await st.RunAsync(io, "dC", false, 2, default, []);   // dA is only in the index
+        Assert.Equal(1, r.Band); Assert.Equal(1, r.BandLinked); Assert.Equal(0, r.PairsSkipped); Assert.True(r.Reused); Assert.Equal(0, r.PartnerR50);
+        Assert.DoesNotContain(fs.Gets, n => n.Contains(".zip") || n.Contains("/cast/") || n.Contains("dA/") || n.Contains("r50/dA") || n.Contains("units/dA"));   // 0 zips, no cast files, nothing of the partner but the index
+    }
+
+    [Fact]
+    public async Task A_partner_with_no_r50_yet_is_skipped_and_recorded_pending_with_no_compute_and_the_index_build_settles_it()
+    {
+        var fs = new FakeStore(); var st = StageOn(fs); var io = new ActorsIO(fs, P);
+        await Drama(fs, "dA", WithCos(1, 1), (200, 150, 100), seed: 1); await Drama(fs, "dC", WithCos(0.72, 2), (200, 150, 100), seed: 4); foreach (var id in new[] { "dA", "dC" }) await Group(fs, id);
+        await Repair(st, io, "dA"); await st.RunAsync(io, "dA", false, 2, default, []); await Repair(st, io, "dC");
+        await fs.DeleteAsync(ActorsData.R50File(P, "dA"), default); ActorsStage.ForgetSeen(); ColourEmbedder.Faces = 0;   // dA's repaired units are there, its r50 is not
+        var r = await st.RunAsync(io, "dC", false, 2, default, ["dA"], null, null, null, 0, up => ActorsStage.PredKind.UnitsFile, false, up => true);
+        Assert.Equal(1, r.Band); Assert.Equal(0, r.BandLinked); Assert.Equal(1, r.PairsSkipped); Assert.Equal(0, r.PartnerR50); Assert.Equal(0, ColourEmbedder.Faces);   // skipped, not computed
+        Assert.Equal(true, (bool?)((await Units(fs, "dC")).Links[0]!["pending"]));
+        await Repair(st, io, "dA");   // dA's repair lands its r50 (its units file is rebuilt: same keys)
+        var rep = await ActorsIndex.BuildAsync(io, default); Assert.Equal(1, rep.Resolved); Assert.Equal(0, rep.Pending);
+        Assert.Equal((await ActorsOf(io))["dA#0"], (await ActorsOf(io))["dC#0"]);   // the pair was settled by the build and linked
+    }
+
     static async Task<Dictionary<string, string>> ActorsOf(ActorsIO io) => (await ActorsIndex.LoadAsync(io, default)).Idx!.Uploads.SelectMany(u => u.Units).ToDictionary(u => u.Key, u => u.Actor);
 
     [Fact]
@@ -61,7 +94,7 @@ public class ActorsStageTests
     {
         async Task<(FakeStore, ActorsIO, ActorsStage)> Fresh() { var fs = new FakeStore(); var io = new ActorsIO(fs, P); await Drama(fs, "dA", WithCos(1, 1), (200, 150, 100), seed: 1); await Drama(fs, "dB", WithCos(0.9, 1), (10, 10, 10), seed: 2); await Group(fs, "dA"); await Group(fs, "dB"); return (fs, io, StageOn(fs)); }
         var (f1, io1, s1) = await Fresh(); var rB = await s1.RunAsync(io1, "dB", false, 2, default, ["dA"]);   // dA's stage has not run at all: no units file
-        Assert.Equal(1, rB.Links); Assert.Empty(((JsonArray)(await Units(f1, "dA")).Links));   // dA computed from its cast file and kept as its units file (create-only, no links yet); its own run replaces it
+        Assert.Equal(1, rB.Links); Assert.Null(await f1.GetAsync(ActorsData.UnitFile(P, "dA"), default)); Assert.Null(await f1.GetAsync(ActorsData.R50File(P, "dA"), default));   // 0.13.32: dA is computed from its cast file in memory only: another job never writes an upload's repaired state
         Assert.Contains("computed 1", rB.Timing); Assert.Equal(1, rB.Predecessors);
         Assert.Equal("dA#0", ((string)(await Units(f1, "dB")).Links[0]!["other"]!));   // the key is the one dA's own run makes
         await s1.RunAsync(io1, "dA", false, 2, default, []); await ActorsIndex.BuildAsync(io1, default); var order1 = await ActorsOf(io1);
@@ -80,9 +113,9 @@ public class ActorsStageTests
         var preds = await ActorsStage.PredecessorsAsync(fs, P, "dC", seqC, null, default);
         Assert.Equal(new[] { "dA", "dB" }, preds.ToArray()); Assert.True(seqA < seqC);
         var st = StageOn(fs); var r1 = await st.RunAsync(io, "dC", false, 2, default);   // preds from the aggregate, not passed
-        Assert.Equal(2, r1.Predecessors); Assert.Contains("computed 2", r1.Timing); Assert.Contains("written 2", r1.Timing);
+        Assert.Equal(2, r1.Predecessors); Assert.Contains("computed 2", r1.Timing); Assert.Contains("written 0", r1.Timing);   // 0.13.32: never written for another upload
         var r2 = await st.RunAsync(io, "dC", false, 2, default);
-        Assert.Contains("computed 0", r2.Timing); Assert.Contains("from process cache 2", r2.Timing);   // 0.13.27: the units this process wrote are kept in memory, not read back
+        Assert.Contains("computed 0", r2.Timing); Assert.Contains("from process cache 2", r2.Timing);   // the units computed in this process are kept in memory, not computed again
     }
 
     [Fact]

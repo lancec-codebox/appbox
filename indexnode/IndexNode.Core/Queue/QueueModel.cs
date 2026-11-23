@@ -62,6 +62,10 @@ public sealed class QLine
     [JsonPropertyName("ver")] public int? Ver { get; set; }
     [JsonPropertyName("ets")] public string? Ets { get; set; }
 
+    /// <summary>0.13.32 done: the version of the step (with Step) or of the stage (without) that just finished; a line without one counts as v1. claim: the steps of a finished process entry this claim re-opens because their recorded version is below the required one (control.json versions).</summary>
+    [JsonPropertyName("sv")] public int? StepVer { get; set; }
+    [JsonPropertyName("redo")] public string[]? Redo { get; set; }
+
     public string ToJson() => JsonSerializer.Serialize(this, Protocol.Json);
     public static QLine? Parse(string line) { try { return JsonSerializer.Deserialize<QLine>(line, Protocol.Json); } catch (JsonException) { return null; } }
 
@@ -81,6 +85,8 @@ public sealed class QEntry
     public bool? Permanent { get; set; }
     public List<string>? StepsDone { get; set; }
     public string? FinishedAt { get; set; }
+    /// <summary>0.13.32: the version the stage finished at (null = v1: lines written before versions).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? Ver { get; set; }
     public string? Node { get; set; }
     public JobDescriptor? Job { get; set; }
     /// <summary>Marked for deletion by a pre-check skip ("download.zip/video"), why, and when it was really deleted (by `indexnode trash empty`; null until then).</summary>
@@ -116,6 +122,11 @@ public sealed class QSubject
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Pub { get; set; }
     /// <summary>0.13.26: how the upload entered the processing queue ("full" | "precheck"); only a "full" subject's process stage becomes ready on its own.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Data { get; set; }
+    /// <summary>0.13.32: the version each step of the process entry last finished at (absent = v1). Kept by the snapshot, also for a finished subject.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public Dictionary<string, int>? StepVer { get; set; }
+    /// <summary>0.13.32: a fully downloaded upload: data is full, or (a subject migrated by queue split carries no data fact) its download is done and it is not a precheck entry (check: duplicate).</summary>
+    [JsonIgnore] public bool IsFull => Data == "full" || (Data == null && Entries.GetValueOrDefault("download") is { State: "done" } && Entries.GetValueOrDefault("check") is not { State: "duplicate" });
+    public int VerOf(string step) => StepVer != null && StepVer.TryGetValue(step, out var v) ? v : 1;
     [JsonIgnore] public bool Active => Entries.Values.Any(e => !e.Final);
 }
 
@@ -179,7 +190,12 @@ public sealed class QueueState
                     if (!Subjects.TryGetValue(l.S, out var sub)) Subjects[l.S] = sub = new QSubject { Id = l.S };
                     sub.Epoch = l.Epoch ?? sub.Epoch + 1; sub.ClaimBy = l.By; sub.ClaimStages = l.Stages; sub.ClaimAt = l.At; sub.LastAt = l.At;
                     // 0.13.24: a stage that became READY on its own has no entry yet: the claim creates it (a finished actors-index build is replaced by the new one)
-                    foreach (var cs in l.Stages ?? []) if (StageDeps.IsDerived(cs) && (!sub.Entries.TryGetValue(cs, out var ce0) || (cs == ActorsIndexJobs.Stage && ce0.Final))) sub.Entries[cs] = StageDeps.Materialize(sub, cs, l.At ?? "");
+                    if (l.Redo is { Length: > 0 } && sub.Entries.TryGetValue("process", out var pe))
+                    {
+                        var basis = pe.Final ? NodeEngine.StandardSteps.ToList() : (pe.StepsDone ?? []).ToList(); foreach (var rs in l.Redo) basis.Remove(rs); pe.StepsDone = basis;
+                        if (pe.Final) { pe.State = "pending"; pe.Attempts = 0; pe.LastError = null; pe.Permanent = null; pe.FinishedAt = null; pe.Due = l.At ?? pe.Due; }
+                    }   // 0.13.32: a step below the required version runs again (its repair mode); the other steps stay done
+                    foreach (var cs in l.Stages ?? []) if (StageDeps.IsDerived(cs) && (!sub.Entries.TryGetValue(cs, out var ce0) || ((cs == ActorsIndexJobs.Stage || cs == "actors") && ce0.Final))) sub.Entries[cs] = StageDeps.Materialize(sub, cs, l.At ?? "");
                     break;
                 }
             case "done":
@@ -187,6 +203,8 @@ public sealed class QueueState
                     var sub = Get(l.S); if (sub == null) break;
                     if (l.Stage != null && sub.Entries.TryGetValue(l.Stage, out var e))
                     {
+                        if (l.Step != null && l.StepVer is { } sv0 && l.Stage == "process") (sub.StepVer ??= new(StringComparer.Ordinal))[l.Step] = sv0;
+                        if (l.Step == null && l.StepVer is { } sv1) e.Ver = sv1;
                         if (l.Step != null) { (e.StepsDone ??= []).Remove(l.Step); e.StepsDone.Add(l.Step); if (l.Hold != null) { e.Hold = l.Hold; e.HoldAiScore = l.AiScore; } }
                         else
                         {
@@ -286,6 +304,7 @@ public sealed class QueueState
             // 0.13.24: actors is READY when the group step is done (no add line): computed from this in-memory state only
             if (ready != null && s.Data == "full" && stageOk("process") && StageDeps.ReadyEntry(this, s, "process", nowUtc, ready) is { } rpe && (canRun == null || canRun(s, rpe))) r.Add(rpe);
             if (ready != null && s.Id != ActorsIndexJobs.Subject && stageOk("actors") && StageDeps.ReadyEntry(this, s, "actors", nowUtc, ready) is { } rae && (canRun == null || canRun(s, rae))) r.Add(rae);
+            if (ready != null && s.IsFull && !r.Any(e => e.Stage == "process") && stageOk("process") && StageDeps.StaleEntry(s, ready) is { } rse && (canRun == null || canRun(s, rse))) r.Add(rse);   // 0.13.32: a finished step below the required version is ready again (its repair mode)
             if (r.Count > 0) res.Add((s, r));
         }
         if (ready != null && stageOk(ActorsIndexJobs.Stage) && !(skip?.Invoke(ActorsIndexJobs.Subject) ?? false) && !res.Any(x => x.Item1.Id == ActorsIndexJobs.Subject))
@@ -295,7 +314,7 @@ public sealed class QueueState
         }
         // 0.13.2: a due search-index entry goes before any drama work (a singleton added today must not wait behind a backlog of older priority-0 entries); then priority, added, id as before
         // 0.13.11: a due group entry goes right behind search-index and before process work: group steps are short, and a group entry added today must not wait behind a backlog of older priority-0 process entries
-        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? 3 : x.Item2.Any(e => e.Stage == "group") ? 2 : x.Item2.Any(e => e.Stage == "actors") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage is "group" or "actors") && !x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.24: ready actors jobs in grouping seq order, no window   // 0.13.12: group entries lowest sequence number first
+        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? 3 : x.Item2.Any(e => e.Stage == "group") ? 2 : x.Item2.Any(e => e.Stage == "actors" || StageDeps.IsVersionEntry(e)) ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage is "group" or "actors" || StageDeps.IsVersionEntry(e)) && !x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.24: ready actors jobs in grouping seq order, no window   // 0.13.12: group entries lowest sequence number first
             .ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenByDescending(x => PubKey(x.Item1, x.Item2), StringComparer.Ordinal).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
     }
 
@@ -334,7 +353,7 @@ public sealed class QueueState
             if (!allDone && s.ClaimBy == null && s.Entries.Values.All(e => e.Final) && !s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(SlimFinished(s)); continue; }   // finished, some failed for good: ids, states, priority and the reason are enough
             if (!allDone) { list.Add(s); continue; }
             if (s.Entries.Values.Any(e => e.Trash != null && e.TrashDeletedAt == null)) { list.Add(s); continue; }   // a trash mark is kept until `trash empty` has acted on it
-            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Entries = { ["download"] = d } }));
+            if (s.Entries.TryGetValue("download", out var d)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Data = s.Data, StepVer = s.StepVer, Entries = { ["download"] = d } }));
             else if (s.Entries.TryGetValue("check", out var ck)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Entries = { ["check"] = ck } }));   // 0.13.16: a sample-first duplicate has no download entry
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
@@ -344,13 +363,13 @@ public sealed class QueueState
     /// <summary>A finished subject as the snapshot needs it: the stage states, priority, when it was added and finished, a cut-down error and a minimal job (id, url, reason, duplicate-of) so a retry or a duplicate check still works. Everything else (due, attempts, node, steps, network, titles, ...) is dropped.</summary>
     static QSubject SlimFinished(QSubject s)
     {
-        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub };
+        var o = new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Data = s.Data, StepVer = s.StepVer };
         foreach (var (k, e) in s.Entries)
         {
             var j = e.Job; var keepsJob = k is "download" or "sample" or "check" or "refresh" or "classify" or "availability";
             o.Entries[k] = new QEntry
             {
-                Stage = e.Stage, State = e.State, Priority = e.Priority, Added = e.Added, FinishedAt = e.FinishedAt, Permanent = e.Permanent,
+                Stage = e.Stage, State = e.State, Priority = e.Priority, Added = e.Added, FinishedAt = e.FinishedAt, Permanent = e.Permanent, Ver = e.Ver,
                 LastError = e.LastError is { Length: > 160 } le ? le[..160] : e.LastError, Trash = e.Trash, TrashWhy = e.TrashWhy, TrashDeletedAt = e.TrashDeletedAt,
                 Job = j == null || !keepsJob ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Url = j.Url, Reason = j.Reason, DuplicateOf = j.DuplicateOf, DuplicateShare = j.DuplicateShare, Permanent = j.Permanent, MaxHeight = j.MaxHeight, Format = j.Format, Kind = j.Kind, Id = j.Id, Name = j.Name, Every = j.Every, Schedule = j.Schedule, AddedAt = j.AddedAt },
             };

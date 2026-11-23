@@ -194,11 +194,11 @@ public class NexisTouchTests
         var s = new FakeStore();
         await s.PutAsync("index/videos/x/video.mp4", [1], new Dictionary<string, string>
         {
-            ["ghostd_state"] = "ghost", ["ghostd_block_prefix"] = "gd+1+", ["ghostd_size"] = "9", ["idx_kind"] = "keep",
+            ["ghostd_state"] = "active", ["ghostd_block_prefix"] = "gd+1+", ["ghostd_size"] = "9", ["idx_kind"] = "keep",
         }, null, false, default);
         await NexisAccess.TouchAsync(s, "index/videos/x/video.mp4", default);
         var t = s["index/videos/x/video.mp4"].Tags;
-        Assert.Equal("ghost", t["ghostd_state"]);
+        Assert.Equal("active", t["ghostd_state"]);
         Assert.Equal("gd+1+", t["ghostd_block_prefix"]);
         Assert.Equal("9", t["ghostd_size"]);
         Assert.Equal("keep", t["idx_kind"]);

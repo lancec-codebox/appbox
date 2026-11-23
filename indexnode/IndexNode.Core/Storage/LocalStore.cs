@@ -138,6 +138,7 @@ public sealed class RedirectStore(IStore inner, string from, string to) : IStore
     public Task<bool> PutAsync(string name, byte[] data, IReadOnlyDictionary<string, string>? tags, string? leaseId, bool onlyIfNew, CancellationToken ct, string contentType = "application/json") => inner.PutAsync(W(name), data, tags, leaseId, onlyIfNew, ct, contentType);
     public Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct) => inner.PutFileAsync(W(name), path, contentType, progress, ct);
     public Task DownloadToFileAsync(string name, string path, CancellationToken ct) => inner.DownloadToFileAsync(name, path, ct); // inputs come from the source
+    public Task<BlobProps?> DownloadToFileWithPropsAsync(string name, string path, CancellationToken ct) => inner.DownloadToFileWithPropsAsync(name, path, ct);
     public Task<string?> AcquireLeaseAsync(string name, int seconds, CancellationToken ct) => inner.AcquireLeaseAsync(W(name), seconds, ct);
     public Task RenewLeaseAsync(string name, string leaseId, CancellationToken ct) => inner.RenewLeaseAsync(W(name), leaseId, ct);
     public Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct) => inner.ReleaseLeaseAsync(W(name), leaseId, ct);

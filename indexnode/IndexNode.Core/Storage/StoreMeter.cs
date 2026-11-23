@@ -23,7 +23,7 @@ public sealed class StorageLimits
     /// <summary>0.13.30: a hard limit on the store ops of ONE job step (storage.max-per-step): the runaway signal. Over it the step fails Transient with the per-site report and the node stops claiming.</summary>
     public int MaxPerStep { get; set; } = 25;
     /// <summary>Named larger limits for singleton builds that legitimately read many files (stage name -> ops).</summary>
-    public Dictionary<string, int> StepLimits { get; set; } = new() { ["actors-index"] = 250, ["search-index"] = 400 };
+    public Dictionary<string, int> StepLimits { get; set; } = new() { ["actors-index"] = 250, ["search-index"] = 400, ["process"] = 150, ["process:frames"] = 80, ["process:sscd"] = 60, ["process:centers"] = 50, ["process:thumbs"] = 60, ["process:transcribe"] = 60, ["process:ocrsubs"] = 60, ["process:cast"] = 60, ["process:sync"] = 40, ["process:describe"] = 40, ["process:translate"] = 40 };   // 0.13.32: "process" = the claim outside its steps (pre-check, listings, queue lines); "process:<step>" = each step's own budget (sum of the standard steps 410, a measured full job was about 221 live)
     public int StepLimitFor(string? stage) => stage != null && StepLimits.TryGetValue(stage, out var n) ? n : MaxPerStep;
     public int MaxFailuresPerMin { get; set; } = 100;
     public TimeSpan Cooldown { get; set; } = TimeSpan.FromMinutes(5);
@@ -47,7 +47,7 @@ public sealed class StoreMeter
     int winOps, winFails; long lastWarnMin = -1; DateTimeOffset? trippedAt; string? tripMessage;
     public StoreMeter(Func<DateTimeOffset>? clock = null) { now = clock ?? (() => DateTimeOffset.UtcNow); }
 
-    sealed class Cell { public long Count, Failed, NotModified; public string? Example; }
+    sealed class Cell { public long Count, Failed, NotModified; public string? Example; readonly HashSet<string> names = new(); public void Seen(string? n) { if (n == null) return; lock (names) if (names.Count < 1000) names.Add(n); } public int Blobs { get { lock (names) return names.Count; } } }
     /// <summary>One full stack sample per call site, refreshed at most once a minute (what the breaker logs on a warn or a trip).</summary>
     readonly ConcurrentDictionary<string, (DateTimeOffset At, string Stack)> samples = new();
     public static readonly TimeSpan SampleEvery = TimeSpan.FromMinutes(1);
@@ -123,7 +123,7 @@ public sealed class StoreMeter
             if (sc != null && sc.Tripped != null) throw new StorageBudgetExceeded(sc.Tripped);
             if (sc != null && sc.Ops >= sc.Max)
             {
-                sc.Tripped = $"storage: this step made {sc.Ops} store ops (max-per-step {sc.Max}). Top sites: {Top(Rows(sc.Cells), 5)}";
+                sc.Tripped = $"storage: this step made {sc.Ops} store ops (max-per-step {sc.Max}). Top sites: {Top(Rows(sc.Cells), 5, true)}";
                 stepHaltAt = now(); stepHaltMessage = $"storage: a step made {sc.Ops} store ops (max-per-step {sc.Max}); the node stops claiming for {Limits.Cooldown.TotalMinutes:0.#} min. Top sites: {Top(Rows(sc.Cells), 5, true)}";   // 0.13.30: the node stops claiming (store calls stay open, so the step's failure line can still be written)
                 Log.Info(stepHaltMessage);
                 throw new StorageBudgetExceeded(sc.Tripped);
@@ -174,14 +174,14 @@ public sealed class StoreMeter
 
     static void Count(ConcurrentDictionary<(string, string), Cell> d, string site, string op, string? name, bool failed)
     {
-        var c = d.GetOrAdd((site, op), _ => new Cell()); Interlocked.Increment(ref c.Count); if (failed) Interlocked.Increment(ref c.Failed); c.Example ??= name;
+        var c = d.GetOrAdd((site, op), _ => new Cell()); Interlocked.Increment(ref c.Count); if (failed) Interlocked.Increment(ref c.Failed); c.Example ??= name; c.Seen(name);
     }
     static void CountNotModified(ConcurrentDictionary<(string, string), Cell> d, string site, string op, string? name)
     {
-        var c = d.GetOrAdd((site, op + "!304"), _ => new Cell()); Interlocked.Increment(ref c.Count); Interlocked.Increment(ref c.NotModified); c.Example ??= name;
+        var c = d.GetOrAdd((site, op + "!304"), _ => new Cell()); Interlocked.Increment(ref c.Count); Interlocked.Increment(ref c.NotModified); c.Example ??= name; c.Seen(name);
     }
 
-    static IReadOnlyList<SiteRow> Rows(ConcurrentDictionary<(string, string), Cell>? d) => d == null ? [] : d.Select(kv => new SiteRow(kv.Key.Item1, kv.Key.Item2, kv.Value.Count, kv.Value.Failed, kv.Value.Example, kv.Value.NotModified)).OrderByDescending(r => r.Count).ToList();
+    static IReadOnlyList<SiteRow> Rows(ConcurrentDictionary<(string, string), Cell>? d) => d == null ? [] : d.Select(kv => new SiteRow(kv.Key.Item1, kv.Key.Item2, kv.Value.Count, kv.Value.Failed, kv.Value.Example, kv.Value.NotModified, kv.Value.Blobs)).OrderByDescending(r => r.Count).ToList();
     List<SiteRow> WindowRows() => window.GroupBy(o => (o.Site, o.Op)).Select(g => new SiteRow(g.Key.Site, g.Key.Op, g.Count(), g.Count(x => x.Failed), g.Select(x => x.Name).FirstOrDefault(n => n != null), 0, g.Select(x => x.Name).Where(n => n != null).Distinct().Count())).OrderByDescending(r => r.Count).ToList();
     /// <summary>"site op xN" per row; with examples: how many distinct blobs and one of them ("295 blobs, e.g. ..."), or "all on one blob" when it really is one: never a lone path that reads like a loop on one file.</summary>
     static string Top(IReadOnlyList<SiteRow> rows, int n, bool withExample = false) => string.Join("; ", rows.Take(n).Select(r => $"{r.Site} {r.Op} x{r.Count}" + (!withExample || r.Example == null ? "" : r.Blobs > 1 ? $" ({r.Blobs} blobs, e.g. {r.Example})" : r.Blobs == 1 && r.Count > 1 ? $" (all on one blob: {r.Example})" : $" (e.g. {r.Example})")));

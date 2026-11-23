@@ -85,7 +85,7 @@ public sealed partial class NodeEngine
                                 var gv = await gate.RefreshAsync(queue, queue.Now, ct); gateView = gv;
                                 if (gate.Summary(gv, queue.Now) is { } gsum) Log.Info(gsum);
                             }
-                            look = await queue.LookAsync(StageEnabled, CanRunEntry, ct, o.Ready);
+                            look = await queue.LookAsync(StageEnabled, CanRunEntry, ct, ReadyNow);
                             await Control.RefreshIfAnnouncedAsync(queue.Read(st => st.ControlETag), ct);   // 0.13.28: control.json is read only when a "ctl" line says it changed
                         }
 
@@ -237,7 +237,7 @@ public sealed partial class NodeEngine
         if (!TryReserve()) { o.Limits?.Release(first, false); return false; }
         if (o.Shadow && !shadowTaken.TryAdd(id, 0)) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); return false; }
         ClaimHandle? h;
-        try { h = await queue.TryClaimAsync(id, (st, s) => ClaimableStages(st, s), ct); }
+        try { h = await queue.TryClaimAsync(id, (st, s) => ClaimableStages(st, s), ct, null, ReadyNow); }
         catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); throw; }
         catch (Exception e) { Log.Info($"[{first}#{lane}] {id}: claim failed ({e.Message})"); h = null; }
         if (h == null) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); return false; }
@@ -246,13 +246,17 @@ public sealed partial class NodeEngine
         return true;
     }
 
+    /// <summary>0.13.32: the readiness options with the versions control.json requires now.</summary>
+    private ReadyOptions ReadyNow => o.Ready with { Required = s => Control.Current.RequiredVersion(s) };
+
     /// <summary>What this node would run of the subject right now (also the check, after the active file is ours, that the work is not done already).</summary>
     private string[]? ClaimableStages(QueueState state, QSubject s)
     {
         var now = Protocol.Utc(NowUtc);
         var st = s.Entries.Values.Where(e => e.Runnable(now) && StageEnabled(e.Stage) && CanRunEntry(s, e)).Select(e => e.Stage).ToList();
         foreach (var d in StageDeps.Derived)   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
-            if (!st.Contains(d) && StageEnabled(d) && StageDeps.ReadyEntry(state, s, d, now, o.Ready) is { } re && CanRunEntry(s, re)) st.Add(d);
+            if (!st.Contains(d) && StageEnabled(d) && StageDeps.ReadyEntry(state, s, d, now, ReadyNow) is { } re && CanRunEntry(s, re)) st.Add(d);
+        if (!st.Contains("process") && s.Data == "full" && StageEnabled("process") && StageDeps.StaleEntry(s, ReadyNow) is { } sre && CanRunEntry(s, sre)) st.Add("process");   // 0.13.32: a step below the required version is ready again
         return st.Count == 0 ? null : st.OrderBy(QueueState.Rank).ToArray();
     }
 
@@ -381,7 +385,7 @@ public sealed partial class NodeEngine
                         ctx = NewContext(lane, w, stage, job, store, [], token);
                         await handlers[stage].RunAsync(ctx);
                         var lines = new List<QLine>();
-                        var done = new QLine { T = "done", Stage = stage, Job = ctx.Job, Ver = ctx.PublishedVersion };
+                        var done = new QLine { T = "done", Stage = stage, Job = ctx.Job, Ver = ctx.PublishedVersion, StepVer = Array.IndexOf(StepVersions.Stages, stage) >= 0 ? StepVersions.Code(stage) : null };
                         job.FinishedAt = Protocol.NowUtc(); job.NodeId = o.NodeId;
                         if (ctx.NextDue is { } nd) { done.State = "pending"; done.Due = nd; }   // a source, the classifier, the sweep: pending again, due later
                         lines.Add(done); lines.AddRange(ctx.FollowUps);
@@ -474,9 +478,9 @@ public sealed partial class NodeEngine
             w.Run.Info.Stage = step; w.Run.Info.Step = null; RegistryChanged();
             var sj = JobDescriptor.NewStep(step, id); sj.Priority = entry.Priority;
             ctx = NewContext(lane, w, step, sj, w.Local, done.ToArray(), token);
-            await handlers[step].RunAsync(ctx);
+            using (o.Meter.BeginStep(o.Meter.Limits.StepLimitFor("process:" + step), $"[process:{step}#{lane}] {id}")) await handlers[step].RunAsync(ctx);   // 0.13.32: each step has its own named budget
             done.Add(step); ran.Add(step); avail.Add(step + ".zip");
-            var stepLines = new List<QLine> { new() { T = "done", Stage = "process", Step = step } };
+            var stepLines = new List<QLine> { new() { T = "done", Stage = "process", Step = step, StepVer = Array.IndexOf(StepVersions.Steps, step) >= 0 ? ctx.StepVersion ?? StepVersions.Code(step) : null } };
             // 0.13.1: a new centers.zip means the search index is behind: add the singleton, due in 15 minutes (nothing when one is pending)
             if (step == "centers" && handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } si) stepLines.Add(si);
             await h.AppendAsync(stepLines, false, CancellationToken.None);
@@ -505,7 +509,7 @@ public sealed partial class NodeEngine
     /// <summary>0.13.18: the file names (not paths) in the video's folder, from one LIST.</summary>
     private async Task<HashSet<string>> VideoFilesAsync(string id, CancellationToken ct)
     {
-        var list = await store.ListAsync(paths.VideoDir(id), false, false, ct);
+        var list = await StageZipStore.ListRawAsync(store, paths.VideoDir(id), ct);   // names only: no stage zip is opened for the question "is this output stored"
         return list.Select(b => b.Name[(b.Name.LastIndexOf('/') + 1)..]).ToHashSet(StringComparer.Ordinal);
     }
     private static bool HasProcessing(HashSet<string> have) => have.Any(n => n == "processed.json" || (n.EndsWith(".zip", StringComparison.Ordinal) && n is not ("download.zip" or "comments.zip")));

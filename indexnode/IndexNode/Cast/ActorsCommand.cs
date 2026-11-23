@@ -12,6 +12,10 @@ public static class ActorsAdd
     public static QLine ManualLine(string id, QEntry? existing, int priority) => QLine.Add(id, "actors", new JobDescriptor { Stage = "actors", JobId = id, Priority = priority, AddedAt = Protocol.NowUtc(), Reason = ActorsStage.ManualReason }, Protocol.NowUtc(), null, null, null, force: existing != null);
 }
 
+public static class ActorsCommandCast
+{
+}
+
 public static class ActorsCommandSupport
 {
     /// <summary>--preds listed: the predecessors of <paramref name="id"/> (lower grouping.seq, seq order) restricted to the listed ids.</summary>
@@ -25,6 +29,16 @@ public static class ActorsCommandSupport
 public static class ActorsCommand
 {
     const string Use = "actors build --ids <file> --out-local <dir> [...]  |  actors add <id>... [--dry-run]  |  actors run <id>... [--dry-run] [--out-local <dir>] [--prefix <p>] [--manual] [--preds all|listed]  |  actors index [--dry-run] [--out-local <dir>] [--prefix <p>]   (shared: [--child-probe <file>] [--tiebreak-cut 0.64] [--threads N])";
+
+    /// <summary>0.13.32: the cast step's repair mode for the claimed upload: the repaired cast state under index/actors/; false when its grouping record is not there yet (the step then records v1).</summary>
+    public static async Task<bool> CastRepairAsync(ActorsStage stage, JobContext ctx, CancellationToken ct)
+    {
+        var vj = await VideoJson.ReadAsync(ctx.Store, ctx.Paths, ctx.BlobName, ct); if (vj?.Root["grouping"] is not System.Text.Json.Nodes.JsonObject) return false;
+        var q = ctx.Queue; var io = new ActorsIO(ctx.Store, ctx.Paths);
+        var r = await stage.RepairAsync(io, ctx.BlobName, false, Math.Max(1, ctx.ThreadShare()), ct, q == null ? null : up => q.Read(st => st.Get(up) is { } sub && sub.Entries.Values.Any(e => e.Hold == "ai")), q?.Read(ActorsStage.GroupOfQueue));
+        Log.Info($"cast repair {r.Id}: " + (r.Skipped ?? (r.Reused ? $"already repaired ({r.Units} units)" : $"{r.Units} units ({r.FacesUsed} faces, {r.ChildUnits} child), {r.R50Units} r50 vectors")));
+        return r.Skipped == null;
+    }
 
     public static ActorsStage NewStage(IStore store, HttpClient http, Args a, bool dry, string? outLocal, ActorsBuild.Probe? probe)
     {

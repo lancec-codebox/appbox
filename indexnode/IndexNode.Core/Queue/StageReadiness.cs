@@ -5,6 +5,9 @@ namespace IndexNode;
 /// <summary>0.13.24 settings of the readiness check (config actors.index-min-uploads / actors.index-max-wait-minutes).</summary>
 public sealed record ReadyOptions(int IndexMinUploads = 25, int IndexMaxWaitMinutes = 10)
 {
+    /// <summary>0.13.32: the version control.json requires of a step or stage (0 / 1 = none) and the version this node's code can make.</summary>
+    public Func<string, int> Required { get; init; } = _ => 0;
+    public Func<string, int> Code { get; init; } = StepVersions.Code;
     public TimeSpan IndexMaxWait => TimeSpan.FromMinutes(Math.Max(0, IndexMaxWaitMinutes));
 }
 
@@ -16,7 +19,9 @@ public sealed record ReadyOptions(int IndexMinUploads = 25, int IndexMaxWaitMinu
 public static class StageDeps
 {
     /// <summary>stage -> the stages of the same subject that must be done first.</summary>
-    public static readonly IReadOnlyDictionary<string, string[]> Needs = new Dictionary<string, string[]>(StringComparer.Ordinal) { ["actors"] = ["group"] };
+    public static readonly IReadOnlyDictionary<string, string[]> Needs = new Dictionary<string, string[]>(StringComparer.Ordinal) { ["actors"] = ["group", "cast"] };   // 0.13.32: (stage or step, minimum version) below
+    /// <summary>0.13.32: stage -> (stage or step of the same subject, the version it must have finished at). actors needs its group step (any version) and the process subject's cast step at v2 (the repaired cast state).</summary>
+    public static readonly IReadOnlyDictionary<string, (string Dep, int Min)[]> VersionedNeeds = new Dictionary<string, (string, int)[]>(StringComparer.Ordinal) { ["actors"] = [("group", 1), ("cast", StepVersions.CastRepaired)] };
     public static readonly string[] Derived = ["process", "actors", ActorsIndexJobs.Stage];
 
     public static bool IsDerived(string stage) => Array.IndexOf(Derived, stage) >= 0;
@@ -24,7 +29,33 @@ public static class StageDeps
     /// <summary>An actors entry with a hold (the AI hold, put where the flag is known: the group step's done / the import) is never ready; a manual "actors add" replaces the entry and so releases it.</summary>
     public static bool Held(QEntry e) => e.Stage == "actors" && e.Hold != null;
 
-    static bool NeedsDone(QSubject s, string stage) => Needs.TryGetValue(stage, out var n) && n.All(x => s.Entries.TryGetValue(x, out var e) && e.State == "done");
+    /// <summary>A dependency is met when the stage (an entry) or the step (of the process entry) is done AND finished at the minimum version; a recorded line without a version is v1.</summary>
+    public static bool NeedMet(QSubject s, string dep, int min)
+    {
+        if (Array.IndexOf(StepVersions.Steps, dep) >= 0 || NodeEngine.StandardSteps.Contains(dep))
+            return s.Entries.TryGetValue("process", out var pe) && (pe.State == "done" || pe.StepsDone?.Contains(dep) == true) && s.VerOf(dep) >= min;
+        return s.Entries.TryGetValue(dep, out var e) && e.State == "done" && (e.Ver ?? 1) >= min;
+    }
+    static bool NeedsDone(QSubject s, string stage) => VersionedNeeds.TryGetValue(stage, out var n) && n.All(x => NeedMet(s, x.Dep, x.Min));
+
+    /// <summary>0.13.32: the versioned steps of a FINISHED process entry whose recorded version is below the one control requires and this node's code can make: ready again (their repair mode), nothing is queued by hand. Not for an AI-held or not fully downloaded upload.</summary>
+    public static List<string> StaleSteps(QSubject s, ReadyOptions ro)
+    {
+        var res = new List<string>();
+        if (!s.IsFull || s.Entries.GetValueOrDefault("process") is not { State: "done" } || s.Entries.Values.Any(e => e.Hold == "ai")) return res;
+        if (s.Entries.GetValueOrDefault("group") is not { State: "done" }) return res;   // the cast repair needs the grouping record (a join uses only the faces on its retained frames)
+        foreach (var step in StepVersions.Steps) { int req = ro.Required(step); if (req > 1 && s.VerOf(step) < req && ro.Code(step) >= req) res.Add(step); }
+        return res;
+    }
+
+    public const string VersionReason = "version";
+    public static bool IsVersionEntry(QEntry e) => e.Stage == "process" && e.State == "pending" && e.Job?.Reason == VersionReason;
+    /// <summary>The process entry a claim would re-open for the stale steps of <paramref name="s"/> (not stored: the claim line's Redo creates the real change), or null.</summary>
+    public static QEntry? StaleEntry(QSubject s, ReadyOptions ro)
+    {
+        var stale = StaleSteps(s, ro); if (stale.Count == 0 || s.Entries.GetValueOrDefault("process") is not { } pe) return null;
+        return new QEntry { Stage = "process", State = "pending", Priority = pe.Priority, Added = pe.Added, Due = "", StepsDone = NodeEngine.StandardSteps.Where(x => !stale.Contains(x)).ToList(), Job = new JobDescriptor { Stage = "process", JobId = s.Id, Priority = pe.Priority, Reason = VersionReason } };
+    }
 
     /// <summary>The entry a claim would create for <paramref name="stage"/> on <paramref name="s"/>, or null when the stage is not ready there.</summary>
     public static QEntry? ReadyEntry(QueueState st, QSubject s, string stage, string nowUtc, ReadyOptions ro)
@@ -36,7 +67,8 @@ public static class StageDeps
         }
         if (stage == "actors")
         {
-            if (s.Id == ActorsIndexJobs.Subject || s.Entries.ContainsKey("actors") || !NeedsDone(s, "actors")) return null;
+            if (s.Id == ActorsIndexJobs.Subject || !NeedsDone(s, "actors")) return null;
+            if (s.Entries.TryGetValue("actors", out var ae0) && !(ae0.State == "done" && (ae0.Ver ?? 1) < ro.Required("actors") && ro.Code("actors") >= ro.Required("actors"))) return null;   // 0.13.32: an existing entry is the ordinary path, unless it finished before the repaired state (v1) and its cast is repaired now: it runs again, on the repaired units
             return Make("actors", s.Id, s.Entries.GetValueOrDefault("group")?.Priority ?? 0, "");
         }
         if (stage == ActorsIndexJobs.Stage && s.Id == ActorsIndexJobs.Subject)

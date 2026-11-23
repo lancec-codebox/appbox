@@ -51,6 +51,8 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct) => inner.PutBlockListAsync(name, blockIds, etag, ct);
     public Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchWithETagAsync(name, data, etag, ct);
     public IStore Inner => inner;
+    /// <summary>0.13.32: the blob names under a prefix as the store really holds them: no zip is opened (a ListAsync of a video's folder opens every stage zip to show its members).</summary>
+    public static async Task<IReadOnlyList<BlobEntry>> ListRawAsync(IStore s, string prefix, CancellationToken ct) { using var none = OnlyZips(); return await s.ListAsync(prefix, false, false, ct); }   // an empty OnlyZips scope: through any wrapper (shadow, recording, local cache) no zip is opened
     public static IStore? Find(IStore s) { for (int i = 0; i < 8 && s != null; i++) { if (s is StageZipStore z) return z; s = s switch { LocalCacheStore l => l.Inner, RecordingStore r => r.Inner, RedirectStore d => d.Inner, _ => null! }; } return null; }
     public static IStageStore? Stage(IStore s) => Find(s) as IStageStore;
     public static string Wrap(string? dir) => dir ?? Path.Combine(Path.GetTempPath(), "indexnode", "zips-" + Environment.ProcessId);
@@ -60,6 +62,9 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public long WholeZipLimit { get; set; } = 64L << 20;
     static readonly AsyncLocal<bool> wholeAlways = new();
     /// <summary>0.13.30: inside the returned scope every zip this store opens is fetched whole in one GET (cast.zip, frames.zip) and then read locally: no range-read series. For jobs that read most of a zip anyway.</summary>
+    static readonly AsyncLocal<HashSet<string>?> listOnly = new();
+    /// <summary>0.13.32: inside the returned scope a listing of a video's folder opens only these stage zips (by file name, e.g. "cast.zip"), not every zip found: a repair-mode cast claim needs cast.zip and frames.zip, nothing else.</summary>
+    public static IDisposable OnlyZips(params string[] zips) { var was = listOnly.Value; var wasWhole = wholeAlways.Value; listOnly.Value = new HashSet<string>(zips, StringComparer.Ordinal); if (zips.Length > 0) wholeAlways.Value = true; return new Scope(() => { listOnly.Value = was; wholeAlways.Value = wasWhole; }); }   // whole: a repair claim reads both zips entirely, so each is one GET after the touch, no HEAD
     public static IDisposable WholeZips() { var was = wholeAlways.Value; wholeAlways.Value = true; return new Scope(() => wholeAlways.Value = was); }
     sealed class Scope(Action done) : IDisposable { public void Dispose() => done(); }
 
@@ -85,21 +90,54 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     private static string H(string s) => Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(s)))[..16];
     private string StageDir(string zipBlob) => Path.Combine(cacheDir, "stage", H(zipBlob));
 
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> opening = new();
+    private readonly ConcurrentDictionary<string, DateTime> absent = new();   // 0.13.32: a zip found missing (the sscd probe of every frames index) is not looked for again for a minute, or until this store writes a zip
+    /// <summary>0.13.32: one open of a zip at a time per blob: reads that start together (a pool of threads each wanting a member) share the one open (tags, head, one whole GET) instead of each doing its own.</summary>
     private async Task<View?> ViewAsync(string blob, CancellationToken ct, bool fresh = false)
     {
-        if (!fresh && views.TryGetValue(blob, out var v)) return v;
-        views.TryRemove(blob, out _);
-        if (LocalCacheStore.Unwrap(inner) is RestStore rest && !fresh) { try { await NexisAccess.PrepareAsync(rest, blob, ct); } catch (OperationCanceledException) { throw; } catch (Exception e) { Log.Info($"zip {blob}: touch failed ({e.Message})"); } }   // a ghosted zip is restored first
-        var h = await ZipOpen.HeadReadableAsync(inner, blob, ct, mustBeZip: false);
-        if (h == null) return null;
-        IZipSource src;
-        if (h.Size <= WholeZipLimit || wholeAlways.Value)
+        if (!fresh && views.TryGetValue(blob, out var v0) && (!wholeAlways.Value || v0.Src is FileZipSource)) return v0;   // a range view opened earlier is not reused where the zip is wanted whole (the 58 ranged reads of frames.zip)
+        if (!fresh && (absent.TryGetValue(blob, out var at0) && DateTime.UtcNow - at0 < TimeSpan.FromSeconds(60))) return null;
+        var gate = opening.GetOrAdd(blob, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
         {
-            var local = Path.Combine(cacheDir, "zips", H(blob) + "-" + H(h.ETag ?? h.Size.ToString() + h.Metadata.GetValueOrDefault("idx_sha256", "")) + ".zip");
-            if (!File.Exists(local)) { Directory.CreateDirectory(Path.GetDirectoryName(local)!); var tmp = local + "." + Guid.NewGuid().ToString("N")[..6]; await inner.DownloadToFileAsync(blob, tmp, ct); File.Move(tmp, local, true); }
-            src = new FileZipSource(local);
+            if (!fresh && (absent.TryGetValue(blob, out var at) && DateTime.UtcNow - at < TimeSpan.FromSeconds(60))) return null;
+            if (!fresh && views.TryGetValue(blob, out var v1) && (!wholeAlways.Value || v1.Src is FileZipSource)) return v1;   // another reader opened it while we waited
+            var ov = await OpenViewAsync(blob, ct, fresh); if (ov == null) absent[blob] = DateTime.UtcNow; return ov;
         }
-        else src = new BlobZipSource(inner, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
+        finally { gate.Release(); }
+    }
+
+    private async Task<View?> OpenViewAsync(string blob, CancellationToken ct, bool fresh)
+    {
+        views.TryRemove(blob, out _);
+        BlobProps? h; IZipSource src;
+        string Cache(BlobProps p) => Path.Combine(cacheDir, "zips", H(blob) + "-" + H(p.Size + "|" + (p.Metadata.GetValueOrDefault("idx_sha256") ?? p.ETag ?? "")) /* content identity: a Nexis hydrate changes the ETag and nothing else */ + ".zip");
+        // 0.13.32: a zip read whole is ONE GET (the response carries the length, ETag and metadata): no touch, no HEAD, no tags unless the GET comes back empty. Only a zip read by ranges (held for minutes) is touched.
+        async Task<BlobProps?> Whole()
+        {
+            Directory.CreateDirectory(Path.Combine(cacheDir, "zips")); var tmp = Path.Combine(cacheDir, "zips", H(blob) + "." + Guid.NewGuid().ToString("N")[..6] + ".part");
+            var p = await inner.DownloadToFileWithPropsAsync(blob, tmp, ct); if (p == null) return null;
+            if (p.Size < ZipOpen.MinZip)
+            {   // a store that does not settle ghosts itself (not a RestStore): hydrate through the readable HEAD, then fetch again
+                try { File.Delete(tmp); } catch { }
+                p = await ZipOpen.HeadReadableAsync(inner, blob, ct, mustBeZip: false); if (p == null) return null;
+                p = await inner.DownloadToFileWithPropsAsync(blob, tmp, ct); if (p == null) return null;
+            }
+            var local = Cache(p); File.Move(tmp, local, true); return p;
+        }
+        if (wholeAlways.Value) { h = await Whole(); if (h == null) return null; src = new FileZipSource(Cache(h)); }
+        else
+        {
+            h = await inner.HeadAsync(blob, ct); if (h == null) return null;
+            if (h.Size <= WholeZipLimit) { var local = h.Size > 0 && File.Exists(Cache(h)) ? h : await Whole(); if (local == null) return null; h = local; src = new FileZipSource(Cache(h)); }
+            else
+            {
+                if (LocalCacheStore.Unwrap(inner) is RestStore rest && !fresh) { try { await NexisAccess.PrepareAsync(rest, blob, ct); } catch (OperationCanceledException) { throw; } catch (Exception e) { Log.Info($"zip {blob}: touch failed ({e.Message})"); } }   // a ghosted big zip is read by ranges for minutes: keep it warm
+                h = await ZipOpen.HeadReadableAsync(inner, blob, ct, mustBeZip: false); if (h == null) return null;
+                src = new BlobZipSource(inner, blob, h.Size, h.ETag, h.Metadata.GetValueOrDefault("idx_sha256"));
+            }
+        }
         var entries = (await ZipFormat.ReadDirectoryAsync(src, ct)).Where(e => !e.IsDirectory).ToDictionary(e => e.Name, StringComparer.Ordinal);
         return views[blob] = new View { Blob = blob, ETag = h.ETag, Src = src, Entries = entries, Meta = h.Metadata };
     }
@@ -141,7 +179,8 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
         string p = m.Groups["p"].Value, id = m.Groups["id"].Value; var dirPrefix = $"{p}videos/{id}/";
         var all = prefix == dirPrefix ? real : await inner.ListAsync(dirPrefix, false, false, ct);
         var result = real.ToList(); var seen = result.Select(b => b.Name).ToHashSet(StringComparer.Ordinal);
-        foreach (var z in all.Where(b => IsZipName(b.Name[dirPrefix.Length..]) && b.Name[dirPrefix.Length..] != "video.zip"))
+        var only = listOnly.Value;
+        foreach (var z in all.Where(b => IsZipName(b.Name[dirPrefix.Length..]) && b.Name[dirPrefix.Length..] != "video.zip" && (only == null || only.Contains(b.Name[dirPrefix.Length..]))))
         {
             var v = await ViewAsync(z.Name, ct); if (v == null) continue;
             foreach (var e in v.Entries.Values)
@@ -152,7 +191,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
             if (z.Name == ZipBlob(p, id, "cast") && v.Entries.ContainsKey(StageLayout.CropsDir + "map.json") && await ReadMemberAsync(z.Name, StageLayout.CropsDir + "map.json", ct) is { } mb)
                 foreach (var kv in JsonNode.Parse(mb)!.AsObject()) { var n = $"{dirPrefix}cast/{kv.Key}.jpg"; if (n.StartsWith(prefix, StringComparison.Ordinal) && seen.Add(n)) result.Add(new BlobEntry(n, new Dictionary<string, string>(), new Dictionary<string, string>(), null, 0)); }
         }
-        if (prefix.Length <= (dirPrefix + "processed.json").Length && (dirPrefix + "processed.json").StartsWith(prefix, StringComparison.Ordinal) && seen.Add(dirPrefix + "processed.json") && await VirtualProcessedAsync(p, id, ct) != null) result.Add(new BlobEntry(dirPrefix + "processed.json", new Dictionary<string, string>(), new Dictionary<string, string>(), null, 0));
+        if (prefix.Length <= (dirPrefix + "processed.json").Length && (dirPrefix + "processed.json").StartsWith(prefix, StringComparison.Ordinal) && seen.Add(dirPrefix + "processed.json") && listOnly.Value == null && await VirtualProcessedAsync(p, id, ct) != null) result.Add(new BlobEntry(dirPrefix + "processed.json", new Dictionary<string, string>(), new Dictionary<string, string>(), null, 0));
         foreach (var kv in pending) if (kv.Key.StartsWith(dirPrefix, StringComparison.Ordinal))
             foreach (var f in kv.Value.Files.Keys) { var n = dirPrefix + f; if (n.StartsWith(prefix, StringComparison.Ordinal) && seen.Add(n)) result.Add(new BlobEntry(n, new Dictionary<string, string>(), new Dictionary<string, string>(), null, new FileInfo(kv.Value.Files[f]).Length)); }
         return result.OrderBy(b => b.Name, StringComparer.Ordinal).ToList();
@@ -191,7 +230,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
             var h = await inner.HeadAsync(blob, ct);
             return h?.Metadata.GetValueOrDefault("idx_summary") is { Length: > 2 } s ? new(Encoding.UTF8.GetBytes(s), null) : null;
         }
-        if (FrameIdxRx().IsMatch(member))   // the sscd pass's rewrite of a frames index wins over frames.zip's
+        if (FrameIdxRx().IsMatch(member) && (listOnly.Value is not { } only || only.Contains("sscd.zip")))   // the sscd pass's rewrite (not looked for inside a scoped repair claim: it reads cast.zip and frames.zip only) of a frames index wins over frames.zip's
         {
             var sb = ZipBlob(prefix, id, "sscd"); var sm = "sscd/" + member;
             if (pending.TryGetValue(sb, out var sp) && sp.Files.TryGetValue(sm, out var spath) && File.Exists(spath)) return new(await File.ReadAllBytesAsync(spath, ct), null);
@@ -283,10 +322,10 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public async Task<bool> PutZipIfMatchAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, string etag, CancellationToken ct)
     {
         var ok = await inner.PutZipIfMatchAsync(name, path, metadata, tags, etag, ct);
-        views.TryRemove(name, out _);
+        views.TryRemove(name, out _); absent.Clear();
         return ok;
     }
-    public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) => inner.PutZipAsync(name, path, metadata, tags, onlyIfNew, ct);
+    public Task<bool> PutZipAsync(string name, string path, IReadOnlyDictionary<string, string> metadata, IReadOnlyDictionary<string, string>? tags, bool onlyIfNew, CancellationToken ct) { absent.Clear(); return inner.PutZipAsync(name, path, metadata, tags, onlyIfNew, ct); }
 
     // ------------------------------------------------------------------ commit
     public void DiscardStaged(string videoId, string? stage = null)
@@ -311,7 +350,7 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
             var prefix = blob[..(blob.Length - $"videos/{videoId}/{stage}.zip".Length)];
             var md = await StageZipBuilder.MetadataAsync(inner, prefix, videoId, stage, ZipFormat.Sha256Of(zip), nodeId, built.Summary, ct);
             var wrote = await inner.PutZipAsync(blob, zip, md, null, onlyIfNew, ct);
-            views.TryRemove(blob, out _);
+            views.TryRemove(blob, out _); absent.Clear();
             if (pending.TryRemove(blob, out _)) { try { Directory.Delete(StageDir(blob), true); } catch { } }
             return wrote;
         }

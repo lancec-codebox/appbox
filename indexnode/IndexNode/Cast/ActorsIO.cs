@@ -23,6 +23,12 @@ public sealed class ActorsIO(IStore store, Paths paths, bool dry = false, string
         if (LocalBytes(name) is { } lb) return new BlobContent(lb, LocalETag(lb));
         return await store.GetAsync(name, ct);
     }
+    /// <summary>0.13.32: a read that never comes from a cache layer (process, local-file or zip cache): a fresh GET with the blob's current ETag, for a read-modify-write that must see what another lane just wrote. The overlay of a dry or local run still wins.</summary>
+    public async Task<BlobContent?> GetFreshAsync(string name, CancellationToken ct)
+    {
+        if (mem.ContainsKey(name) || gone.Contains(name) || LocalBytes(name) != null) return await GetAsync(name, ct);
+        var r = await store.GetIfChangedAsync(name, null, ct); return r.Exists && r.Data != null ? new BlobContent(r.Data, r.ETag) : null;
+    }
     /// <summary>Bytes of one blob (a vector row), from the overlay or by a ranged read that must still match the ETag (Mismatch: the file moved).</summary>
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? etag, CancellationToken ct)
         => mem.TryGetValue(name, out var m) ? new RangeRead(m.Data.AsSpan((int)off, len).ToArray(), false) : LocalBytes(name) is { } lb ? new RangeRead(lb.AsSpan((int)off, len).ToArray(), false) : await store.GetRangeAsync(name, off, len, etag, ct);

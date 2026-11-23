@@ -36,6 +36,42 @@ public static class QueueCommand
         return new ImportReport(grouped, done, seqs, joins, holds, appends);
     }
 
+    public sealed record ProcessImportReport(int Subjects, int NoProcess, int Imported, int Partial, int NotFull, int Claimed, int Appends);
+    public static readonly string[] ProcessEvidence = ["cast", "centers", "frames", "sscd"];
+
+    /// <summary>0.13.32 queue import-done process [--dry-run|--out-local FILE]: a processing subject whose download is done but that has NO process entry (processed before the queue tracked process) and whose stored outputs show it was processed (cast.zip, centers.zip, frames.zip, sscd.zip, from ONE listing of videos/, names only) gets
+    /// "enter data=full" (when it has no data fact), "add process (state done)" and a "fixsteps" line with the steps whose output is present (cast stays v1: a done line without a version). Batched, paced; idempotent (the append drops what the queue has meanwhile).</summary>
+    public static async Task<ProcessImportReport> ImportDoneProcessAsync(JobQueue q, IStore store, Paths paths, bool dry, CancellationToken ct, OpPacer? pacer = null, string? outLocal = null)
+    {
+        await q.PollAsync(ct);
+        var zips = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var b in await store.ListAsync(paths.Prefix + "videos/", false, false, ct)) if (b.Name.EndsWith(".zip", StringComparison.Ordinal)) zips.Add(b.Name);
+        var at = q.NowUtc(); var lines = new List<QLine>(); int subjects = 0, noProc = 0, imported = 0, partial = 0, notFull = 0, claimed = 0;
+        var items = q.Read(st => st.Subjects.Values.Where(s => s.Id != ActorsIndexJobs.Subject && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-")).OrderBy(s => s.Id, StringComparer.Ordinal).Select(s => (s.Id, s.IsFull, s.Data, Has: s.Entries.ContainsKey("process"), s.ClaimBy, Pri: s.Entries.GetValueOrDefault("download")?.Priority ?? 0)).ToList());
+        foreach (var (id, full, data, has, claimBy, pri) in items)
+        {
+            subjects++; if (has) continue; noProc++;
+            if (!full) { notFull++; continue; }
+            if (claimBy != null) { claimed++; continue; }
+            var present = NodeEngine.StandardSteps.Where(s => s != "sync" && zips.Contains(paths.Video(id, s + ".zip"))).ToList();
+            if (!ProcessEvidence.All(e => present.Contains(e))) { partial++; continue; }
+            var done = NodeEngine.StandardSteps.Where(s => s == "sync" || present.Contains(s)).ToArray();
+            if (data == null) lines.Add(new QLine { T = "enter", S = id, Data = "full", At = at });
+            lines.Add(QLine.Add(id, "process", new JobDescriptor { Stage = "process", JobId = id, Priority = pri, AddedAt = at }, at, pri, null, "done"));
+            lines.Add(new QLine { T = "fixsteps", S = id, Stage = "process", Done = done, At = at });
+            imported++;
+        }
+        int appends = 0;
+        if (outLocal != null) File.WriteAllLines(outLocal, lines.Select(l => l.ToJson()));
+        else if (!dry)
+            foreach (var chunk in JobQueue.Chunks(lines, l => l.ToJson().Length))
+            {
+                if (pacer != null) await pacer.WaitAsync(ct);
+                await q.AppendLinesAsync(st => chunk.Where(l => l.T switch { "add" => st.Entry(l.S, "process") == null, "fixsteps" => st.Entry(l.S, "process") is { State: "done" } pe && pe.StepsDone == null, "enter" => st.Get(l.S)?.Data == null, _ => true }).ToList(), ct); appends++;
+            }
+        return new ProcessImportReport(subjects, noProc, imported, partial, notFull, claimed, appends);
+    }
+
     /// <summary>queue split [--dry-run] [--out-local DIR | --from-local DIR] [--work-max N]: --out-local writes the plan (three snapshots) to DIR for inspection and changes nothing in the store; --from-local applies that folder to the store. Without either, plans in memory (--dry-run) or plans and applies in one go.</summary>
     static async Task<int> SplitAsync(Args a, IStore store, Paths paths, bool dry, CancellationToken ct)
     {
@@ -56,11 +92,38 @@ public static class QueueCommand
         Console.WriteLine(ap.Message + $"; store ops {StoreMeter.Current.Total - ops0}"); return ap.Written > 0 ? 0 : 1;
     }
 
+    /// <summary>0.13.32 queue whatif --stage S [--set k=v]... [--top N] [--ids]: read-only readiness check with in-memory control overrides (see <see cref="WhatIf"/>).</summary>
+    static async Task<int> WhatIfAsync(Args a, IStore store, Paths paths, CancellationToken ct)
+    {
+        var stage = a.Get("stage") ?? throw new ArgumentException("queue whatif --stage <stage or step> [--set versions.cast=2] [--set stage.actors=run] [--top N] [--ids]");
+        int top = a.Get("top") is { } t ? int.Parse(t) : 20; long ops0 = StoreMeter.Current.Total;
+        var q = await JobQueue.OpenAsync(store, paths, "whatif", a.Has("download"), ct);
+        var ctl = WhatIf.Apply(ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data), a.Multi.GetValueOrDefault("set") ?? []);
+        var liveLeases = new HashSet<string>(StringComparer.Ordinal);   // a claim counts only while its active file holds a live lease (or is brand new): a node that stopped leaves the file behind and the lease lapses
+        foreach (var b in await store.ListAsync(paths.ActiveDir, false, false, ct)) if (b.LeaseState == "leased" || b.Created is { } cr && DateTimeOffset.UtcNow - cr < JobQueue.NewActiveGrace) liveLeases.Add(Path.GetFileNameWithoutExtension(b.Name));
+        var rep = q.Read(st => WhatIf.Run(st, stage, ctl, Protocol.Utc(DateTimeOffset.UtcNow), new ReadyOptions(), top, liveLeases.Contains));
+        Console.WriteLine($"whatif {rep.Stage} (read-only; overrides: {(a.Multi.GetValueOrDefault("set") is { Count: > 0 } sets ? string.Join(", ", sets) : "none")}): {rep.Ready} of {rep.Total} subject(s) would be READY now");
+        foreach (var n in rep.Notes) Console.WriteLine("  " + n);
+        if (rep.Ready > 0) Console.WriteLine($"  first {rep.First.Count}: " + (a.Has("ids") ? string.Join(", ", rep.First) : $"{rep.First.Count} shown (add --ids to list them)"));
+        Console.WriteLine($"  not ready: {rep.Total - rep.Ready}");
+        foreach (var (why, n) in rep.Blockers) Console.WriteLine($"    {n,7}  {why}");
+        Console.WriteLine($"store ops {StoreMeter.Current.Total - ops0}");
+        return 0;
+    }
+
     public static async Task<int> RunAsync(Args a, IStore? remote = null)
     {
         var (_, store, paths, _) = CentersCommands.OpenStore(a, remote);
         bool dry = a.Has("dry-run"); using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         if (a.Positional.FirstOrDefault() == "split") return await SplitAsync(a, store, paths, dry, cts.Token);
+        if (a.Positional.FirstOrDefault() == "whatif") return await WhatIfAsync(a, store, paths, cts.Token);
+        if (a.Positional.FirstOrDefault() == "import-done" && a.Positional.Skip(1).FirstOrDefault() == "process")
+        {
+            await JobQueue.RequireSnapshotAsync(store, paths, cts.Token); var pq = new JobQueue(store, paths, "cli"); await pq.LoadAsync(cts.Token); long pops = StoreMeter.Current.Total;
+            var pr = await ImportDoneProcessAsync(pq, store, paths, dry, cts.Token, new OpPacer(() => StoreMeter.Current.Total, () => StoreMeter.Current.Limits.MaxPerMin), a.Get("out-local"));
+            Console.WriteLine($"{(dry || a.Get("out-local") != null ? "dry run, nothing written: " : "")}{pr.Subjects} subjects, {pr.NoProcess} without a process entry: {pr.Imported} {(dry ? "would be " : "")}imported as processed (done process, data full), {pr.Partial} lack one of cast/centers/frames/sscd.zip, {pr.NotFull} not a fully downloaded upload, {pr.Claimed} claimed; {pr.Appends} append(s); store ops {StoreMeter.Current.Total - pops}");
+            return 0;
+        }
         if (a.Positional.FirstOrDefault() != "import-done" || a.Positional.Skip(1).FirstOrDefault() != "group") throw new ArgumentException("queue import-done group [--dry-run]");
         await JobQueue.RequireSnapshotAsync(store, paths, cts.Token); var q = new JobQueue(store, paths, "cli"); await q.LoadAsync(cts.Token); long ops0 = StoreMeter.Current.Total;
         var r = await ImportDoneGroupAsync(q, store, paths, dry, cts.Token, new OpPacer(() => StoreMeter.Current.Total, () => StoreMeter.Current.Limits.MaxPerMin));

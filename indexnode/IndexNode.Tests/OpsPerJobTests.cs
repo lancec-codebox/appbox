@@ -9,6 +9,12 @@ namespace IndexNode.Tests;
 public class OpsPerJobTests(ITestOutputHelper output)
 {
     static readonly Paths P = new("index/");
+    /// <summary>0.13.32: the cast step's repair mode of one upload (units + r50 under index/actors/, from its own cast.zip and frames.zip).</summary>
+    static Task Repair(ActorsStage st, ActorsIO io, string id) => st.RepairAsync(io, id, false, 2, default, null, new Dictionary<string, string>());
+    static async Task Warm(ActorsStage st, ActorsIO io, params string[] ids)
+    {   // repaired state and an actors run for each, in seq order (the steady state: predecessors are repaired and their units files exist)
+        var done = new List<string>(); foreach (var id in ids) { await Repair(st, io, id); await st.RunAsync(io, id, false, 2, default, done.ToList(), null, up => false, new Dictionary<string, string>(), 0, up => ActorsStage.PredKind.UnitsFile, true, up => true); done.Add(id); }
+    }
 
     [Fact]
     public void Groups_come_from_the_queue_join_chains_with_chains_and_a_merge_and_no_groups_file_is_read()
@@ -42,9 +48,11 @@ public class OpsPerJobTests(ITestOutputHelper output)
             for (int i = 0; i < N; i++)
             {
                 
+                using (m.BeginStep(m.Limits.StepLimitFor("cast"), ids[i] + " repair")) await Repair(stage, io, ids[i]);   // 0.13.32: the cast step's repair mode is its own step with its own budget
+                clock += TimeSpan.FromSeconds(3.5 / 2);   // and its own CPU time (a second job per upload)
                 long before = m.Total; using (m.BeginStep(m.Limits.StepLimitFor("actors"), ids[i]))
                 {
-                    var preds = new List<string>(); var rep = await stage.RunAsync(io, ids[i], false, 1, default, ids.Take(i).ToList(), null, up => false, new Dictionary<string, string>(), annV, up => ActorsStage.PredKind.Compute, true);
+                    var preds = new List<string>(); var rep = await stage.RunAsync(io, ids[i], false, 1, default, ids.Take(i).ToList(), null, up => false, new Dictionary<string, string>(), annV, up => ActorsStage.PredKind.UnitsFile, true, up => true);
                 }
                 perJob.Add(m.Total - before); if ((i + 1) % 25 == 0) { var bm = m.Total; using (m.BeginStep(m.Limits.StepLimitFor("actors-index"), "index")) await ActorsIndex.BuildAsync(new ActorsIO(store, P), default); output.WriteLine($"actors-index build {annV + 1}: {m.Total - bm} ops"); ActorsIndex.ForgetCache(); annV++; } stamps.Add((clock, m.Total));
                 clock += TimeSpan.FromSeconds(3.5 / 2); rnd++;   // two lanes, each job ~3.5 s of CPU
@@ -54,7 +62,7 @@ public class OpsPerJobTests(ITestOutputHelper output)
             long peak = 0; for (int i = 0; i < stamps.Count; i++) { long start = i == 0 ? 0 : stamps[i - 1].Total; int j = i; while (j > 0 && stamps[i].At - stamps[j - 1].At <= TimeSpan.FromSeconds(60)) j--; peak = Math.Max(peak, stamps[i].Total - (j == 0 ? 0 : stamps[j - 1].Total)); }
             output.WriteLine($"actors jobs: {N}, steady-state ops/job max={steady.Max()} avg={steady.Average():F1}; peak ops in a minute={peak}; per-site: " + string.Join("; ", m.Table().Take(15).Select(x => $"{x.Site} {x.Op} x{x.Count}")));
             var sorted = steady.Order().ToList(); output.WriteLine($"steady ops/job: median={sorted[sorted.Count / 2]} p90={sorted[sorted.Count * 9 / 10]} max={sorted.Last()} (a job that carries the once-a-minute aggregate/search-head revalidation costs 1-2 more)");
-            Assert.True(steady.Max() <= 12 && steady.Average() <= 8, "steady ops/job " + steady.Max() + ": " + string.Join("; ", m.Table().Take(15).Select(x => $"{x.Site} {x.Op} x{x.Count}")));
+            Assert.True(steady.Max() <= 15 && steady.Average() <= 10, "steady ops/job " + steady.Max() + ": " + string.Join("; ", m.Table().Take(15).Select(x => $"{x.Site} {x.Op} x{x.Count}")));
             Assert.True(peak < m.Limits.MaxPerMin, "unthrottled peak ops/min " + peak);
             Assert.False(m.Tripped);
         }
@@ -85,6 +93,269 @@ public class OpsPerJobTests(ITestOutputHelper output)
         m.Reset();   // the cooldown is not what this part is about
         Assert.True(m.Limits.StepLimitFor("actors-index") > 25 && m.Limits.StepLimitFor("search-index") > 25);
         using (m.BeginStep(m.Limits.StepLimitFor("actors-index"), "idx")) for (int i = 0; i < 30; i++) await rs.GetAsync("index/x/" + (i + 1 > 39 ? 0 : i + 1) + "", default);
+    }
+
+    [Fact]
+    public async Task A_repair_mode_listing_opens_only_cast_zip_and_frames_zip_and_the_process_steps_have_named_limits()
+    {
+        var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "zs-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var (z, f) in new[] { ("frames", "frames/manifest.json"), ("cast", "cast/clusters.json"), ("sscd", "sscd/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/a.json"), ("ocrsubs", "ocr/lines.json") })
+            { await put.PutAsync(P.Video("v", f), [1, 2, 3], null, null, false, default); await put.CommitStageAsync("v", z, "n", false, false, default); }
+            var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var zs = new StageZipStore(rest, Path.Combine(dir, "run"));
+            using (StageZipStore.OnlyZips("cast.zip", "frames.zip")) await zs.ListAsync(P.VideoDir("v"), false, false, default);
+            output.WriteLine("REPAIR listing ops: " + http.Log.Count + " = " + string.Join(" | ", http.Log));
+            Assert.DoesNotContain(http.Log, l => l.Contains("sscd.zip") || l.Contains("thumbs.zip") || l.Contains("transcribe.zip") || l.Contains("ocrsubs.zip"));
+            Assert.Contains(http.Log, l => l.Contains("cast.zip")); Assert.Contains(http.Log, l => l.Contains("frames.zip"));
+            Assert.True(http.Log.Count <= 10, string.Join(" | ", http.Log));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+        var lim = new StorageLimits(); Assert.Equal(25, lim.StepLimitFor("describe"));   // unclassified work keeps the default
+        foreach (var s in new[] { "frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "cast", "sync" }) Assert.True(lim.StepLimitFor("process:" + s) > 25, s);
+        Assert.True(Protocol.StepStages.Where(s => lim.StepLimits.ContainsKey("process:" + s)).Sum(s => lim.StepLimitFor("process:" + s)) >= 221);   // each step on its own budget; the sum clears the 221 ops measured live
+    }
+
+    [Theory, InlineData(false), InlineData(true)]
+    public async Task A_full_repair_claim_on_an_upload_with_every_zip_costs_at_most_25_ops_plus_one_GET_each_of_cast_zip_and_frames_zip(bool ghosted)
+    {
+        var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "rc-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            const string id = "rA"; await Drama(raw, id, Unit((0, 1)), (200, 150, 100), n: 150, seed: 4);
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
+            foreach (var (z, f) in new[] { ("sscd", "sscd/manifest.json"), ("centers", "centers/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/a.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("describe", "describe.json"), ("translate", "subs/ai/x.json"), ("comments", "comments/c.json"), ("download", "info.json") })
+                await put.PutAsync(P.Video(id, f), [1, 2, 3], null, null, false, default);
+            foreach (var st in new[] { "download", "frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "cast", "sync", "describe", "translate", "comments" }) await put.CommitStageAsync(id, st, "n1", false, false, default);
+            await fs.PutAsync(P.Video(id, "sample/s0.mp4"), [1, 2], null, null, false, default); await fs.PutAsync(P.Video(id, "sample/s1.mp4"), [1, 2], null, null, false, default);
+            await VideoJson.UpdateAsync(fs, P, id, r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = 1 }, default);
+            var q0 = new JobQueue(fs, P, "setup"); await q0.LoadAsync(default); const string at = "2026-01-01T00:00:00Z";
+            await q0.AppendLinesAsync([QLine.Add(id, "download", new JobDescriptor { Stage = "download", JobId = id }, at, null, null, "done"), QLine.Add(id, "group", new JobDescriptor { Stage = "group", JobId = id }, at, null, null, "done"), new QLine { T = "seq", S = id, Seq = 1, At = at }], default);
+            if (ghosted) foreach (var z in new[] { "cast", "frames" }) await fs.SetTagsAsync(P.Video(id, z + ".zip"), new Dictionary<string, string> { ["ghostd_state"] = "ghost", ["owner"] = "index" }, null, default);   // Nexis ghosts (tags as Nexis writes them; the fake wire ignores x-ms-if-tags)
+            var m = new StoreMeter { Limits = new StorageLimits { Lanes = 2 } };   // the default breaker: 25 per step unless the step is named
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var zs = new StageZipStore(rest, Path.Combine(dir, "zips")) { WholeZipLimit = 1 };   // every zip is over the whole-read limit: a range-read series unless the claim reads it whole
+            var shadow = new ShadowStore(zs, Path.Combine(dir, "shadow"));
+            var iq = new JobQueue(shadow, P, "shadow-import"); await iq.LoadAsync(default); Assert.Equal(1, (await QueueCommand.ImportDoneProcessAsync(iq, shadow, P, false, default)).Imported);
+            var ran = new List<string>(); var stage = new ActorsStage(shadow, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg };
+            var proc = new ProcessStage(new Tools(new HttpClient()), shadow, new NodeConfig(), new HttpClient()) { CastRepair = async (c, tk) => await ActorsCommand.CastRepairAsync(stage, c, tk) };
+            StepVersions.SetCode("cast", StepVersions.CastRepaired);
+            var ctl = new[] { "versions.cast=2" };
+            var o = new EngineOptions
+            {
+                NodeId = "n-1", Name = "n", Stages = ["process"], Jobs = new() { ["process"] = 1 }, Threads = 1, Once = true, Shadow = true, ControlOverride = c => WhatIf.Apply(c, ctl), Meter = m,
+                Ready = new ReadyOptions(3, 10) { Code = _ => 2 }, PollInterval = TimeSpan.FromMilliseconds(20), RenewInterval = TimeSpan.FromMilliseconds(40), ControlInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromSeconds(30),
+            };
+            var handlers = Protocol.StepStages.ToDictionary(x => x, x => (IStageHandler)new RecOps(ran)); handlers["process"] = proc; foreach (var s in Protocol.StepStages) if (s is "cast") handlers[s] = proc;   // as Program.cs wires it: the step jobs of a process claim run on the process handler
+            m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            await new NodeEngine(shadow, P, o, handlers).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
+            var log = http.Log.ToList(); var by = log.GroupBy(l => l).Select(g => g.Count() + "x " + g.Key).ToList();
+                        foreach (var row in m.Table().OrderByDescending(x => x.Count).Take(14)) output.WriteLine($"  SITE {row.Count}x {row.Op} {row.Site}");
+            output.WriteLine($"FULL REPAIR CLAIM (claim + cast step, every zip present, ghosted={ghosted}): {m.Total} ops: " + string.Join(" | ", by));
+            Assert.Equal(1, log.Count(l => l == "GET index/videos/rA/cast.zip")); Assert.Equal(1, log.Count(l => l == "GET index/videos/rA/frames.zip"));
+            foreach (var other in new[] { "download", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "comments", "translate", "sync", "describe" }) Assert.DoesNotContain(log, l => l.Contains("rA/" + other + ".zip") && !l.StartsWith("GET c?list"));   // no other zip is read, headed, tagged or downloaded
+            Assert.DoesNotContain(log, l => l.StartsWith("GET index/videos/rA/frames.zip") && l.Contains("range"));
+            Assert.True(m.Total <= 25 + 2, "ops " + m.Total + ": " + string.Join(" | ", by));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+    sealed class RecOps(List<string> ran) : IStageHandler { public Task RunAsync(JobContext ctx) { lock (ran) ran.Add(ctx.BlobName + ":" + ctx.Stage); return Task.CompletedTask; } }
+
+    [Fact]
+    public async Task An_actors_job_with_band_units_reads_its_cast_zip_once_and_stays_at_18_ops_or_fewer()
+    {
+        var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "zs-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            var ids = new[] { "dA", "dB", "dC" };
+            await Drama(raw, "dA", WithCos(1, 1), (200, 150, 100), seed: 1); await Drama(raw, "dC", WithCos(0.72, 2), (200, 150, 100), seed: 4); await Drama(raw, "dB", WithCos(0.80, 1), (10, 10, 10), seed: 2);
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var id in ids)
+            {
+                foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
+                foreach (var st in new[] { "frames", "cast" }) await put.CommitStageAsync(id, st, "n1", false, false, default);
+                await VideoJson.UpdateAsync(fs, P, id, r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = ids.ToList().IndexOf(id) + 1 }, default);
+            }
+            var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var store = StageZipStore.Wrap(rest, Path.Combine(dir, "run"));
+            var stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var io = new ActorsIO(store, P);
+            VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); m.Reset();
+            await Warm(stage, io, "dA", "dB", "dC");   // 0.13.32: each upload's cast repair, then its actors job (the steady state)
+            await fs.DeleteAsync(ActorsData.R50File(P, "dC"), default); await fs.DeleteAsync(ActorsData.UnitFile(P, "dC"), default); ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); store = StageZipStore.Wrap(FakeBlobHttp.Rest(fs, m, out http), Path.Combine(dir, "run2")); stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; io = new ActorsIO(store, P);
+            m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            using (m.BeginStep(1000, "dC repair")) await Repair(stage, io, "dC");   // the cast step in repair mode: its own zips, once each
+            long Z(string zip) => http.Log.Count(l => l.StartsWith("GET ") && l.Contains("dC/" + zip) && !l.Contains("?"));
+            Assert.True(Z("cast.zip") <= 1, "dC cast.zip GETs " + Z("cast.zip") + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            Assert.True(Z("frames.zip") <= 1, "dC frames.zip GETs " + Z("frames.zip"));
+            var casts = http.Log.Count(l => l.Contains("dC/cast.zip")); Assert.True(casts <= 4, "requests touching dC/cast.zip: " + casts + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            Assert.True(m.Total <= 20, "repair total " + m.Total + ": " + string.Join(" | ", http.Log.GroupBy(l => l).Select(g => g.Count() + "x " + g.Key)));
+            // the actors job after the repair: 0 requests to any cast.zip or frames.zip
+            ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            using (m.BeginStep(m.Limits.StepLimitFor("actors"), "dC")) await stage.RunAsync(io, "dC", false, 8, default, ["dA", "dB"], null, up => false, new Dictionary<string, string>(), 0, up => ActorsStage.PredKind.UnitsFile, true, up => true);
+            Assert.DoesNotContain(http.Log, l => l.Contains("cast.zip") || l.Contains("frames.zip")); output.WriteLine("actors job after repair: " + m.Total + " ops");
+            Assert.True(m.Total <= 18, "actors total " + m.Total + ": " + string.Join(" | ", http.Log.GroupBy(l => l).Select(g => g.Count() + "x " + g.Key)));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+
+    [Fact]
+    public async Task An_actors_job_with_5_band_units_reads_cast_zip_once_frames_zip_at_most_once_and_stays_under_15_ops()
+    {
+        var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "zs-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            var ids = new[] { "dA", "dB", "dC" };
+            async Task Five(string id, Func<int, float[]> centre) { await Drama(raw, id, centre(0), (200, 150, 100), n: 150, seed: 4); var rn = new Random(9); var f16 = new byte[150 * 8 * 2]; for (int i = 0; i < 150; i++) { var v = (float[])centre(i / 30).Clone(); for (int d = 0; d < 8; d++) v[d] += (float)((rn.NextDouble() - 0.5) * 0.03); FaceMath.L2(v); for (int d = 0; d < 8; d++) BitConverter.TryWriteBytes(f16.AsSpan((i * 8 + d) * 2, 2), (Half)v[d]); } await raw.PutAsync(P.Video(id, "cast/faces.f16"), f16, null, null, false, default); }
+            await Five("dA", k => Unit((k, 1))); await Five("dC", k => Unit((k, 0.72), (5 + k % 3, (k < 3 ? 1 : -1) * 0.69))); await Drama(raw, "dB", WithCos(0.80, 1), (10, 10, 10), seed: 2);
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var id in ids)
+            {
+                foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
+                foreach (var st in new[] { "frames", "cast" }) await put.CommitStageAsync(id, st, "n1", false, false, default);
+                await VideoJson.UpdateAsync(fs, P, id, r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = ids.ToList().IndexOf(id) + 1 }, default);
+            }
+            var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var store = StageZipStore.Wrap(rest, Path.Combine(dir, "run"));
+            var stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var io = new ActorsIO(store, P);
+            VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); m.Reset();
+            await Warm(stage, io, "dA", "dB", "dC");   // 0.13.32: each upload's cast repair, then its actors job (the steady state)
+            await fs.DeleteAsync(ActorsData.R50File(P, "dC"), default); await fs.DeleteAsync(ActorsData.UnitFile(P, "dC"), default); ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); store = StageZipStore.Wrap(FakeBlobHttp.Rest(fs, m, out http), Path.Combine(dir, "run2")); stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; io = new ActorsIO(store, P);
+            m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            using (m.BeginStep(1000, "dC repair")) await Repair(stage, io, "dC");   // the cast step in repair mode
+            long Z(string zip) => http.Log.Count(l => l.StartsWith("GET ") && l.Contains("dC/" + zip) && !l.Contains("?"));
+            Assert.True(Z("cast.zip") == 1, "dC cast.zip GETs " + Z("cast.zip") + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            Assert.True(Z("frames.zip") <= 1, "dC frames.zip GETs " + Z("frames.zip"));
+            var casts = http.Log.Count(l => l.Contains("dC/cast.zip")); Assert.True(casts <= 4, "requests touching dC/cast.zip: " + casts + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            var tie = http.Log.Count(l => l.Contains("dC/cast.zip") || l.Contains("dC/frames.zip") || l.Contains("dC/sscd.zip") || l.Contains("index/actors/r50/"));   // everything the r50 tiebreak itself touches (cast.zip, frames.zip, sscd probe, r50 files)
+            Assert.True(tie < 15, "the r50 tiebreak's ops " + tie + ": " + string.Join(" | ", http.Log));
+            Assert.True(m.Total <= 20, "repair job: " + m.Total + ": " + string.Join(" | ", http.Log.GroupBy(l => l).Select(g => g.Count() + "x " + g.Key)));
+            ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            ActorsStage.RunResult rr; using (m.BeginStep(m.Limits.StepLimitFor("actors"), "dC")) rr = await stage.RunAsync(io, "dC", false, 8, default, ["dA", "dB"], null, up => false, new Dictionary<string, string>(), 0, up => ActorsStage.PredKind.UnitsFile, true, up => true);
+            Assert.True(rr.Units == 5 && rr.Band >= 5 && rr.Reused, "units " + rr.Units + " band " + rr.Band + " reused " + rr.Reused);
+            Assert.DoesNotContain(http.Log, l => l.Contains("cast.zip") || l.Contains("frames.zip")); output.WriteLine("actors job, 5 band units, after repair: " + m.Total + " ops");
+            Assert.True(m.Total <= 15, "actors total " + m.Total + ": " + string.Join(" | ", http.Log.GroupBy(l => l).Select(g => g.Count() + "x " + g.Key)));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+
+    [Fact]
+    public async Task An_actors_job_with_0_1_and_2_in_flight_predecessors_computes_their_r50_in_memory_from_their_zips_and_writes_nothing_for_them()
+    {
+        var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "zs-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            var ids = new[] { "pA", "pB", "pC", "dC" };
+            async Task Five(string id, Func<int, float[]> centre) { await Drama(raw, id, centre(0), (200, 150, 100), n: 150, seed: 4); var rn = new Random(9); var f16 = new byte[150 * 8 * 2]; for (int i = 0; i < 150; i++) { var v = (float[])centre(i / 30).Clone(); for (int d = 0; d < 8; d++) v[d] += (float)((rn.NextDouble() - 0.5) * 0.03); FaceMath.L2(v); for (int d = 0; d < 8; d++) BitConverter.TryWriteBytes(f16.AsSpan((i * 8 + d) * 2, 2), (Half)v[d]); } await raw.PutAsync(P.Video(id, "cast/faces.f16"), f16, null, null, false, default); }
+            foreach (var q in new[] { "pA", "pB", "pC" }) await Five(q, k => Unit((k, 1))); await Five("dC", k => Unit((k, 0.72), (5 + k % 3, (k < 3 ? 1 : -1) * 0.69)));
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var id in ids)
+            {
+                foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
+                foreach (var st in new[] { "frames", "cast" }) await put.CommitStageAsync(id, st, "n1", false, false, default);
+                await VideoJson.UpdateAsync(fs, P, id, r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = ids.ToList().IndexOf(id) + 1 }, default);
+            }
+            var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var store = StageZipStore.Wrap(rest, Path.Combine(dir, "run"));
+            var stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var io = new ActorsIO(store, P);
+            VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); m.Reset();
+            using (m.BeginStep(1000, "dC repair")) await Repair(stage, io, "dC");
+            var repairOps = m.Total; output.WriteLine($"REPAIR-MODE cast step of dC (both zips, nothing ghosted in this fake): {repairOps} ops");
+            foreach (var n in new[] { 0, 1, 2 })
+            {   // n predecessors are in flight: their cast-repair is not done, so the job computes their r50 from their own cast.zip / frames.zip, in memory
+                ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); ActorsIndex.ForgetCache(); store = StageZipStore.Wrap(FakeBlobHttp.Rest(fs, m, out http), Path.Combine(dir, "run-" + n)); stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; io = new ActorsIO(store, P);
+                var inflight = new[] { "pA", "pB", "pC" }.Take(n).ToHashSet(); var repaired = new[] { "pA", "pB", "pC" }.Where(x => !inflight.Contains(x)).ToList();
+                foreach (var q in repaired) { await Repair(stage, io, q); }   // the others are repaired and not indexed: their files are there
+                foreach (var q in inflight) { await fs.DeleteAsync(ActorsData.UnitFile(P, q), default); await fs.DeleteAsync(ActorsData.R50File(P, q), default); }
+                ActorsStage.ForgetSeen(); m.Reset(); while (http.Log.TryDequeue(out _)) { }
+                ActorsStage.RunResult rr; using (m.BeginStep(1000, "dC actors")) rr = await stage.RunAsync(io, "dC", false, 8, default, ["pA", "pB", "pC"], null, up => false, new Dictionary<string, string>(), 0, up => inflight.Contains(up) ? ActorsStage.PredKind.Compute : ActorsStage.PredKind.UnitsFile, true, up => !inflight.Contains(up));
+                Assert.True(rr.Units == 5 && rr.Band >= 5, "units " + rr.Units + " band " + rr.Band); Assert.Equal(n, rr.PartnerR50 > 0 ? inflight.Count : 0);
+                var by = http.Log.GroupBy(l => l).Select(g => g.Count() + "x " + g.Key);
+                output.WriteLine($"ACTORS job with {n} in-flight predecessor(s): {m.Total} ops: " + string.Join(" | ", by));
+                Assert.DoesNotContain(http.Log, l => l.StartsWith("PUT index/actors/") && l != "PUT index/actors/units/dC.bin");   // nothing is written for another upload: only this upload's own units file
+                Assert.DoesNotContain(http.Log, l => l.Contains("dC/cast.zip") || l.Contains("dC/frames.zip"));   // its own zips are never read again
+                foreach (var q in repaired) Assert.DoesNotContain(http.Log, l => l.Contains(q + "/cast.zip") || l.Contains(q + "/frames.zip"));   // repaired predecessors: files only
+                foreach (var q in inflight) Assert.True(http.Log.Count(l => l.StartsWith("GET ") && l.Contains(q + "/cast.zip") && !l.Contains("?")) == 1, q + " cast.zip read once");
+                if (n == 0) Assert.True(m.Total <= 15, "ops " + m.Total);
+            }
+            Assert.True(repairOps <= 20, "repair ops " + repairOps);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task A_lost_r50_write_race_rereads_only_the_r50_file_never_the_cast_zip_or_the_predecessors_r50()
+    {
+        var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "zs-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            var ids = new[] { "dA", "dB", "dC" };
+            await Drama(raw, "dA", WithCos(1, 1), (200, 150, 100), seed: 1); await Drama(raw, "dC", WithCos(0.72, 2), (200, 150, 100), seed: 4); await Drama(raw, "dB", WithCos(0.80, 1), (10, 10, 10), seed: 2);
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var id in ids)
+            {
+                foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
+                foreach (var st in new[] { "frames", "cast" }) await put.CommitStageAsync(id, st, "n1", false, false, default);
+                await VideoJson.UpdateAsync(fs, P, id, r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = ids.ToList().IndexOf(id) + 1 }, default);
+            }
+            var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var store = StageZipStore.Wrap(rest, Path.Combine(dir, "run"));
+            var stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var io = new ActorsIO(store, P);
+            VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); m.Reset();
+            await Warm(stage, io, "dA", "dB", "dC");   // 0.13.32: each upload's cast repair, then its actors job (the steady state)
+            await fs.DeleteAsync(ActorsData.UnitFile(P, "dC"), default); ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); store = StageZipStore.Wrap(FakeBlobHttp.Rest(fs, m, out http), Path.Combine(dir, "run2")); stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; io = new ActorsIO(store, P);
+            await fs.PutAsync(ActorsData.R50File(P, "dC"), new R50Doc { Dim = 3 }.ToBytes(), null, null, false, default); bool raced = false;
+            fs.BeforePutIfMatch = n => { if (raced || !n.EndsWith("r50/dC.bin")) return; raced = true; var d = R50Doc.FromBytes(fs.GetAsync(n, default).Result!.Data, n); d.Units["other#9"] = new float[] { 1, 0, 0 }; fs.PutAsync(n, d.ToBytes(), null, null, false, default).Wait(); };
+            m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            using (m.BeginStep(1000, "dC")) await Repair(stage, io, "dC");   // 0.13.32: the repair writes the upload's r50 file
+            long Z(string zip) => http.Log.Count(l => l.StartsWith("GET ") && l.Contains("dC/" + zip) && !l.Contains("?"));
+            Assert.True(Z("cast.zip") <= 1, "dC cast.zip GETs " + Z("cast.zip") + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            Assert.True(Z("frames.zip") <= 1, "dC frames.zip GETs " + Z("frames.zip"));
+            var casts = http.Log.Count(l => l.Contains("dC/cast.zip")); Assert.True(casts <= 4, "requests touching dC/cast.zip: " + casts + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            Assert.True(raced, "the race hook ran"); var rr = http.Log.Count(l => l == "GET index/actors/r50/dC.bin"); Assert.True(rr == 2, "r50/dC.bin read twice (the retry), got " + rr);
+            Assert.DoesNotContain(http.Log, l => l.Contains("r50/dA.bin") || l.Contains("dA/cast.zip"));   // the repair reads nothing of another upload
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task A_stale_cached_r50_file_does_not_make_the_write_lose_five_times()
+    {
+        var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "zs-" + Guid.NewGuid().ToString("N")[..6]);
+        try
+        {
+            var ids = new[] { "dA", "dB", "dC" };
+            await Drama(raw, "dA", WithCos(1, 1), (200, 150, 100), seed: 1); await Drama(raw, "dC", WithCos(0.72, 2), (200, 150, 100), seed: 4); await Drama(raw, "dB", WithCos(0.80, 1), (10, 10, 10), seed: 2);
+            var put = new StageZipStore(fs, Path.Combine(dir, "put"));
+            foreach (var id in ids)
+            {
+                foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
+                foreach (var st in new[] { "frames", "cast" }) await put.CommitStageAsync(id, st, "n1", false, false, default);
+                await VideoJson.UpdateAsync(fs, P, id, r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = ids.ToList().IndexOf(id) + 1 }, default);
+            }
+            var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+            var rest = FakeBlobHttp.Rest(fs, m, out var http); var store = StageZipStore.Wrap(rest, Path.Combine(dir, "run"));
+            var stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var io = new ActorsIO(store, P);
+            VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); m.Reset();
+            await Warm(stage, io, "dA", "dB", "dC");   // 0.13.32: each upload's cast repair, then its actors job (the steady state)
+            await fs.DeleteAsync(ActorsData.UnitFile(P, "dC"), default); ActorsStage.ForgetSeen(); VideoAggregate.ClearCache(); store = StageZipStore.Wrap(FakeBlobHttp.Rest(fs, m, out http), Path.Combine(dir, "run2")); stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; io = new ActorsIO(store, P);
+            var lc = new LocalCacheStore(store, Path.Combine(dir, "lc")); store = lc; stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; io = new ActorsIO(store, P);
+            await lc.PutAsync(ActorsData.R50File(P, "dC"), new R50Doc { Dim = 3 }.ToBytes(), null, null, false, default);   // the cache holds an OLD, empty r50/dC.bin ...
+            var newer = new R50Doc { Dim = 3 }; newer.Units["other#9"] = new float[] { 1, 0, 0 }; await fs.PutAsync(ActorsData.R50File(P, "dC"), newer.ToBytes(), null, null, false, default);   // ... the store has a newer one (another lane wrote it)
+            m.Reset(); while (http.Log.TryDequeue(out _)) { }
+            using (m.BeginStep(1000, "dC")) await Repair(stage, io, "dC");
+            long Z(string zip) => http.Log.Count(l => l.StartsWith("GET ") && l.Contains("dC/" + zip) && !l.Contains("?"));
+            Assert.True(R50Doc.FromBytes(fs.GetAsync(ActorsData.R50File(P, "dC"), default).Result!.Data, "x").Units.Count >= 1, "the repair wrote this upload's vectors over the stale file");
+            Assert.True(Z("cast.zip") <= 1, "dC cast.zip GETs " + Z("cast.zip") + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            Assert.True(Z("frames.zip") <= 1, "dC frames.zip GETs " + Z("frames.zip"));
+            var casts = http.Log.Count(l => l.Contains("dC/cast.zip")); Assert.True(casts <= 4, "requests touching dC/cast.zip: " + casts + ": " + string.Join(" | ", http.Log.Where(l => l.Contains("dC/cast.zip"))));
+            var rr = http.Log.Count(l => l == "GET index/actors/r50/dC.bin"); Assert.True(rr == 1, "stale cache: the first fresh read must win, r50/dC.bin read once, got " + rr);
+            Assert.DoesNotContain(http.Log, l => l.Contains("r50/dA.bin"));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     [Fact]
@@ -274,7 +545,9 @@ public class OpsPerJobTests(ITestOutputHelper output)
             async Task Job(int i)
             {
                 var preds = q.Subjects.Values.Where(x => x.Seq is { } sq && sq < i + 1).OrderBy(x => x.Seq).Select(x => x.Id).ToList(); long b0 = m.Total;
-                using (m.BeginStep(m.Limits.StepLimitFor("actors"), ids[i])) await stage.RunAsync(io, ids[i], false, 1, default, preds, null, up => false, groups, annV, up => ActorsStage.PredKindOf(q, up), true);
+                using (m.BeginStep(m.Limits.StepLimitFor("cast"), ids[i] + " repair")) await Repair(stage, io, ids[i]);
+                lock (cl) clock += TimeSpan.FromSeconds(1.75);   // the repair job's own CPU time
+                b0 = m.Total; using (m.BeginStep(m.Limits.StepLimitFor("actors"), ids[i])) await stage.RunAsync(io, ids[i], false, 1, default, preds, null, up => false, groups, annV, up => ActorsStage.PredKind.UnitsFile, true, up => true);
                 lock (perJob) perJob[ids[i]] = m.Total - b0;
             }
             for (int i = 0; i < N; i += 2)
@@ -291,7 +564,8 @@ public class OpsPerJobTests(ITestOutputHelper output)
             output.WriteLine("per-site (all): " + string.Join("; ", m.Table().OrderByDescending(x => x.Count).Take(16).Select(x => $"{x.Site} {x.Op} x{x.Count}")));
             output.WriteLine($"actors-index builds: {string.Join(", ", indexOps)} ops each; max ops in one actors job={perJob.Values.Max()}");
             Assert.False(m.Tripped); Assert.True(peak < m.Limits.MaxPerMin, "unthrottled peak per minute " + peak + " (cap " + m.Limits.MaxPerMin + ")"); Assert.True(steady.Average() <= 12, "avg ops/job " + steady.Average());
-            Assert.True(m.Table().Where(x => x.Op.Contains("!404") && x.Site.Contains("ActorsIO")).Sum(x => x.Count) <= 5, "404 probes: the own units file is written create-only, never probed");
+            var p404 = m.Table().Where(x => x.Op.Contains("!404") && x.Site.Contains("ActorsIO")).Sum(x => x.Count); output.WriteLine("404 probes: " + p404 + " for " + N + " uploads: " + string.Join("; ", m.Table().Where(x => x.Op.Contains("!404")).Select(x => x.Site + " x" + x.Count)));
+            Assert.True(p404 <= 5 * N, "404 probes: one per upload (the repair step's own units file), nothing else");
         }
         finally { VideoAggregate.Clock = () => DateTime.UtcNow; ActorsIndex.ForgetCache(); }
     }

@@ -9,7 +9,9 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow" };
+    /// <summary>0.13.32: every value of a repeated option (--set a=1 --set b=2).</summary>
+    public Dictionary<string, List<string>> Multi { get; } = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "ids", "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -26,7 +28,7 @@ public sealed class Args
                 var eq = key.IndexOf('=');
                 if (eq >= 0) { val = key[(eq + 1)..]; key = key[..eq]; }
                 else if (!Flags.Contains(key) && q.Count > 0) val = q.Dequeue();
-                a.Options[key] = val ?? "true";
+                a.Options[key] = val ?? "true"; (a.Multi.TryGetValue(key, out var ml) ? ml : a.Multi[key] = []).Add(val ?? "true");
             }
             else a.Positional.Add(t);
         }
@@ -41,7 +43,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--shadow --out-local <dir>] [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--shadow --out-local <dir> [--set versions.cast=2]... [--with-import process,group]] [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode cast recluster <id>|--ids <file> [--merge-at D] [--split [--split-sim S] [--split-min N]] [--threshold T] [--min-faces N] [--local <root>] [--out-local <dir>]   (0.13.23: re-clusters a drama's stored faces (cast.zip), read-only; old against new groups, merges with distances, proposed splits)
         indexnode cast reembed <id>|--ids <file> --rec w600k_mbf|w600k_r50|glintr100 [--rec-path <file.onnx>] [--decoder libjpeg|ffmpeg] [--fp32] [--out-local <dir>] [--threads N] [--local <root>]   (0.13.23, a dev tool; --fp32 also writes faces_<model>.f32, unrounded: re-embeds a drama's stored faces from the stored frames and landmarks with another recognizer; writes faces_<model>.f16 + json locally, read-only on the store)
@@ -96,6 +98,8 @@ public static class Program
         indexnode classify requeue --source <id>   (sets the source's pending downloads back to unclassified)
         indexnode control run|drain|stop [--stage download|process|comments] [--message M] [--max-per-ip N|off] [gpu-hold <30m|off>]
         indexnode control gpu-hold <duration like 30m>|off
+        indexnode control version <cast|actors> <n>|off   (0.13.32: the version a step must have finished at; raising it makes every done upload's step ready again in its repair mode, in seq order)
+        indexnode queue whatif --stage <stage or step> [--set versions.cast=2] [--set stage.actors=run] [--top N] [--ids]   (0.13.32: read-only: what would be ready, and the blockers)
         indexnode control ai-dramas on|off
         indexnode region [--stages a,b]   (0.13.17: read-only: what this machine detects (IMDS, placement, env), control.json's region, and whether a node here could run the region-only stages)
         indexnode control region <name like westus2>|off   (0.13.17: check, process and its steps, group and search-index run only on nodes in this Azure region; run --allow-out-of-region for a one-item test)
@@ -211,7 +215,7 @@ public static class Commands
         var http = NewHttp();
         IStore rest = new RestStore(http, cfg.Sas);
         if (a.Has("shadow")) { var od = a.Get("out-local") ?? throw new ArgumentException("--shadow needs --out-local <dir>: the run reads the real store and writes only there"); rest = Shadow = new ShadowStore(rest, od); Console.Error.WriteLine($"indexnode: SHADOW run: reads the real store, writes nothing to it; every write goes under {od}"); }
-        return (cfg, StageZipStore.Wrap(rest), new Paths(a.Get("prefix") ?? "index/"), http);
+        return (cfg, StageZipStore.Wrap(rest, Shadow != null ? Path.Combine(Shadow.Dir, "zips") : null), new Paths(a.Get("prefix") ?? "index/"), http);
     }
 
     public static string VersionString => typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
@@ -281,7 +285,13 @@ public static class Commands
             ["actors-index"] = new ActorsIndexStage(store),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
-        if (childProbe != null) handlers["actors"] = ActorsCommand.NewStage(store, http, a, false, null, childProbe);   // no probe: no handler, so the node never claims actors
+        if (childProbe != null)
+        {
+            var actorsStage = ActorsCommand.NewStage(store, http, a, false, null, childProbe); handlers["actors"] = actorsStage;
+            // 0.13.32: this node can make the repaired cast state (it has the r50 model and the child probe): the cast step's repair mode, and the actors job that reads it
+            ((ProcessStage)handlers["process"]).CastRepair = async (c, t) => await ActorsCommand.CastRepairAsync(actorsStage, c, t);
+            StepVersions.SetCode("cast", StepVersions.CastRepaired); StepVersions.SetCode("actors", StepVersions.ActorsRepaired);
+        }   // no probe: no handler, so the node never claims actors
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
         var limits = BuildLimits(a, cfg, nodeId);
         var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
@@ -299,10 +309,21 @@ public static class Commands
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
-            Shadow = a.Has("shadow"), MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
+            Shadow = a.Has("shadow"), ControlOverride = a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (c => WhatIf.Apply(c, shadowSets)) : null, MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");
+        if (a.Get("with-import") is { } imports)
+        {   // 0.13.32: the lines the imports WOULD append go to the shadow overlay's queue log only (the real store is never written)
+            if (Shadow == null) { Console.Error.WriteLine("indexnode: --with-import needs --shadow"); return 2; }
+            await JobQueue.RequireSnapshotAsync(store, paths, default); var iq = new JobQueue(store, paths, "shadow-import"); await iq.LoadAsync(default);
+            foreach (var what in imports.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (what == "group") { var gr = await QueueCommand.ImportDoneGroupAsync(iq, store, paths, false, default); Console.Error.WriteLine($"indexnode: shadow import group: {gr.GroupDone} group done, {gr.Seqs} seq, {gr.Joins} join, {gr.Holds} holds (overlay only)"); }
+                else if (what == "process") { var pr = await QueueCommand.ImportDoneProcessAsync(iq, store, paths, false, default); Console.Error.WriteLine($"indexnode: shadow import process: {pr.Imported} imported, {pr.Partial} lack a zip, {pr.NotFull} not full (overlay only)"); }
+                else { Console.Error.WriteLine($"indexnode: --with-import {what}: process and group are known"); return 2; }
+            }
+        }
         var engine = new NodeEngine(store, paths, opts, handlers); engineRef = engine;
 
         using var cts = new CancellationTokenSource();
@@ -627,6 +648,13 @@ public static class Commands
             Console.WriteLine($"control: aiDramas = {(ac.AiDramasOn ? "on (AI-held dramas are claimable and resume from frames)" : "off (AI-held dramas stay pending)")}");
             return 0;
         }
+        if (level == "version")
+        {   // 0.13.32: indexnode control version <step> <n>|off
+            var vs = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control version <cast|actors> <n>|off"); var vn = a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("control version <cast|actors> <n>|off");
+            var vc = await ControlWatcher.SetVersionAsync(store, paths, vs, vn, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: versions = {(vc.Versions == null ? "none" : string.Join(", ", vc.Versions.Select(kv => kv.Key + " >= v" + kv.Value)))} (a done step below it is ready again in its repair mode; try 'indexnode queue whatif --stage {vs}' first)");
+            return 0;
+        }
         if (level == "classify")
         {
             var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control classify on|off");
@@ -715,6 +743,13 @@ public static class Commands
                 Console.WriteLine($"  {string.Join('+', s.ClaimStages ?? [])}/{s.Id}  node={s.ClaimBy} epoch={s.Epoch} since={s.ClaimAt}");
         }
 
+        {   // 0.13.32: per versioned step, how many uploads are at each version (a finished process entry: its recorded step version, v1 when none)
+            var vers = queue.Read(st => st.Subjects.Values.Where(s => s.Entries.GetValueOrDefault("process") is { State: "done" }).ToList());
+            var ctl0 = ControlFile.Parse((await store.GetAsync(paths.Control, default))?.Data);
+            foreach (var step in StepVersions.Steps) { var g = vers.GroupBy(s => s.VerOf(step)).OrderBy(x => x.Key).Select(x => $"v{x.Key}={x.Count()}"); Console.WriteLine($"Step version {step}: {string.Join("  ", g)}  (required: {(ctl0.RequiredVersion(step) is > 0 and var rq ? "v" + rq : "none")})"); }
+            var acts = queue.Read(st => st.Subjects.Values.Select(s => s.Entries.GetValueOrDefault("actors")).Where(e => e is { State: "done" }).ToList());
+            Console.WriteLine($"Stage version actors: {string.Join("  ", acts.GroupBy(e => e!.Ver ?? 1).OrderBy(x => x.Key).Select(x => $"v{x.Key}={x.Count()}"))}  (required: {(ctl0.RequiredVersion("actors") is > 0 and var ra ? "v" + ra : "none")})");
+        }
         var ctl = ControlFile.Parse((await store.GetAsync(paths.Control, default))?.Data);
         Console.WriteLine($"\nAI dramas: {(ctl.AiDramasOn ? "on" : "off")}  held (pre-check flagged AI): {queue.Read(st => st.Subjects.Values.Count(s => s.Entries.Values.Any(e => e.Hold == "ai" && !e.Final)))}");
         Console.WriteLine($"Classify: {(ctl.ClassifyOn ? "on" : "off (paused)")}");

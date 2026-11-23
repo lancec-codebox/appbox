@@ -4,6 +4,8 @@ namespace IndexNode;
 
 public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, HttpClient http) : IStageHandler
 {
+    /// <summary>0.13.32: the cast step's repair of the cast state (units + r50 under index/actors/, from the upload's own cast.zip and frames.zip); false when the upload has no grouping record yet. Set by the node when it has the r50 model and the child probe.</summary>
+    public Func<JobContext, CancellationToken, Task<bool>>? CastRepair { get; set; }
     /// <summary>This node's --gpu-fallback; it overrides control.json gpu.hold when deciding whether to write gpu-ready markers.</summary>
     public TimeSpan? GpuFlag { get; init; }
     /// <summary>Set by `run` from flag > environment > config; null or unconfigured means AI steps are skipped.</summary>
@@ -90,7 +92,10 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
         var compress = job.Compress ?? new CompressSettings();
         var watch = System.Diagnostics.Stopwatch.StartNew();
 
-        var listing = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).ToDictionary(b => b.Name, b => b.Size);
+        // 0.13.32: a repair-mode cast claim (the cast step alone, for an upload whose cast is stored) lists the folder with only cast.zip and frames.zip opened: it needs no other stage zip
+        IDisposable? only = steps.Length == 1 && steps[0] == "cast" && CastRepair != null ? StageZipStore.OnlyZips("cast.zip", "frames.zip") : null;
+        Dictionary<string, long> listing;
+        try { listing = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).ToDictionary(b => b.Name, b => b.Size); } finally { only?.Dispose(); }
         bool Has(string file) => !Redo && listing.ContainsKey(paths.Video(id, file));
         bool HasAny(string file) => listing.ContainsKey(paths.Video(id, file));
         if (Has("processed.json") && !Redo && !stepJob) return;
@@ -240,6 +245,11 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
                 }
                 await Commit("cast");
             }
+            if (steps.Contains("cast") && CastRepair != null && (need["cast"] || Has("cast/clusters.json")))
+            {   // 0.13.32: the cast step builds the repaired cast state after a fresh cast, or alone (repair mode: no detection, no video) for an upload whose cast is stored and whose recorded version is below the required one
+                ctx.Report("cast", "repair"); bool made; using (StageZipStore.OnlyZips("cast.zip", "frames.zip")) made = await CastRepair(ctx, ct);   // the repair reads these two zips whole, once, and no other ctx.StepVersion = made ? StepVersions.CastRepaired : 1;
+                if (stepJob && !need["cast"] && !Redo) { Log.Info($"process {id}: cast repair done (repair mode: no other output is touched)"); return; }   // 0.13.32: a repair claim touches cast.zip and frames.zip and its own files under index/actors/ only
+            }
             if (need["describe"])
             {
                 ctx.Report("describe", null);
@@ -276,7 +286,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             if (stepJob)
             {
                 // the node that finishes the last step writes processed.json
-                var after = (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Select(b => b.Name).ToHashSet();
+                var after = (await StageZipStore.ListRawAsync(store, paths.VideoDir(id), ct)).Select(b => b.Name).ToHashSet();
+                foreach (var o in Outputs) if (StageLayout.StageOf(o.File) is { } zz && after.Contains(paths.Video(id, zz + ".zip"))) after.Add(paths.Video(id, o.File));   // a stage zip's existence is the step's completion
                 bool aiOff = Ai is not { Configured: true };
                 if (Outputs.Any(o => !(aiOff && AiSteps.Contains(o.Step)) && !after.Contains(paths.Video(id, o.File)))) { Log.Info($"process {id}: step {job.Stage} done"); return; }
                 steps = Protocol.DefaultSteps.Concat(["cast", "sync", "describe", "translate"]).ToArray();

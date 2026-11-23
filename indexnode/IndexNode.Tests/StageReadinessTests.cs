@@ -13,7 +13,9 @@ public class StageReadinessTests
     static bool Ok(QSubject s, QEntry e) => !StageDeps.Held(e);
 
     static QLine GroupDone(string id, string at, long? seq = null) => QLine.Add(id, "group", new JobDescriptor { Stage = "group", JobId = id, AddedAt = at }, at, null, null, "done");
-    static async Task Group(JobQueue q, string id, long? seq = null) { await q.AppendLinesAsync([GroupDone(id, q.NowUtc())], default); if (seq != null) await q.AppendLinesAsync([new QLine { T = "seq", S = id, Seq = seq }], default); }
+    /// <summary>0.13.32: the cast step of the upload's process entry finished at the given version (a done line with step "cast" and sv).</summary>
+    static async Task CastAt(JobQueue q, string id, int ver) { await q.AppendLinesAsync([QLine.Add(id, "process", new JobDescriptor { Stage = "process", JobId = id }, q.NowUtc())], default); await q.AppendLinesAsync([new QLine { T = "done", S = id, Stage = "process", Step = "cast", StepVer = ver }], default); }
+    static async Task Group(JobQueue q, string id, long? seq = null, int castVer = 2) { await q.AppendLinesAsync([GroupDone(id, q.NowUtc())], default); if (seq != null) await q.AppendLinesAsync([new QLine { T = "seq", S = id, Seq = seq }], default); if (castVer > 0) await CastAt(q, id, castVer); }
     static List<string> Ready(JobQueue q, Clock c, string stage = "actors") => q.Read(st => st.Candidates(Protocol.Utc(c.T), x => true, Ok, null, Ro)).Where(x => x.Runnable.Any(e => e.Stage == stage)).Select(x => x.Subject.Id).ToList();
     static string[]? Pick(QueueState st, QSubject s, Clock c) => StageDeps.Derived.Where(d => StageDeps.ReadyEntry(st, s, d, Protocol.Utc(c.T), Ro) != null).ToArray() is { Length: > 0 } r ? r : null;
     static async Task Finish(JobQueue q, Clock c, string id)   // a claim of the ready actors stage, then its done line
@@ -91,14 +93,16 @@ public class StageReadinessTests
     {
         var (s, c) = NewStore();
         foreach (var (id, sq, ai) in new[] { ("i1", 1, false), ("i2", 2, true), ("i3", 3, false), ("i4", 4, false) }) await UpdateGrouping(s, id, sq, ai);
-        var q = await Node(s, c, "a"); await Group(q, "i4", 4);       // i4 is already in the queue with group done and its seq
+        var q = await Node(s, c, "a"); await Group(q, "i4", 4, 0);       // i4 is already in the queue with group done and its seq
         var ops0 = s.Gets.Count; var dry = await QueueCommand.ImportDoneGroupAsync(q, s, P, true, default);
         Assert.Equal(4, dry.Grouped); Assert.Equal(3, dry.GroupDone); Assert.Equal(3, dry.Seqs); Assert.Equal(1, dry.Holds); Assert.Equal(0, dry.Appends);
         Assert.Null(q.Read(st => st.Get("i1")));                       // a dry run writes nothing
         var real = await QueueCommand.ImportDoneGroupAsync(q, s, P, false, default);
         Assert.Equal(3, real.GroupDone); Assert.True(real.Appends >= 1);
         Assert.Equal("done", q.Read(st => st.Entry("i1", "group"))!.State); Assert.Equal(2, q.Read(st => st.Get("i2")!.Seq)); Assert.Equal("ai", q.Read(st => st.Entry("i2", "actors"))!.Hold);
-        Assert.Equal(["i1", "i3", "i4"], Ready(q, c).OrderBy(x => x, StringComparer.Ordinal).ToList());   // imported done groups make actors ready; the AI one is held
+        Assert.Empty(Ready(q, c));   // 0.13.32: a done group alone is not enough: actors also needs the cast step at v2
+        foreach (var id in new[] { "i1", "i3", "i4" }) await CastAt(q, id, 2);
+        Assert.Equal(["i1", "i3", "i4"], Ready(q, c).OrderBy(x => x, StringComparer.Ordinal).ToList());   // imported done groups with their cast repaired make actors ready; the AI one is held
         var again = await QueueCommand.ImportDoneGroupAsync(q, s, P, false, default);
         Assert.Equal(0, again.GroupDone); Assert.Equal(0, again.Seqs); Assert.Equal(0, again.Holds);
     }

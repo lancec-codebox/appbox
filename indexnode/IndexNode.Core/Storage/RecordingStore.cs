@@ -33,6 +33,7 @@ public sealed class RecordingStore(IStore inner) : IStore
     public async Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct)
     { await inner.PutFileAsync(name, path, contentType, progress, ct); Note(name); }
     public Task DownloadToFileAsync(string name, string path, CancellationToken ct) => inner.DownloadToFileAsync(name, path, ct);
+    public Task<BlobProps?> DownloadToFileWithPropsAsync(string name, string path, CancellationToken ct) => inner.DownloadToFileWithPropsAsync(name, path, ct);
     public Task<string?> AcquireLeaseAsync(string name, int seconds, CancellationToken ct) => inner.AcquireLeaseAsync(name, seconds, ct);
     public Task RenewLeaseAsync(string name, string leaseId, CancellationToken ct) => inner.RenewLeaseAsync(name, leaseId, ct);
     public Task ReleaseLeaseAsync(string name, string leaseId, CancellationToken ct) => inner.ReleaseLeaseAsync(name, leaseId, ct);

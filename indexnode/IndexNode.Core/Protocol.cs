@@ -417,6 +417,9 @@ public sealed class ControlFile
     public DownloadsControl? Downloads { get; set; }
     /// <summary>0.13.1: "on" lets nodes claim an AI-held drama (the pre-check flagged it AI); "off" or absent: they stay pending. Default off.</summary>
     public string? AiDramas { get; set; }
+    /// <summary>0.13.32: the version each versioned step / stage must have finished at (e.g. { "cast": 2 }); a done step below it is ready again in its repair mode. Absent: no requirement (nothing re-runs).</summary>
+    public Dictionary<string, int>? Versions { get; set; }
+    public int RequiredVersion(string step) => Versions != null && Versions.TryGetValue(step, out var v) ? v : 0;
     /// <summary>0.13.26: "on" lets the download service seed refreshes of sources with a dynamic schedule; "off" or absent (the default): it seeds none for them (explicit schedules, a manual refresh and a new source's first listing are always seeded).</summary>
     public string? DynamicRefresh { get; set; }
     /// <summary>0.13.26: "on" lets the download service seed the classify singleton and a node claim it; "off" or absent (the default): classify is paused (it needs an AI endpoint).</summary>

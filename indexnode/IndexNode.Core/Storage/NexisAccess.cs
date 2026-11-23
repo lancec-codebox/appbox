@@ -30,18 +30,26 @@ public sealed record BlobRead(string? Snapshot, bool Repaired);
 public static class NexisAccess
 {
     /// <summary>Sets the Nexis tag last_access to now (Nexis Timestamp format), keeping every other tag.</summary>
-    public static async Task TouchAsync(IStore store, string name, CancellationToken ct)
+    public static async Task<bool> TouchAsync(IStore store, string name, CancellationToken ct)
     {
         var tags = await store.GetTagsAsync(name, ct);
-        if (tags == null) return;
+        if (tags == null) return true;
         var next = new Dictionary<string, string>(tags) { [DehydrateOperation.TagNames.LastAccess] = Timestamp.Now.ToString() };
-        await store.SetTagsAsync(name, next, null, ct);
+        // 0.13.32: CONDITIONAL touch (x-ms-if-tags ghostd_state = 'active'): Nexis's ghosting commit is conditional on the last-access it saw, so a touch that lands blocks it for that round, and one that loses to a transition
+        // fails (false) instead of writing over the ghoster's tags: the caller then takes the ghost / transitioning branch. An untagged blob has no state to condition on: plain write.
+        var state = tags.GetValueOrDefault(DehydrateOperation.TagNames.State);
+        if (state == null) { await store.SetTagsAsync(name, next, null, ct); return true; }
+        return await store.SetTagsIfAsync(name, next, new Dictionary<string, string> { [DehydrateOperation.TagNames.State] = "active" }, ct);
     }
+
+    /// <summary>The tag set with ghostd_last_access = now (Set Blob Tags replaces every tag, so the others are sent unchanged).</summary>
+    public static Dictionary<string, string> WithTouch(IReadOnlyDictionary<string, string> tags) => new(tags) { [DehydrateOperation.TagNames.LastAccess] = Timestamp.Now.ToString() };
+    public const string ActiveState = "active";
 
     /// <summary>Touch, make the blob readable (ghost: commit its blocks; transitioning: read the snapshot, no write).</summary>
     public static async Task<BlobRead> PrepareAsync(RestStore store, string name, CancellationToken ct)
     {
-        try { await TouchAsync(store, name, ct); }
+        try { if (!await TouchAsync(store, name, ct)) Log.Info($"nexis: the touch of {name} lost to a state change: taking the ghost / transitioning branch"); }
         catch (StorageException e) { Log.Info($"nexis: could not touch {name} ({e.Message})"); }
         var read = await EnsureReadableAsync(store.GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(store, name), ct);
         if (read.Snapshot != null) store.ReadSnapshots[name] = read.Snapshot; else store.ReadSnapshots.TryRemove(name, out _);

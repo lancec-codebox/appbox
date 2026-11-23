@@ -8,6 +8,8 @@ namespace IndexNode.Tests;
 public sealed class FakeBlobHttp(FakeStore fs) : HttpMessageHandler
 {
     public int Requests;
+    /// <summary>Every request as "METHOD blob-name[?comp]", in order (tests count the requests per blob).</summary>
+    public System.Collections.Concurrent.ConcurrentQueue<string> Log { get; } = new();
     public static RestStore Rest(FakeStore fs, StoreMeter meter, out FakeBlobHttp h)
     {
         h = new FakeBlobHttp(fs);
@@ -33,7 +35,7 @@ public sealed class FakeBlobHttp(FakeStore fs) : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage q, CancellationToken ct)
     {
-        Interlocked.Increment(ref Requests);
+        Interlocked.Increment(ref Requests); Log.Enqueue(q.Method + " " + Uri.UnescapeDataString(q.RequestUri!.AbsolutePath.TrimStart('/')).Split('/', 2).Last() + (q.RequestUri.Query.Contains("comp=") ? "?" + System.Web.HttpUtility.ParseQueryString(q.RequestUri.Query)["comp"] : ""));
         var u = q.RequestUri!; var qs = System.Web.HttpUtility.ParseQueryString(u.Query); var comp = qs["comp"];
         var name = Uri.UnescapeDataString(u.AbsolutePath.TrimStart('/')); name = name.Contains('/') ? name[(name.IndexOf('/') + 1)..] : "";
         if (qs["restype"] == "container")

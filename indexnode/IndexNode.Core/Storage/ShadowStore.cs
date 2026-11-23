@@ -8,7 +8,7 @@ public sealed class ShadowStore : IStore
 {
     readonly IStore real; readonly LocalStore local; readonly string dir;
     readonly ConcurrentDictionary<string, Log0> appends = new(); readonly ConcurrentDictionary<string, bool> deleted = new();
-    public long BlockedWrites;
+    public long BlockedWrites; public string Dir => dir;
     sealed class Log0 { public byte[] Data = []; public bool Sealed; public readonly object Gate = new(); }
     public ShadowStore(IStore real, string dir) { this.real = real; this.dir = dir; Directory.CreateDirectory(dir); local = new LocalStore(Path.Combine(dir, "blobs")); }
 
@@ -38,7 +38,41 @@ public sealed class ShadowStore : IStore
     public async Task<IReadOnlyDictionary<string, string>?> GetTagsAsync(string name, CancellationToken ct) => await local.GetTagsAsync(name, ct) ?? (Gone(name) ? null : await real.GetTagsAsync(name, ct));
     public async Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => await local.HeadAsync(name, ct) ?? (Gone(name) ? null : await real.HeadAsync(name, ct));
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => await local.HeadAsync(name, ct) != null ? await local.GetRangeAsync(name, off, len, ifMatch, ct) : Gone(name) ? new(null, false) : await real.GetRangeAsync(name, off, len, ifMatch, ct);
-    public async Task DownloadToFileAsync(string name, string path, CancellationToken ct) { if (await local.HeadAsync(name, ct) != null) await local.DownloadToFileAsync(name, path, ct); else await real.DownloadToFileAsync(name, path, ct); }
+    /// <summary>0.13.32: a download from the real store is kept under DIR/dl (keyed by name, size and ETag), so a repeat open is a local copy, as the node's zip and work caches make it; only writes are redirected.</summary>
+    public async Task DownloadToFileAsync(string name, string path, CancellationToken ct)
+    {
+        if (await local.HeadAsync(name, ct) != null) { await local.DownloadToFileAsync(name, path, ct); return; }
+        var h = Gone(name) ? null : await real.HeadAsync(name, ct);
+        if (h == null) { await real.DownloadToFileAsync(name, path, ct); return; }
+        var key = Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(name + "|" + h.Size + "|" + (h.Metadata.GetValueOrDefault("idx_sha256") ?? h.ETag))))[..24];
+        var cached = Path.Combine(dir, "dl", key); Directory.CreateDirectory(Path.GetDirectoryName(cached)!);
+        var gate = dlGates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1)); await gate.WaitAsync(ct);
+        try
+        {
+            if (!File.Exists(cached)) { var tmp = cached + "." + Guid.NewGuid().ToString("N")[..6]; await real.DownloadToFileAsync(name, tmp, ct); File.Move(tmp, cached, true); }
+        }
+        finally { gate.Release(); }
+        File.Copy(cached, path, true);
+    }
+    readonly ConcurrentDictionary<string, SemaphoreSlim> dlGates = new();
+    readonly ConcurrentDictionary<string, (string Path, BlobProps Props)> dlProps = new();
+    /// <summary>The GET-first whole read of the real store, kept under DIR/dl: a repeat open of the same blob in this run is a local copy.</summary>
+    public async Task<BlobProps?> DownloadToFileWithPropsAsync(string name, string path, CancellationToken ct)
+    {
+        if (await local.HeadAsync(name, ct) is { } lp) { await local.DownloadToFileAsync(name, path, ct); return lp; }
+        if (Gone(name)) return null;
+        if (dlProps.TryGetValue(name, out var c) && File.Exists(c.Path)) { File.Copy(c.Path, path, true); return c.Props; }
+        var cached = Path.Combine(dir, "dl", Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes("w|" + name)))[..24]); Directory.CreateDirectory(Path.GetDirectoryName(cached)!);
+        var gate = dlGates.GetOrAdd(cached, _ => new SemaphoreSlim(1, 1)); await gate.WaitAsync(ct);
+        try
+        {
+            if (dlProps.TryGetValue(name, out c) && File.Exists(c.Path)) { File.Copy(c.Path, path, true); return c.Props; }
+            var tmp = cached + "." + Guid.NewGuid().ToString("N")[..6]; var p = await real.DownloadToFileWithPropsAsync(name, tmp, ct);
+            if (p == null) return null;
+            File.Move(tmp, cached, true); dlProps[name] = (cached, p); File.Copy(cached, path, true); return p;
+        }
+        finally { gate.Release(); }
+    }
 
     // ---- writes: overlay only
     public Task<bool> PutAsync(string name, byte[] data, IReadOnlyDictionary<string, string>? tags, string? leaseId, bool onlyIfNew, CancellationToken ct, string contentType = "application/json") => PutCore(name, data, tags, onlyIfNew, ct);

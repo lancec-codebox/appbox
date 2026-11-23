@@ -95,6 +95,23 @@ public class StageZipTests
     }
 
     [Fact]
+    public async Task Concurrent_first_reads_of_one_zip_open_it_once()
+    {
+        var fs = new FakeStore(); var d = Tmp(); var put = new StageZipStore(fs, Path.Combine(d, "p"));
+        for (int i = 0; i < 6; i++) await put.PutAsync(P.Video("v", $"cast/m{i}.json"), B("{\"i\":" + i + "}"), null, null, false, default);
+        await put.CommitStageAsync("v", "cast", "n", false, false, default);
+        var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000, MaxPerMin = 100000, WarnPerMin = 100000, MaxFailuresPerMin = 100000 } };
+        var rest = FakeBlobHttp.Rest(fs, m, out var http); var zs = new StageZipStore(rest, Path.Combine(d, "r"));
+        using (StageZipStore.WholeZips())
+        {
+            var got = await Task.WhenAll(Enumerable.Range(0, 6).Select(i => Task.Run(() => zs.GetAsync(P.Video("v", $"cast/m{i}.json"), default))));
+            Assert.All(got, g => Assert.NotNull(g));
+        }
+        Assert.True(http.Log.Count(l => l == "GET index/videos/v/cast.zip") == 1, string.Join(" | ", http.Log));
+        Assert.True(http.Log.Count(l => l == "HEAD index/videos/v/cast.zip") == 0, string.Join(" | ", http.Log));   // 0.13.32: a whole zip is tags + touch + one GET, no HEAD
+    }
+
+    [Fact]
     public async Task Each_stage_commits_one_zip_with_its_members_and_metadata_each_time()
     {
         var (fake, zs, d) = await Rig();

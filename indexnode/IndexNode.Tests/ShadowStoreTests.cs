@@ -43,4 +43,48 @@ public class ShadowStoreTests : IDisposable
         await s.PutBlockAsync("index/videos.agg", "AAAA", [1], default); Assert.True(await s.PutBlockListAsync("index/videos.agg", ["AAAA"], null, default));
         Assert.Equal(2, s.BlockedWrites); Assert.False(real.Exists("index/videos.agg"));
     }
+
+    static byte[] ZipOf(params (string, string)[] m) { var ms = new MemoryStream(); using (var z = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Create, true)) foreach (var (n, d) in m) { var e = z.CreateEntry(n); using var w = e.Open(); w.Write(System.Text.Encoding.UTF8.GetBytes(d)); } return ms.ToArray(); }
+
+    [Fact]
+    public async Task In_shadow_mode_five_opens_of_one_zip_cost_one_store_GET()
+    {
+        var fs = new FakeStore(); var P = new Paths("index/");
+        await fs.PutAsync(P.Video("sz1", "cast.zip"), ZipOf(("cast/faces.json", "{}"), ("cast/clusters.json", "{}")), null, null, false, default);
+        var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000 } }; var rest = FakeBlobHttp.Rest(fs, m, out var http);
+        var shadow = new ShadowStore(rest, Path.Combine(dir, "out")); var store = StageZipStore.Wrap(shadow, Path.Combine(dir, "zips"));   // exactly what Program.Open builds
+        using (StageZipStore.WholeZips())
+            for (int i = 0; i < 5; i++) { Assert.NotNull(await store.GetAsync(P.Video("sz1", "cast/faces.json"), default)); await store.GetTagsAsync(P.Video("sz1", "cast/clusters.json"), default); }
+        var gets = http.Log.Count(l => l == "GET index/videos/sz1/cast.zip"); Assert.True(gets == 1, "shadow: cast.zip GETs " + gets + ": " + string.Join(" | ", http.Log));
+        // the live node path: the same opens, over a fresh store with a per-job LocalCacheStore on top
+        while (http.Log.TryDequeue(out _)) { }
+        var live = new LocalCacheStore(StageZipStore.Wrap(rest, Path.Combine(dir, "zips2")), Path.Combine(dir, "lc"));
+        using (StageZipStore.WholeZips())
+            for (int i = 0; i < 5; i++) { Assert.NotNull(await live.GetAsync(P.Video("sz1", "cast/faces.json"), default)); await live.GetTagsAsync(P.Video("sz1", "cast/clusters.json"), default); }
+        gets = http.Log.Count(l => l == "GET index/videos/sz1/cast.zip"); Assert.True(gets == 1, "live: cast.zip GETs " + gets + ": " + string.Join(" | ", http.Log));
+    }
+
+    [Fact]
+    public async Task A_shadow_download_is_kept_so_five_downloads_of_one_blob_cost_one_GET()
+    {
+        var fs = new FakeStore(); await fs.PutAsync("index/videos/sz2/cast.zip", new byte[5000], null, null, false, default);
+        var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000 } }; var rest = FakeBlobHttp.Rest(fs, m, out var http); var s = new ShadowStore(rest, Path.Combine(dir, "out"));
+        for (int i = 0; i < 5; i++) { var f = Path.Combine(dir, "d" + i); await s.DownloadToFileAsync("index/videos/sz2/cast.zip", f, default); Assert.Equal(5000, new FileInfo(f).Length); }
+        var gets = http.Log.Count(l => l == "GET index/videos/sz2/cast.zip"); Assert.True(gets == 1, "GETs " + gets + ": " + string.Join(" | ", http.Log));
+        await s.PutAsync("index/videos/sz2/cast.zip", new byte[10], null, null, false, default);   // a shadow write wins over the kept download
+        var g = Path.Combine(dir, "dw"); await s.DownloadToFileAsync("index/videos/sz2/cast.zip", g, default); Assert.Equal(10, new FileInfo(g).Length);
+    }
+
+    [Fact]
+    public async Task All_readers_of_one_job_share_one_open_of_each_zip_no_per_member_touch_or_head()
+    {
+        var fs = new FakeStore(); var P = new Paths("index/");
+        await fs.PutAsync(P.Video("sz3", "cast.zip"), ZipOf(("cast/faces.json", "{}"), ("cast/clusters.json", "{}"), ("cast/faces.f16", "xx")), null, null, false, default);
+        var m = new StoreMeter { Limits = new StorageLimits { MaxPerStep = 1000 } }; var rest = FakeBlobHttp.Rest(fs, m, out var http);
+        var store = StageZipStore.Wrap(new ShadowStore(rest, Path.Combine(dir, "out")), Path.Combine(dir, "zips"));
+        using (StageZipStore.WholeZips())
+            for (int i = 0; i < 5; i++) foreach (var n in new[] { "cast/faces.json", "cast/clusters.json", "cast/faces.f16" }) Assert.NotNull(await FrameChunks.ReadAsync(store, P.Video("sz3", n), default));
+        var z = http.Log.Where(l => l.Contains("sz3/cast.zip")).GroupBy(l => l.Split(' ')[0] + (l.Contains('?') ? "?" + l.Split('?')[1] : "")).ToDictionary(g => g.Key, g => g.Count());
+        Assert.True(z.GetValueOrDefault("GET") == 1 && z.Values.Sum() <= 4 && http.Log.Count <= 6, "one open of cast.zip: " + string.Join(", ", z.Select(x => x.Key + " x" + x.Value)) + " | " + string.Join(" | ", http.Log));
+    }
 }

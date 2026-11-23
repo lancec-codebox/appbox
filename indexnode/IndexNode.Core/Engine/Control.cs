@@ -8,7 +8,11 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     private bool missing;
     private DateTimeOffset lastFetch = DateTimeOffset.MinValue;
 
-    public ControlFile Current { get; private set; } = new();
+    /// <summary>0.13.32 (run --shadow --set ...): in-memory overrides applied to every control.json this watcher reads; nothing is written back.</summary>
+    public Func<ControlFile, ControlFile>? Override { get; set; }
+    ControlFile current = new();
+    public ControlFile Current { get => current; private set => current = Override != null ? Override(value) : value; }
+    public void SetOverride(Func<ControlFile, ControlFile> f) { Override = f; Current = current; }
     public event Action? Changed;
 
     /// <summary>Calls with <paramref name="force"/> always hit storage; others are throttled to 1 s.</summary>
@@ -82,6 +86,19 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         if (string.IsNullOrWhiteSpace(value)) throw new ArgumentException("control region <name like westus2>|off");
         cur.Region = value.Equals("off", StringComparison.OrdinalIgnoreCase) ? null : Placement.NormRegion(value);
+        cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
+        return cur;
+    }
+
+    /// <summary>indexnode control version &lt;step&gt; &lt;n&gt;|off: the version a step must have finished at (control.json versions). Raising it makes every done upload's step ready again, in its repair mode, in seq order; lowering or off stops it.</summary>
+    public static async Task<ControlFile> SetVersionAsync(IStore store, Paths paths, string step, string value, string changedBy, CancellationToken ct)
+    {
+        if (Array.IndexOf(StepVersions.All, step) < 0) throw new ArgumentException("control version <" + string.Join('|', StepVersions.All) + "> <n>|off");
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        if (value.Equals("off", StringComparison.OrdinalIgnoreCase)) { cur.Versions?.Remove(step); if (cur.Versions is { Count: 0 }) cur.Versions = null; }
+        else if (int.TryParse(value, out var n) && n >= 1) (cur.Versions ??= new(StringComparer.Ordinal))[step] = n;
+        else throw new ArgumentException("the version must be a number (1 or more) or off");
         cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
         await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;

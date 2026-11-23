@@ -61,6 +61,8 @@ public interface IStore
     Task<bool> PutAsync(string name, byte[] data, IReadOnlyDictionary<string, string>? tags, string? leaseId, bool onlyIfNew, CancellationToken ct, string contentType = "application/json");
     Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct);
     Task DownloadToFileAsync(string name, string path, CancellationToken ct);
+    /// <summary>0.13.32: ONE GET of the whole blob into a file; the response carries what a HEAD would (length, ETag, metadata), so there is no HEAD first. Null when the blob does not exist. A 0-byte answer is a ghost: hydrated, then read again (RestStore). Other stores: download, then HEAD.</summary>
+    async Task<BlobProps?> DownloadToFileWithPropsAsync(string name, string path, CancellationToken ct) { if (await HeadAsync(name, ct) == null) return null; await DownloadToFileAsync(name, path, ct); return await HeadAsync(name, ct); }
 
     /// <summary>Null when another node holds the lease (409).</summary>
     Task<string?> AcquireLeaseAsync(string name, int seconds, CancellationToken ct);

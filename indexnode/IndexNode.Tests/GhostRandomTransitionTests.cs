@@ -134,6 +134,44 @@ public class GhostRandomTransitionTests
         Assert.True(sim.Flips >= 10, "the simulated Nexis must really have flipped the blob (" + sim.Flips + ")");
     }
 
+    sealed class Router(Dictionary<string, Sim> sims) : HttpMessageHandler
+    {
+        public readonly System.Collections.Concurrent.ConcurrentQueue<string> Log = new();
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
+        {
+            var path = Uri.UnescapeDataString(req.RequestUri!.AbsolutePath); var q = req.RequestUri.Query;
+            Log.Enqueue(req.Method + " " + path.Split('/', 3).Last() + (q.Contains("comp=tags") ? "?tags" : ""));
+            var s = sims.Values.FirstOrDefault(x => path.EndsWith(x.Name)); if (s == null) return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            return new HttpMessageInvoker(s).SendAsync(req, ct);
+        }
+    }
+
+    static byte[] ZipBytes(params (string, byte[])[] m) { var ms = new MemoryStream(); using (var z = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Create, true)) foreach (var (n, d) in m) { var e = z.CreateEntry(n); using var w = e.Open(); w.Write(d); } return ms.ToArray(); }
+    static Sim Ghosted(string name, byte[] data) { var s = new Sim(name, data); s.B.NexisSnapshot(); s.B.NexisCommitEmptyTransitioning("snap1"); s.B.NexisStageBlocksFromSnapshot("snap1"); s.B.NexisGhost(); return s; }
+
+    [Fact]
+    public async Task A_job_over_ghosted_cast_and_frames_zips_hydrates_and_downloads_each_once_for_all_its_readers()
+    {
+        var cast = Ghosted("index/videos/GZ1/cast.zip", ZipBytes(("cast/faces.json", Bytes(300, 1)), ("cast/clusters.json", Bytes(300, 2)), ("cast/faces.f16", Bytes(900, 3))));
+        var frames = Ghosted("index/videos/GZ1/frames.zip", ZipBytes(("frames/manifest.json", Bytes(300, 5)), ("frames/0000.json", Bytes(300, 6)), ("frames/0000.mp4", Bytes(5000, 7))));
+        var router = new Router(new() { [cast.Name] = cast, [frames.Name] = frames });
+        var rest = new RestStore(new HttpClient(router), Sas) { RetryDelay = _ => TimeSpan.FromMilliseconds(1), GhostBlobFor = n => n == cast.Name ? cast : frames };
+        var dir = Path.Combine(Path.GetTempPath(), "gz-" + Guid.NewGuid().ToString("N")); var P = new Paths("index/");
+        try
+        {
+            var store = new LocalCacheStore(StageZipStore.Wrap(rest, Path.Combine(dir, "zips")), Path.Combine(dir, "lc"));
+            using (StageZipStore.WholeZips())
+                for (int i = 0; i < 5; i++)   // units, r50 crops, landmarks ... each reader of the job
+                {
+                    foreach (var n in new[] { "cast/faces.json", "cast/clusters.json", "cast/faces.f16", "frames/manifest.json", "frames/0000.json", "frames/0000.mp4" }) Assert.NotNull(await FrameChunks.ReadAsync(store, P.Video("GZ1", n), default));
+                }
+            var by = router.Log.GroupBy(l => l).ToDictionary(g => g.Key, g => g.Count());
+            Assert.True(cast.Hydrates == 1 && frames.Hydrates == 1, "hydrates " + cast.Hydrates + "/" + frames.Hydrates);
+            Assert.True(by.GetValueOrDefault("GET index/videos/GZ1/cast.zip") <= 2 && by.GetValueOrDefault("GET index/videos/GZ1/frames.zip") <= 2 && router.Log.Count < 15, "ops " + router.Log.Count + ": " + string.Join(" > ", router.Log) + " ## " + string.Join(" | ", by.Select(x => x.Value + "x " + x.Key)));
+            Console.WriteLine("WORST CASE ops (both zips ghosted): " + router.Log.Count + " = " + string.Join(", ", by.Select(x => x.Value + "x " + x.Key)));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
     [Fact]
     public async Task A_real_404_on_the_base_blob_and_changed_content_are_the_only_errors()
     {

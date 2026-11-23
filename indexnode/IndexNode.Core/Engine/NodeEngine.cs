@@ -15,6 +15,8 @@ public sealed class JobContext
     public int Worker { get; init; }
     /// <summary>The queue, for handlers that look at it (never to find work).</summary>
     public JobQueue? Queue { get; init; }
+    /// <summary>0.13.32: the version a versioned step finished at, when it differs from the node's code version (a cast step whose upload has no grouping record yet records v1; its repair runs once the group step is done and control requires v2).</summary>
+    public int? StepVersion { get; set; }
     /// <summary>What the stage unlocks (add describe, add process ...): appended together with the final done, in one append.</summary>
     public List<QLine> FollowUps { get; } = new();
     /// <summary>The steps this claim already finished (a process claim resumes from the first unfinished step).</summary>
@@ -74,6 +76,8 @@ public sealed class EngineOptions
     public int? MaxJobs { get; init; }
     /// <summary>0.13.30: a shadow run records claims in-process: a subject taken once (done or failed) is never claimed again in this run, by any lane.</summary>
     public bool Shadow { get; init; }
+    /// <summary>0.13.32: shadow run only: control overrides (queue whatif's --set) applied to the run's view of control.json, never written.</summary>
+    public Func<ControlFile, ControlFile>? ControlOverride { get; init; }
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan RenewInterval { get; init; } = TimeSpan.FromSeconds(30);
     /// <summary>How long renewals may keep failing before the job counts as lost and is cancelled (the lease itself lasts this long).</summary>
@@ -209,7 +213,7 @@ public sealed partial class NodeEngine
     {
         this.store = store; this.paths = paths; o = options; this.handlers = handlers;
         instance = string.IsNullOrEmpty(o.InstanceId) ? Guid.NewGuid().ToString("N") : o.InstanceId;   // a host that is one instance per device (the phone) passes a stable id, so its own earlier heartbeat is "me", not a peer
-        Control = new ControlWatcher(store, paths);
+        Control = new ControlWatcher(store, paths); if (o.ControlOverride != null) Control.SetOverride(o.ControlOverride);
         Control.Changed += OnControlChanged;
         o.Limits?.Apply(Control.Current);
     }

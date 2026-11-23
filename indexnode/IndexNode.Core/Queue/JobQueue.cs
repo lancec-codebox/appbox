@@ -441,7 +441,7 @@ public sealed class JobQueue
     public ClaimHandle AdoptClaim(string subject, int epoch, string lease) => new(this, store, subject, epoch, lease, paths.Active(subject));
 
     /// <summary>0.13.24: the picker also sees the whole state (a stage that is READY on its own is decided from it, inside the conditional append). The actors-index singleton may not exist yet: it is offered as an empty subject.</summary>
-    public async Task<ClaimHandle?> TryClaimAsync(string subject, Func<QueueState, QSubject, string[]?> pickStages, CancellationToken ct, string? by = null)
+    public async Task<ClaimHandle?> TryClaimAsync(string subject, Func<QueueState, QSubject, string[]?> pickStages, CancellationToken ct, string? by = null, ReadyOptions? ready = null)
     {
         var name = paths.Active(subject);
         var body = Encoding.UTF8.GetBytes($"{{\"subject\":\"{subject}\",\"node\":\"{NodeId}\",\"at\":\"{NowUtc()}\"}}");
@@ -460,7 +460,7 @@ public sealed class JobQueue
                 var stages = s == null ? null : pickStages(state, s);
                 if (stages == null || stages.Length == 0) return null;   // the work is already done (or not ours): nothing to claim
                 epoch = s!.Epoch + 1;
-                return [new QLine { T = "claim", S = subject, Stages = stages, By = by ?? NodeId, Epoch = epoch, At = NowUtc() }];
+                return [new QLine { T = "claim", S = subject, Stages = stages, By = by ?? NodeId, Epoch = epoch, At = NowUtc(), Redo = ready != null && stages.Contains("process") && s.Entries.GetValueOrDefault("process") is { Final: true } && StageDeps.StaleSteps(s, ready) is { Count: > 0 } st0 ? st0.ToArray() : null }];
             }, ct);
         }
         catch { try { await store.DeleteAsync(name, lease, CancellationToken.None); } catch { } throw; }

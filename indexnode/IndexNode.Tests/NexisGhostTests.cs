@@ -24,7 +24,7 @@ public sealed class NexisFakeBlob(string name, byte[] data) : IGhostBlob
     public Task CommitGhostAsync(GhostState s, CancellationToken ct)
     {
         BeforeWrite?.Invoke(); BeforeWrite = null;
-        if (s.ETag != ETag) throw new RequestFailedException(412, "The condition specified using HTTP conditional header(s) is not met.", "ConditionNotMet", null);
+        if (s.ETag.Trim('"') != ETag) throw new RequestFailedException(412, "The condition specified using HTTP conditional header(s) is not met.", "ConditionNotMet", null);
         var blocks = Uncommitted ?? [];
         if (blocks.Length.ToString() != Tags.GetValueOrDefault("ghostd_size", "0")) throw new InvalidOperationException($"actual size ({blocks.Length}) != expected size ({Tags.GetValueOrDefault("ghostd_size", "0")})");
         Committed = blocks; Uncommitted = null; Tags["ghostd_state"] = "active"; ETagN++; Commits++; return Task.CompletedTask;

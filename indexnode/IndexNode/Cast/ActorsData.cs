@@ -13,7 +13,10 @@ public sealed class UnitRec
 /// <summary>index/actors/units/&lt;id&gt;.bin: everything the actors stage found for ONE upload (written only by that upload's stage run). Header JSON + float16 vector rows.</summary>
 public sealed class UnitDoc
 {
-    public string Id = "", Prod = "", Kind = "new", At = ""; public bool Manual; public int Dim, FacesUsed; public List<UnitRec> Units = []; public JsonArray Links = [];
+    public string Id = "", Prod = "", Kind = "new", At = ""; public bool Manual; public int Dim, FacesUsed, ChildUnits, Gen; public string Grp = ""; public List<UnitRec> Units = []; public JsonArray Links = [];
+    /// <summary>0.13.32: Gen 2 = the repaired cast state: the units of this file came from the stored faces under the current band limits, the upload's own r50 file holds a vector for each of them, and nothing later needs cast.zip or frames.zip. Grp = hash of the grouping record the units were built from.</summary>
+    public const int CurrentGen = 2;
+    public static string GrpOf(JsonObject? rec) => rec == null ? "" : Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(rec.ToJsonString())))[..16];
 
     public byte[] ToBytes()
     {
@@ -25,12 +28,12 @@ public sealed class UnitDoc
             rows.AddRange(u.Vec);
         }
         var blob = new byte[rows.Count * Dim * 2]; for (int r = 0; r < rows.Count; r++) for (int d = 0; d < Dim; d++) BitConverter.TryWriteBytes(blob.AsSpan((r * Dim + d) * 2, 2), (Half)rows[r][d]);
-        return ActorsData.Pack(new JsonObject { ["v"] = 1, ["id"] = Id, ["prod"] = Prod, ["kind"] = Kind, ["at"] = At, ["manual"] = Manual, ["dim"] = Dim, ["facesUsed"] = FacesUsed, ["units"] = units, ["links"] = Links.DeepClone() }, blob);
+        return ActorsData.Pack(new JsonObject { ["v"] = 1, ["id"] = Id, ["prod"] = Prod, ["kind"] = Kind, ["at"] = At, ["manual"] = Manual, ["dim"] = Dim, ["facesUsed"] = FacesUsed, ["childUnits"] = ChildUnits, ["gen"] = Gen, ["grp"] = Grp, ["units"] = units, ["links"] = Links.DeepClone() }, blob);
     }
 
     public static UnitDoc FromBytes(byte[] b, string what)
     {
-        var (h, blob) = ActorsData.Unpack(b, what); var d = new UnitDoc { Id = (string?)h["id"] ?? "", Prod = (string?)h["prod"] ?? "", Kind = (string?)h["kind"] ?? "new", At = (string?)h["at"] ?? "", Manual = (bool?)h["manual"] ?? false, Dim = (int?)h["dim"] ?? 0, FacesUsed = (int?)h["facesUsed"] ?? 0, Links = (h["links"] as JsonArray)?.DeepClone() as JsonArray ?? [] };
+        var (h, blob) = ActorsData.Unpack(b, what); var d = new UnitDoc { Id = (string?)h["id"] ?? "", Prod = (string?)h["prod"] ?? "", Kind = (string?)h["kind"] ?? "new", At = (string?)h["at"] ?? "", Manual = (bool?)h["manual"] ?? false, Dim = (int?)h["dim"] ?? 0, FacesUsed = (int?)h["facesUsed"] ?? 0, ChildUnits = (int?)h["childUnits"] ?? 0, Gen = (int?)h["gen"] ?? 0, Grp = (string?)h["grp"] ?? "", Links = (h["links"] as JsonArray)?.DeepClone() as JsonArray ?? [] };
         int row = 0;
         foreach (var o in (h["units"] as JsonArray)?.OfType<JsonObject>() ?? [])
         {
@@ -89,6 +92,7 @@ public static class ActorsData
     public static string UnitsDir(Paths p) => $"{p.Prefix}actors/units/";
     public static string UnitFile(Paths p, string id) => $"{p.Prefix}actors/units/{id}.bin";
     public static string R50File(Paths p, string id) => $"{p.Prefix}actors/r50/{id}.bin";
+    public static string R50Dir(Paths p) => $"{p.Prefix}actors/r50/";
     public static string StateFile(Paths p) => $"{p.Prefix}actors/state.json";
     public static string HeadFile(Paths p) => $"{p.Prefix}actors/head.json";
     public static string VersionDir(Paths p, int v) => $"{p.Prefix}actors/v{v}/";

@@ -37,6 +37,7 @@ public sealed class SplitStore(IStore input, IStore output, string videosPrefix)
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => R(name).HeadAsync(name, ct);
     public Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => R(name).GetRangeAsync(name, off, len, ifMatch, ct);
     public Task DownloadToFileAsync(string name, string path, CancellationToken ct) => R(name).DownloadToFileAsync(name, path, ct);
+    public Task<BlobProps?> DownloadToFileWithPropsAsync(string name, string path, CancellationToken ct) => R(name).DownloadToFileWithPropsAsync(name, path, ct);
 
     public Task<bool> PutAsync(string name, byte[] data, IReadOnlyDictionary<string, string>? tags, string? leaseId, bool onlyIfNew, CancellationToken ct, string contentType = "application/json") => W(name).PutAsync(name, data, tags, leaseId, onlyIfNew, ct, contentType);
     public Task PutFileAsync(string name, string path, string contentType, IProgress<long>? progress, CancellationToken ct) => W(name).PutFileAsync(name, path, contentType, progress, ct);

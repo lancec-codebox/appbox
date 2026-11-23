@@ -117,6 +117,22 @@ public class QueueEngineTests
     }
 
     [Fact]
+    public async Task A_step_limit_trip_counts_an_attempt_backs_off_and_the_third_parks_the_job_failed_with_its_site_report()
+    {
+        var s = new FakeStore(); await s.AddJob(P, "download", "greedy", T(0));
+        var calls = new ConcurrentDictionary<string, int>(); var times = new List<DateTimeOffset>();
+        var o = Opts(["download"], backoff: n => TimeSpan.FromMilliseconds(150 * n), once: false);
+        var e = Engine(s, o, stage: ctx => { calls.AddOrUpdate(ctx.Job.JobId, 1, (_, n) => n + 1); lock (times) times.Add(DateTimeOffset.UtcNow); throw new StorageBudgetExceeded("storage: this step made 26 store ops (max-per-step 25). Top sites: FrameChunks.ReadAsync x20"); });
+        using var cts = new CancellationTokenSource(); var run = e.RunAsync(cts.Token);
+        await Within(() => Q(s).Entry("greedy", "download")?.State == "failed", 8000);
+        cts.Cancel(); await run;
+        var en = Q(s).Entry("greedy", "download")!;
+        Assert.Equal(Protocol.MaxAttempts, calls["greedy"]); Assert.Equal(Protocol.MaxAttempts, en.Attempts); Assert.Equal("failed", en.State);
+        Assert.Contains("Top sites: FrameChunks.ReadAsync x20", en.LastError);   // the per-site report stays on the parked job
+        lock (times) Assert.True(times[1] - times[0] >= TimeSpan.FromMilliseconds(100) && times[2] - times[1] >= TimeSpan.FromMilliseconds(200), "retries are backed off, not claimed at once");
+    }
+
+    [Fact]
     public async Task Transient_failures_count_attempts_and_the_third_is_final_permanent_is_at_once_a_bot_block_counts_none()
     {
         var s = new FakeStore(); await s.AddJob(P, "download", "flaky", T(0)); await s.AddJob(P, "download", "dead", T(1));

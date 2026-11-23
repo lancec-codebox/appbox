@@ -594,6 +594,115 @@ public sealed class RestStore : IStore
         return true;
     }
 
+    /// <summary>0.13.32: the GET-first whole read: one GET, no tags, no touch, no HEAD. The response has the length and ETag: data at its length is the blob; only a 0-byte answer goes into the hydrate flow (SettleAsync) and is read again.</summary>
+    /// <summary>Get Blob Tags with the response's Date header: the SERVER's clock, which is what ghostd_last_access must carry (never the node's).</summary>
+    private async Task<(IReadOnlyDictionary<string, string>? Tags, DateTimeOffset? Date)> TagsWithDateAsync(string name, CancellationToken ct)
+    {
+        using var r = await SendAsync(() => Req(HttpMethod.Get, BlobUri(name, "comp=tags")), ct);
+        if (r.StatusCode == HttpStatusCode.NotFound) return (null, null);
+        if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob Tags");
+        return (ParseTagSet(XDocument.Parse(await r.Content.ReadAsStringAsync(ct)).Root), r.Headers.Date);
+    }
+
+    public TimeSpan TouchMemo { get; set; } = TimeSpan.FromMinutes(5);
+    public int TouchTries { get; set; } = 5;
+    /// <summary>A blob with no ghostd_state yet also gets the touch (Nexis may start tracking it). Off only for a store whose SAS cannot write tags.</summary>
+    public bool UntaggedTouch { get; set; } = true;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> touched = new();
+    /// <summary>
+    /// 0.13.32: touch first, as a conditional read-modify-write, then read by the state touched under (Nexis learns a blob is in use only from ghostd_last_access; reads do not update it).
+    /// 1. Get Blob Tags (state, the full tag set, and the response's Date = server time). 2. Set Blob Tags: every tag as read, ghostd_last_access = that Date, conditional on ghostd_state = the state just read.
+    /// 3. A failed condition (412) starts again from 1, at most <see cref="TouchTries"/> times, then a transient failure. 4. By the state: active - read; transitioning - read from ghostd_snapshot (no hydrate); ghost - hydrate, then read; pending / unknown - wait, from 1.
+    /// 5. A blob with no ghostd_state (never tracked by Nexis) is touched too (adds ghostd_last_access only; see the note in the code on the missing absence condition). A blob this process touched within <see cref="TouchMemo"/> skips 1-3. False when the blob does not exist.
+    /// </summary>
+    private async Task<bool> TouchForReadAsync(string name, CancellationToken ct)
+    {
+        if (VideoAggregate.IsAggregate(name)) return true;
+        if (touched.TryGetValue(name, out var at) && DateTime.UtcNow - at < TouchMemo) return true;
+        int lost = 0, waits = 0;
+        while (true)
+        {
+            var (tags, date) = await TagsWithDateAsync(name, ct);
+            if (tags == null) { NoteMissing(name); return false; }
+            if (!tags.ContainsKey("ghostd_state"))
+            {   // never tagged by Nexis (it may start to): the touch adds ghostd_last_access and nothing else. The tag grammar of x-ms-if-tags has NO absence test (a predicate on a missing key is false -> 412), so this one write cannot be conditional:
+                // it replaces the tag set as read. The window is the time between our tags read and this write; every OTHER tag read is written back unchanged. (Known gap, reported to the owner.)
+                if (date is { } du && UntaggedTouch)
+                {
+                    try { await SetTagsAsync(name, new Dictionary<string, string>(tags) { ["ghostd_last_access"] = du.UtcDateTime.ToString("o") }, null, ct); touched[name] = DateTime.UtcNow; }
+                    catch (ForbiddenException e) { Log.Info($"nexis: could not touch {name} ({e.Message})"); }
+                }
+                ReadSnapshots.TryRemove(name, out _); return true;
+            }
+            var st = tags.GetValueOrDefault("ghostd_state");
+            if (st is not ("active" or "transitioning" or "ghost"))
+            {   // pending or unknown: a short wait, then from step 1
+                touched.TryRemove(name, out _);
+                if (++waits >= 6) throw new StorageException(503, "Pending", $"blob {name} stayed {st ?? "(no state)"}; try again later");
+                await Task.Delay(RetryDelay(waits), ct); continue;
+            }
+            if (date is { } d)
+            {
+                var next = new Dictionary<string, string>(tags) { ["ghostd_last_access"] = d.UtcDateTime.ToString("o") };
+                bool ok;
+                try { ok = await SetTagsIfAsync(name, next, new Dictionary<string, string> { ["ghostd_state"] = st }, ct); }
+                catch (ForbiddenException e) { Log.Info($"nexis: could not touch {name} ({e.Message})"); ok = true; }
+                if (!ok)
+                {
+                    if (++lost >= TouchTries) throw new StorageException(503, "TouchLost", $"touch of {name} lost to a state change {lost} times (last state {st}); try again later");
+                    continue;   // the state moved between the read and the touch: from step 1
+                }
+            }
+            else Log.Info($"nexis: no Date header on the tags response for {name}: not touching");
+            if (st == "active") { if (date != null) touched[name] = DateTime.UtcNow; ReadSnapshots.TryRemove(name, out _); return true; }
+            touched.TryRemove(name, out _);
+            if (st == "transitioning" && tags.GetValueOrDefault("ghostd_snapshot") is { Length: > 0 } snap) { ReadSnapshots[name] = snap; return true; }
+            if (st == "ghost") { await SettleAsync(name, ct); ReadSnapshots.TryRemove(name, out _); return true; }   // hydrated (Nexis's own commit)
+            if (++waits >= 6) throw new StorageException(503, "Pending", $"blob {name} is transitioning with no snapshot; try again later");
+            await Task.Delay(RetryDelay(waits), ct);
+        }
+    }
+
+    public async Task<BlobProps?> DownloadToFileWithPropsAsync(string name, string path, CancellationToken ct)
+    {
+        if (KnownMissing(name)) return null;
+        if (!await TouchForReadAsync(name, ct)) return null;
+        for (int depth = 0; ; depth++)
+        {
+            using var r = await SendReadAsync(name, () => Req(HttpMethod.Get, ReadUri(name)), ct, HttpCompletionOption.ResponseHeadersRead);
+            if (r.StatusCode == HttpStatusCode.NotFound) { NoteMissing(name); return null; }
+            if (!r.IsSuccessStatusCode) throw await Fail(r, "Get Blob");
+            if (r.Content.Headers.ContentLength == 0 && depth < 6 && !VideoAggregate.IsAggregate(name) && !(r.Headers.TryGetValues("x-ms-tag-count", out var tcv) && tcv.FirstOrDefault() == "0"))
+            {
+                touched.TryRemove(name, out _);
+                // 0 bytes: look at the tags (1 op) and branch on ghostd_state. Data at full length never gets here, whatever the state.
+                var tags = await GetTagsAsync(name, ct);
+                if (tags == null) { NoteMissing(name); return null; }
+                var st = tags.GetValueOrDefault("ghostd_state");
+                if (st == "ghost")
+                {   // hydrate (commit the uncommitted blocks), conditional on the ETag we saw; a lost race just reads again
+                    var blob = GhostBlobFor?.Invoke(name) ?? new RestGhostBlob(this, name);
+                    try { await blob.CommitGhostAsync(new GhostState(0, r.Headers.ETag?.Tag ?? "", tags, MetaOf(r)), ct); Log.Info($"nexis: hydrated {name}"); }
+                    catch (InvalidOperationException e) { throw new PermanentFailure($"blob {name} cannot be read: state ghost ({e.Message}); not retrying"); }
+                    catch (Exception e) when (NexisAccess.IsConditionNotMet(e)) { Log.Info($"nexis: {name} changed under us (ghost), reading again"); }
+                    ReadSnapshots.TryRemove(name, out _);
+                    continue;
+                }
+                if (st == "transitioning" && tags.GetValueOrDefault("ghostd_snapshot") is { Length: > 0 } snap)
+                {   // caught mid-dehydrate: the data is in the snapshot; no hydrate, no fight with the ghoster
+                    ReadSnapshots[name] = snap; continue;
+                }
+                if (st is "transitioning" or "pending" || (st != null && st != "active")) { await Task.Delay(RetryDelay(depth + 1), ct); ReadSnapshots.TryRemove(name, out _); continue; }
+                if (st == "active" && long.TryParse(tags.GetValueOrDefault("ghostd_size"), out var gs) && gs > 0) { ReadSnapshots.TryRemove(name, out _); continue; }   // hydrated meanwhile: read again
+                // untagged or active with no recorded size: really empty
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+            await using (var fs = File.Create(path)) await r.Content.CopyToAsync(fs, ct);
+            long len = new FileInfo(path).Length; var etag = r.Headers.ETag?.Tag; Know(name, etag, len, ShaOf(r));
+            return new BlobProps(len, etag, MetaOf(r));
+        }
+    }
+
     public Task DownloadToFileAsync(string name, string path, CancellationToken ct) => DownloadToFileAsync(name, path, ct, 0);
     private async Task DownloadToFileAsync(string name, string path, CancellationToken ct, int depth)
     {
