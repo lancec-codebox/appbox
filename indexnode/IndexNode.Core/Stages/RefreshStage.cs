@@ -104,7 +104,7 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     }
 
     private async Task<bool> KnownAsync(JobQueue queue, Paths paths, string id, CancellationToken ct) =>
-        queue.Read(s => s.Entry(id, "download") != null) || (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0;
+        queue.Read(s => s.Entry(id, "download") != null) || (!queue.Paths.IsWorkQueue && (await store.ListAsync(paths.VideoDir(id), false, false, ct)).Count > 0);   // 0.13.27: on the work queue no per-id listing: the service skips ids either queue knows when it folds the result back
 
     /// <summary>Answers the admin page's add requests; run by the refresh node about once a minute, whether or not any source is due.</summary>
     public Task HousekeepingAsync(Paths paths, JobQueue queue, CancellationToken ct) => ResolveRequestsAsync(paths, queue, ct);

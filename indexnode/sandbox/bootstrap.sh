@@ -109,12 +109,14 @@ fi
 "$BIN" tools install --models serve || echo "bootstrap: models are fetched on first start instead"
 
 # 4. the service: a tiny restart loop (nohup), the log in /var/log/indexnode-serve.log. A re-run stops the old loop first.
+# 0.13.27: extra serve options (e.g. --download-service) from INDEXNODE_SERVE_ARGS are written into the loop
+SERVE_ARGS="${INDEXNODE_SERVE_ARGS:-}"
 RUNNER="$INSTALL_DIR/serve-loop.sh"
 cat > "$RUNNER" <<EOF
 #!/usr/bin/env bash
 export INDEXNODE_CONFIG_DIR="$CONFIG_DIR" INDEXNODE_REGION="$INDEXNODE_REGION"
 while true; do
-  "$BIN" serve --port $PORT --threads $THREADS >> "$LOG" 2>&1
+  "$BIN" serve --port $PORT --threads $THREADS $SERVE_ARGS >> "$LOG" 2>&1
   echo "\$(date -u +%FT%TZ) serve exited (\$?), restarting in 2 s" >> "$LOG"
   sleep 2
 done

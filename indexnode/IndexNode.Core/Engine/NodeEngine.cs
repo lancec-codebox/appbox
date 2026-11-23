@@ -108,6 +108,8 @@ public sealed class EngineOptions
     public OpCounter? Ops { get; init; }
     /// <summary>0.13.18: the store meter and breaker (default: the process-wide one).</summary>
     public StoreMeter Meter { get; init; } = StoreMeter.Current;
+    /// <summary>0.13.27: claims and steps wait while the ops of the last 60 s exceed 80% of the breaker's max-per-min (null: built from <see cref="Meter"/>).</summary>
+    public OpPacer? Pacer { get; init; }
     // ---- accepted and ignored since 0.13.0 (old callers and tests set them)
     [Obsolete("0.13.0: a node runs one claim per lane; there are no per-stage job counts")] public Dictionary<string, int>? Jobs { get; init; }
     [Obsolete("0.13.0: batches are gone; --lanes is the number of concurrent claims")] public int Lanes { get => Workers; init => Workers = value; }
@@ -166,6 +168,16 @@ public sealed partial class NodeEngine
     private readonly EngineOptions o;
     private readonly IReadOnlyDictionary<string, IStageHandler> handlers;
     private readonly ConcurrentDictionary<Running, byte> running = new();
+    private string? lastControl; private OpPacer? pacer; private int pacing; private long pacedMs;
+    internal OpPacer Pacer => pacer ??= o.Pacer ?? new OpPacer(() => o.Meter.Total, () => o.Meter.Limits.MaxPerMin);
+    public long PacingWaits => Pacer.Waits; public bool IsPacing => Volatile.Read(ref pacing) > 0;
+    /// <summary>0.13.27: wait while this node's ops in the last minute are over 80% of max-per-min (before a look/claim and between steps). The breaker stays the guard for runaways.</summary>
+    internal async Task PaceAsync(CancellationToken ct)
+    {
+        long w0 = Pacer.Waits; Interlocked.Increment(ref pacing);
+        try { await Pacer.WaitAsync(ct); }
+        finally { Interlocked.Decrement(ref pacing); if (Pacer.Waits != w0 && Environment.TickCount64 - Interlocked.Exchange(ref pacedMs, Environment.TickCount64) > 30000) Log.Info("pacing: ops are over 80% of max-per-min, waiting before the next claim/step"); }
+    }
     private readonly SemaphoreSlim registryGate = new(1, 1);
     private readonly DateTimeOffset startedAt = DateTimeOffset.UtcNow;
     private int reserved;
@@ -202,6 +214,7 @@ public sealed partial class NodeEngine
         var stages = o.Stages.ToList();
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) == Level.Stop)) return "stopped";
         if (stages.Count > 0 && stages.All(s => Control.Effective(s) >= Level.Drain)) return "draining";
+        if (Volatile.Read(ref pacing) > 0) return "pacing";
         if (!running.IsEmpty) return "working";
         if (o.Limits?.Status() is { } limited) return limited;
         if (stageBackoff.Any(b => b.Value > DateTimeOffset.UtcNow)) return "backoff";
@@ -226,11 +239,17 @@ public sealed partial class NodeEngine
         await registryGate.WaitAsync(ct);
         try
         {
-            try { peers = LivePeers(NodeInfo.Parse((await store.GetAsync(paths.Node(o.NodeId), ct))?.Data ?? []), instance, DateTimeOffset.UtcNow); } catch (Exception ex) when (ex is not OperationCanceledException) { }
+            // 0.13.27: no read before a write. The record is read to find other live processes only at start (LoadPreviousRecordAsync) and then every PeerCheck; every other write is a single put.
+            if (NowUtc - lastPeerRead >= PeerCheck)
+            {
+                lastPeerRead = NowUtc;
+                try { peers = LivePeers(NodeInfo.Parse((await store.GetAsync(paths.Node(o.NodeId), ct))?.Data ?? []), instance, DateTimeOffset.UtcNow); } catch (Exception ex) when (ex is not OperationCanceledException) { }
+            }
+            lastRegistryWrite = NowUtc;
             var info = Snapshot(state);
             // every live process under this name, this one included, while there is more than one
             info.Instances = peers.Count > 0 && state != "offline" ? new Dictionary<string, string>(peers) { [instance] = info.LastSeen } : null;
-            lastRegistryKey = RegistryKey(info);
+            lastRegistryKey = RegistryKey(info); Interlocked.Increment(ref registryWrites);
             await store.PutAsync(paths.Node(o.NodeId), info.ToBytes(), new Dictionary<string, string> { [Tags.Kind] = "node" }, null, false, ct);
         }
         catch (OperationCanceledException) { throw; }
@@ -240,12 +259,10 @@ public sealed partial class NodeEngine
 
     private static string RegistryKey(NodeInfo i) => i.State + "|" + i.Control + "|" + string.Join(';', i.Running.Select(r => $"{r.JobId}/{r.Stage}/{r.Step}"));
 
-    private void RegistryChanged()
-    {
-        // a write on any change of state or running set; never blocks the caller
-        if (RegistryKey(Snapshot()) == lastRegistryKey) return;
-        _ = WriteRegistryAsync();
-    }
+    /// <summary>0.13.27: a change of state or running set no longer writes (that was a read+write per job step: ~40 ops in 30 s). The timed RegistryLoop write (every RegistryInterval, 60 s) carries state, running set and lane progress; start, stop and a control (stage-set) change write at once.</summary>
+    private void RegistryChanged() { }
+    private DateTimeOffset lastRegistryWrite, lastPeerRead; public static readonly TimeSpan PeerCheck = TimeSpan.FromMinutes(5);
+    public int RegistryWrites => registryWrites; private int registryWrites;
 
     /// <summary>The instances in a record that wrote within the last 2 minutes, other than this process.</summary>
     public static Dictionary<string, string> LivePeers(NodeInfo? rec, string self, DateTimeOffset now)
@@ -368,7 +385,7 @@ public sealed partial class NodeEngine
         o.Limits?.Apply(Control.Current);
         foreach (var r in running.Keys)
             if (Control.Effective(r.Info.Stage) == Level.Stop) { r.StopRequested = true; r.Cts.Cancel(); }
-        RegistryChanged();
+        if (Control.Current.Mode + "" != lastControl) { lastControl = Control.Current.Mode + ""; _ = WriteRegistryAsync(); }   // a control / stage-set change is written at once
     }
 
     // ---------------------------------------------------------------- main

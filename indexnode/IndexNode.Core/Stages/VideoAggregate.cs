@@ -23,8 +23,8 @@ public static class VideoAggregate
     /// <summary>What the writers did, for the store-op accounting (per process).</summary>
     public static class Stats
     {
-        public static long BlocksPut, ListGets, Commits, CommitConflicts, Reputs, AlreadyCommitted, Writes, BulkReads, RangeReads, ReadRetries;
-        public static void Reset() { BlocksPut = ListGets = Commits = CommitConflicts = Reputs = AlreadyCommitted = Writes = BulkReads = RangeReads = ReadRetries = 0; }
+        public static long BlocksPut, ListGets, CacheHits, NotModified, Commits, CommitConflicts, Reputs, AlreadyCommitted, Writes, BulkReads, RangeReads, ReadRetries;
+        public static void Reset() { BlocksPut = ListGets = CacheHits = NotModified = Commits = CommitConflicts = Reputs = AlreadyCommitted = Writes = BulkReads = RangeReads = ReadRetries = 0; }
         public static string Describe() => $"aggregate: writes={Writes} blockPuts={BlocksPut} listGets={ListGets} commits={Commits} commitRetries(412)={CommitConflicts} reputs={Reputs} skippedCommit(already in)={AlreadyCommitted} bulkReads={BulkReads} rangeReads={RangeReads} readRetries(412)={ReadRetries}";
     }
 
@@ -68,6 +68,7 @@ public static class VideoAggregate
     public static async Task<bool> WriteAsync(IStore store, Paths paths, string id, long rev, JsonObject root, CancellationToken ct, Func<long, CancellationToken, Task<bool>>? rebase = null)
     {
         if (Off(store) || !Supports(id) || rev <= 0 || rev > 9_999_999_999) return false;
+        Invalidate(store);
         var name = Name(paths); var mine = BlockId(id, rev); var bytes = BlockBytes(root);
         try
         {
@@ -97,7 +98,7 @@ public static class VideoAggregate
                 foreach (var p in com.Concat(unc)) { if (!best.TryGetValue(p.Id, out var o)) { best[p.Id] = p; order.Add(p.Id); } else if (p.Rev > o.Rev) best[p.Id] = p; }
                 if (order.Count > MaxBlocks) throw new IOException($"videos.agg would hold {order.Count} blocks (limit {MaxBlocks}): shard by id prefix");
                 if (order.Count >= WarnBlocks && attempt == 1) Log.Info($"warning: videos.agg holds {order.Count} of {MaxBlocks} blocks (sharding by id prefix is due)");
-                if (await store.PutBlockListAsync(name, order.Select(i => best[i].BlockId).ToList(), bl?.ETag, ct)) { Interlocked.Increment(ref Stats.Commits); return true; }   // the list I committed holds my id (or a higher rev): nothing can take it out but a higher rev
+                if (await store.PutBlockListAsync(name, order.Select(i => best[i].BlockId).ToList(), bl?.ETag, ct)) { Invalidate(store); Invalidate(store); Interlocked.Increment(ref Stats.Commits); return true; }   // the list I committed holds my id (or a higher rev): nothing can take it out but a higher rev
                 Interlocked.Increment(ref Stats.CommitConflicts);
                 await Task.Delay(Backoff(attempt), ct);
             }
@@ -141,7 +142,7 @@ public static class VideoAggregate
                     if (!best.ContainsKey(id)) order.Add(id); best[id] = new Parsed(id, m.Rev, BlockId(id, m.Rev));
                 }
                 if (order.Count > MaxBlocks) throw new IOException($"videos.agg would hold {order.Count} blocks (limit {MaxBlocks}): shard by id prefix");
-                if (await store.PutBlockListAsync(name, order.Select(i => best[i].BlockId).ToList(), bl?.ETag, ct)) { Interlocked.Increment(ref Stats.Commits); Commits++; lock (gate) pending.Clear(); return; }
+                if (await store.PutBlockListAsync(name, order.Select(i => best[i].BlockId).ToList(), bl?.ETag, ct)) { Invalidate(store); Invalidate(store); Interlocked.Increment(ref Stats.Commits); Commits++; lock (gate) pending.Clear(); return; }
                 Interlocked.Increment(ref Stats.CommitConflicts); Conflicts++; await Task.Delay(Backoff(attempt), ct);
             }
             throw new IOException($"videos.agg batch commit kept losing (412) after {Attempts} tries");
@@ -161,6 +162,46 @@ public static class VideoAggregate
     public static async Task<Dictionary<string, VideoJson.Doc>?> ReadManyAsync(IStore store, Paths paths, IReadOnlyCollection<string>? ids, CancellationToken ct)
     {
         if (Off(store)) return null;
+        if (CacheTtl <= TimeSpan.Zero) return await ReadFreshAsync(store, paths, ids, ct);
+        var key = Identity(store); var ce = caches.GetValue(key, _ => new CacheEntry()); var name0 = Name(paths);
+        await ce.Gate.WaitAsync(ct);
+        try
+        {
+            var now = Clock(); int gen = Volatile.Read(ref ce.Gen);
+            if (ce.Docs != null && ce.Name == name0)
+            {
+                bool fresh = now - ce.CheckedAt < CacheTtl;
+                bool missing = ids != null && ids.Any(i => !ce.Docs.ContainsKey(i));
+                if (fresh && !(missing && now - ce.CheckedAt >= MissRevalidate)) { Interlocked.Increment(ref Stats.CacheHits); return Pick(ce.Docs, ids); }
+                // revalidate: ONE Get Block List; the same ETag is the 304 (no GET of the whole blob)
+                var bl = await store.GetBlockListAsync(name0, ct); Interlocked.Increment(ref Stats.ListGets);
+                if (bl != null && bl.ETag != null && bl.ETag == ce.ETag) { ce.CheckedAt = now; Interlocked.Increment(ref Stats.NotModified); return Pick(ce.Docs, ids); }
+            }
+            var all = await ReadFreshAsync(store, paths, null, ct, ce);
+            if (Volatile.Read(ref ce.Gen) == gen) { ce.Name = name0; ce.CheckedAt = now; ce.Docs = all; } else ce.Docs = null;
+            return all == null ? null : Pick(all, ids);
+        }
+        finally { ce.Gate.Release(); }
+    }
+
+    static Dictionary<string, VideoJson.Doc> Pick(Dictionary<string, VideoJson.Doc> all, IReadOnlyCollection<string>? ids)
+    {
+        if (ids == null) return all;
+        var r = new Dictionary<string, VideoJson.Doc>(StringComparer.Ordinal); foreach (var i in ids) if (all.TryGetValue(i, out var d)) r[i] = d; return r;
+    }
+
+    /// <summary>0.13.27: one copy of the whole aggregate per process (per store). Revalidated by one Get Block List at most every <see cref="CacheTtl"/> (an unchanged ETag is the 304), or when a reader asks for an upload the copy lacks (at most once per <see cref="MissRevalidate"/>). A write through this process drops the copy. Zero turns the cache off.</summary>
+    public static TimeSpan CacheTtl { get; set; } = TimeSpan.FromSeconds(60);
+    public static TimeSpan MissRevalidate { get; set; } = TimeSpan.FromSeconds(5);
+    public static Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
+    sealed class CacheEntry { public readonly SemaphoreSlim Gate = new(1, 1); public Dictionary<string, VideoJson.Doc>? Docs; public string? ETag, Name; public DateTime CheckedAt; public int Gen; }
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, CacheEntry> caches = new();
+    static void Invalidate(IStore store) { if (caches.TryGetValue(Identity(store), out var e)) { Interlocked.Increment(ref e.Gen); e.Docs = null; } }
+    public static void ClearCache() { foreach (var kv in caches) { kv.Value.Docs = null; } }
+
+    static async Task<Dictionary<string, VideoJson.Doc>?> ReadFreshAsync(IStore store, Paths paths, IReadOnlyCollection<string>? ids, CancellationToken ct, CacheEntry? ce = null)
+    {
+        if (Off(store)) return null;
         var name = Name(paths); var want = ids == null ? null : new HashSet<string>(ids, StringComparer.Ordinal);
         try
         {
@@ -168,6 +209,7 @@ public static class VideoAggregate
             {
                 var bl = await store.GetBlockListAsync(name, ct); Interlocked.Increment(ref Stats.ListGets);
                 if (bl == null || bl.Committed.Count == 0 || bl.ETag == null) return null;
+                if (ce != null) ce.ETag = bl.ETag;
                 var items = new List<(Parsed P, long Off, long Len)>(); long at = 0;
                 foreach (var b in bl.Committed) { var p = Decode(b.Id) ?? throw new InvalidDataException($"videos.agg has a committed block that is not <id,rev>: {b.Id}"); items.Add((new Parsed(p.Id, p.Rev, b.Id), at, b.Size)); at += b.Size; }
                 var pick = want == null ? items : items.Where(i => want.Contains(i.P.Id)).ToList();

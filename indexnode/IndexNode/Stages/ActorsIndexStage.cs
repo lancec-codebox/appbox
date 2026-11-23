@@ -7,8 +7,9 @@ public sealed class ActorsIndexStage(IStore store) : IStageHandler
     public async Task RunAsync(JobContext ctx)
     {
         ctx.Report("actors-index", "building"); var ct = ctx.Token; var io = new ActorsIO(ctx.Store, ctx.Paths);
-        Dictionary<string, VideoJson.Doc?>? aiDocs = null;
-        var rep = await ActorsIndex.BuildAsync(io, ct, async id => { aiDocs ??= await VideoJson.ReadManyAsync(store, ctx.Paths, new List<string>(), ct, all: true); return ActorsStage.AiFlag((aiDocs.TryGetValue(id, out var d) ? d : await VideoJson.ReadAsync(store, ctx.Paths, id, ct))?.Root); }, 2);
+        // 0.13.27: the AI check is the queue's hold (actors / process entry), not the aggregate; an upload the queue does not know falls back to its own video.json
+        var q = ctx.Queue;
+        var rep = await ActorsIndex.BuildAsync(io, ct, async id => q != null && q.Read(st => st.Entry(id, "actors")?.Hold == "ai" || st.Entry(id, "process")?.Hold == "ai") ? true : ActorsStage.AiFlag((await VideoJson.ReadAsync(store, ctx.Paths, id, ct))?.Root), 2);
         Last = rep; Log.Info("actors-index: " + rep.Note);
     }
 }

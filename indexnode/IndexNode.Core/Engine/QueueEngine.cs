@@ -69,6 +69,7 @@ public sealed partial class NodeEngine
             while (!ct.IsCancellationRequested)
             {
                 if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
+                await PaceAsync(ct);
                 await Control.RefreshAsync(ct);
                 bool worked = false;
                 if (QueueStages().Any(StageEnabled))
@@ -278,6 +279,7 @@ public sealed partial class NodeEngine
             // the stages of the subject this node runs, in order; follow-ups the stages add (process -> describe) join the same claim when this node runs them
             for (int guard = 0; guard < 16 && !cts.IsCancellationRequested; guard++)
             {
+                if (guard > 0) await PaceAsync(cts.Token);
                 var entry = queue.Read(s => s.Get(id)?.Entries.Values.Where(e => (e.Runnable(Protocol.Utc(NowUtc)) || (pulled && e.Stage == SearchIndexJobs.Stage && e.State == "pending")) && StageEnabled(e.Stage) && CanRunEntry(s.Get(id)!, e)).OrderBy(e => QueueState.Rank(e.Stage)).FirstOrDefault());
                 if (entry == null) break;
                 var (outcome, error, last, ctx) = await RunStageAsync(lane, work, entry, cts.Token);
@@ -461,6 +463,7 @@ public sealed partial class NodeEngine
         {
             if (token.IsCancellationRequested) return (h.Lost ? Outcome.LeaseLost : Outcome.Released, null, false, ctx);
             if (Control.Effective(step) != Level.Run) continue;
+            if (ran.Count > 0) await PaceAsync(token);   // 0.13.27: between steps of one claim
             // inputs: made earlier in this claim, or already stored; a step whose producer is not ours and is not done yet is not ready for this node
             foreach (var need in Protocol.NormalizeNeeds(Protocol.NeedsOf(step)))
             {

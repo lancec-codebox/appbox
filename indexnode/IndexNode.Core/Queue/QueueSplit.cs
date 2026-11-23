@@ -20,7 +20,7 @@ public static class QueueSplit
     {
         public int Total, ToProcessing, ToDownload, Seeded, StoredApplied, StoredListed; public string? Seals;
         public SortedDictionary<string, int> ProcessingKinds = new(StringComparer.Ordinal), DownloadKinds = new(StringComparer.Ordinal);
-        public string Text(bool dry) => (Seals != null ? Seals + "\n" : "") + $"{(dry ? "dry run, nothing written: " : "")}{Total} subjects: {ToProcessing} to processing, {ToDownload} to download ({Seeded} seeded into the work queue); {StoredApplied} stored classify decision(s) applied to still-unclassified uploads ({StoredListed} found under classify/)\n  processing entries: {Fmt(ProcessingKinds)}\n  download entries:   {Fmt(DownloadKinds)}";
+        public string Text(bool dry) => (Seals != null ? Seals + "\n" : "") + $"{(dry ? "dry run, nothing written: " : "")}{Total} subjects: {ToProcessing} to processing, {ToDownload} to download ({Seeded} seeded into the work queue); {StoredApplied} stored classify decision(s) applied to still-unclassified uploads ({StoredListed} found under classify/)\n  processing entries: {Fmt(ProcessingKinds)}\n  download entries:   {Fmt(DownloadKinds)}\n  note: split.json is local-only (it stays in the --out-local folder, is read by --from-local, and is never written to the store)";
         static string Fmt(SortedDictionary<string, int> d) => d.Count == 0 ? "-" : string.Join(", ", d.Select(kv => $"{kv.Key}={kv.Value}"));
     }
 

@@ -82,7 +82,7 @@ public class ActorsStageTests
         var st = StageOn(fs); var r1 = await st.RunAsync(io, "dC", false, 2, default);   // preds from the aggregate, not passed
         Assert.Equal(2, r1.Predecessors); Assert.Contains("computed 2", r1.Timing); Assert.Contains("written 2", r1.Timing);
         var r2 = await st.RunAsync(io, "dC", false, 2, default);
-        Assert.Contains("computed 0", r2.Timing); Assert.Contains("reused from units files 2", r2.Timing);   // the units files written by the first run
+        Assert.Contains("computed 0", r2.Timing); Assert.Contains("from process cache 2", r2.Timing);   // 0.13.27: the units this process wrote are kept in memory, not read back
     }
 
     [Fact]

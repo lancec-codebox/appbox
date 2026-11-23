@@ -128,7 +128,22 @@ public class DownloadRunsTests
         Assert.DoesNotContain(s.Names("index/").Except(before), n => n.Contains("queue") || n.Contains("/active/"));   // only the source's members file
     }
 
-    static QLine AddAvail(string due) => QLine.Add("sweep", "availability", AvailabilityStage.NewSweep(), At, 0, due, "pending");
+    [Fact]
+    public async Task A_work_queue_refresh_of_300_fresh_ids_makes_no_per_id_store_listing()
+    {
+        var s = new FakeStore { Clock = () => T0 }; var work = new JobQueue(s, P.DownloadWork, "dl1", () => T0); await work.LoadAsync(default);
+        var ids = Enumerable.Range(0, 300).Select(i => "v" + i.ToString("D10")).ToList();
+        var f = new Fake(); f.Listings["https://www.youtube.com/playlist?list=PLx"] = string.Concat(ids.Select(i => i + "\tNA\tNA\n"));
+        var job = JobDescriptor.NewSource("playlist", "PLx", "pl", "6h", ["videos"], false, -1, 360); job.AddedAt = At;
+        var ctx = new JobContext { Job = job, Stage = "refresh", BlobName = "x", LeaseId = "l", Worker = 1, Store = s, Paths = P, NodeId = "dl1", Token = default, ThreadShare = () => 1, Report = (_, _) => { }, Queue = work };
+        int lists0 = s.Calls.Count(c => c == "list");
+        await new RefreshStage(f.Tools(), s, () => T0).RunAsync(ctx);
+        Assert.NotNull(ctx.NextDue);   // the 300 ids went into the result (spilled when large)
+        Assert.True(s.Calls.Count(c => c == "list") - lists0 < 5);   // none per id
+    }
+
+    static QLine AddAvail(string due)
+ => QLine.Add("sweep", "availability", AvailabilityStage.NewSweep(), At, 0, due, "pending");
     static QLine AddDone(string id) => QLine.Add(id, "download", Video(id), At, 0, null, "done");
 
     [Fact]

@@ -22,7 +22,9 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
     public async Task RunAsync(JobContext ctx)
     {
         var io = new ActorsIO(ctx.Store, ctx.Paths, dry, outLocal); ctx.Report("actors", "units");
-        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, null, ctx.Queue?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } q && q < me).Select(x => x.Id).ToList() : new List<string>())); Last = r;
+        var q = ctx.Queue; List<string>? qpreds = q?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
+        // 0.13.27: predecessors (a) and which are AI (b) come from the queue this node holds; its own grouping record (c) from its own video.json. No read of the aggregate.
+        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai")); Last = r;
         Log.Info($"actors {r.Id}: " + (r.Skipped ?? $"{r.Units} units ({r.FacesUsed} faces, {r.ChildUnits} child), {r.Links} links ({r.BandLinked}/{r.Band} band), predecessors {r.Predecessors}, index {r.IndexRouted}; {r.Timing}"));
     }
 
@@ -44,6 +46,36 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
 
     // predecessor units computed from cast files, kept for later uploads of this process (key: store, id, the grouping record they were computed from)
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Prod, List<UnitRec> Units)> unitCache = new(StringComparer.Ordinal);
+
+    // 0.13.27: the unit docs this process has read or written (key: store, name). Units never change for a given grouping record, so a later job reads no predecessor file it already has.
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, UnitDoc> seenUnits = new(StringComparer.Ordinal);
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, object> storeIds = new(); static long nextStoreId;
+    static string SeenKey(ActorsIO io, string name) => storeIds.GetValue(io.Store, _ => (object)Interlocked.Increment(ref nextStoreId)) + "|" + name;
+    static void Remember(ActorsIO io, string name, UnitDoc d) { if (!io.Writes) return; if (seenUnits.Count > 2000) seenUnits.Clear(); seenUnits[SeenKey(io, name)] = d; }
+    public static void ForgetSeen() { seenUnits.Clear(); lock (groupCache) groupCache.Clear(); }
+
+    // 0.13.27: the group map is keyed by the search head's version: head.yaml (a few bytes) is read at most once a minute, the groups file only when the version moved. Cached on every path (--out-local too).
+    static readonly Dictionary<string, (DateTime At, string Version, Dictionary<string, string> Map)> groupCache = new(StringComparer.Ordinal);
+    public static Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
+    internal static async Task<Dictionary<string, string>> GroupOfAsync(ActorsIO io, CancellationToken ct)
+    {
+        var key = SeenKey(io, "group"); (DateTime At, string Version, Dictionary<string, string> Map) c = default; bool have;
+        lock (groupCache) have = groupCache.TryGetValue(key, out c);
+        if (have && Clock() - c.At < TimeSpan.FromSeconds(60)) return c.Map;
+        var map = new Dictionary<string, string>(StringComparer.Ordinal); string ver = "";
+        try
+        {
+            if (await io.Store.GetAsync(SearchData.HeadName(io.Paths), ct) is { } hc)
+            {
+                var head = SearchData.ParseHead(hc.Data); ver = head.ToString() ?? "";
+                if (have && c.Version == ver) { lock (groupCache) groupCache[key] = (Clock(), ver, c.Map); return c.Map; }
+                if (await GroupStore.LoadAsync(io.Store, io.Paths, head, ct) is { } gs) map = gs.GroupOf();
+            }
+        }
+        catch (Exception e) when (e is FileNotFoundException or InvalidDataException) { }
+        lock (groupCache) groupCache[key] = (Clock(), ver, map);
+        return map;
+    }
 
     sealed class Built { public string Prod = "", Kind = "new"; public ActorsBuild.Drama D = null!; public List<UnitRec> Units = []; public int Dim, FacesUsed; }
 
@@ -68,42 +100,44 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         return b2;
     }
 
-    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null)
+    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null)
     {
         var paths = io.Paths; var now = Protocol.NowUtc(); var sw = System.Diagnostics.Stopwatch.StartNew(); long msOwn = 0, msPred = 0, msRoute = 0, msR50 = 0; int predComputed = 0, predReused = 0, predCached = 0, predWritten = 0;
         var vj = await VideoJson.ReadAsync(io.Store, paths, id, ct); var uf = ActorsData.UnitFile(paths, id);
-        var ex = await io.GetAsync(uf, ct); var exDoc = ex == null ? null : UnitDoc.FromBytes(ex.Data, uf); manual |= exDoc?.Manual == true || (await io.ListAsync(uf, ct)).Any(e => e.Name == uf && e.Manual);
+        var ex = await io.GetAsync(uf, ct); var exDoc = ex == null ? null : UnitDoc.FromBytes(ex.Data, uf); manual |= exDoc?.Manual == true;   // 0.13.27: no listing: the unit file's own record says whether it was added by hand
         if (!manual && AiFlag(vj?.Root))
         {
             var w = new List<string>(); if (ex != null) { await io.DeleteAsync(uf, ct); w.Add("delete " + uf); }
             return Last = new RunResult(id, "AI-flagged (ai.flag): no units, no links, no index entry", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", "", [], w);
         }
         var rec = vj?.Root["grouping"] as JsonObject ?? throw new InvalidOperationException($"{id}: no grouping record in video.json (the group step has not run)");
-        var groupOf = new Dictionary<string, string>(StringComparer.Ordinal);
-        try { if (await io.Store.GetAsync(SearchData.HeadName(paths), ct) is { } hc && await GroupStore.LoadAsync(io.Store, paths, SearchData.ParseHead(hc.Data), ct) is { } gs) groupOf = gs.GroupOf(); } catch (Exception e) when (e is FileNotFoundException or InvalidDataException) { }
+        var groupOf = new Dictionary<string, string>(await GroupOfAsync(io, ct), StringComparer.Ordinal);   // 0.13.27: the search head and the group store are read once a minute per process, not per job
         preds ??= await PredecessorsAsync(io.Store, paths, id, SeqOf(rec), extraPreds, ct);
         var me = await BuildUnitsAsync(io, id, rec, groupOf, ct); msOwn = sw.ElapsedMilliseconds; var d = me.D; var mine = me.Units; var kind = me.Kind; var prod = me.Prod; int dim = me.Dim;
         // candidates: the actor index for everything in it, and the predecessors that are not in it yet, computed right here from their cast files (their own stage run is never waited for or read)
         var (idx, _) = await ActorsIndex.LoadAsync(io, ct); var indexed = idx?.Ids ?? [];
-        var listed = await io.ListAsync(ActorsData.UnitsDir(paths), ct); var manualIds = listed.Where(e => e.Manual).Select(e => Path.GetFileNameWithoutExtension(e.Name)).ToHashSet(StringComparer.Ordinal);
+        var manualIds = new HashSet<string>(StringComparer.Ordinal);   // 0.13.27: no units/ listing per job; a predecessor is checked for "added by hand" only when its video.json is AI-flagged (below), from its own unit doc
         var aiCache = new Dictionary<string, bool>(StringComparer.Ordinal);
-        var predDocs = await VideoJson.ReadManyAsync(io.Store, paths, (preds ?? []).Where(p => p != id).Distinct(StringComparer.Ordinal).ToList(), ct);   // the aggregate: one block-list + one GET for every predecessor's video.json, no per-upload reads
-        async Task<bool> Ai(string up) { if (manualIds.Contains(up)) return false; if (!aiCache.TryGetValue(up, out var f)) aiCache[up] = f = AiFlag((predDocs.TryGetValue(up, out var pd) ? pd : await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root); return f; }
+        var qmode = queueAi != null; var predDocs = qmode ? new Dictionary<string, VideoJson.Doc?>(StringComparer.Ordinal) : await VideoJson.ReadManyAsync(io.Store, paths, (preds ?? []).Where(p => p != id).Distinct(StringComparer.Ordinal).ToList(), ct);   // the aggregate: one block-list + one GET for every predecessor's video.json, no per-upload reads
+        async Task<bool> Ai(string up) { if (manualIds.Contains(up)) return false; if (!aiCache.TryGetValue(up, out var f)) { aiCache[up] = f = qmode ? queueAi!(up) : AiFlag((predDocs.TryGetValue(up, out var pd) ? pd : await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root); if (f) { var puf0 = ActorsData.UnitFile(paths, up); var pc0 = seenUnits.TryGetValue(SeenKey(io, puf0), out var sd0) ? sd0 : await io.GetAsync(puf0, ct) is { } c0 ? UnitDoc.FromBytes(c0.Data, puf0) : null; if (pc0?.Manual == true) { manualIds.Add(up); aiCache[up] = f = false; } } } return f; }
         var pend = new List<(string Id, string Prod, List<UnitRec> Units)>(); int aiSkipped = 0, missing = 0;
         foreach (var up in (preds ?? []).Where(p => p != id && !indexed.Contains(p)).Distinct(StringComparer.Ordinal))
         {
             if (await Ai(up)) { aiSkipped++; continue; }   // an AI predecessor: its cast data is never read
-            if ((predDocs.TryGetValue(up, out var pdoc) ? pdoc : await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root["grouping"] is not JsonObject prec) { missing++; continue; }
+            JsonObject? prec = null;
+            if (!qmode && (predDocs.TryGetValue(up, out var pdoc) ? pdoc : await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root["grouping"] is not JsonObject prec0) { missing++; continue; } else if (!qmode) prec = (predDocs.TryGetValue(up, out var pdoc1) ? pdoc1 : await VideoJson.ReadAsync(io.Store, paths, up, ct))!.Root["grouping"] as JsonObject;
             try
             {
                 var puf = ActorsData.UnitFile(paths, up);   // 1) its units file, when its own run (or an earlier run of ours) wrote it: a cache with the same keys, never a wait
-                if (await io.GetAsync(puf, ct) is { } pc) { var pdoc2 = UnitDoc.FromBytes(pc.Data, puf); pend.Add((up, pdoc2.Prod, pdoc2.Units)); predReused++; continue; }
+                if (seenUnits.TryGetValue(SeenKey(io, puf), out var sd)) { pend.Add((up, sd.Prod, sd.Units)); predCached++; continue; }   // 0.13.27: a units file this process has read or written is not read again
+                if (await io.GetAsync(puf, ct) is { } pc) { var pdoc2 = UnitDoc.FromBytes(pc.Data, puf); Remember(io, puf, pdoc2); pend.Add((up, pdoc2.Prod, pdoc2.Units)); predReused++; continue; }
+                if (prec == null && (prec = (await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root["grouping"] as JsonObject) == null) { missing++; continue; }   // queue mode: the predecessor's own video.json, only when its units are not already at hand
                 var ckey = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(io.Store) + "|" + up + "|" + prec.ToJsonString().GetHashCode();
                 if (unitCache.TryGetValue(ckey, out var hit)) { pend.Add((up, hit.Prod, hit.Units)); predCached++; continue; }   // 2) computed earlier in this process
                 var b = await BuildUnitsAsync(io, up, prec, groupOf, ct); pend.Add((up, b.Prod, b.Units)); predComputed++;   // 3) from its cast files, then kept
                 if (unitCache.Count > 400) unitCache.Clear(); unitCache[ckey] = (b.Prod, b.Units);
                 var wdoc = new UnitDoc { Id = up, Prod = b.Prod, Kind = b.Kind, At = now, Manual = false, Dim = b.Dim, FacesUsed = b.FacesUsed, Units = b.Units, Links = [] };
-                if (await io.PutAsync(puf, wdoc.ToBytes(), null, true, false, ct)) predWritten++;   // create-only: the next run reuses it; its own stage run replaces it (with the ETag) when it adds the links
+                if (await io.PutAsync(puf, wdoc.ToBytes(), null, true, false, ct)) { predWritten++; Remember(io, puf, wdoc); }   // create-only: the next run reuses it; its own stage run replaces it (with the ETag) when it adds the links
             }
             catch (Exception e) when (e is InvalidOperationException or FileNotFoundException or InvalidDataException) { missing++; }   // no cast files yet: nothing to compare
         }
@@ -142,6 +176,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
             }
         var doc = new UnitDoc { Id = id, Prod = prod, Kind = kind, At = now, Manual = manual, Dim = dim, FacesUsed = me.FacesUsed, Units = mine, Links = links };
         if (!await io.PutAsync(uf, doc.ToBytes(), ex?.ETag, ex == null, manual, ct)) throw new IOException($"{uf} changed while this run wrote it (two writers for one upload?)");
+        Remember(io, uf, doc);
         return Last = new RunResult(id, null, doc.FacesUsed, mine.Count, d.ChildUnits, nLinks, band, bandOk, r50New, pend.Count, aiSkipped + aiIdx.Count, routed, kind, prod, [], io.Log.ToList()) { Timing = $"time own units {msOwn / 1000.0:F1}s, predecessors {msPred / 1000.0:F1}s (computed {predComputed}, reused from units files {predReused}, from process cache {predCached}, units files written {predWritten}), routing {msRoute / 1000.0:F1}s, r50 {msR50 / 1000.0:F1}s" };
     }
 
