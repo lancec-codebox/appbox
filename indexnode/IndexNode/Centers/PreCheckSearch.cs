@@ -185,6 +185,8 @@ public sealed class SearchIndexCache(string root, TimeSpan recheck, Func<DateTim
     SearchData? mem; DateTimeOffset checkedAt = DateTimeOffset.MinValue; string? headEtag;
     public int HeadReads { get; private set; }
     public int Downloads { get; private set; }
+    /// <summary>0.13.31: the loaded index with no store read and no wait (null before the first load). A search uses it: the version moves only when GetAsync (start-up, the refresh loop) sees head.yaml change.</summary>
+    public SearchData? Loaded => Volatile.Read(ref mem);
 
     /// <summary>The current index; null when the store has none. A store error with an index already loaded keeps that one.</summary>
     public async Task<SearchData?> GetAsync(IStore store, Paths paths, CancellationToken ct)

@@ -116,7 +116,7 @@ public sealed class StoreMeter
             var sec = Minute(); Roll(sec);
             if (trippedAt is { } t)
             {
-                if (now() - t >= Limits.Cooldown) { trippedAt = null; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); tripMessage = null; }
+                if (now() - t >= Limits.Cooldown) { trippedAt = null; window.Clear(); winOps = winFails = 0; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); tripMessage = null; }
                 else throw new StorageBudgetExceeded(tripMessage ?? "storage breaker open");
             }
             if (CliMax > 0 && Total >= CliMax) throw new StorageBudgetExceeded($"storage: --storage-max {CliMax} reached. Top sites: {Top(Table(), 5)}");
@@ -187,7 +187,7 @@ public sealed class StoreMeter
     static string Top(IReadOnlyList<SiteRow> rows, int n, bool withExample = false) => string.Join("; ", rows.Take(n).Select(r => $"{r.Site} {r.Op} x{r.Count}" + (!withExample || r.Example == null ? "" : r.Blobs > 1 ? $" ({r.Blobs} blobs, e.g. {r.Example})" : r.Blobs == 1 && r.Count > 1 ? $" (all on one blob: {r.Example})" : $" (e.g. {r.Example})")));
 
     // ------------------------------------------------------------ reports
-    public bool Tripped { get { lock (gate) { Roll(Minute()); if (stepHaltAt is { } sh && now() - sh >= Limits.Cooldown) { stepHaltAt = null; stepHaltMessage = null; } if (stepHaltAt != null) return true; if (trippedAt is { } t && now() - t >= Limits.Cooldown) { trippedAt = null; tripMessage = null; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); } return trippedAt != null; } } }
+    public bool Tripped { get { lock (gate) { Roll(Minute()); if (stepHaltAt is { } sh && now() - sh >= Limits.Cooldown) { stepHaltAt = null; stepHaltMessage = null; } if (stepHaltAt != null) return true; if (trippedAt is { } t && now() - t >= Limits.Cooldown) { trippedAt = null; tripMessage = null; window.Clear(); winOps = winFails = 0; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); } return trippedAt != null; } } }
     public string? TripMessage { get { lock (gate) return tripMessage ?? stepHaltMessage; } }
     public long OpsLastMinute { get { lock (gate) { Roll(Minute()); return winOps; } } }
     public long Total => total.Where(kv => !kv.Key.Op.Contains('!')).Sum(kv => kv.Value.Count);   // the "op!404" rows are failures of ops already counted

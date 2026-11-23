@@ -474,7 +474,7 @@ public static class CenterSearch
             {
                 try
                 {
-                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t, whole: false);   // /v1/search: a few blocks of many uploads: ranges
+                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t, whole: true);   // 0.13.31: never a range read of a frames file: the cached copy, else ONE whole GET kept in the cache, then local reads
                     var res = await z.ReadBlocksAsync(centers, MergeGap, MaxMerged, t);
                     Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests);
                     perUpload[g] = res.Select(x => (up, x.Center, x.Members)).ToList(); return;

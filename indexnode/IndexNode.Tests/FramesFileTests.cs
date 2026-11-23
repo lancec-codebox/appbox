@@ -9,7 +9,7 @@ public class FramesFileTests
 {
     static readonly Paths P = new("index/");
     const int D = CentersFile.Dim;
-    static float[] Make(int n, int groups, int seed)
+    internal static float[] Make(int n, int groups, int seed)
     {
         var rng = new Random(seed); var dirs = new float[groups][]; var x = new float[n * D];
         float[] G() { var v = new float[D]; for (int j = 0; j < D; j++) v[j] = (float)(Math.Sqrt(-2 * Math.Log(1 - rng.NextDouble())) * Math.Cos(2 * Math.PI * rng.NextDouble())); Vec.Normalize(v); return v; }
@@ -17,9 +17,9 @@ public class FramesFileTests
         for (int i = 0; i < n; i++) { var d = dirs[i % groups]; var z = G(); var row = new float[D]; for (int j = 0; j < D; j++) row[j] = d[j] + 0.3f * z[j]; Vec.Normalize(row); row.CopyTo(x, i * D); }
         return x;
     }
-    static byte[] F16(float[] x) { var b = new byte[x.Length * 2]; for (int i = 0; i < x.Length; i++) BitConverter.TryWriteBytes(b.AsSpan(i * 2, 2), (Half)x[i]); return b; }
+    internal static byte[] F16(float[] x) { var b = new byte[x.Length * 2]; for (int i = 0; i < x.Length; i++) BitConverter.TryWriteBytes(b.AsSpan(i * 2, 2), (Half)x[i]); return b; }
 
-    static async Task<(FakeStore Fs, StageZipStore Wr)> Drama(string id, byte[] f16, int n, string cache, FakeStore? fs = null)
+    internal static async Task<(FakeStore Fs, StageZipStore Wr)> Drama(string id, byte[] f16, int n, string cache, FakeStore? fs = null)
     {
         fs ??= new FakeStore(); var wr = (StageZipStore)StageZipStore.Wrap(fs, cache);
         var frames = Enumerable.Range(0, n).Select(i => new ChunkFrame(i, i * 1.0, i * 1.0, [], null, i, 1)).ToList();
@@ -31,8 +31,8 @@ public class FramesFileTests
         await VideoJsonSeed.PutAsync(fs, P, id, 300);
         return (fs, wr);
     }
-    static async Task Centers(StageZipStore wr, string id) { await CentersStep.RunAsync(new RecordingStore(wr), P, id, 2, null, default); Assert.True(await StageCommit.CommitAsync(wr, id, "centers", "n1", false, default)); }
-    static string Tmp() => Path.Combine(Path.GetTempPath(), "ff-" + Guid.NewGuid().ToString("N")[..8]);
+    internal static async Task Centers(StageZipStore wr, string id) { await CentersStep.RunAsync(new RecordingStore(wr), P, id, 2, null, default); Assert.True(await StageCommit.CommitAsync(wr, id, "centers", "n1", false, default)); }
+    internal static string Tmp() => Path.Combine(Path.GetTempPath(), "ff-" + Guid.NewGuid().ToString("N")[..8]);
 
     [Fact]
     public async Task The_centers_step_writes_the_frames_file_and_it_holds_exactly_the_centers_bin_bytes_after_the_magic_and_seq()
@@ -243,4 +243,5 @@ public class FramesFileTests
         foreach (var f in new[] { "SearchIndex.cs", "PreCheckSearch.cs", "GroupBuild.cs", "Catalog.cs" })
             Assert.DoesNotContain("CentersZip", File.ReadAllText(Path.Combine(root!, "IndexNode", "Centers", f)).Replace("CentersZip/", "").Replace("0.11.0 SearchData/CentersZip", ""));
     }
+
 }

@@ -31,6 +31,25 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     }
     void NoteVersion(int v) { var old = Interlocked.Exchange(ref indexVersion, v); if (old != -1 && old != v) { blocks.Clear(); Log.Info($"serve: search index v{old} -> v{v}, block cache cleared"); } }
 
+    /// <summary>0.13.31 (serve --warm): fetches every frames file of the loaded index into the local cache, whole, one GET each, paced by <paramref name="pacer"/> (one-off at start; files already cached cost nothing). Returns (fetched, alreadyCached, failed).</summary>
+    public static async Task<(int Fetched, int Cached, int Failed)> WarmFramesAsync(IStore store, SearchData? idx, OpPacer? pacer, Action<string>? progress, CancellationToken ct)
+    {
+        var fc = FramesCache.Current;
+        if (fc == null || idx == null) return (0, 0, 0);
+        int fetched = 0, cached = 0, failed = 0, done = 0;
+        foreach (var u in idx.Uploads)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (u.File == null) continue;
+            if (File.Exists(fc.PathOf(u.File, u.Sha, u.ZipSize))) { cached++; continue; }
+            if (pacer != null) await pacer.WaitAsync(ct);
+            try { var (p, f) = await fc.LocalOrFetchAsync(store, u.File, u.Sha, u.ZipSize, ct); if (p != null && f) fetched++; else if (p != null) cached++; else failed++; }
+            catch (Exception e) when (e is not OperationCanceledException) { failed++; Log.Info($"serve: warm {u.File}: {e.Message}"); if (StoreMeter.Current.Tripped) { await Task.Delay(TimeSpan.FromSeconds(5), ct); } }
+            if (++done % 50 == 0) progress?.Invoke($"serve: warm {fetched} fetched, {cached} cached, {failed} failed of {idx.Uploads.Count}");
+        }
+        return (fetched, cached, failed);
+    }
+
     /// <summary>Re-checks the index every <paramref name="every"/> until cancelled (so a new version is swapped in without waiting for a request).</summary>
     public async Task RefreshLoopAsync(TimeSpan every, CancellationToken ct)
     {
@@ -178,15 +197,19 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             finally { slots.Release(); }
         }
         else throw new ArgumentException("send an image (multipart 'image', JPEG/PNG) or a vector (multipart 'vector', 512 f32/f16)");
-        var idx = await IndexAsync(ct) ?? throw new InvalidOperationException("no search index");
-        var (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct);
+        // 0.13.31: a search makes no head.yaml / uploads.yaml / catalog read (the loaded version; the refresh loop moves it) and is ONE step of the storage budget: a warm search is 0 ops, a cold file is one whole GET
+        var idx = index.Loaded ?? await IndexAsync(ct) ?? throw new InvalidOperationException("no search index");
+        var meter = StoreMeter.Current;
+        if (meter.Tripped) throw new StorageBudgetExceeded(meter.TripMessage ?? "the storage breaker is open");
+        List<Hit> hits; QueryTimings tm; long ops;
+        using (var scope = meter.BeginStep(0, null)) { (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct); ops = meter.StepOps; }
         Interlocked.Increment(ref searches);
         return new JsonObject
         {
             ["indexVersion"] = idx.Version,
             ["query"] = new JsonObject { ["kind"] = kind, ["trim"] = trim, ["crop"] = trim && kind == "image" ? new JsonObject { ["top"] = crop.Top, ["bottom"] = crop.Bottom, ["left"] = crop.Left, ["right"] = crop.Right } : null, ["topCenters"] = topCenters, ["top"] = top },
             ["hits"] = new JsonArray(hits.Select(h => (JsonNode?)new JsonObject { ["upload"] = h.Upload, ["time"] = Math.Round(h.Time, 2), ["timestamp"] = Clip.Stamp(h.Time), ["score"] = Math.Round(h.Score, 4), ["row"] = h.Row, ["center"] = h.Center }).ToArray()),
-            ["timings"] = new JsonObject { ["embedMs"] = Math.Round(embedMs, 1), ["scanMs"] = Math.Round(tm.ScanMs, 1), ["readMs"] = Math.Round(tm.ReadMs, 1), ["scoreMs"] = Math.Round(tm.ScoreMs, 1), ["uploads"] = tm.Uploads, ["requests"] = tm.Requests, ["bytes"] = tm.Bytes, ["totalMs"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1) },
+            ["timings"] = new JsonObject { ["embedMs"] = Math.Round(embedMs, 1), ["scanMs"] = Math.Round(tm.ScanMs, 1), ["readMs"] = Math.Round(tm.ReadMs, 1), ["scoreMs"] = Math.Round(tm.ScoreMs, 1), ["uploads"] = tm.Uploads, ["storeOps"] = ops, ["requests"] = tm.Requests, ["bytes"] = tm.Bytes, ["totalMs"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1) },
         };
     }
 
@@ -276,6 +299,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             }
             catch (Exception e) when (e is ArgumentException or FormatException or OverflowException or InvalidDataException or BadHttpRequestException) { Interlocked.Increment(ref failures); return Results.BadRequest(new { error = e.Message }); }
             catch (OperationCanceledException) { return Results.StatusCode(499); }
+            catch (StorageBudgetExceeded e) { Interlocked.Increment(ref failures); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
             catch (Exception e) { Interlocked.Increment(ref failures); Log.Info("serve: search failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
         });
         return app;
@@ -313,6 +337,8 @@ public static class ServeCommand
         var bind = a.Get("bind") ?? "0.0.0.0";
         var app = server.Build($"http://{bind}:{port}");
         _ = server.RefreshLoopAsync(TimeSpan.FromMinutes(5), cts.Token);
+        if (a.Has("warm"))   // 0.13.31: every frames file into the local cache once (paced at 80% of the per-minute cap); from then on a search reads nothing from the store
+            _ = Task.Run(async () => { var w = Stopwatch.StartNew(); var r = await PreCheckServer.WarmFramesAsync(store, await server.IndexAsync(cts.Token), new OpPacer(() => StoreMeter.Current.Total, () => StoreMeter.Current.Limits.MaxPerMin), Console.WriteLine, cts.Token); Console.WriteLine($"serve: warm done in {w.Elapsed.TotalMinutes:0.0} min: {r.Fetched} fetched, {r.Cached} already cached, {r.Failed} failed"); });
         if (a.Has("download-service")) await DownloadServiceHost.StartAsync(server, store, paths, cfg, a, cts.Token);
         await app.StartAsync(cts.Token);
         Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/health)");
