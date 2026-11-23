@@ -8,7 +8,7 @@ public sealed class ShadowStore : IStore
 {
     readonly IStore real; readonly LocalStore local; readonly string dir;
     readonly ConcurrentDictionary<string, Log0> appends = new(); readonly ConcurrentDictionary<string, bool> deleted = new();
-    public long BlockedWrites; public string Dir => dir;
+    public long BlockedWrites; public string Dir => dir; public IStore Real => real;
     sealed class Log0 { public byte[] Data = []; public bool Sealed; public readonly object Gate = new(); }
     public ShadowStore(IStore real, string dir) { this.real = real; this.dir = dir; Directory.CreateDirectory(dir); local = new LocalStore(Path.Combine(dir, "blobs")); }
 
@@ -53,6 +53,12 @@ public sealed class ShadowStore : IStore
         }
         finally { gate.Release(); }
         File.Copy(cached, path, true);
+    }
+    /// <summary>0.13.34: forgets (and deletes) the kept whole downloads of the blobs whose name contains <paramref name="part"/>: a claim that ended needs none of them.</summary>
+    public void DropDownloads(string part)
+    {
+        foreach (var kv in dlProps.Where(k => k.Key.Contains(part, StringComparison.Ordinal)).ToList())
+            if (dlProps.TryRemove(kv.Key, out var c)) try { File.Delete(c.Path); } catch { }
     }
     readonly ConcurrentDictionary<string, SemaphoreSlim> dlGates = new();
     readonly ConcurrentDictionary<string, (string Path, BlobProps Props)> dlProps = new();

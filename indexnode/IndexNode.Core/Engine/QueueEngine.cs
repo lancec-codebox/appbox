@@ -70,6 +70,7 @@ public sealed partial class NodeEngine
             while (!ct.IsCancellationRequested)
             {
                 if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
+                if (diskFull is { } full) { if (Interlocked.Exchange(ref diskLogged, 1) == 0) Log.Info($"node stopped: {full}"); runStop?.Cancel(); return; }
                 bool worked = false; IdleEnd();
                 if (QueueStages().Any(StageEnabled))
                 {
@@ -95,7 +96,13 @@ public sealed partial class NodeEngine
                         {
                             if (look.Stale.Count > 0) try { await queue.CleanStaleAsync(look.Stale, ct); } catch (Exception e) when (e is not OperationCanceledException) { }
                             foreach (var (subject, runnable) in look.Candidates)
-                                if (await TryClaimAndRunAsync(lane, subject, runnable, ct)) { worked = true; break; }
+                            {
+                                bool ran = false;
+                                try { ran = await TryClaimAndRunAsync(lane, subject, runnable, ct); }
+                                catch (OperationCanceledException) { throw; }
+                                catch (Exception e) { Log.Info($"[claim#{lane}] {subject.Id}: the claim failed outside a stage ({DiskGuard.Root(e).GetType().Name}: {Redact.Sas(DiskGuard.Root(e).Message)}); the node goes on"); ignoreSubject[subject.Id] = DateTimeOffset.UtcNow.AddMinutes(2); if (DiskGuard.IsDiskError(e) && o.FreeSpace((StageZipStore.Find(store) as StageZipStore)?.CacheDir ?? Path.GetTempPath()) is { } fr && fr < o.MinFreeBytes) diskFull ??= $"local disk full ({(StageZipStore.Find(store) as StageZipStore)?.CacheDir ?? Path.GetTempPath()}, {DiskGuard.Fmt(fr)} free)"; }
+                                if (ran) { worked = true; break; }
+                            }
                         }
                     }
                     finally { Interlocked.Decrement(ref busyClaims); }
@@ -301,6 +308,7 @@ public sealed partial class NodeEngine
         {
             try { await h.FinishAsync(); } catch { }
             work.Local?.Dispose();
+            try { StageZipStore.ReleaseAll(store, id); } catch (Exception e) { Log.Info($"[claim#{lane}] {id}: could not remove the downloaded zips ({e.Message})"); }   // 0.13.34: done, failed, Transient or released: the zips of this claim go
             running.TryRemove(run, out _);
             cts.Cancel();
             if (timing.Line(o.Device?.Invoke() ?? "cpu") is { Length: > 0 } t) Log.Info($"[claim#{lane}] {id}: time by step: {t}");
@@ -401,8 +409,18 @@ public sealed partial class NodeEngine
         catch (LeaseLostException e) { return (Outcome.LeaseLost, e.Message, false, ctx); }
         catch (OperationCanceledException) { return (h.Lost ? Outcome.LeaseLost : Outcome.Released, null, false, ctx); }
         catch (StorageBudgetExceeded e) { Log.Info($"[{stage}#{lane}] {id}: {e.Message}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, e.Message, false, ctx); }
+        catch (Exception e) when (DiskGuard.IsDiskError(e))
+        {   // 0.13.34: the local disk failed (full, or a write error): this claim fails as Transient, the node goes on; it stops only if the disk is still too full for the next download
+            var dir = (StageZipStore.Find(store) as StageZipStore)?.CacheDir ?? Path.GetTempPath(); var free = o.FreeSpace(dir);
+            Log.Info($"[{stage}#{lane}] {id}: LOCAL DISK ERROR writing under {dir} ({e.GetType().Name}: {DiskGuard.Root(e).Message}); free {DiskGuard.Fmt(free)}; this claim fails as Transient");
+            if (free != null && free < o.MinFreeBytes) diskFull ??= $"local disk full ({dir}, {DiskGuard.Fmt(free)} free)";
+            return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, "local disk error: " + DiskGuard.Root(e).Message, false, ctx);
+        }
         catch (Exception e) { Console.Error.WriteLine($"[{stage}#{lane}] {id}: {Redact.Trace(e)}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, e.Message, false, ctx); }
     }
+    private volatile string? diskFull; private int diskLogged; private CancellationTokenSource? runStop;
+    /// <summary>0.13.34: why the node stopped for the local disk (null = it did not).</summary>
+    public string? DiskStop => diskFull;
 
     private static JobDescriptor NewFollow(string stage, string id, int priority) => new() { Stage = stage, JobId = id, Priority = priority, AddedAt = Protocol.NowUtc() };
 

@@ -114,6 +114,8 @@ public static class Program
     {
         try
         {
+            // 0.13.34: a background task nobody awaited (an HTTP copy into a file that hits a full disk) must not take the node down: it is logged and observed
+            TaskScheduler.UnobservedTaskException += (_, e) => { e.SetObserved(); Log.Info($"background task failed (ignored): {Redact.Sas(DiskGuard.Root(e.Exception).Message)}"); };
             var a = Args.Parse(argv);
             if (a.Has("version") && a.Positional.Count == 0) { Console.WriteLine(Commands.VersionString); return 0; }
             if (a.Positional.Count == 0 || a.Has("help")) { Console.WriteLine(Usage); return a.Has("help") ? 0 : 2; }

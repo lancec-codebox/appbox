@@ -14,6 +14,8 @@ public interface IStageStore
     Task<bool> CommitStageAsync(string videoId, string stage, string nodeId, bool merge, bool onlyIfNew, CancellationToken ct);
     /// <summary>Drops what a stage staged without uploading it (a failed or released run).</summary>
     void DiscardStaged(string videoId, string? stage = null);
+    /// <summary>0.13.34: deletes the zips this store downloaded into its local cache for a video (and their half-written .part files) when a claim ends: nothing a later job needs lives there.</summary>
+    void ReleaseDownloads(string videoId);
 }
 
 /// <summary>The zip behind a read changed (ETag no longer matches): reopen and read again.</summary>
@@ -51,11 +53,11 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     public Task<bool> PutBlockListAsync(string name, IReadOnlyList<string> blockIds, string? etag, CancellationToken ct) => inner.PutBlockListAsync(name, blockIds, etag, ct);
     public Task<(bool Ok, string? ETag)> PutIfMatchWithETagAsync(string name, byte[] data, string? etag, CancellationToken ct) => inner.PutIfMatchWithETagAsync(name, data, etag, ct);
     public IStore Inner => inner;
+    public string CacheDir => cacheDir;
     /// <summary>0.13.32: the blob names under a prefix as the store really holds them: no zip is opened (a ListAsync of a video's folder opens every stage zip to show its members).</summary>
     public static async Task<IReadOnlyList<BlobEntry>> ListRawAsync(IStore s, string prefix, CancellationToken ct) { using var none = OnlyZips(); return await s.ListAsync(prefix, false, false, ct); }   // an empty OnlyZips scope: through any wrapper (shadow, recording, local cache) no zip is opened
-    public static IStore? Find(IStore s) { for (int i = 0; i < 8 && s != null; i++) { if (s is StageZipStore z) return z; s = s switch { LocalCacheStore l => l.Inner, RecordingStore r => r.Inner, RedirectStore d => d.Inner, _ => null! }; } return null; }
+    public static IStore? Find(IStore s) { for (int i = 0; i < 8 && s != null; i++) { if (s is StageZipStore z) return z; s = s switch { LocalCacheStore l => l.Inner, RecordingStore r => r.Inner, RedirectStore d => d.Inner, ShadowStore sh => sh.Real, _ => null! }; } return null; }
     public static IStageStore? Stage(IStore s) => Find(s) as IStageStore;
-    public static string Wrap(string? dir) => dir ?? Path.Combine(Path.GetTempPath(), "indexnode", "zips-" + Environment.ProcessId);
     public static IStore Wrap(IStore store, string? dir = null) => store is StageZipStore ? store : new StageZipStore(store, Wrap(dir));
 
     /// <summary>A zip at most this big is downloaded whole into the cache; a bigger one is range-read.</summary>
@@ -90,6 +92,38 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
     private static string H(string s) => Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(s)))[..16];
     private string StageDir(string zipBlob) => Path.Combine(cacheDir, "stage", H(zipBlob));
 
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> downloaded = new();   // zip blob -> the local files downloaded for it
+    private void Track(string blob, string path) => downloaded.GetOrAdd(blob, _ => new())[path] = 0;
+    private static bool InVideo(string blob, string videoId) => blob.Contains($"/videos/{videoId}/", StringComparison.Ordinal) || blob.StartsWith($"videos/{videoId}/", StringComparison.Ordinal);
+    public void ReleaseDownloads(string videoId)
+    {
+        foreach (var blob in downloaded.Keys.Concat(views.Keys).Distinct().Where(b => InVideo(b, videoId)).ToList())
+        {
+            views.TryRemove(blob, out _);
+            if (downloaded.TryRemove(blob, out var files)) foreach (var f in files.Keys) try { File.Delete(f); } catch { }
+            try { var zd = Path.Combine(cacheDir, "zips"); if (Directory.Exists(zd)) foreach (var part in Directory.EnumerateFiles(zd, H(blob) + ".*.part")) File.Delete(part); } catch { }
+        }
+    }
+    /// <summary>0.13.34: a claim ended: its downloaded zips go, in the stage store and in a shadow layer's kept whole downloads, wherever they sit in the wrapper chain.</summary>
+    public static void ReleaseAll(IStore s, string videoId)
+    {
+        for (int i = 0; i < 8 && s != null; i++) { if (s is ShadowStore sh) sh.DropDownloads($"/videos/{videoId}/"); if (s is StageZipStore z) z.ReleaseDownloads(videoId); s = s switch { StageZipStore z2 => z2.Inner, LocalCacheStore l => l.Inner, RecordingStore r => r.Inner, RedirectStore d => d.Inner, ShadowStore sh2 => sh2.Real, _ => null! }; }
+    }
+
+    /// <summary>0.13.34: removes the zips-&lt;pid&gt; cache dirs under <paramref name="root"/> whose process is gone (a node that died or was killed never cleaned its own). Returns the dirs removed.</summary>
+    public static int SweepStaleDirs(string root, Func<int, bool>? alive = null)
+    {
+        alive ??= IsLive; int n = 0;
+        if (!Directory.Exists(root)) return 0;
+        foreach (var d in Directory.EnumerateDirectories(root, "zips-*"))
+            if (int.TryParse(Path.GetFileName(d)["zips-".Length..], out var pid) && pid != Environment.ProcessId && !alive(pid))
+                try { Directory.Delete(d, true); n++; Log.Info($"cache: removed the zips of a dead process: {d}"); } catch (Exception e) { Log.Info($"cache: could not remove {d} ({e.Message})"); }
+        return n;
+    }
+    static bool IsLive(int pid) { try { using var p = System.Diagnostics.Process.GetProcessById(pid); return !p.HasExited; } catch (ArgumentException) { return false; } catch { return true; } }
+    static int swept;
+    public static string Wrap(string? dir) { if (dir == null && Interlocked.Exchange(ref swept, 1) == 0) try { SweepStaleDirs(Path.Combine(Path.GetTempPath(), "indexnode")); } catch { } return dir ?? Path.Combine(Path.GetTempPath(), "indexnode", "zips-" + Environment.ProcessId); }
+
     private readonly ConcurrentDictionary<string, SemaphoreSlim> opening = new();
     private readonly ConcurrentDictionary<string, DateTime> absent = new();   // 0.13.32: a zip found missing (the sscd probe of every frames index) is not looked for again for a minute, or until this store writes a zip
     /// <summary>0.13.32: one open of a zip at a time per blob: reads that start together (a pool of threads each wanting a member) share the one open (tags, head, one whole GET) instead of each doing its own.</summary>
@@ -117,20 +151,23 @@ public sealed partial class StageZipStore(IStore inner, string cacheDir) : IStor
         async Task<BlobProps?> Whole()
         {
             Directory.CreateDirectory(Path.Combine(cacheDir, "zips")); var tmp = Path.Combine(cacheDir, "zips", H(blob) + "." + Guid.NewGuid().ToString("N")[..6] + ".part");
-            var p = await inner.DownloadToFileWithPropsAsync(blob, tmp, ct); if (p == null) return null;
+            BlobProps? p;
+            try { p = await inner.DownloadToFileWithPropsAsync(blob, tmp, ct); }
+            catch { try { File.Delete(tmp); } catch { } throw; }   // a failed download (a full disk too) leaves no half-written .part behind
+            if (p == null) { try { File.Delete(tmp); } catch { } return null; }
             if (p.Size < ZipOpen.MinZip)
             {   // a store that does not settle ghosts itself (not a RestStore): hydrate through the readable HEAD, then fetch again
                 try { File.Delete(tmp); } catch { }
                 p = await ZipOpen.HeadReadableAsync(inner, blob, ct, mustBeZip: false); if (p == null) return null;
                 p = await inner.DownloadToFileWithPropsAsync(blob, tmp, ct); if (p == null) return null;
             }
-            var local = Cache(p); File.Move(tmp, local, true); return p;
+            var local = Cache(p); File.Move(tmp, local, true); Track(blob, local); return p;
         }
         if (wholeAlways.Value) { h = await Whole(); if (h == null) return null; src = new FileZipSource(Cache(h)); }
         else
         {
             h = await inner.HeadAsync(blob, ct); if (h == null) return null;
-            if (h.Size <= WholeZipLimit) { var local = h.Size > 0 && File.Exists(Cache(h)) ? h : await Whole(); if (local == null) return null; h = local; src = new FileZipSource(Cache(h)); }
+            if (h.Size <= WholeZipLimit) { var local = h.Size > 0 && File.Exists(Cache(h)) ? h : await Whole(); if (local != null) Track(blob, Cache(local)); if (local == null) return null; h = local; src = new FileZipSource(Cache(h)); }
             else
             {
                 if (LocalCacheStore.Unwrap(inner) is RestStore rest && !fresh) { try { await NexisAccess.PrepareAsync(rest, blob, ct); } catch (OperationCanceledException) { throw; } catch (Exception e) { Log.Info($"zip {blob}: touch failed ({e.Message})"); } }   // a ghosted big zip is read by ranges for minutes: keep it warm

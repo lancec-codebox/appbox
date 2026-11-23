@@ -87,6 +87,9 @@ public sealed class EngineOptions
     public TimeSpan TailMin { get; init; } = TimeSpan.FromSeconds(2); public TimeSpan TailMax { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan RegistryInterval { get; init; } = TimeSpan.FromSeconds(60);
     public TimeSpan BotBackoff { get; init; } = TimeSpan.FromHours(1);
+    /// <summary>0.13.34: the local disk guard. FreeSpace(path) is the free bytes where downloads land (null = unknown, never stops); the node stops cleanly when less than MinFreeBytes is left after a claim failed on the disk.</summary>
+    public Func<string, long?> FreeSpace { get; init; } = DiskGuard.Free;
+    public long MinFreeBytes { get; init; } = 2L << 30;
     public Func<int, TimeSpan> TransientBackoff { get; init; } = attempts => TimeSpan.FromMinutes(Math.Pow(2, attempts));
     public string? Conditions { get; init; }
     /// <summary>The process steps this node can run (advertised in the registry).</summary>
@@ -402,7 +405,7 @@ public sealed partial class NodeEngine
         var loops = new[] { RegistryLoop(loopsCts.Token), IdleLoop(runCts, loopsCts.Token) };
         try
         {
-            var rt = runCts.Token; o.Meter.Limits.Lanes = Math.Max(1, o.Workers);   // 0.13.30: the per-minute cap is per lane
+            runStop = runCts; var rt = runCts.Token; o.Meter.Limits.Lanes = Math.Max(1, o.Workers);   // 0.13.30: the per-minute cap is per lane
             queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now, o.DownloaderOnly);
             await queue.LoadAsync(rt);
             await EnsureSearchIndexAsync(rt);
