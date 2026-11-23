@@ -23,16 +23,16 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
     public async Task<RunResult> RunWithQueueAsync(ActorsIO io, JobQueue q, string id, bool manual, int threads, CancellationToken ct)
     {
         long? mySeq = q.Read(st => st.Get(id)?.Seq); if (mySeq == null) mySeq = SeqOf((await VideoJson.ReadAsync(io.Store, io.Paths, id, ct))?.Root["grouping"] as JsonObject);   // the queue has no seq for it yet: its own video.json says
-        List<string> qpreds = q.Read(st => mySeq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
-        return await RunAsync(io, id, manual, threads, ct, qpreds, null, up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q.Read(GroupOfQueue), q.Read(st => st.ActorsIndexVer));
+        List<string> qpreds = q.Read(st => mySeq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me && PredKindOf(st, x.Id) != PredKind.Skip).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
+        return await RunAsync(io, id, manual, threads, ct, qpreds, null, up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q.Read(GroupOfQueue), q.Read(st => st.ActorsIndexVer), up => q.Read(st => PredKindOf(st, up)));
     }
 
     public async Task RunAsync(JobContext ctx)
     {
         var io = new ActorsIO(ctx.Store, ctx.Paths, dry, outLocal); ctx.Report("actors", "units");
-        var q = ctx.Queue; List<string>? qpreds = q?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
+        var q = ctx.Queue; List<string>? qpreds = q?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } sq && sq < me && PredKindOf(st, x.Id) != PredKind.Skip).OrderBy(x => x.Seq).ThenBy(x => x.Id, StringComparer.Ordinal).Select(x => x.Id).ToList() : new List<string>());
         // 0.13.27: predecessors (a) and which are AI (b) come from the queue this node holds; its own grouping record (c) from its own video.json. No read of the aggregate.
-        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q?.Read(GroupOfQueue), q?.Read(st => st.ActorsIndexVer)); Last = r;
+        var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, qpreds, null, q == null ? null : up => q.Read(st => st.Entry(up, "actors")?.Hold == "ai" || st.Entry(up, "process")?.Hold == "ai"), q?.Read(GroupOfQueue), q?.Read(st => st.ActorsIndexVer), q == null ? null : up => q.Read(st => PredKindOf(st, up))); Last = r;
         Log.Info($"actors {r.Id}: " + (r.Skipped ?? $"{r.Units} units ({r.FacesUsed} faces, {r.ChildUnits} child), {r.Links} links ({r.BandLinked}/{r.Band} band), predecessors {r.Predecessors}, index {r.IndexRouted}; {r.Timing}"));
     }
 
@@ -58,9 +58,21 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
     // 0.13.27: the unit docs this process has read or written (key: store, name). Units never change for a given grouping record, so a later job reads no predecessor file it already has.
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, UnitDoc> seenUnits = new(StringComparer.Ordinal);
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, object> storeIds = new(); static long nextStoreId;
-    static string SeenKey(ActorsIO io, string name) => storeIds.GetValue(io.Store, _ => (object)Interlocked.Increment(ref nextStoreId)) + "|" + name;
-    static void Remember(ActorsIO io, string name, UnitDoc d) { if (!io.Writes) return; if (seenUnits.Count > 2000) seenUnits.Clear(); seenUnits[SeenKey(io, name)] = d; }
+    static string SeenKey(ActorsIO io, string name) { var st = io.Store; while (st is MeteredStore ms) st = ms.Inner; return storeIds.GetValue(st, _ => (object)Interlocked.Increment(ref nextStoreId)) + "|" + name; }   // 0.13.29: keyed by the underlying store, so a metering wrapper never splits the cache
+    static void Remember(ActorsIO io, string name, UnitDoc d) { if (!io.Writes) return; if (seenUnits.Count > 50000) seenUnits.Clear(); seenUnits[SeenKey(io, name)] = d; }
     public static void ForgetSeen() { seenUnits.Clear(); ActorsIndex.ForgetCache(); }
+
+    /// <summary>0.13.29: what a predecessor can have, from the queue state alone (no store call): Skip = it can never have units (AI held, failed, a catalog-only upload with no cast, or its process step not finished: nothing to read yet); Compute = its process step is done but its actors step is not (in flight on another lane, or not claimed yet): built from its cast files, no units-file probe; UnitsFile = its actors step is done, so its units file exists (written by whichever node ran it).</summary>
+    public enum PredKind { Skip, Compute, UnitsFile }
+    public static PredKind PredKindOf(QueueState st, string up)
+    {
+        var s = st.Get(up); if (s == null) return PredKind.Skip;
+        if (s.Data != "full" || s.Entries.GetValueOrDefault("process") is not { State: "done" } || s.Entries.Values.Any(e => e.Hold == "ai")) return PredKind.Skip;   // 0.13.29: only fully processed, non-AI uploads are predecessors
+        if (s.Entries.GetValueOrDefault("actors") is { State: "done" }) return PredKind.UnitsFile;
+        if (s.Entries.Values.Any(e => e.State == "failed" || e.Hold == "ai")) return PredKind.Skip;
+        if (s.Data != "full" || s.Entries.GetValueOrDefault("process") is not { State: "done" }) return PredKind.Skip;
+        return PredKind.Compute;
+    }
 
     /// <summary>0.13.28: an upload's group comes from the queue state (the join record the group step's done line put there): each upload maps to the root of its join chain. No groups file, no head.yaml.</summary>
     public static Dictionary<string, string> GroupOfQueue(QueueState st)
@@ -106,7 +118,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         return b2;
     }
 
-    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null, Dictionary<string, string>? queueGroups = null, int? announcedIndex = null)
+    public async Task<RunResult> RunAsync(ActorsIO io, string id, bool manual, int threads, CancellationToken ct, IReadOnlyList<string>? preds = null, IReadOnlyList<string>? extraPreds = null, Func<string, bool>? queueAi = null, Dictionary<string, string>? queueGroups = null, int? announcedIndex = null, Func<string, PredKind>? queuePred = null)
     {
         var paths = io.Paths; var now = Protocol.NowUtc(); var sw = System.Diagnostics.Stopwatch.StartNew(); long msOwn = 0, msPred = 0, msRoute = 0, msR50 = 0; int predComputed = 0, predReused = 0, predCached = 0, predWritten = 0;
         var vj = await VideoJson.ReadAsync(io.Store, paths, id, ct); var uf = ActorsData.UnitFile(paths, id);
@@ -129,6 +141,8 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         var pend = new List<(string Id, string Prod, List<UnitRec> Units)>(); int aiSkipped = 0, missing = 0;
         foreach (var up in (preds ?? []).Where(p => p != id && !indexed.Contains(p)).Distinct(StringComparer.Ordinal))
         {
+            var pk = queuePred?.Invoke(up) ?? PredKind.UnitsFile;
+            if (pk == PredKind.Skip) { missing++; continue; }   // 0.13.29: it can never have units (or none yet): no store call at all
             if (await Ai(up)) { aiSkipped++; continue; }   // an AI predecessor: its cast data is never read
             JsonObject? prec = null;
             if (!qmode && (predDocs.TryGetValue(up, out var pdoc) ? pdoc : await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root["grouping"] is not JsonObject prec0) { missing++; continue; } else if (!qmode) prec = (predDocs.TryGetValue(up, out var pdoc1) ? pdoc1 : await VideoJson.ReadAsync(io.Store, paths, up, ct))!.Root["grouping"] as JsonObject;
@@ -136,7 +150,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
             {
                 var puf = ActorsData.UnitFile(paths, up);   // 1) its units file, when its own run (or an earlier run of ours) wrote it: a cache with the same keys, never a wait
                 if (seenUnits.TryGetValue(SeenKey(io, puf), out var sd)) { pend.Add((up, sd.Prod, sd.Units)); predCached++; continue; }   // 0.13.27: a units file this process has read or written is not read again
-                if (await io.GetAsync(puf, ct) is { } pc) { var pdoc2 = UnitDoc.FromBytes(pc.Data, puf); Remember(io, puf, pdoc2); pend.Add((up, pdoc2.Prod, pdoc2.Units)); predReused++; continue; }
+                if (pk != PredKind.Compute && await io.GetAsync(puf, ct) is { } pc) { var pdoc2 = UnitDoc.FromBytes(pc.Data, puf); Remember(io, puf, pdoc2); pend.Add((up, pdoc2.Prod, pdoc2.Units)); predReused++; continue; }
                 if (prec == null && (prec = (await VideoJson.ReadAsync(io.Store, paths, up, ct))?.Root["grouping"] as JsonObject) == null) { missing++; continue; }   // queue mode: the predecessor's own video.json, only when its units are not already at hand
                 var ckey = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(io.Store) + "|" + up + "|" + prec.ToJsonString().GetHashCode();
                 if (unitCache.TryGetValue(ckey, out var hit)) { pend.Add((up, hit.Prod, hit.Units)); predCached++; continue; }   // 2) computed earlier in this process

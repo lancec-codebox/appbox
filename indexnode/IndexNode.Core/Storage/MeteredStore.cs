@@ -7,7 +7,9 @@ public sealed class MeteredStore(IStore inner, StoreMeter? meter = null) : IStor
     public StoreMeter Meter { get; } = meter ?? StoreMeter.Current;
     /// <summary>0.13.28 safety valve: when set, every store operation first waits until the last minute's ops are under the pacer's budget (normal work never waits; a heavy single step cannot trip the breaker).</summary>
     public OpPacer? Pacer { get; set; }
-    Task Pace(CancellationToken ct) => Pacer == null ? Task.CompletedTask : Pacer.WaitAsync(ct);
+    /// <summary>Called once per admitted op (after the pacer let it through, before it runs): lets a test measure the true admission times.</summary>
+    public Action? OnAdmitted { get; set; }
+    async Task Pace(CancellationToken ct) { if (Pacer != null) await Pacer.WaitAsync(ct); OnAdmitted?.Invoke(); }
     string B(string op, string? name) => Meter.Before(op, name);
     T F<T>(string site, string op, string? name, T r, bool missing) { if (missing) Meter.Failed(site, op, name, 404); return r; }
 

@@ -20,6 +20,8 @@ public sealed class RestStore : IStore
     public OpCounter Ops { get; set; } = OpCounter.Current;
     /// <summary>0.13.18: the meter and circuit breaker every request of this store passes (per call site, per op, failures apart).</summary>
     public StoreMeter Meter { get; set; } = StoreMeter.Current;
+    /// <summary>0.13.29: the per-op gate: every request of every stage (ActorsIO, JobQueue, VideoJson, BlobZipSource, ...) waits here until the last minute's ops are under the pacer's budget. A node sets it; it is a safety valve, normal work never waits.</summary>
+    public OpPacer? Pacer { get; set; }
     /// <summary>0.13.18: names this store answered 404 for. A missing name is not asked for again within a minute, until a write, a listing or a queue line says it exists. control.json is exempt (the kill switch must be seen within one poll).</summary>
     public NegativeCache Negative { get; set; } = new();
     private bool KnownMissing(string name) => !name.EndsWith("jobs/control.json", StringComparison.Ordinal) && Negative.IsMissing(name);
@@ -171,6 +173,7 @@ public sealed class RestStore : IStore
         {
             try
             {
+                if (Pacer != null) await Pacer.WaitAsync(ct);   // 0.13.29: before EVERY request, retries included
                 var req = make();
                 var cnt = Count(req, site); site = cnt.Site;
                 var sent = req.Content?.Headers.ContentLength ?? 0;

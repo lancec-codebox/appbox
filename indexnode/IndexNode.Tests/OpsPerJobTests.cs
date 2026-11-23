@@ -204,6 +204,55 @@ public class OpsPerJobTests(ITestOutputHelper output)
         Assert.Contains(fs.Gets, n => n.EndsWith("actors/head.json")); Assert.Equal(1, fs.Gets.Count(n => n.EndsWith("vec.f16"))); Assert.True(r2.IndexRouted >= 1, "the indexed uploads were not considered"); ActorsIndex.ForgetCache();
     }
 
+    [Fact]
+    public async Task Two_lanes_of_actors_with_index_builds_through_one_paced_store_never_exceed_200_a_minute_and_never_trip()
+    {
+        VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); ActorsIndex.ForgetCache();
+        var fs = new FakeStore(); var clock = new DateTime(2026, 11, 23, 1, 0, 0, DateTimeKind.Utc); var cl = new object();
+        DateTime Now() { lock (cl) return clock; }
+        var m = new StoreMeter(() => new DateTimeOffset(Now())) { Limits = new StorageLimits { MaxPerMin = 200, WarnPerMin = 150, MaxPerStep = 100000, MaxFailuresPerMin = 100000 } };
+        var store = new MeteredStore(fs, m); VideoAggregate.Clock = Now;
+        var admitted = new List<DateTime>(); store.OnAdmitted = () => { lock (admitted) admitted.Add(Now()); };
+        try
+        {
+            const int N = 60; var ids = Enumerable.Range(0, N).Select(i => "q" + i.ToString("D3")).ToList(); var q = new QueueState();
+            for (int i = 0; i < N; i++)
+            {
+                await Drama(fs, ids[i], WithCos(1 - (i % 7) * 0.05, i % 5 + 1), ((byte)(10 + i), 50, 90), n: 4, seed: i + 1);
+                await VideoJson.UpdateAsync(fs, P, ids[i], r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = i + 1 }, default);
+                q.Apply(new QLine { T = "enter", S = ids[i], Data = "full", At = "2026-01-01T00:00:00Z" }); q.Apply(new QLine { T = "add", S = ids[i], Stage = "process", Job = new JobDescriptor { Stage = "process" }, At = "2026-01-01T00:00:00Z" });
+                q.Apply(new QLine { T = "done", S = ids[i], Stage = "process", At = "2026-01-01T00:00:01Z" }); q.Apply(new QLine { T = "seq", S = ids[i], Seq = i + 1 });
+                q.Apply(new QLine { T = "add", S = ids[i], Stage = "group", Job = new JobDescriptor { Stage = "group" }, At = "2026-01-01T00:00:01Z" }); q.Apply(new QLine { T = "done", S = ids[i], Stage = "group", JoinKind = "new", At = "2026-01-01T00:00:02Z" });
+                q.Apply(new QLine { T = "add", S = ids[i], Stage = "actors", Job = new JobDescriptor { Stage = "actors" }, At = "2026-01-01T00:00:02Z" });
+            }
+            VideoAggregate.ClearCache();
+            var pacer = new OpPacer(() => m.Total, () => m.Limits.MaxPerMin, 0.8, Now, (d, t) => { lock (cl) clock += d; return Task.CompletedTask; }); store.Pacer = pacer;
+            var stage = new ActorsStage(store, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg };
+            var io = new ActorsIO(store, P); var groups = ActorsStage.GroupOfQueue(q); int annV = 0; var stamps = new List<(DateTime At, long T)>(); var perJob = new Dictionary<string, long>();
+            async Task Job(int i)
+            {
+                var preds = q.Subjects.Values.Where(x => x.Seq is { } sq && sq < i + 1).OrderBy(x => x.Seq).Select(x => x.Id).ToList(); long b0 = m.Total;
+                using (m.BeginStep(0, ids[i])) await stage.RunAsync(io, ids[i], false, 1, default, preds, null, up => false, groups, annV, up => ActorsStage.PredKindOf(q, up));
+                lock (perJob) perJob[ids[i]] = m.Total - b0;
+            }
+            for (int i = 0; i < N; i += 2)
+            {
+                await Task.WhenAll(Job(i), Job(i + 1));   // two lanes: each is the other's in-flight predecessor
+                foreach (var k in new[] { i, i + 1 }) q.Apply(new QLine { T = "done", S = ids[k], Stage = "actors", At = "2026-01-01T00:01:00Z" });
+                lock (cl) clock += TimeSpan.FromSeconds(3.5); stamps.Add((Now(), m.Total));
+                if ((i + 2) % 25 == 0 || (i + 2) % 30 == 0) { await pacer.WaitAsync(default); await ActorsIndex.BuildAsync(new ActorsIO(store, P), default); ActorsIndex.ForgetCache(); annV++; stamps.Add((Now(), m.Total)); }
+            }
+            long peak = 0; for (int i = 0; i < stamps.Count; i++) { int j = i; while (j > 0 && stamps[i].At - stamps[j - 1].At <= TimeSpan.FromSeconds(60)) j--; peak = Math.Max(peak, stamps[i].T - (j == 0 ? 0 : stamps[j - 1].T)); }
+            var steady = perJob.Where(kv => kv.Key.CompareTo("q020") >= 0).Select(kv => kv.Value).ToList();
+            var adm = admitted.OrderBy(x => x).ToList(); int truePeak = 0; for (int a = 0, b = 0; a < adm.Count; a++) { while (adm[a] - adm[b] > TimeSpan.FromSeconds(60)) b++; truePeak = Math.Max(truePeak, a - b + 1); }
+            output.WriteLine($"2 lanes: {N} jobs, steady ops/job avg={steady.Average():F1} max={steady.Max()}; peak/min(coarse stamps)={peak}; true peak per 60 s by admission time={truePeak} of {adm.Count} ops; pacer waits={pacer.Waits}; tripped={m.Tripped}");
+            output.WriteLine("per-site (all): " + string.Join("; ", m.Table().OrderByDescending(x => x.Count).Take(16).Select(x => $"{x.Site} {x.Op} x{x.Count}")));
+            Assert.False(m.Tripped); Assert.True(truePeak <= 165, "true peak per 60 s " + truePeak); Assert.True(steady.Average() <= 12, "avg ops/job " + steady.Average());
+            Assert.True(m.Table().Where(x => x.Op.Contains("!404") && x.Site.Contains("ActorsIO")).Sum(x => x.Count) <= 70, "404 probes");   // one own-unit-file probe per job
+        }
+        finally { VideoAggregate.Clock = () => DateTime.UtcNow; ActorsIndex.ForgetCache(); }
+    }
+
     sealed class Fn(Func<JobContext, Task> f) : IStageHandler { public Task RunAsync(JobContext ctx) => f(ctx); }
 
     static EngineOptions Opts(StoreMeter m, Func<DateTimeOffset> now, Func<TimeSpan, CancellationToken, Task> delay) => new()
@@ -272,6 +321,68 @@ public class OpsPerJobTests(ITestOutputHelper output)
         Assert.DoesNotContain(m.Table(), x => x.Site.Contains("VideoAggregate"));
         Assert.Equal(2, rep.Predecessors); Assert.Equal(1, rep.PredecessorsAi);   // a1, a2 compared; ai1 skipped by its hold
         Assert.DoesNotContain(fs.Seen, n => n.Contains("videos.agg")); Assert.DoesNotContain(fs.Seen, n => n.Contains("ai1/cast"));
+    }
+
+    [Fact]
+    public async Task Predecessors_that_can_never_have_units_are_skipped_from_queue_state_with_no_store_call()
+    {
+        VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); ActorsIndex.ForgetCache();
+        var fs = new FakeStore(); var q = new QueueState(); const string At = "2026-01-01T00:00:00Z"; int seq = 0;
+        void Up(string id, string data, string processState, string? hold = null)
+        {
+            q.Apply(new QLine { T = "enter", S = id, Data = data, At = At }); q.Apply(new QLine { T = "seq", S = id, Seq = ++seq });
+            if (data == "full") { q.Apply(new QLine { T = "add", S = id, Stage = "process", Job = new JobDescriptor { Stage = "process" }, At = At }); q.Apply(new QLine { T = "done", S = id, Stage = "process", State = processState, At = At }); }
+        }
+        var skipIds = new List<string>(); var full = 0;
+        for (int i = 0; i < 132; i++) { Up("pc" + i, "precheck", "done"); skipIds.Add("pc" + i); }      // check:duplicate, entered as precheck data
+        for (int i = 0; i < 36; i++) { Up("pd" + i, "full", "duplicate"); skipIds.Add("pd" + i); }      // process:duplicate
+        for (int i = 0; i < 20; i++) { Up("fu" + i, "full", "done"); full++; }                          // a real cast, actors not done yet
+        Up("me", "full", "done");
+        var kinds = q.Subjects.Keys.Where(k => k != "me").GroupBy(k => ActorsStage.PredKindOf(q, k)).ToDictionary(g => g.Key, g => g.Count());
+        output.WriteLine($"predecessors excluded: {kinds.GetValueOrDefault(ActorsStage.PredKind.Skip)} of {q.Subjects.Count - 1} (precheck 132 + process:duplicate 36); kept as Compute: {kinds.GetValueOrDefault(ActorsStage.PredKind.Compute)}");
+        Assert.Equal(168, kinds[ActorsStage.PredKind.Skip]); Assert.Equal(full, kinds[ActorsStage.PredKind.Compute]);
+        Assert.All(skipIds, k => Assert.Equal(ActorsStage.PredKind.Skip, ActorsStage.PredKindOf(q, k)));
+    }
+
+    [Fact]
+    public async Task Concurrent_readers_on_two_lanes_and_an_index_build_never_pass_the_pacer_together()
+    {
+        var fs = new FakeStore(); for (int i = 0; i < 50; i++) await fs.PutAsync("x/" + i, [1], null, null, false, default);
+        var clock = new DateTime(2026, 11, 23, 1, 0, 0, DateTimeKind.Utc); var cl = new object(); DateTime Now() { lock (cl) return clock; }
+        var m = new StoreMeter(() => new DateTimeOffset(Now())) { Limits = new StorageLimits { MaxPerMin = 200, WarnPerMin = 150, MaxPerStep = 100000, MaxFailuresPerMin = 100000 } };
+        var store = new MeteredStore(fs, m);
+        var pacer = new OpPacer(() => m.Total, () => m.Limits.MaxPerMin, 0.8, Now, async (d, ct) => { lock (cl) clock += d; await Task.Yield(); }); store.Pacer = pacer;
+        var stamps = new List<DateTime>(); var sl = new object(); store.OnAdmitted = () => { lock (sl) stamps.Add(Now()); };
+        async Task Reader() { for (int i = 0; i < 80; i++) { await store.GetAsync("x/" + (i % 50), default); await Task.Yield(); } }
+        var tasks = new List<Task>(); for (int lane = 0; lane < 2; lane++) for (int th = 0; th < 8; th++) tasks.Add(Task.Run(Reader));
+        tasks.Add(Task.Run(async () => { for (int i = 0; i < 150; i++) { await store.ListAsync("x/", false, false, default); await Task.Yield(); } }));   // the concurrent index build
+        await Task.WhenAll(tasks);
+        stamps.Sort(); int peak = 0; for (int i = 0, j = 0; i < stamps.Count; i++) { while (stamps[i] - stamps[j] > TimeSpan.FromSeconds(60)) j++; peak = Math.Max(peak, i - j + 1); }
+        output.WriteLine($"{stamps.Count} ops, peak per 60 s = {peak}, waits = {pacer.Waits}"); Assert.True(peak <= 165, "peak " + peak); Assert.False(m.Tripped); Assert.True(pacer.Waits > 0);
+    }
+
+    [Fact]
+    public async Task A_nodes_own_units_files_are_never_read_back_in_one_process()
+    {
+        VideoAggregate.ClearCache(); ActorsStage.ForgetSeen(); ActorsIndex.ForgetCache();
+        var fs = new FakeStore(); const int N = 60; var ids = Enumerable.Range(0, N).Select(i => "u" + i.ToString("D3")).ToList(); var q = new QueueState(); const string At = "2026-01-01T00:00:00Z";
+        for (int i = 0; i < N; i++)
+        {
+            await Drama(fs, ids[i], WithCos(1 - (i % 7) * 0.05, i % 5 + 1), ((byte)(10 + i), 50, 90), n: 4, seed: i + 1);
+            await VideoJson.UpdateAsync(fs, P, ids[i], r => r["grouping"] = new JsonObject { ["v"] = 1, ["proposal"] = new JsonObject { ["kind"] = "new", ["mixed"] = false }, ["seq"] = i + 1 }, default);
+            q.Apply(new QLine { T = "enter", S = ids[i], Data = "full", At = At }); q.Apply(new QLine { T = "add", S = ids[i], Stage = "process", Job = new JobDescriptor { Stage = "process" }, At = At });
+            q.Apply(new QLine { T = "done", S = ids[i], Stage = "process", At = At }); q.Apply(new QLine { T = "seq", S = ids[i], Seq = i + 1 });
+            q.Apply(new QLine { T = "add", S = ids[i], Stage = "group", Job = new JobDescriptor { Stage = "group" }, At = At }); q.Apply(new QLine { T = "done", S = ids[i], Stage = "group", JoinKind = "new", At = At });
+            q.Apply(new QLine { T = "add", S = ids[i], Stage = "actors", Job = new JobDescriptor { Stage = "actors" }, At = At });
+        }
+        var stage = new ActorsStage(fs, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var groups = ActorsStage.GroupOfQueue(q);
+        for (int i = 0; i < N; i++)
+        {
+            await stage.RunAsync(new ActorsIO(fs, P), ids[i], false, 1, default, ids.Take(i).ToList(), null, up => false, groups, 0, up => ActorsStage.PredKindOf(q, up));
+            q.Apply(new QLine { T = "done", S = ids[i], Stage = "actors", At = At });
+        }
+        var unitGets = fs.Gets.Count(n => n.Contains("actors/units/")); output.WriteLine($"units-file GETs over {N} jobs: {unitGets} (the own-file probe is one per job)");
+        Assert.True(unitGets <= N, "units gets " + unitGets);   // only each job's own probe (a 404); never a predecessor's file this node wrote
     }
 
     [Fact]

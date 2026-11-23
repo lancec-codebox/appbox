@@ -409,7 +409,7 @@ public sealed partial class NodeEngine
         try
         {
             var rt = runCts.Token;
-            if (store is MeteredStore ms) ms.Pacer ??= Pacer;   // 0.13.28: per-op pacing, a safety valve
+            if (store is MeteredStore ms) ms.Pacer ??= Pacer; if (store is RestStore rs) rs.Pacer ??= Pacer;   // 0.13.28: per-op pacing, a safety valve
             queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now, o.DownloaderOnly);
             await queue.LoadAsync(rt);
             await EnsureSearchIndexAsync(rt);
