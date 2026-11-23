@@ -70,8 +70,9 @@ public static class ClassifyJobs
     }
 
     /// <summary>The unclassified download entries, oldest first (added, then id): read from the queue's memory, no listing.</summary>
-    public static List<(string Id, QEntry Entry)> ListUnclassified(JobQueue queue) =>
-        queue.Read(st => st.Subjects.Values.Where(s => s.Entries.TryGetValue("download", out var e) && e.State == Tags.Unclassified).Select(s => (Id: s.Id, Entry: s.Entries["download"])).ToList())
+    public static List<(string Id, QEntry Entry)> ListUnclassified(JobQueue queue) => ListUnclassified(queue.Read(st => st));
+    public static List<(string Id, QEntry Entry)> ListUnclassified(QueueState state) =>
+        state.Subjects.Values.Where(s => s.Entries.TryGetValue("download", out var e) && e.State == Tags.Unclassified).Select(s => (Id: s.Id, Entry: s.Entries["download"])).ToList()
             .OrderBy(x => x.Entry.Added, StringComparer.Ordinal).ThenBy(x => x.Id, StringComparer.Ordinal).ToList();
 
     private static readonly string[] DeadAvailability = ["private", "deleted", "unavailable"];

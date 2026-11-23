@@ -59,5 +59,17 @@ public class ClassifyAllTests
         return "{\"videos\":[" + string.Join(",", ids.Select(x => $"{{\"id\":\"{x}\",\"candidate\":true,\"kind\":\"full\",\"language\":\"zh\",\"reason\":\"r\"}}")) + "]}";
     }); }
 
-
+    [Fact]
+    public async Task A_classify_run_makes_no_per_upload_get_of_a_stored_decision_and_writes_no_blob()
+    {
+        var s = new FakeStore(); var queue = new JobQueue(s, P, "n", () => Now); await queue.LoadAsync(default);
+        for (int i = 0; i < 30; i++) await ClassifyJobs.CreateUnclassifiedAsync(queue, Dl(Id(i), 90), default);
+        await ClassifyJobs.EnsureSingletonAsync(queue, default);
+        var job = queue.Read(st => st.Entry(ClassifyJobs.Subject, "classify"))!.Job!;
+        var ctx = new JobContext { Job = job, Stage = "classify", BlobName = ClassifyJobs.Subject, Worker = 1, Queue = queue, Store = s, Paths = P, NodeId = "n", Token = default, ThreadShare = () => 1, Report = (_, _) => { } };
+        int gets = s.Gets.Count; int puts = s.Puts.Keys.Count(x => x.Contains("classify/"));
+        await new ClassifyStage(s, () => Now) { Ai = () => (Yes(), "m") }.RunAllAsync(ctx);
+        Assert.DoesNotContain(s.Gets.Skip(gets), g => g.Contains("classify/"));
+        Assert.Equal(puts, s.Puts.Keys.Count(x => x.Contains("classify/")));
+    }
 }

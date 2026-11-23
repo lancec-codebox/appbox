@@ -120,4 +120,30 @@ public class ActorsBuildTests
         Assert.Single(res.Dramas.Single(d => d.Id == "dA").Units); Assert.Empty(res.Dramas.Single(d => d.Id == "dK").Units); Assert.Equal(1, res.Dramas.Single(d => d.Id == "dK").ChildUnits);
         Assert.Contains("1 units left out", ActorsBuild.Summary(res, ["dA", "dK"], true, 0, null, 0.64));
     }
+
+    [Fact]
+    public async Task The_probe_comes_from_the_flag_else_the_store_else_nothing()
+    {
+        var fs = new FakeStore(); var P2 = new Paths("index/");
+        Assert.Null(await ActorsBuild.ResolveProbeAsync(fs, P2, null, default));   // none anywhere: the node must not claim actors
+        var w = new float[Dim]; w[1] = 1;
+        await fs.PutAsync(ActorsBuild.StoreProbe(P2), System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { w, b = 0.0, cut = 0.8 })), null, null, false, default);
+        Assert.Equal("index/models/child-probe.json", ActorsBuild.StoreProbe(P2));
+        Assert.Equal(0.8, (await ActorsBuild.ResolveProbeAsync(fs, P2, null, default))!.Cut);
+        var path = Path.Combine(Path.GetTempPath(), "cp-" + Guid.NewGuid().ToString("N") + ".json");
+        File.WriteAllText(path, JsonSerializer.Serialize(new { w, b = 0.0, cut = 0.5 }));
+        try { Assert.Equal(0.5, (await ActorsBuild.ResolveProbeAsync(fs, P2, path, default))!.Cut); } finally { File.Delete(path); }   // the flag wins
+    }
+
+    [Fact]
+    public async Task The_op_pacer_holds_a_job_at_80_percent_of_the_breaker()
+    {
+        long ops = 0; var t = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc); var slept = TimeSpan.Zero;
+        var pacer = new OpPacer(() => ops, 10000, 0.8, () => t, (d, _) => { slept += d; t += d; return Task.CompletedTask; });
+        Assert.Equal(8000, pacer.Budget);
+        await pacer.WaitAsync(default); Assert.Equal(0, pacer.Waits);          // quiet: no wait
+        ops = 7999; await pacer.WaitAsync(default); Assert.Equal(0, pacer.Waits);   // under 8,000 in the window
+        ops = 8100; await pacer.WaitAsync(default); Assert.True(pacer.Waits > 0);   // over: it waits until the minute rolls past the burst
+        Assert.True(slept >= TimeSpan.FromSeconds(59) && slept <= TimeSpan.FromSeconds(62), slept.ToString());
+    }
 }

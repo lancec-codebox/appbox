@@ -1,0 +1,266 @@
+using System.Text.Json.Nodes;
+
+namespace IndexNode;
+
+/// <summary>
+/// 0.13.26: the download side's service (run by `indexnode serve`, which alone reads and writes the FULL download queue, jobs/download/, under a singleton lease). Downloaders work from the small WORK queue (jobs/download/work/, at most
+/// <see cref="WorkMax"/> items, same format and claim/lease protocol as every queue). One <see cref="RunOnceAsync"/> pass: fold the work queue's finished items back into the full queue; run the check for every finished sample (a full download
+/// is added, a duplicate or an AI upload is settled: "enter" with data precheck, or held); hand every finished download to processing ("enter", data full, AFTER its "done download" is in the full log; a crash in between is repaired by
+/// <see cref="Handoff.RepairAsync"/>); top the work queue up (newest first, priorities kept) when it is under half full; clear finished items out of it. Downloaders never touch the processing queue.
+/// </summary>
+public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue processing, Func<string, CancellationToken, Task<JsonObject?>> check, int workMax = QueueSplit.DefaultWorkMax, IStore? store = null)
+{
+    public int WorkMax { get; } = Math.Max(2, workMax);
+    public const int ClassifyBatch = 400;
+    public static readonly TimeSpan ClassifyIdle = TimeSpan.FromMinutes(10);
+    static bool IsRun(string stage) => stage is "refresh" or "classify" or "availability";
+    public sealed record Pass(int FoldedBack, int Checked, int Entered, int ToppedUp, int Cleared);
+
+    static bool Ready(QEntry e, string now) => e.State == "pending" && e.Hold == null && string.CompareOrdinal(e.Due, now) <= 0;
+
+    public async Task<Pass> RunOnceAsync(CancellationToken ct)
+    {
+        await full.PollAsync(ct); await work.PollAsync(ct); await processing.PollAsync(ct);
+        await ResolveRequestsAsync(ct);
+        int folded = await FoldRunsAsync(ct) + await FoldBackAsync(ct), checks = await CheckSamplesAsync(ct);
+        int entered = await EnterDownloadsAsync(ct);
+        int top = await TopUpAsync(ct), cleared = await ClearOutAsync(ct);
+        return new Pass(folded, checks, entered, top, cleared);
+    }
+
+    /// <summary>
+    /// A refresh or classify a downloader finished (its done line carries a <see cref="RunResult"/>; large ones are a blob): refresh adds the new uploads as sample-ready subjects (the ones neither queue knows), starts following the channels it found and
+    /// rewrites the source (its body, modified time, next due time); classify turns each decision into the download entry's state. Then the work entry is dropped (the top-up adds it again when it is next due). A run already folded (same last-polled time) is only dropped.
+    /// </summary>
+    public async Task<int> FoldRunsAsync(CancellationToken ct)
+    {
+        await work.PollAsync(ct); await full.PollAsync(ct); await processing.PollAsync(ct);
+        var runs = work.Read(w => w.Subjects.Values.Where(s => s.ClaimBy == null).SelectMany(s => s.Entries.Values.Where(e => IsRun(e.Stage) && e.Job?.Result != null).Select(e => (s.Id, E: e))).ToList());
+        int n = 0;
+        foreach (var (id, e) in runs)
+        {
+            var job = e.Job!; var res = await RunResults.ResolveAsync(store, job.Result!, ct);
+            if (res == null) { Log.Info($"download service: the result of {id}/{e.Stage} is missing ({job.Result!.Blob}); it runs again"); await work.AppendLinesAsync([new QLine { T = "retry", S = id, Stage = e.Stage, Due = work.NowUtc() }], ct); continue; }
+            var at = work.NowUtc(); bool already = full.Read(f => f.Entry(id, e.Stage)?.Job?.LastPolled) is { } lp && lp == job.LastPolled && job.LastPolled != null && e.Stage is "refresh" or "availability";
+            if (!already)
+            {
+                if (e.Stage == "refresh") await FoldRefreshAsync(id, e, job, res, at, ct); else if (e.Stage == "availability") await FoldAvailabilityAsync(id, e, job, at, ct); else await FoldClassifyAsync(id, e, job, res, at, ct);
+                n++;
+            }
+            await work.AppendLinesAsync([new QLine { T = "drop", S = id, Stage = e.Stage }], ct);
+            if (job.Result!.Blob != null && store != null) await store.DeleteAsync(job.Result.Blob, ct);
+        }
+        return n;
+    }
+
+    /// <summary>The admin page's add requests (requests/sources/&lt;id&gt;.json): a channel or playlist URL becomes a source in the full queue whose first look is due now (a downloader lists it); the service makes no YouTube call. A URL that needs YouTube to resolve (a @handle) is marked failed with the reason.</summary>
+    public async Task<int> ResolveRequestsAsync(CancellationToken ct)
+    {
+        if (store == null) return 0;
+        int n = 0;
+        foreach (var b in await store.ListAsync(RefreshStage.RequestsDir(work.Paths), false, false, ct))
+        {
+            if (await store.GetAsync(b.Name, ct) is not { } body || System.Text.Json.Nodes.JsonNode.Parse(body.Data) is not System.Text.Json.Nodes.JsonObject req || req["state"]?.ToString() != "pending") continue;
+            var url = req["url"]?.ToString() ?? "";
+            try
+            {
+                var known = Sources.Classify(url) ?? throw new InvalidOperationException("the download service does not call YouTube: give the channel (/channel/UC...) or playlist (list=...) URL, or add it with `indexnode sources add`");
+                bool playlist = known.Kind == "playlist";
+                var job = JobDescriptor.NewSource(known.Kind, known.Id, known.Id, req["schedule"]?.ToString() ?? "once", ["videos"], req["followChannels"]?.GetValue<bool>() ?? playlist, playlist ? -1 : 0, 480);
+                bool made = await Sources.AddAsync(full, job, ct);
+                req["state"] = "done"; req["jobId"] = job.JobId; req["name"] = job.Name; req["note"] = made ? "source added, its first look is due now" : "already watched";
+            }
+            catch (Exception e) when (e is not OperationCanceledException) { req["state"] = "failed"; req["error"] = Redact.Sas(e.Message.Length > 300 ? e.Message[..300] : e.Message); }
+            req["resolvedAt"] = Protocol.Utc(DateTimeOffset.UtcNow);
+            await store.PutAsync(b.Name, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(req), null, null, false, ct); n++;
+        }
+        return n;
+    }
+
+    async Task FoldRefreshAsync(string id, QEntry e, JobDescriptor job, RunResult res, string at, CancellationToken ct)
+    {
+        var fresh = (res.Videos ?? []).Where(d => d.JobId.Length > 0).GroupBy(d => d.JobId, StringComparer.Ordinal).Select(g => g.First()).ToList();
+        foreach (var chunk in JobQueue.Chunks(fresh, d => d.ToBytes().Length))
+            await full.AppendLinesAsync(st =>
+            {
+                var lines = chunk.Where(d => st.Get(d.JobId) == null && processing.Read(p => p.Get(d.JobId)) == null).Select(d => { d.Stage = "sample"; d.AddedAt = d.AddedAt.Length > 0 ? d.AddedAt : at; return QLine.Add(d.JobId, "sample", d, d.AddedAt, d.Priority, d.AddedAt); }).ToList();
+                return lines.Count == 0 ? null : lines;
+            }, ct);
+        if (res.Follow is { Count: > 0 } follow) await Sources.AddBatchAsync(full, follow, ct);
+        var body = Sources.Clone(job); body.Result = null; if (res.Modified != null) body.LastModified = res.Modified;
+        bool ended = e.State is "done";
+        await full.AppendLinesAsync(st =>
+        {
+            var cur = st.Entry(id, "refresh");
+            if (cur == null) return [QLine.Add(id, "refresh", body, at, body.Priority, ended ? null : e.Due, ended ? "done" : "pending")];
+            var lines = new List<QLine> { new() { T = "upd", S = id, Stage = "refresh", Job = body } };
+            if (ended) lines.Add(new QLine { T = "done", S = id, Stage = "refresh", State = "done", At = at });
+            else { lines.Add(new QLine { T = "retry", S = id, Stage = "refresh", Due = e.Due, At = at }); lines.Add(new QLine { T = "pri", S = id, Pri = body.Priority }); }
+            return lines;
+        }, ct);
+    }
+
+    /// <summary>The sweep's own blobs are written by the downloader; the full queue only learns when it ran and when it is next due.</summary>
+    async Task FoldAvailabilityAsync(string id, QEntry e, JobDescriptor job, string at, CancellationToken ct)
+    {
+        var body = Sources.Clone(job); body.Result = null; body.InputBlob = null;
+        await full.AppendLinesAsync(st => st.Entry(id, "availability") == null ? [QLine.Add(id, "availability", body, at, null, e.Due, "pending")] : [new QLine { T = "upd", S = id, Stage = "availability", Job = body }, new QLine { T = "retry", S = id, Stage = "availability", Due = e.Due, At = at }], ct);
+        if (job.InputBlob != null && store != null) await store.DeleteAsync(job.InputBlob, ct);
+    }
+
+    /// <summary>The sweep's input for a downloader: every finished download of the full queue and the channels that have a refresh source (so the downloader never reads a queue).</summary>
+    async Task<string> WriteAvailabilityInputAsync(CancellationToken ct)
+    {
+        var (tracked, ingest) = full.Read(st => (st.Subjects.Values.Where(x => x.Entries.TryGetValue("download", out var d) && d.State == "done").Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList(),
+            st.Subjects.Values.Where(x => x.Id.StartsWith("ch-") && x.Entries.ContainsKey("refresh")).Select(x => x.Id[3..]).ToList()));
+        var blob = work.Paths.Prefix + "jobs/download/results/availability-input.json";
+        await store!.PutAsync(blob, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { tracked, ingest }), null, null, false, ct);
+        return blob;
+    }
+
+    async Task FoldClassifyAsync(string id, QEntry e, JobDescriptor job, RunResult res, string at, CancellationToken ct)
+    {
+        var decisions = (res.Decisions ?? []).GroupBy(d => d.Id, StringComparer.Ordinal).Select(g => g.Last()).ToList();
+        foreach (var chunk in JobQueue.Chunks(decisions, _ => 300))
+            await full.AppendLinesAsync(st =>
+            {
+                var lines = new List<QLine>();
+                foreach (var d in chunk)
+                {
+                    var cur = st.Entry(d.Id, "download"); if (cur == null || cur.State != Tags.Unclassified) continue;   // decided meanwhile
+                    var body = Sources.Clone(cur.Job ?? new JobDescriptor { JobId = d.Id, Stage = "download" });
+                    if (d.Candidate is { } c) lines.Add(ClassifyJobs.Decision(d.Id, body, c, d.Kind ?? "", d.Reason ?? "", at));
+                    else { body.ClassifyMisses = d.Misses; lines.Add(new QLine { T = "upd", S = d.Id, Stage = "download", Job = body }); }
+                }
+                return lines.Count == 0 ? null : lines;
+            }, ct);
+        bool more = full.Read(st => st.Subjects.Values.Any(s => s.Entries.TryGetValue("download", out var d) && d.State == Tags.Unclassified));
+        var due = Protocol.Utc(DateTimeOffset.Parse(at, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal) + (more ? TimeSpan.Zero : ClassifyIdle));
+        var body2 = Sources.Clone(job); body2.Result = null; body2.Entries = null;
+        await full.AppendLinesAsync(st => st.Entry(id, "classify") == null ? [QLine.Add(id, "classify", body2, at, null, due, "pending")] : [new QLine { T = "upd", S = id, Stage = "classify", Job = body2 }, new QLine { T = "retry", S = id, Stage = "classify", Due = due, At = at }], ct);
+    }
+
+    /// <summary>Carries each finished or retried item of the work queue back into the full queue, with its attempts and error.</summary>
+    public async Task<int> FoldBackAsync(CancellationToken ct)
+    {
+        await work.PollAsync(ct); await full.PollAsync(ct);
+        var items = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Values.Select(e => (s.Id, E: e))).ToList());
+        int n = 0;
+        foreach (var chunk in JobQueue.Chunks(items, _ => 400))
+            await full.AppendLinesAsync(st =>
+            {
+                var at = full.NowUtc(); var lines = new List<QLine>();
+                foreach (var (id, e) in chunk)
+                {
+                    if (!(e.Final || e.Attempts > 0) || e.Job?.Result != null) continue;   // a run with a result is FoldRunsAsync's
+                    var cur = st.Entry(id, e.Stage); if (cur == null) { lines.Add(QLine.Add(id, e.Stage, e.Job ?? new JobDescriptor { Stage = e.Stage, JobId = id, AddedAt = at }, at, e.Priority, e.Due, "pending")); continue; }   // a subject the full queue lost: put it back first
+                    if (cur.State == e.State && cur.Attempts == e.Attempts) continue;
+                    lines.Add(new QLine { T = e.State == "done" || e.State == "duplicate" ? "done" : "failed", S = id, Stage = e.Stage, State = e.State, Attempt = e.Attempts, Error = e.LastError, Permanent = e.Permanent, Job = e.Job, Due = e.State == "pending" ? e.Due : null, At = e.FinishedAt ?? at });
+                }
+                n += lines.Count; return lines;
+            }, ct);
+        return n;
+    }
+
+    /// <summary>A finished sample is checked once (the full queue has no "check" entry for it yet): a duplicate settles it, AI holds its download, anything else adds the full download.</summary>
+    public async Task<int> CheckSamplesAsync(CancellationToken ct)
+    {
+        await full.PollAsync(ct);
+        var todo = full.Read(st => st.Subjects.Values.Where(s => s.Entries.GetValueOrDefault("sample") is { State: "done" } && !s.Entries.ContainsKey("check") && !s.Entries.ContainsKey("download")).Select(s => (s.Id, S: s.Entries["sample"], s.Pub)).OrderBy(x => x.Id, StringComparer.Ordinal).ToList());
+        int n = 0;
+        foreach (var (id, sm, pub) in todo)
+        {
+            JsonObject? rec; try { rec = await check(id, ct); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: check of {id} failed ({e.Message}); it is asked again on the next pass"); continue; }
+            if (rec == null) continue;
+            var decision = (string?)rec["decision"] ?? "new"; var at = full.NowUtc(); bool skip = PreCheckDecision.IsSkip(decision); bool ai = AiHold.Flagged(rec);
+            var url = sm.Job?.Url ?? "https://www.youtube.com/watch?v=" + id; var top = (rec["top"] as JsonArray)?.OfType<JsonObject>().FirstOrDefault();
+            var lines = new List<QLine> { QLine.Add(id, "check", new JobDescriptor { Stage = "check", JobId = id, Url = url, Priority = sm.Priority, AddedAt = at, Pub = pub, DuplicateOf = skip ? (string?)rec["matchUpload"] ?? (string?)top?["upload"] : null }, at, sm.Priority, at, skip ? "duplicate" : "done") };
+            if (!skip) lines.Add(new QLine { T = "add", S = id, Stage = "download", Job = new JobDescriptor { Stage = "download", JobId = id, Url = url, MaxHeight = sm.Job?.MaxHeight, Format = sm.Job?.Format, Priority = sm.Priority, AddedAt = at, Pub = pub }, Pri = sm.Priority, Due = at, At = at, Hold = ai ? "ai" : null, AiScore = ai ? (double?)(rec["ai"] as JsonObject)?["score"] : null });
+            await full.AppendLinesAsync(lines, ct);   // the check line goes first: a crash after it leaves a decided upload, and a settled one is entered below
+            if (skip) await Handoff.EnterAsync(processing, new Handoff.Facts(id, "precheck", Title: (string?)rec["title"], Pub: pub, Priority: sm.Priority, Check: rec, State: "duplicate", Hold: null, AiScore: (double?)(rec["ai"] as JsonObject)?["score"], DuplicateOf: (string?)rec["matchUpload"] ?? (string?)top?["upload"], DuplicateShare: (double?)top?["share"], Url: url), ct);
+            n++;
+        }
+        return n;
+    }
+
+    /// <summary>"done download" is in the full log (fold-back ran first); now each such upload enters processing (create-only; the repair covers a crash between the two appends).</summary>
+    public Task<int> EnterDownloadsAsync(CancellationToken ct) => Handoff.RepairAsync(full, processing, ct);
+
+    /// <summary>When ready items drop below half of the max, the next ready ones of the full queue (priority, then newest) join the work queue, up to the max.</summary>
+    public async Task<int> TopUpAsync(CancellationToken ct)
+    {
+        var now = work.NowUtc(); int addedRuns = await TopUpRunsAsync(now, ct);   // due refresh and classify go first (they are few and need no room)
+        int live = work.Read(w => w.Subjects.Values.Count(s => s.Entries.Values.Any(e => !e.Final && !IsRun(e.Stage))));   // the few due runs do not count against the max
+        if (live >= WorkMax / 2) return addedRuns;
+        int room = WorkMax - live;
+        var pick = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Id != null && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-"))
+            .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" or "download" && Ready(e, now)).OrderByDescending(e => QueueState.Rank(e.Stage)).FirstOrDefault()))   // a download before a sample of the same subject
+            .Where(x => x.E != null).OrderByDescending(x => x.E!.Priority).ThenByDescending(x => x.S.Pub ?? x.E!.Job?.Pub ?? "", StringComparer.Ordinal).ThenBy(x => x.S.Id, StringComparer.Ordinal)
+            .Select(x => (x.S.Id, E: x.E!, x.S.Pub)).ToList());
+        var have = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Keys.Select(k => s.Id + "/" + k)).ToHashSet(StringComparer.Ordinal)); int added = 0;
+        var take = new List<(string Id, QEntry E, string? Pub)>();
+        foreach (var x in pick) { if (take.Count >= room) break; if (have.Contains(x.Id + "/" + x.E.Stage)) continue; take.Add(x); }
+        foreach (var chunk in JobQueue.Chunks(take, _ => 700))
+            await work.AppendLinesAsync(st => { var at = work.NowUtc(); var l = chunk.Where(x => st.Entry(x.Id, x.E.Stage) == null).Select(x => { var j = x.E.Job ?? new JobDescriptor { Stage = x.E.Stage, JobId = x.Id }; j.Pub ??= x.Pub; return QLine.Add(x.Id, x.E.Stage, j, at, x.E.Priority, x.E.Due.Length > 0 ? x.E.Due : at); }).ToList(); added += l.Count; return l; }, ct);
+        return added + addedRuns;
+    }
+
+    /// <summary>The refresh entries (channel / playlist subjects) and the classify singleton that are due and not in the work queue yet; classify carries its batch of unclassified uploads on the job.</summary>
+    async Task<int> TopUpRunsAsync(string now, CancellationToken ct)
+    {
+        var have = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Keys.Select(k => s.Id + "/" + k)).ToHashSet(StringComparer.Ordinal));
+        var ctl = store != null ? ControlFile.Parse((await store.GetAsync(work.Paths.Control, ct))?.Data) : new ControlFile(); bool dyn = ctl.DynamicRefreshOn, cls = ctl.ClassifyOn;
+        var due = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null).SelectMany(s => s.Entries.Values.Where(e => IsRun(e.Stage) && Ready(e, now) && QueueSplit.RefreshSeedable(e, dyn, cls)).Select(e => (s.Id, E: e))).ToList())
+            .Where(x => !have.Contains(x.Id + "/" + x.E.Stage)).OrderByDescending(x => x.E.Priority).ThenBy(x => x.E.Due, StringComparer.Ordinal).ThenBy(x => x.Id, StringComparer.Ordinal).ToList();
+        if (due.Count == 0) return 0;
+        var unclassified = due.Any(x => x.E.Stage == "classify") ? ClassifyJobs.ListUnclassified(full).Take(ClassifyBatch).Select(x => new ClassifyEntry { Id = x.Id, Title = x.Entry.Job?.Title, Duration = x.Entry.Job?.Duration, ChannelName = x.Entry.Job?.ChannelName, Availability = x.Entry.Job?.Availability }).ToList() : [];
+        string? availBlob = null;
+        if (due.Any(x => x.E.Stage == "availability")) { if (store == null) due = due.Where(x => x.E.Stage != "availability").ToList(); else availBlob = await WriteAvailabilityInputAsync(ct); }
+        if (due.Count == 0) return 0;
+        int added = 0;
+        foreach (var chunk in JobQueue.Chunks(due, _ => 200))
+            await work.AppendLinesAsync(st =>
+            {
+                var at = work.NowUtc(); var l = new List<QLine>();
+                foreach (var (id, e) in chunk)
+                {
+                    if (st.Entry(id, e.Stage) != null) continue;
+                    var j = Sources.Clone(e.Job ?? new JobDescriptor { Stage = e.Stage, JobId = id }); j.Result = null;
+                    if (e.Stage == "classify") { if (unclassified.Count == 0) continue; j.Entries = unclassified; }
+                    if (e.Stage == "availability") j.InputBlob = availBlob;   // nothing to decide: it stays in the full queue until there is
+                    l.Add(QLine.Add(id, e.Stage, j, at, e.Priority, e.Due.Length > 0 ? e.Due : at));
+                }
+                added += l.Count; return l.Count == 0 ? null : l;
+            }, ct);
+        return added;
+    }
+
+    /// <summary>Drops the finished items (their outcome is folded back) so the work queue's next snapshot holds only live ones; then a rollover writes that snapshot.</summary>
+    public async Task<int> ClearOutAsync(CancellationToken ct)
+    {
+        await work.PollAsync(ct); await full.PollAsync(ct);
+        var gone = work.Read(w => w.Subjects.Values.Where(s => s.ClaimBy == null && s.Entries.Count > 0 && s.Entries.Values.All(e => e.Final)).Select(s => (s.Id, Entries: s.Entries.Values.ToList())).ToList())
+            .Where(x => full.Read(f => x.Entries.All(e => f.Entry(x.Id, e.Stage) is { } fe && fe.State == e.State))).Select(x => x.Id).ToList();   // dropped only once the full queue has the same outcome
+        foreach (var chunk in JobQueue.Chunks(gone, _ => 120))
+            await work.AppendLinesAsync(chunk.Select(id => new QLine { T = "drop", S = id }), ct);
+        return gone.Count;
+    }
+
+    public Task RollOverWorkAsync(CancellationToken ct) => work.RollOverAsync(ct);
+
+    public sealed record Claimed(string Subject, string Stage, int Epoch, string Lease, string Active);
+
+    /// <summary>POST /v1/download/next: tops the work queue up at once, then claims ONE ready item for <paramref name="node"/> with the claim line and the lease a node would make. Two concurrent callers never get the same item (the active file's lease decides). Null: nothing ready.</summary>
+    public async Task<Claimed?> NextAsync(string node, string[] stages, CancellationToken ct)
+    {
+        await work.PollAsync(ct); await full.PollAsync(ct); await TopUpAsync(ct);
+        var now = work.NowUtc(); var ok = stages.Length == 0 ? (Func<string, bool>)(_ => true) : st => Array.IndexOf(stages, st) >= 0;
+        var look = await work.LookAsync(st => st is "sample" or "download" or "refresh" or "classify" && ok(st), null, ct);
+        foreach (var (s, runnable) in look.Candidates)
+        {
+            var h = await work.TryClaimForAsync(s.Id, node, (_, sub) => sub.ClaimBy == null ? sub.Entries.Values.Where(e => e.Runnable(now) && ok(e.Stage)).Select(e => e.Stage).Take(1).ToArray() : null, ct);
+            if (h != null) return new Claimed(s.Id, runnable[0].Stage, h.Epoch, h.Lease, work.Paths.Active(s.Id));
+        }
+        return null;
+    }
+}

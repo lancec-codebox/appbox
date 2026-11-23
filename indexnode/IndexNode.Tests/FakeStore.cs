@@ -27,6 +27,8 @@ public sealed class FakeStore : IStore
     private void Lapse(Blob b) { if (Clock != null && b.Lease != null && b.LeaseUntil <= Now) b.Lease = null; }
     /// <summary>Counts of every call by kind, for the op-count tests.</summary>
     public readonly Dictionary<string, int> Ops = new();
+    /// <summary>Every blob name or list prefix any call touched (a test asserts what was never touched).</summary>
+    public readonly System.Collections.Concurrent.ConcurrentQueue<string> Seen = new();
     private void Op(string k) { Ops[k] = Ops.GetValueOrDefault(k) + 1; }
     /// <summary>Test hook: runs right before the next Append Block is checked (a racing writer gets in first).</summary>
     public Action<string>? BeforeAppend;
@@ -141,6 +143,7 @@ public sealed class FakeStore : IStore
 
     public Task<IReadOnlyList<BlobEntry>> ListAsync(string prefix, bool withTags, bool withMetadata, CancellationToken ct)
     {
+        Seen.Enqueue(prefix);
         lock (gate)
         {
             Calls.Add("list"); Op("list");
@@ -152,6 +155,7 @@ public sealed class FakeStore : IStore
 
     public Task<BlobContent?> GetAsync(string name, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         lock (gate) { Op("get"); Gets.Add(name); if (Blobs.TryGetValue(name, out var g) && g.GhostData != null) { g.Data = g.GhostData; g.GhostData = null; g.Version++; } return Task.FromResult(Blobs.TryGetValue(name, out var b) ? new BlobContent(b.Data, "\"v" + b.Version + "\"", new Dictionary<string, string>(b.Meta)) : null); }
     }
 
@@ -176,6 +180,7 @@ public sealed class FakeStore : IStore
     /// <summary>Head with a real ETag ("v&lt;version&gt;", as GetAsync gives), size and metadata.</summary>
     public Task<BlobProps?> HeadAsync(string name, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         lock (gate)
         {
             if (!Blobs.TryGetValue(name, out var b)) return Task.FromResult<BlobProps?>(null);
@@ -214,6 +219,7 @@ public sealed class FakeStore : IStore
     public TimeSpan RangeLatency; public int RangeInFlightPeak, RangeReads; int rangeNow;
     public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         if (RangeLatency == TimeSpan.Zero) return GetRangeCore(name, off, len, ifMatch);
         int n = Interlocked.Increment(ref rangeNow); int pk; while (n > (pk = RangeInFlightPeak)) Interlocked.CompareExchange(ref RangeInFlightPeak, n, pk);
         try { await Task.Delay(RangeLatency, ct); Interlocked.Increment(ref RangeReads); return GetRangeCore(name, off, len, ifMatch); } finally { Interlocked.Decrement(ref rangeNow); }
@@ -287,6 +293,7 @@ public sealed class FakeStore : IStore
 
     public Task<string?> AcquireLeaseAsync(string name, int seconds, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         lock (gate)
         {
             Op("lease");
@@ -371,6 +378,7 @@ public sealed class FakeStore : IStore
 
     public Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         Action<string>? hook; lock (gate) { hook = BeforeAppend; BeforeAppend = null; }
         hook?.Invoke(name);
         lock (gate)
@@ -387,6 +395,7 @@ public sealed class FakeStore : IStore
 
     public Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         lock (gate)
         {
             Op("get");
@@ -410,6 +419,7 @@ public sealed class FakeStore : IStore
 
     public Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct)
     {
+        Seen.Enqueue(name);
         lock (gate)
         {
             Op("get");

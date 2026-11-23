@@ -116,7 +116,8 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
     {
         var job = ctx.Job; var ct = ctx.Token; var paths = ctx.Paths;
         var queue = ctx.Queue ?? throw new InvalidOperationException("refresh runs on the queue");
-        await HousekeepingAsync(paths, queue, ct);
+        bool onWork = queue.Paths.IsWorkQueue;   // 0.13.26: a downloader works from the work queue: it writes nothing into any queue but hands the result back on its done line; the download service folds it into the full queue
+        if (!onWork) await HousekeepingAsync(paths, queue, ct);
         if (string.IsNullOrEmpty(job.Id) || job.Kind is not ("playlist" or "channel")) throw new PermanentFailure("refresh job needs kind (playlist|channel) and id");
         var schedule = Schedule.Of(job);
         var run = KindOf(job); bool lookup = run == "lookup";
@@ -151,7 +152,8 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
             d.ChannelId = e.ChannelId ?? (job.Kind == "channel" ? job.Id : null); d.ChannelName = e.ChannelName ?? (job.Kind == "channel" ? job.Name : null);
             batch.Add(d);
         }
-        made = (await ClassifyJobs.CreateUnclassifiedBatchAsync(queue, batch, ct)).Count; skipped += batch.Count - made;
+        var result = onWork ? new RunResult { Videos = batch } : null;
+        if (onWork) made = batch.Count; else { made = (await ClassifyJobs.CreateUnclassifiedBatchAsync(queue, batch, ct)).Count; skipped += batch.Count - made; }
 
         if (job.FollowChannels == true)
         {
@@ -171,7 +173,8 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
                 ch.Source = job.JobId; ch.AddedAt = addedAt; ch.Priority = job.Priority;
                 follow.Add(ch);
             }
-            foreach (var ch in await Sources.AddBatchAsync(queue, follow, ct)) Log.Info($"{run} {job.JobId}: now following channel {ch.Name} ({ch.Id})");
+            if (onWork) { foreach (var ch in follow) ch.Run = "lookup"; result!.Follow = follow; }
+            else foreach (var ch in await Sources.AddBatchAsync(queue, follow, ct)) Log.Info($"{run} {job.JobId}: now following channel {ch.Name} ({ch.Id})");
         }
 
         await WriteMembersAsync(paths, job, listed, lookup, addedAt, ct);
@@ -208,6 +211,11 @@ public sealed partial class RefreshStage(ITools tools, IStore store, Func<DateTi
         }
         else next = schedule.Next(now());
         job.NextRefresh = next == null ? null : Protocol.Utc(next.Value);
+        if (result != null)
+        {
+            result.Modified = job.LastModified;
+            job.Result = await RunResults.SpillAsync(store, paths, job.JobId, result, ct);
+        }
         ctx.NextDue = job.NextRefresh; // once / off: the job is done until triggered by hand
         Log.Info($"{run} {job.JobId}: {listed.Count} listed, {fresh.Count} {(lookup ? "looked at" : "new")}, {made} download job(s) created, {skipped} already known; schedule {schedule.Describe()}{tierText}{(next != null ? ", next " + job.NextRefresh : "")}");
     }

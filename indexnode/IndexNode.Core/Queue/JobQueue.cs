@@ -112,6 +112,10 @@ public sealed record QueueLook(List<(QSubject Subject, List<QEntry> Runnable)> C
 /// (jobs/active/&lt;subject&gt;.json). The in-memory state is the snapshot plus the log lines after it. Appends are read-modify-write: conditional on the length read (412 = read and decide again).
 /// </summary>
 public sealed class QueueNotMigratedException(string m) : Exception(m);
+/// <summary>The queue moved (`queue split`) and this node was pinned to the old place.</summary>
+public sealed class QueueMovedException(string m) : Exception(m);
+/// <summary>A snapshot or marker with a format version this binary does not know.</summary>
+public sealed class QueueFormatException(string m) : Exception(m);
 
 public sealed class JobQueue
 {
@@ -141,7 +145,39 @@ public sealed class JobQueue
     public static readonly TimeSpan NewActiveGrace = TimeSpan.FromMinutes(2);
     private const int ReadChunk = 1 << 20;
 
-    private readonly IStore store; private readonly Paths paths; private readonly Func<DateTimeOffset> clock;
+    private readonly IStore store; private Paths paths; private readonly Func<DateTimeOffset> clock;
+    private bool layoutResolved;
+    /// <summary>The paths of the queue this object reads (after LoadAsync: the split layout's processing queue when jobs/moved.json exists).</summary>
+    public Paths Paths => paths;
+    public const string MovedHint = "indexnode: the job queue moved: it is now index/jobs/process/ (processing) and index/jobs/download/ (download). This binary predates the split: update indexnode.";
+
+    /// <summary>0.13.26: the queue this node works in. With index/jobs/moved.json (written by `queue split`) it is the processing queue (jobs/process/); without it, the old jobs/ layout. A marker with a version newer than this binary knows refuses.</summary>
+    public static async Task<Paths> ResolveAsync(IStore store, Paths paths, CancellationToken ct)
+    {
+        if (!paths.IsLegacyLayout) return paths;
+        var m = await store.GetAsync(paths.Moved, ct);
+        if (m == null) return paths;
+        int v = 0; try { v = System.Text.Json.JsonDocument.Parse(m.Data).RootElement.GetProperty("v").GetInt32(); } catch { }
+        if (v > MovedVersion) throw new QueueFormatException($"indexnode: the queue layout has version {v}; this binary reads up to {MovedVersion}. Update indexnode.");
+        return paths.ProcessQueue;
+    }
+    public const int MovedVersion = 2;
+
+    /// <summary>0.13.26: opens (loads) the queue a command works on. Processing is what <c>new JobQueue(store, paths)</c> follows to after the split; the FULL download queue (host one-offs only: sources, priority, classify, enqueue; the breaker's --storage-max applies) is jobs/download/. Before the split both are the one queue.</summary>
+    public static async Task<JobQueue> OpenAsync(IStore store, Paths paths, string node, bool download, CancellationToken ct)
+    {
+        var root = await ResolveAsync(store, paths, ct);
+        var q = new JobQueue(store, download && !root.IsLegacyLayout ? paths.DownloadQueue : paths, node); await q.LoadAsync(ct); return q;
+    }
+
+    /// <summary>Commands that take a video id: the processing queue first, then the full download queue; the processing queue when neither knows it.</summary>
+    public static async Task<JobQueue> OpenForVideoAsync(IStore store, Paths paths, string node, string id, CancellationToken ct)
+    {
+        var pq = await OpenAsync(store, paths, node, false, ct);
+        if (pq.Read(s => s.Get(id)) != null || (await ResolveAsync(store, paths, ct)).IsLegacyLayout) return pq;
+        var dq = await OpenAsync(store, paths, node, true, ct);
+        return dq.Read(s => s.Get(id)) != null ? dq : pq;
+    }
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly object stateLock = new();
     private QueueState state = new();
@@ -149,11 +185,14 @@ public sealed class JobQueue
     private bool loaded;
     public string NodeId { get; }
 
-    public JobQueue(IStore store, Paths paths, string nodeId, Func<DateTimeOffset>? clock = null)
-    { this.store = store; this.paths = paths; NodeId = nodeId; this.clock = clock ?? (() => DateTimeOffset.UtcNow); }
+    private readonly bool downloader;
+    /// <summary><paramref name="downloader"/>: a node that only downloads reads the work queue (jobs/download/work/) after the split, never the processing queue or the full download queue.</summary>
+    public JobQueue(IStore store, Paths paths, string nodeId, Func<DateTimeOffset>? clock = null, bool downloader = false)
+    { this.store = store; this.paths = paths; NodeId = nodeId; this.clock = clock ?? (() => DateTimeOffset.UtcNow); this.downloader = downloader; }
 
     public string NowUtc() => Protocol.Utc(clock());
     public DateTimeOffset Now => clock();
+    public IStore Store => store;
     public int Segment => seg;
     public long Offset => off;
     public int Blocks => blocks;
@@ -165,6 +204,7 @@ public sealed class JobQueue
     /// <summary>0.13.0 cutover: a node command that needs the queue refuses to start without the snapshot (it would otherwise start an empty queue beside the old store). Throws with one clear line.</summary>
     public static async Task RequireSnapshotAsync(IStore store, Paths paths, CancellationToken ct)
     {
+        paths = await ResolveAsync(store, paths, ct);
         if (await store.HeadAsync(paths.QueueSnapshotGz, ct) == null && await store.HeadAsync(paths.QueueSnapshot, ct) == null) throw new QueueNotMigratedException(MigrateHint);
     }
 
@@ -174,6 +214,7 @@ public sealed class JobQueue
         await gate.WaitAsync(ct);
         try
         {
+            if (!layoutResolved) { paths = await ResolveAsync(store, paths, ct); if (downloader && !ReferenceEquals(paths, null) && !paths.IsLegacyLayout) paths = paths.DownloadWork; layoutResolved = true; }
             var snap = await store.GetAsync(paths.QueueSnapshotGz, ct);
             var legacy = snap == null ? await store.GetAsync(paths.QueueSnapshot, ct) : null;   // the plain file of the first 0.13.0 migration, until the first rollover writes the .gz
             if (snap != null && snap.Data.Length > 0 || legacy != null && legacy.Data.Length > 0)
@@ -214,7 +255,13 @@ public sealed class JobQueue
             if (r.NotFound)
             {
                 // step (2) of a rollover: the segment after a sealed one is created with If-None-Match: * (whoever gets here first; the others see it exist)
-                if (off == 0) { await store.CreateAppendBlobAsync(paths.QueueSegment(seg), true, ct); if (seg == 1) return applied; continue; }
+                if (off == 0)
+                {
+                    bool made = await store.CreateAppendBlobAsync(paths.QueueSegment(seg), true, ct); if (seg == 1) return applied;
+                    // 0.13.26: the name is taken but is no append blob (the split's marker where a pre-split node would continue): this node must not go on writing there
+                    if (!made && (await store.ReadAppendAsync(paths.QueueSegment(seg), 0, 1, ct)).NotFound) throw new InvalidDataException($"queue segment {paths.QueueSegment(seg)} is not an append blob: the queue moved (see jobs/moved.json); update indexnode");
+                    continue;
+                }
                 throw new InvalidDataException($"queue segment {paths.QueueSegment(seg)} is missing");
             }
             int used = 0;
@@ -329,7 +376,7 @@ public sealed class JobQueue
         if (!loaded || snapSeg >= seg) return;
         try
         {
-            byte[] data; lock (stateLock) data = QueueState.Pack(state.ToSnapshot(seg, off, blocks, NowUtc(), clock()));
+            byte[] data; lock (stateLock) data = QueueState.Pack(state.ToSnapshot(seg, off, blocks, NowUtc(), clock(), paths.IsLegacyLayout ? 1 : 2));
             if (await store.PutIfMatchAsync(paths.QueueSnapshotGz, data, snapEtag, ct))
             {
                 snapSeg = seg; snapEtag = (await store.HeadAsync(paths.QueueSnapshotGz, ct))?.ETag;
@@ -346,7 +393,7 @@ public sealed class JobQueue
     // ---------------------------------------------------------------- finding work and claiming
 
     /// <summary>One look: poll the log tail (one ranged read), list jobs/active/ once, and name what this node could claim now. No job bodies are read and no inputs are checked.</summary>
-    public async Task<QueueLook> LookAsync(Func<string, bool> stageOk, Func<QSubject, QEntry, bool>? canRun, CancellationToken ct)
+    public async Task<QueueLook> LookAsync(Func<string, bool> stageOk, Func<QSubject, QEntry, bool>? canRun, CancellationToken ct, ReadyOptions? ready = null)
     {
         await PollAsync(ct);
         var active = await store.ListAsync(paths.ActiveDir, false, false, ct);
@@ -359,7 +406,7 @@ public sealed class JobQueue
             if (leased || young) blocked.Add(subject); else stale.Add(subject);   // no lease and older than the grace: abandoned
         }
         var nowUtc = Protocol.Utc(now);
-        var cands = Read(s => s.Candidates(nowUtc, stageOk, canRun, blocked.Contains));
+        var cands = Read(s => s.Candidates(nowUtc, stageOk, canRun, blocked.Contains, ready));
         var candIds = cands.Select(c => c.Subject.Id).ToHashSet();
         return new QueueLook(cands, stale.Where(x => !candIds.Contains(x)).ToList(), active.Count);
     }
@@ -385,7 +432,16 @@ public sealed class JobQueue
     /// The claim order of the protocol: (1) create jobs/active/&lt;subject&gt;.json (If-None-Match: *) and take its 60 s lease, or take the lease of one that has lapsed; (2) read the log to its end, and if the subject has nothing left to run for this node release and delete;
     /// (3) append "claim &lt;subject&gt; &lt;stages&gt; by &lt;node&gt;, epoch k". Null when another node won, or there was nothing to do.
     /// </summary>
-    public async Task<ClaimHandle?> TryClaimAsync(string subject, Func<QSubject, string[]?> pickStages, CancellationToken ct)
+    public Task<ClaimHandle?> TryClaimAsync(string subject, Func<QSubject, string[]?> pickStages, CancellationToken ct) => TryClaimAsync(subject, (_, s) => pickStages(s), ct);
+
+    /// <summary>0.13.26: a claim the download service makes FOR a downloader (POST /v1/download/next): the claim line names <paramref name="by"/>; the service keeps the lease only until the node renews it with the lease id it is handed.</summary>
+    public Task<ClaimHandle?> TryClaimForAsync(string subject, string by, Func<QueueState, QSubject, string[]?> pickStages, CancellationToken ct) => TryClaimAsync(subject, pickStages, ct, by);
+
+    /// <summary>A node that was handed a claim (the service made it) takes over its handle: the lease id and epoch from the answer.</summary>
+    public ClaimHandle AdoptClaim(string subject, int epoch, string lease) => new(this, store, subject, epoch, lease, paths.Active(subject));
+
+    /// <summary>0.13.24: the picker also sees the whole state (a stage that is READY on its own is decided from it, inside the conditional append). The actors-index singleton may not exist yet: it is offered as an empty subject.</summary>
+    public async Task<ClaimHandle?> TryClaimAsync(string subject, Func<QueueState, QSubject, string[]?> pickStages, CancellationToken ct, string? by = null)
     {
         var name = paths.Active(subject);
         var body = Encoding.UTF8.GetBytes($"{{\"subject\":\"{subject}\",\"node\":\"{NodeId}\",\"at\":\"{NowUtc()}\"}}");
@@ -400,11 +456,11 @@ public sealed class JobQueue
         {
             ok = await AppendAsync(state =>
             {
-                var s = state.Get(subject);
-                var stages = s == null ? null : pickStages(s);
+                var s = state.Get(subject) ?? (subject == ActorsIndexJobs.Subject ? new QSubject { Id = subject } : null);
+                var stages = s == null ? null : pickStages(state, s);
                 if (stages == null || stages.Length == 0) return null;   // the work is already done (or not ours): nothing to claim
                 epoch = s!.Epoch + 1;
-                return [new QLine { T = "claim", S = subject, Stages = stages, By = NodeId, Epoch = epoch, At = NowUtc() }];
+                return [new QLine { T = "claim", S = subject, Stages = stages, By = by ?? NodeId, Epoch = epoch, At = NowUtc() }];
             }, ct);
         }
         catch { try { await store.DeleteAsync(name, lease, CancellationToken.None); } catch { } throw; }

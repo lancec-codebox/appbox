@@ -11,7 +11,7 @@ public static class ClassifyCommand
     public static async Task<int> RunAsync(Args a)
     {
         var (_, store, paths, http) = Commands.Open(a); using var _h = http;
-        var queue = new JobQueue(store, paths, "cli"); await queue.LoadAsync(default);
+        var queue = await JobQueue.OpenAsync(store, paths, "cli", true, default);   // 0.13.26: the full download queue
         var sub = a.Positional.FirstOrDefault();
         switch (sub)
         {
@@ -64,17 +64,21 @@ public static class ClassifyCommand
         var e = queue.Read(st => st.Entry(id, "download"));
         var d = e?.Job;
         var why = string.IsNullOrWhiteSpace(reason) ? "set by the owner" : reason.Trim();
-        await ClassifyStage.SaveDecisionAsync(store, paths, id, d?.ChannelId, d?.ChannelName, d?.Title, d?.Duration, drama, drama ? "drama" : "not-drama", why, "owner", null, at, ct);
         if (e == null || d == null)
         {
-            if (!drama) return $"{id}: decision stored (not a drama); no download entry exists";
+            if (!drama)
+            {
+                var ng = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", 480, null); ng.JobId = id; ng.AddedAt = at;
+                await queue.AppendLinesAsync([QLine.Add(id, "download", ng, at, 0, null, Tags.Unclassified), ClassifyJobs.Decision(id, ng, false, "not-drama", why, at)], ct);
+                return $"{id}: not a drama; recorded as a failed (permanent) download entry";
+            }
             var nd = JobDescriptor.NewDownload($"https://www.youtube.com/watch?v={id}", 480, null); nd.JobId = id; nd.AddedAt = at;
             await queue.AppendLinesAsync([QLine.Add(id, "download", nd, at)], ct);
-            return $"{id}: decision stored; download entry created (pending)";
+            return $"{id}: drama; download entry created (pending)";
         }
         var state = e.State;
         bool classifyFailed = state == "failed" && d.Reason?.StartsWith("classify:", StringComparison.Ordinal) == true;
-        if (state is not (Tags.Unclassified or "pending") && !classifyFailed) return $"{id}: decision stored; the download is {state}, left alone";
+        if (state is not (Tags.Unclassified or "pending") && !classifyFailed) return $"{id}: the download is {state}, left alone (no decision recorded)";
         if (drama)
         {
             d.Reason = null; d.LastError = null; d.Permanent = null; d.FinishedAt = null; d.Attempts = 0;

@@ -55,6 +55,9 @@ public sealed class QLine
     [JsonPropertyName("pub")] public string? PubTime { get; set; }
     [JsonPropertyName("pubsrc")] public string? PubSrc { get; set; }
 
+    /// <summary>0.13.26 "enter" (the handoff into the processing queue): what the upload is to processing. "full" = downloaded (process is ready on its own), "precheck" = settled by the check without a download (a catalog and group member only).</summary>
+    [JsonPropertyName("data")] public string? Data { get; set; }
+
     public string ToJson() => JsonSerializer.Serialize(this, Protocol.Json);
     public static QLine? Parse(string line) { try { return JsonSerializer.Deserialize<QLine>(line, Protocol.Json); } catch (JsonException) { return null; } }
 
@@ -107,6 +110,8 @@ public sealed class QSubject
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? JoinKind { get; set; }
     /// <summary>0.13.16: the upload's publish time (the last add that carried one): the claim order within a priority, newest first, for sample, check, download and process.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Pub { get; set; }
+    /// <summary>0.13.26: how the upload entered the processing queue ("full" | "precheck"); only a "full" subject's process stage becomes ready on its own.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Data { get; set; }
     [JsonIgnore] public bool Active => Entries.Values.Any(e => !e.Final);
 }
 
@@ -140,6 +145,16 @@ public sealed class QueueState
                     if (l.Job?.Pub is { Length: > 0 } pub) sub.Pub = pub;
                     break;
                 }
+            case "enter":   // 0.13.26: the download side hands an upload to processing; a subject that already exists is left alone (a repeat, or a crash between the two appends repaired)
+                {
+                    if (Subjects.TryGetValue(l.S, out var have)) { if (have.Data == null && l.Data == "full" && have.Entries.GetValueOrDefault("download") is { State: "done" }) have.Data = "full"; break; }   // an existing subject keeps what it has (only an old downloaded one learns it is full)
+                    var sub = Subjects[l.S] = new QSubject { Id = l.S, Data = l.Data ?? "full", LastAt = l.At, Pub = l.PubTime ?? l.Job?.Pub };
+                    var at = l.At ?? "";
+                    if (sub.Data == "full") sub.Entries["download"] = new QEntry { Stage = "download", State = "done", Priority = l.Pri ?? l.Job?.Priority ?? 0, Added = at, FinishedAt = at, Node = l.By, Job = Slim(l.Job) };
+                    else sub.Entries["check"] = new QEntry { Stage = "check", State = l.State ?? "duplicate", Priority = l.Pri ?? 0, Added = at, FinishedAt = at, Node = l.By, Job = Slim(l.Job), Hold = null };
+                    if (l.Hold != null) sub.Entries["process"] = new QEntry { Stage = "process", State = "pending", Priority = l.Pri ?? 0, Added = at, Due = at, Hold = l.Hold, HoldAiScore = l.AiScore, Job = JobDescriptor.NewProcess(l.S) };
+                    break;
+                }
             case "hold":   // 0.13.23 (jobs hold-ai): a pending entry gets the hold
                 if (Get(l.S)?.Entries.GetValueOrDefault(l.Stage ?? "") is { Final: false } he && he.State == "pending" && l.Hold != null) { he.Hold = l.Hold; he.HoldAiScore = l.AiScore; }
                 break;
@@ -150,6 +165,8 @@ public sealed class QueueState
                 {
                     if (!Subjects.TryGetValue(l.S, out var sub)) Subjects[l.S] = sub = new QSubject { Id = l.S };
                     sub.Epoch = l.Epoch ?? sub.Epoch + 1; sub.ClaimBy = l.By; sub.ClaimStages = l.Stages; sub.ClaimAt = l.At; sub.LastAt = l.At;
+                    // 0.13.24: a stage that became READY on its own has no entry yet: the claim creates it (a finished actors-index build is replaced by the new one)
+                    foreach (var cs in l.Stages ?? []) if (StageDeps.IsDerived(cs) && (!sub.Entries.TryGetValue(cs, out var ce0) || (cs == ActorsIndexJobs.Stage && ce0.Final))) sub.Entries[cs] = StageDeps.Materialize(sub, cs, l.At ?? "");
                     break;
                 }
             case "done":
@@ -164,7 +181,7 @@ public sealed class QueueState
                             if (l.Trash != null) { e.Trash = l.Trash; e.TrashWhy = l.Why; e.TrashDeletedAt = null; }
                             e.State = l.State ?? "done"; e.FinishedAt = l.At; e.Node = l.By; e.LastError = null; e.Permanent = null; if (l.Job != null) e.Job = l.Job;
                             if (e.State == "pending") { e.Due = l.Due ?? e.Due; e.Attempts = 0; e.StepsDone = null; if (l.Job != null) e.Priority = l.Job.Priority; }   // a source or the classifier: run again later
-                            else if (e.State == "done") e.Job = Slim(e.Job);
+                            else if (e.State == "done") { var keep = e.Job?.Result; e.Job = Slim(e.Job); if (keep != null && e.Job != null) e.Job.Result = keep; }   // 0.13.26: a finished refresh / classify on the work queue keeps its result until the service folds it
                         }
                     }
                     if (l.Stage == "group" && l.Step == null && l.JoinKind != null) { sub.JoinOf = l.Join; sub.JoinKind = l.JoinKind; }
@@ -246,18 +263,26 @@ public sealed class QueueState
     private static JobDescriptor? Slim(JobDescriptor? j) => j == null ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Priority = j.Priority, Title = j.Title, ChannelName = j.ChannelName, Duration = j.Duration, Source = j.Source, Name = j.Name, Kind = j.Kind, Id = j.Id, Network = j.Network, ElapsedSeconds = j.ElapsedSeconds, Pub = j.Pub, PubSource = j.PubSource };
 
     /// <summary>The subjects with something this node can run now, best first: highest priority, then the oldest added entry, then the id. <paramref name="skip"/> leaves out subjects another node holds.</summary>
-    public List<(QSubject Subject, List<QEntry> Runnable)> Candidates(string nowUtc, Func<string, bool> stageOk, Func<QSubject, QEntry, bool>? canRun = null, Func<string, bool>? skip = null)
+    public List<(QSubject Subject, List<QEntry> Runnable)> Candidates(string nowUtc, Func<string, bool> stageOk, Func<QSubject, QEntry, bool>? canRun = null, Func<string, bool>? skip = null, ReadyOptions? ready = null)
     {
         var res = new List<(QSubject, List<QEntry>)>();
         foreach (var s in Subjects.Values)
         {
             if (skip != null && skip(s.Id)) continue;
             var r = s.Entries.Values.Where(e => e.Runnable(nowUtc) && stageOk(e.Stage) && (canRun == null || canRun(s, e))).OrderBy(e => Rank(e.Stage)).ToList();
+            // 0.13.24: actors is READY when the group step is done (no add line): computed from this in-memory state only
+            if (ready != null && s.Data == "full" && stageOk("process") && StageDeps.ReadyEntry(this, s, "process", nowUtc, ready) is { } rpe && (canRun == null || canRun(s, rpe))) r.Add(rpe);
+            if (ready != null && s.Id != ActorsIndexJobs.Subject && stageOk("actors") && StageDeps.ReadyEntry(this, s, "actors", nowUtc, ready) is { } rae && (canRun == null || canRun(s, rae))) r.Add(rae);
             if (r.Count > 0) res.Add((s, r));
+        }
+        if (ready != null && stageOk(ActorsIndexJobs.Stage) && !(skip?.Invoke(ActorsIndexJobs.Subject) ?? false) && !res.Any(x => x.Item1.Id == ActorsIndexJobs.Subject))
+        {   // the actors-index singleton: ready at N finished uploads not in the index, or when the oldest has waited T
+            var ss = Subjects.GetValueOrDefault(ActorsIndexJobs.Subject) ?? new QSubject { Id = ActorsIndexJobs.Subject };
+            if (StageDeps.ReadyEntry(this, ss, ActorsIndexJobs.Stage, nowUtc, ready) is { } rie && (canRun == null || canRun(ss, rie))) res.Add((ss, [rie]));
         }
         // 0.13.2: a due search-index entry goes before any drama work (a singleton added today must not wait behind a backlog of older priority-0 entries); then priority, added, id as before
         // 0.13.11: a due group entry goes right behind search-index and before process work: group steps are short, and a group entry added today must not wait behind a backlog of older priority-0 process entries
-        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? 2 : x.Item2.Any(e => e.Stage == "group") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage == "group") && !x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.12: group entries lowest sequence number first
+        return res.OrderByDescending(x => x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? 3 : x.Item2.Any(e => e.Stage == "group") ? 2 : x.Item2.Any(e => e.Stage == "actors") ? 1 : 0).ThenBy(x => x.Item2.Any(e => e.Stage is "group" or "actors") && !x.Item2.Any(e => e.Stage is "search-index" or "actors-index") ? x.Item1.Seq ?? long.MaxValue : 0L)   // 0.13.24: ready actors jobs in grouping seq order, no window   // 0.13.12: group entries lowest sequence number first
             .ThenByDescending(x => x.Item2.Max(e => e.Priority)).ThenByDescending(x => PubKey(x.Item1, x.Item2), StringComparer.Ordinal).ThenBy(x => x.Item2.Min(e => e.Added), StringComparer.Ordinal).ThenBy(x => x.Item1.Id, StringComparer.Ordinal).ToList();
     }
 
@@ -271,6 +296,7 @@ public sealed class QueueState
     // ---- snapshot
     public sealed class SnapshotDoc
     {
+        /// <summary>The format version: 1 = the pre-split layout, 2 = a split layout's queue (a node that does not know the number refuses to read it).</summary>
         public int V { get; set; } = 1;
         public int Seg { get; set; } = 1;
         public long Off { get; set; }
@@ -285,7 +311,7 @@ public sealed class QueueState
     public static readonly TimeSpan DoneKeep = TimeSpan.FromDays(30);
 
     /// <summary>The compacted state for the snapshot; the live state is not touched, so every node keeps agreeing with the log.</summary>
-    public byte[] ToSnapshot(int seg, long off, int blocks, string at, DateTimeOffset? now = null)
+    public byte[] ToSnapshot(int seg, long off, int blocks, string at, DateTimeOffset? now = null, int version = 1)
     {
         var cut = Protocol.Utc((now ?? DateTimeOffset.UtcNow) - DoneKeep);
         var list = new List<QSubject>();
@@ -299,7 +325,7 @@ public sealed class QueueState
             else if (s.Entries.TryGetValue("check", out var ck)) list.Add(SlimFinished(new QSubject { Id = s.Id, Epoch = s.Epoch, LastAt = s.LastAt, CentersAt = s.CentersAt, Seq = s.Seq, JoinOf = s.JoinOf, JoinKind = s.JoinKind, Pub = s.Pub, Entries = { ["check"] = ck } }));   // 0.13.16: a sample-first duplicate has no download entry
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
-        return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, Subjects = list }, Protocol.Json);
+        return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { V = version, Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, Subjects = list }, Protocol.Json);
     }
 
     /// <summary>A finished subject as the snapshot needs it: the stage states, priority, when it was added and finished, a cut-down error and a minimal job (id, url, reason, duplicate-of) so a retry or a duplicate check still works. Everything else (due, attempts, node, steps, network, titles, ...) is dropped.</summary>
@@ -327,9 +353,16 @@ public sealed class QueueState
         using var gz = new System.IO.Compression.GZipStream(new MemoryStream(data), System.IO.Compression.CompressionMode.Decompress); using var o = new MemoryStream(); gz.CopyTo(o); return o.ToArray();
     }
 
+    /// <summary>The newest snapshot format this binary reads.</summary>
+    public const int SupportedSnapshotVersion = 2;
     public static (QueueState State, SnapshotDoc Doc) FromSnapshot(byte[] data)
     {
         data = Unpack(data);
+        using (var probe = JsonDocument.Parse(data))
+        {
+            if (probe.RootElement.ValueKind == JsonValueKind.Object && probe.RootElement.TryGetProperty("moved", out var mv)) throw new QueueMovedException(mv.GetString() ?? JobQueue.MovedHint);
+            if (probe.RootElement.ValueKind == JsonValueKind.Object && probe.RootElement.TryGetProperty("v", out var vv) && vv.TryGetInt32(out var ver) && ver > SupportedSnapshotVersion) throw new QueueFormatException($"indexnode: the queue snapshot has format version {ver}; this binary reads up to {SupportedSnapshotVersion}. Update indexnode.");
+        }
         var doc = JsonSerializer.Deserialize<SnapshotDoc>(data, Protocol.Json) ?? throw new InvalidDataException("empty queue snapshot");
         var st = new QueueState(); foreach (var s in doc.Subjects) { st.Subjects[s.Id] = s; if (s.Seq > st.MaxSeq) st.MaxSeq = s.Seq.Value; } st.MaxSeq = Math.Max(st.MaxSeq, doc.MaxSeq);
         return (st, doc);

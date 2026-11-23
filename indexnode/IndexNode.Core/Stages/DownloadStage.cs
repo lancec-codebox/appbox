@@ -219,7 +219,8 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
             try { await new CommentsStage(tools, store, gate).FetchAsync(cctx, false); }
             catch (Exception e) when (e is not OperationCanceledException and not BotBlocked) { Log.Info($"download {id}: comments not fetched ({Redact.Sas(e.Message)}); the video is stored without them"); }   // a missing comments snapshot never loses a download
         }
-        if (QueueProcessing)
+        if (ctx.Queue is { Paths.IsLegacyLayout: false }) Log.Info($"download {id}: done; the download side hands it to the processing queue (enter), no process line is added");   // 0.13.26: a split layout: process is ready on its own once the upload has entered
+        else if (QueueProcessing)
         {
             var p = JobDescriptor.NewProcess(id); p.Priority = ctx.Job.Priority; p.Steps = null;
             await PubTime.StampAsync(ctx.Store, ctx.Paths, id, ctx.Job, p, ctx.Token);

@@ -148,9 +148,9 @@ public class RestStoreTests
     }
 
     [Fact]
-    public async Task PutFile_uses_8MiB_blocks_and_a_block_list_in_order_with_equal_length_ids()
+    public async Task PutFile_uses_64MiB_blocks_and_a_block_list_in_order_with_equal_length_ids()
     {
-        var f = TempFile(20L * 1024 * 1024);
+        var f = SparseFile(2L * RestStore.BlockSize + 4L * 1024 * 1024);
         try
         {
             var h = new Handler((_, _) => new HttpResponseMessage(HttpStatusCode.Created));
@@ -158,7 +158,7 @@ public class RestStoreTests
             var blocks = h.Seen.Where(s => s.Req.RequestUri!.Query.Contains("comp=block&")).ToList();
             Assert.Equal(3, blocks.Count);
             var sizes = blocks.Select(b => b.Req.Content!.Headers.ContentLength).OrderByDescending(x => x).ToList();
-            Assert.Equal([8L * 1024 * 1024, 8L * 1024 * 1024, 4L * 1024 * 1024], sizes);
+            Assert.Equal([(long)RestStore.BlockSize, RestStore.BlockSize, 4L * 1024 * 1024], sizes);
             var ids = blocks.Select(b => Uri.UnescapeDataString(System.Web.HttpUtility.ParseQueryString(b.Req.RequestUri!.Query)["blockid"]!)).OrderBy(x => x).ToList();
             Assert.Equal(3, ids.Distinct().Count());
             Assert.Single(ids.Select(i => i.Length).Distinct());
@@ -173,9 +173,9 @@ public class RestStoreTests
     }
 
     [Fact]
-    public async Task PutFile_runs_at_most_4_blocks_in_parallel()
+    public async Task PutFile_runs_at_most_2_blocks_in_parallel()
     {
-        var f = TempFile(48L * 1024 * 1024); // 6 blocks
+        var f = SparseFile(4L * RestStore.BlockSize); // 4 blocks
         try
         {
             int cur = 0, max = 0;
@@ -190,6 +190,8 @@ public class RestStoreTests
         }
         finally { File.Delete(f); }
     }
+
+    private static string SparseFile(long len) { var p = Path.Combine(Path.GetTempPath(), "rs-" + Guid.NewGuid().ToString("N")[..8] + ".bin"); using var fs = new FileStream(p, FileMode.Create); fs.SetLength(len); return p; }
 
     private sealed class DelayHandler(Action enter, Action exit) : HttpMessageHandler
     {

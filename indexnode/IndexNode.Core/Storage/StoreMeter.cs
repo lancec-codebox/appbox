@@ -10,13 +10,13 @@ public sealed class StorageBudgetExceeded(string message) : InvalidOperationExce
 /// <summary>One line of the per-site table. <c>Failed</c> counts real failures (404, 409, 412 ...); <c>NotModified</c> counts 304s of conditional reads, which are successes (not in <c>Failed</c>, not in the breaker). <c>Blobs</c>: distinct blobs behind the row in the breaker's one-minute window (0 = not tracked, e.g. the all-time table).</summary>
 public sealed record SiteRow(string Site, string Op, long Count, long Failed, string? Example, long NotModified = 0, int Blobs = 0);
 
-/// <summary>0.13.18 settings (config storage.*). Defaults: warn 3,000 / max 10,000 per minute, 20,000 per step, 300 failures per minute, 5 minutes cooldown.</summary>
+/// <summary>0.13.18 settings (config storage.*). Defaults (0.13.26, the normal budget is low: a 2-lane processor measured a median of ~41 ops/min): warn 150 / max 200 per minute, 1,000 per step, 100 failures per minute, 5 minutes cooldown. One-off commands widen it with --storage-max N.</summary>
 public sealed class StorageLimits
 {
-    public int WarnPerMin { get; set; } = 3000;
-    public int MaxPerMin { get; set; } = 10000;
-    public int MaxPerStep { get; set; } = 20000;
-    public int MaxFailuresPerMin { get; set; } = 300;
+    public int WarnPerMin { get; set; } = 150;
+    public int MaxPerMin { get; set; } = 200;
+    public int MaxPerStep { get; set; } = 1000;
+    public int MaxFailuresPerMin { get; set; } = 100;
     public TimeSpan Cooldown { get; set; } = TimeSpan.FromMinutes(5);
 }
 

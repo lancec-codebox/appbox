@@ -33,6 +33,7 @@ public sealed partial class NodeEngine
         };
         if (!listed) return false;
         if (Control.Effective(stage) != Level.Run) return false;
+        if (stage == "classify" && !Control.Current.ClassifyOn) return false;   // 0.13.26: classify is paused unless control classify=on
         return !(stageBackoff.TryGetValue(stage, out var u) && u > DateTimeOffset.UtcNow);
     }
 
@@ -52,7 +53,8 @@ public sealed partial class NodeEngine
     private GroupSequencing.Gate? gate; private volatile GroupSequencing.Gate.View? gateView;
 
     private bool CanRunEntry(QSubject s, QEntry e) =>
-        e.Hold == "ai" && !Control.Current.AiDramasOn ? false   // 0.13.23: an AI-held entry of any stage (a download too) waits for control aiDramas=on
+        StageDeps.Held(e) ? false   // 0.13.24: an actors entry with a hold (AI) is never ready; a manual "actors add" replaces it
+        : e.Hold == "ai" && !Control.Current.AiDramasOn ? false   // 0.13.23: an AI-held entry of any stage (a download too) waits for control aiDramas=on
         : e.Stage == "process" && s.Entries.TryGetValue("check", out var ck0) && !ck0.Final ? false   // 0.13.16: the check comes first (a process entry never runs the pre-check itself while a check is pending)
         : e.Stage == "group" ? gateView is not { } gv || gv.Runnable_(s)   // a blocked group step is never claimed and nothing is appended for it (the claim-time BlockersAsync stays as the race safety net)
         : e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
@@ -83,7 +85,7 @@ public sealed partial class NodeEngine
                                 var gv = await gate.RefreshAsync(queue, queue.Now, ct); gateView = gv;
                                 if (gate.Summary(gv, queue.Now) is { } gsum) Log.Info(gsum);
                             }
-                            look = await queue.LookAsync(StageEnabled, CanRunEntry, ct);
+                            look = await queue.LookAsync(StageEnabled, CanRunEntry, ct, o.Ready);
                         }
 
                         catch (OperationCanceledException) { throw; }
@@ -99,6 +101,7 @@ public sealed partial class NodeEngine
                 }
                 if (!worked)
                 {
+                    if (await TryFetchFromServiceAsync(lane, ct)) continue;
                     await RetryFailedSearchIndexAsync(ct);
                     if (await TryPullForwardSearchIndexAsync(lane, ct)) continue;
                     RegistryChanged();
@@ -172,6 +175,30 @@ public sealed partial class NodeEngine
         finally { Interlocked.Decrement(ref busyClaims); }
     }
 
+    private DateTimeOffset nextFetch;
+    /// <summary>0.13.26: a downloader with nothing ready in its work queue asks the download service for one item (already claimed for it). The service answers none when it has nothing: the node waits a minute. A service that is down only means this stays empty.</summary>
+    private async Task<bool> TryFetchFromServiceAsync(int lane, CancellationToken ct)
+    {
+        if (o.FetchNext == null || !o.DownloaderOnly || DateTimeOffset.UtcNow < nextFetch || StorageHalted()) return false;
+        if (!TryReserve()) return false;
+        ClaimHandle? h = null;
+        try
+        {
+            NextClaim? got;
+            try { got = await o.FetchNext(o.Stages.Where(StageEnabled).ToArray(), ct); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception e) { Log.Info($"download: the service did not answer ({e.Message}); working from the work queue only"); got = null; nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); }
+            if (got == null) { nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); return false; }
+            await queue.PollAsync(ct);
+            h = queue.AdoptClaim(got.Subject, got.Epoch, got.Lease);
+        }
+        catch { Interlocked.Decrement(ref reserved); throw; }
+        if (h == null) { Interlocked.Decrement(ref reserved); return false; }
+        Interlocked.Increment(ref busyClaims);
+        try { Log.Info($"download: the service handed over {h.Subject}"); await RunClaimAsync(lane, h, ct); return true; }
+        finally { Interlocked.Decrement(ref busyClaims); }
+    }
+
     private DateTimeOffset nextSearchIndexRetry;
     /// <summary>0.13.3: a search-index entry that ended failed (attempts used up) is added again by a node that runs the stage, at most every 15 minutes: no operator step (the manual one is: indexnode jobs retry --stage search-index).</summary>
     private async Task RetryFailedSearchIndexAsync(CancellationToken ct)
@@ -207,7 +234,7 @@ public sealed partial class NodeEngine
         }
         if (!TryReserve()) { o.Limits?.Release(first, false); return false; }
         ClaimHandle? h;
-        try { h = await queue.TryClaimAsync(id, s => ClaimableStages(s), ct); }
+        try { h = await queue.TryClaimAsync(id, (st, s) => ClaimableStages(st, s), ct); }
         catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); throw; }
         catch (Exception e) { Log.Info($"[{first}#{lane}] {id}: claim failed ({e.Message})"); h = null; }
         if (h == null) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); return false; }
@@ -217,11 +244,13 @@ public sealed partial class NodeEngine
     }
 
     /// <summary>What this node would run of the subject right now (also the check, after the active file is ours, that the work is not done already).</summary>
-    private string[]? ClaimableStages(QSubject s)
+    private string[]? ClaimableStages(QueueState state, QSubject s)
     {
         var now = Protocol.Utc(NowUtc);
-        var st = s.Entries.Values.Where(e => e.Runnable(now) && StageEnabled(e.Stage) && CanRunEntry(s, e)).OrderBy(e => QueueState.Rank(e.Stage)).Select(e => e.Stage).ToArray();
-        return st.Length == 0 ? null : st;
+        var st = s.Entries.Values.Where(e => e.Runnable(now) && StageEnabled(e.Stage) && CanRunEntry(s, e)).Select(e => e.Stage).ToList();
+        foreach (var d in StageDeps.Derived)   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
+            if (!st.Contains(d) && StageEnabled(d) && StageDeps.ReadyEntry(state, s, d, now, o.Ready) is { } re && CanRunEntry(s, re)) st.Add(d);
+        return st.Count == 0 ? null : st.OrderBy(QueueState.Rank).ToArray();
     }
 
     // ---------------------------------------------------------------- one claim
@@ -328,8 +357,8 @@ public sealed partial class NodeEngine
                         await handlers["group"].RunAsync(ctx);
                         var gl = new List<QLine> { new() { T = "done", Stage = "group", Join = ctx.GroupJoin, JoinKind = ctx.GroupJoinKind } };
                         if (handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } gsi) gl.Add(gsi);
-                        // the actors stage follows the group step (an AI-flagged upload is never queued to it; the stage checks the flag again when it runs)
-                        if (handlers.ContainsKey("actors") && queue.Read(st => st.Entry(id, "actors") == null) && !AiHold.Flagged((await VideoJson.ReadAsync(store, paths, id, token))?.Root)) gl.Add(QLine.Add(id, "actors", NewFollow("actors", id, entry.Priority), queue.NowUtc()));
+                        // 0.13.24: actors becomes ready on its own once this group step is done (nothing is added for it); an AI-flagged upload gets the hold on actors here, where the flag is known (the stage checks the flag again when it runs)
+                        if (queue.Read(st => st.Entry(id, "actors") == null) && AiHold.Flagged((await VideoJson.ReadAsync(store, paths, id, token))?.Root)) gl.Add(new QLine { T = "add", S = id, Stage = "actors", Job = NewFollow("actors", id, entry.Priority), At = queue.NowUtc(), Pri = entry.Priority, Hold = "ai" });
                         await h.AppendAsync(gl, !WillContinue(id, "group", gl), CancellationToken.None);
                         return (Outcome.Done, null, ClaimEnded(id), ctx);
                     }
@@ -373,7 +402,7 @@ public sealed partial class NodeEngine
     /// <summary>True when this node runs another stage of the subject after the lines are applied (then the claim stays open).</summary>
     private bool WillContinue(string id, string stage, List<QLine> lines)
     {
-        var next = lines.Where(l => l.T == "add" && l.Stage != null).Select(l => l.Stage!).Where(StageEnabled);
+        var next = lines.Where(l => l.T == "add" && l.Stage != null && l.Hold == null).Select(l => l.Stage!).Where(StageEnabled);
         return next.Any();
     }
 

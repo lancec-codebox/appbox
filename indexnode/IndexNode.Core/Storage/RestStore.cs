@@ -1,4 +1,5 @@
-﻿using System.Net;
+﻿using Microsoft.Win32.SafeHandles;
+using System.Net;
 using System.Security;
 using System.Text;
 using System.Xml.Linq;
@@ -8,8 +9,9 @@ namespace IndexNode;
 /// <summary>Raw REST over a container SAS URL with HttpClient: no SDK, no account key.</summary>
 public sealed class RestStore : IStore
 {
-    public const int BlockSize = 8 * 1024 * 1024;
-    public const int BlockParallelism = 4;
+    /// <summary>0.13.26: large blocks (a 1 GB zip is 16 Put Blocks + the list, not 128): every op counts toward the storage breaker. The API version we send (Protocol.ApiVersion 2021-12-02) allows a block up to 4,000 MiB. Each block is streamed from the file handle, never buffered.</summary>
+    public const int BlockSize = 64 * 1024 * 1024;
+    public const int BlockParallelism = 2;
     public const int BlockRetries = 3;
 
     /// <summary>Where this store counts its bytes (the node's counters unless a test sets its own).</summary>
@@ -338,6 +340,22 @@ public sealed class RestStore : IStore
         return true;
     }
 
+    /// <summary>A read-only stream over [offset, offset+length) of an open file handle (positional reads, so blocks in flight share the handle).</summary>
+    internal sealed class FileSegmentStream(SafeFileHandle h, long offset, long length) : Stream
+    {
+        long pos;
+        public override bool CanRead => true; public override bool CanSeek => false; public override bool CanWrite => false;
+        public override long Length => length; public override long Position { get => pos; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int o, int c) => Read(buffer.AsSpan(o, c));
+        public override int Read(Span<byte> buffer) { var n = (int)Math.Min(buffer.Length, length - pos); if (n <= 0) return 0; n = RandomAccess.Read(h, buffer[..n], offset + pos); pos += n; return n; }
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) { var n = (int)Math.Min(buffer.Length, length - pos); if (n <= 0) return 0; n = await RandomAccess.ReadAsync(h, buffer[..n], offset + pos, ct); pos += n; return n; }
+        public override Task<int> ReadAsync(byte[] buffer, int o, int c, CancellationToken ct) => ReadAsync(buffer.AsMemory(o, c), ct).AsTask();
+        public override void Flush() { }
+        public override long Seek(long o, SeekOrigin so) => throw new NotSupportedException();
+        public override void SetLength(long v) => throw new NotSupportedException();
+        public override void Write(byte[] b, int o, int c) => throw new NotSupportedException();
+    }
+
     public static string BlockId(int index) => Convert.ToBase64String(Encoding.ASCII.GetBytes($"blk{index:D8}"));
 
     public static string BlockListXml(IEnumerable<string> ids)
@@ -533,8 +551,6 @@ public sealed class RestStore : IStore
             try
             {
                 var len = (int)Math.Min(BlockSize, length - (long)i * BlockSize);
-                var buf = new byte[len];
-                await RandomAccess.ReadAsync(handle, buf, (long)i * BlockSize, ct);
                 for (int attempt = 0; ; attempt++)
                 {
                     try
@@ -542,7 +558,7 @@ public sealed class RestStore : IStore
                         using var r = await SendAsync(() =>
                         {
                             var q = Req(HttpMethod.Put, BlobUri(name, $"comp=block&blockid={Uri.EscapeDataString(ids[i])}"));
-                            q.Content = new ByteArrayContent(buf);
+                            q.Content = new StreamContent(new FileSegmentStream(handle, (long)i * BlockSize, len)) { Headers = { ContentLength = len } };   // streamed from the handle: no block-sized buffer
                             return q;
                         }, ct, retries: 0);
                         if (!r.IsSuccessStatusCode) throw await Fail(r, "Put Block");

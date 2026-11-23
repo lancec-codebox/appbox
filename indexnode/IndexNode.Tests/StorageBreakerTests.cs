@@ -6,7 +6,7 @@ public class StorageBreakerTests
     static readonly Paths P = new("index-test/");
     sealed class Clock { public DateTimeOffset T = new(2026, 11, 21, 12, 0, 0, TimeSpan.Zero); public DateTimeOffset Now() => T; }
     sealed class Fn(Func<JobContext, Task> f) : IStageHandler { public Task RunAsync(JobContext ctx) => f(ctx); }
-    static StoreMeter Meter(Clock c, int warn = 3000, int max = 10000, int step = 20000, int fails = 300) => new(c.Now) { Limits = new StorageLimits { WarnPerMin = warn, MaxPerMin = max, MaxPerStep = step, MaxFailuresPerMin = fails, Cooldown = TimeSpan.FromMinutes(5) } };
+    static StoreMeter Meter(Clock c, int warn = 3000, int max = 10000, int step = 20000, int fails = 100) => new(c.Now) { Limits = new StorageLimits { WarnPerMin = warn, MaxPerMin = max, MaxPerStep = step, MaxFailuresPerMin = fails, Cooldown = TimeSpan.FromMinutes(5) } };
 
     static async Task ReadMissing(IStore s, int n) { for (int i = 0; i < n; i++) await s.GetAsync("nope/" + i, default); }
     static async Task HeadOne(IStore s) => await s.HeadAsync("x", default);

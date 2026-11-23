@@ -121,6 +121,7 @@ public sealed class SampleStage(ITools tools, IStore store, DownloadGate gate, P
             await store.PutAsync(paths.Video(id, Dir + "sample.json"), JsonSerializer.SerializeToUtf8Bytes(Marker(res, ctx.NodeId)), null, null, false, ct, "application/json");   // last: its presence says the sample is complete
             Log.Info($"sample {id}: {res.Segments.Count} segment(s) uploaded ({string.Join(", ", res.Seconds.Select(x => x.Key + " " + x.Value.ToString("0.0", CultureInfo.InvariantCulture) + "s"))})");
         }
+        if (ctx.Queue is { Paths.IsLegacyLayout: false }) { Log.Info($"sample {ctx.Job.JobId}: done; the download service checks it (no inline check, no check entry added by the downloader)"); return; }   // 0.13.26: split layout: the service folds the done sample back, checks it and decides
         if (Inline != null && await TryInlineAsync(ctx)) return;
         await AddCheck(ctx);
     }

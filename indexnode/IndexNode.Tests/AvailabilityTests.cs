@@ -82,4 +82,15 @@ public class AvailabilityTests
         Assert.False(s.InQueue(P.Job("refresh", "ch-" + C1)));
         Assert.Equal(C1, J(s, AvailabilityStage.MembersBlob(P))[Id('a')]!.ToString());           // learned once, remembered
     }
+
+    [Fact]
+    public async Task A_sweep_of_many_uploads_reads_no_state_blob_per_upload()
+    {
+        var s = new FakeStore(); var yt = new Yt();
+        var ids = Enumerable.Range(0, 60).Select(i => "v" + i.ToString("D10")).ToArray();
+        foreach (var id in ids) await Track(s, id, C1);
+        yt.Channels[C1] = ids;
+        int gets = s.Gets.Count; await Sweep(s, yt);
+        Assert.DoesNotContain(s.Gets.Skip(gets), g => g.EndsWith("/availability.json") && ids.Any(id => g.Contains("/" + id + "/")));   // no per-upload state read
+    }
 }

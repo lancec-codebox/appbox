@@ -30,10 +30,18 @@ public static class ActorsBuild
         public double Score(float[] x) { double s = B; for (int i = 0; i < W.Length && i < x.Length; i++) { double v = x[i]; if (Mu != null) v -= Mu[i]; if (Sd != null && Sd[i] != 0) v /= Sd[i]; s += W[i] * v; } return 1 / (1 + Math.Exp(-s)); }
     }
 
-    public static Probe? LoadProbe(string? path)
+    public const string StoreProbeName = "models/child-probe.json";
+    public static string StoreProbe(Paths p) => p.Prefix + StoreProbeName;
+    public static Probe? LoadProbe(string? path) => path == null ? null : ParseProbe(File.ReadAllText(path));
+    /// <summary>The child probe: the --child-probe file when given, else index/models/child-probe.json in the store; null when there is none (the actors stage must then not be claimed: without it no child is ever excluded).</summary>
+    public static async Task<Probe?> ResolveProbeAsync(IStore store, Paths paths, string? flag, CancellationToken ct)
     {
-        if (path == null) return null;
-        var o = JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? throw new InvalidDataException("child probe: not a JSON object");
+        if (flag != null) return LoadProbe(flag);
+        var c = await store.GetAsync(StoreProbe(paths), ct); return c == null ? null : ParseProbe(System.Text.Encoding.UTF8.GetString(c.Data));
+    }
+    public static Probe ParseProbe(string json)
+    {
+        var o = JsonNode.Parse(json) as JsonObject ?? throw new InvalidDataException("child probe: not a JSON object");
         var w = (o["w"] ?? o["weights"] ?? o["coef"]) as JsonArray ?? throw new InvalidDataException("child probe: needs w (the weights)"); 
         float[]? V(string k) => o[k] is JsonArray a ? a.Select(v => v!.GetValue<float>()).ToArray() : null;
         var p = new Probe(w.Select(v => v!.GetValue<float>()).ToArray(), (o["b"] ?? o["bias"] ?? o["intercept"])?.GetValue<double>() ?? 0, V("mu"), V("sd"), o["cut"]?.GetValue<double>() ?? ChildCut);

@@ -125,18 +125,20 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         var job = ctx.Job; var ct = ctx.Token; var paths = ctx.Paths;
         var at = Protocol.Utc(now());
         var queue = ctx.Queue ?? throw new InvalidOperationException("classify runs on the queue");
-        var all = ClassifyJobs.ListUnclassified(queue);   // from the queue's memory: no listing, no reads
+        // 0.13.26: on a downloader's work queue the service hands the batch over on the job (Entries) and takes the decisions back on the done line (Result); nothing is written to a queue here
+        bool onWork = queue.Paths.IsWorkQueue; var result = onWork ? new RunResult { Decisions = [] } : null;
+        var all = onWork ? (job.Entries ?? []).Select(e => (Id: e.Id, Entry: new QEntry { Stage = "download", Job = new JobDescriptor { Stage = "download", JobId = e.Id, Title = e.Title, Duration = e.Duration, ChannelName = e.ChannelName, Availability = e.Availability } })).ToList() : ClassifyJobs.ListUnclassified(queue);   // from the queue's memory: no listing, no reads
         var todo = all.Take(MaxPerRun).ToList();
         ctx.Report("classify", $"{todo.Count} of {all.Count} unclassified");
         if (job.CountDay != at[..10]) { job.CountDay = at[..10]; job.Classified = 0; job.Rejected = 0; }
         int stored = 0, rule = 0, dead = 0, aiCount = 0, yes = 0, no = 0, noAnswer = 0;
         var ask = new List<(string Id, JobDescriptor Job)>(); var cls = new List<QLine>();
-        async Task Flush() { if (cls.Count == 0) return; var batch = cls.ToList(); cls.Clear(); await queue.AppendLinesAsync(batch, ct); }
+        async Task Flush() { if (cls.Count == 0) return; var batch = cls.ToList(); cls.Clear(); if (!onWork) await queue.AppendLinesAsync(batch, ct); }
 
         async Task Decide(string id, JobDescriptor d, bool candidate, string kind, string reason, string by, string? model, bool save)
         {
-            if (save) await SaveDecisionAsync(store, paths, id, d.ChannelId, d.ChannelName, d.Title, d.Duration, candidate, kind, reason, by, model, at, ct);
-            cls.Add(ClassifyJobs.Decision(id, d, candidate, kind, reason, at));
+            if (onWork) result!.Decisions!.Add(new RunDecision { Id = id, Candidate = candidate, Kind = kind, Reason = reason });
+            else cls.Add(ClassifyJobs.Decision(id, d, candidate, kind, reason, at));
             if (cls.Count >= 500) await Flush();
             if (candidate) yes++; else no++;
             job.Classified = (job.Classified ?? 0) + 1; if (!candidate) job.Rejected = (job.Rejected ?? 0) + 1;
@@ -146,12 +148,7 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         {
             var d = entry.Job ?? new JobDescriptor { JobId = id, Stage = "download" };
             var b = id;
-            if (await store.GetAsync(Blob(paths, id), ct) is { } sb)                                    // 1. a stored decision, never asked twice
-            {
-                var n = JsonNode.Parse(sb.Data);
-                bool c = n?["candidate"]?.GetValue<bool>() == true;
-                await Decide(id, d, c, n?["kind"]?.ToString() ?? "", n?["reason"]?.ToString() ?? "", "stored", null, false); stored++; continue;
-            }
+            // (no stored-decision read: the queue is the record, an unclassified entry was never decided; old stored decisions are applied once by the split)
             if (d.Duration is { } dur && dur < MinMinutes * 60)                                          // 2. the length rule
             { await Decide(id, d, false, "short", $"{dur / 60:F0} min: shorter than {MinMinutes} min", "rule", null, true); rule++; continue; }
             if (ClassifyJobs.IsUnavailable(d))                                                          // 3. dead videos, before any AI call
@@ -170,6 +167,7 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
                 // no answer even one at a time: it stays unclassified with a counter; the third miss gives up on it
                 x.Job.ClassifyMisses = (x.Job.ClassifyMisses ?? 0) + 1; noAnswer++;
                 if (x.Job.ClassifyMisses >= MaxMisses) await Decide(x.Id, x.Job, false, "no AI answer", "", "ai", model, false);
+                else if (onWork) result!.Decisions!.Add(new RunDecision { Id = x.Id, Misses = x.Job.ClassifyMisses });
                 else cls.Add(new QLine { T = "upd", S = x.Id, Stage = "download", Job = x.Job });   // the miss counter is kept on the entry
                 Log.Info($"classify: no AI answer for {e.Id} (miss {x.Job.ClassifyMisses} of {MaxMisses}){(x.Job.ClassifyMisses >= MaxMisses ? ": given up (failed, classify: no AI answer)" : "")}");
             }
@@ -182,6 +180,7 @@ public sealed class ClassifyStage(IStore store, Func<DateTimeOffset>? clock = nu
         }
         await Flush();
         job.Attempts = 0; job.LastError = null; job.LastPolled = at;
+        if (onWork) { job.Entries = null; job.Result = await RunResults.SpillAsync(store, paths, ClassifyJobs.Subject, result!, ct); }
         bool more = all.Count > todo.Count;   // (a drama left unclassified after a miss is picked up again in the next round)
         ctx.NextDue = Protocol.Utc(more ? now() : now() + IdleEvery);
         Log.Info($"classify all: {todo.Count} of {all.Count} unclassified: {stored} already decided, {rule} too short, {dead} unavailable, {aiCount} by AI{(noAnswer > 0 ? $", {noAnswer} without an AI answer" : "")}; {yes} candidate(s), {no} rejected{(more ? "; more remain" : "")}");

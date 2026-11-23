@@ -23,7 +23,6 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
     {
         var io = new ActorsIO(ctx.Store, ctx.Paths, dry, outLocal); ctx.Report("actors", "units");
         var r = await RunAsync(io, ctx.BlobName, ctx.Job.Reason == ManualReason, Math.Max(1, ctx.ThreadShare()), ctx.Token, null, ctx.Queue?.Read(st => st.Get(ctx.BlobName)?.Seq is { } me ? st.Subjects.Values.Where(x => x.Seq is { } q && q < me).Select(x => x.Id).ToList() : new List<string>())); Last = r;
-        if (ctx.Queue != null && ctx.Queue.Read(st => ActorsIndexJobs.AddLine(st, DateTimeOffset.UtcNow, ActorsIndexJobs.Delay)) is { } il) ctx.FollowUps.Add(il);   // the index follows (debounced): the single writer of actors
         Log.Info($"actors {r.Id}: " + (r.Skipped ?? $"{r.Units} units ({r.FacesUsed} faces, {r.ChildUnits} child), {r.Links} links ({r.BandLinked}/{r.Band} band), predecessors {r.Predecessors}, index {r.IndexRouted}; {r.Timing}"));
     }
 

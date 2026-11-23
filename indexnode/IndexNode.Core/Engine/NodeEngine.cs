@@ -49,10 +49,15 @@ public interface IStageHandler
     Task RunAsync(JobContext ctx);
 }
 
+/// <summary>What POST /v1/download/next answers: one item the service claimed for this node (the claim line is in the work log; the lease is the node's to renew).</summary>
+public sealed record NextClaim(string Subject, string Stage, int Epoch, string Lease);
+
 public sealed class EngineOptions
 {
     /// <summary>0.13.1: at start, add the singleton search-index entry when none is pending (catch-up; tests of the follow-up turn it off).</summary>
     public bool SearchIndexCatchUp { get; init; } = true;
+    /// <summary>0.13.24: the readiness settings (actors-index: N finished uploads not indexed, or the oldest waiting T).</summary>
+    public ReadyOptions Ready { get; init; } = new();
     /// <summary>0.13.17: the head's build time (null: no published index). When set, the start-up catch-up adds a build only if the index is behind the queue; null function = always add (old behaviour).</summary>
     public Func<CancellationToken, Task<DateTimeOffset?>>? HeadBuiltAt { get; init; }
     public required string NodeId { get; init; }
@@ -78,6 +83,10 @@ public sealed class EngineOptions
     public string[]? Steps { get; init; }
     /// <summary>Claim filter: a job this returns false for is left to another node.</summary>
     public Func<JobDescriptor, bool>? CanRun { get; init; }
+    /// <summary>0.13.26: the fallback of a downloader whose work queue has nothing ready: asks the download service (POST /v1/download/next) for one item, already claimed for this node. Null answer: nothing (the node retries later).</summary>
+    public Func<string[], CancellationToken, Task<NextClaim?>>? FetchNext { get; init; }
+    /// <summary>0.13.26: a node whose stages are only download and sample works from the work queue (jobs/download/work/) after the split, and never reads the processing queue.</summary>
+    public bool DownloaderOnly => Stages.Length > 0 && Stages.All(x => x is "download" or "sample" or "refresh" or "classify" or "availability");   // 0.13.26: refresh and classify (the YouTube and AI work of the download side) also come from the work queue
     /// <summary>0.13.3: builds a missing video.json for a video whose lease the claim holds (the backfill's builder); null: a missing descriptor fails the claim as before.</summary>
     public Func<IStore, Paths, string, CancellationToken, Task>? EnsureVideoJson { get; init; }
     /// <summary>Budget, schedule and window; null: no limits.</summary>
@@ -378,7 +387,7 @@ public sealed partial class NodeEngine
         try
         {
             var rt = runCts.Token;
-            queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now);
+            queue = o.Queue ?? new JobQueue(store, paths, o.NodeId, o.Now, o.DownloaderOnly);
             await queue.LoadAsync(rt);
             await EnsureSearchIndexAsync(rt);
             var workers = new List<Task>();

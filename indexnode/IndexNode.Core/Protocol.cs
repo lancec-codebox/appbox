@@ -84,17 +84,30 @@ public static partial class Protocol
     }
 }
 
-public sealed class Paths(string prefix)
+public sealed class Paths(string prefix, string? queueDir = null)
 {
     public string Prefix { get; } = prefix.Length == 0 || prefix.EndsWith('/') ? prefix : prefix + "/";
+    /// <summary>0.13.26: the folder one queue lives in. The pre-split layout keeps it in jobs/; after `queue split` the processing queue is jobs/process/, the download queue jobs/download/ and the downloaders' work queue jobs/download/work/. Each folder holds queue.log, queue.N.log, the snapshot and active/.</summary>
+    public string QueueDir { get; } = queueDir ?? (prefix.Length == 0 || prefix.EndsWith('/') ? prefix : prefix + "/") + "jobs/";
+    public bool IsLegacyLayout => QueueDir == Prefix + "jobs/";
+    /// <summary>0.13.26: true for the downloaders' work queue (jobs/download/work/).</summary>
+    public bool IsWorkQueue => QueueDir == Prefix + "jobs/download/work/";
+    /// <summary>Where a downloader puts a large refresh result (read and deleted by the download service when it folds the run back).</summary>
+    public string RunResult(string subject, string stamp) => $"{Prefix}jobs/download/results/{subject}-{stamp}.json";
+    public const string MovedName = "moved.json";
+    /// <summary>The marker `queue split` writes (create-only): the queue moved; a node reads it once at start and follows it.</summary>
+    public string Moved => $"{Prefix}jobs/{MovedName}";
+    public Paths ProcessQueue => new(Prefix, $"{Prefix}jobs/process/");
+    public Paths DownloadQueue => new(Prefix, $"{Prefix}jobs/download/");
+    public Paths DownloadWork => new(Prefix, $"{Prefix}jobs/download/work/");
     /// <summary>0.13.0 queue: the first log segment, the later numbered segments, the snapshot and the per-subject reservations (all under jobs/, never ghosted).</summary>
-    public string QueueLog => $"{Prefix}jobs/queue.log";
-    public string QueueSegment(int n) => n <= 1 ? QueueLog : $"{Prefix}jobs/queue.{n}.log";
+    public string QueueLog => $"{QueueDir}queue.log";
+    public string QueueSegment(int n) => n <= 1 ? QueueLog : $"{QueueDir}queue.{n}.log";
     /// <summary>The snapshot as 0.13.0 first wrote it (plain JSON, 25 MB on the real store); still read when the .gz does not exist yet.</summary>
-    public string QueueSnapshot => $"{Prefix}jobs/queue.snapshot.json";
-    public string QueueSnapshotGz => $"{Prefix}jobs/queue.snapshot.json.gz";
-    public string ActiveDir => $"{Prefix}jobs/active/";
-    public string Active(string subject) => $"{Prefix}jobs/active/{subject}.json";
+    public string QueueSnapshot => $"{QueueDir}queue.snapshot.json";
+    public string QueueSnapshotGz => $"{QueueDir}queue.snapshot.json.gz";
+    public string ActiveDir => $"{QueueDir}active/";
+    public string Active(string subject) => $"{QueueDir}active/{subject}.json";
     /// <summary>The ids a source has already listed (kept out of the log lines: up to 500 ids).</summary>
     public string SourceSeen(string sourceId) => $"{Prefix}sources/{sourceId}/seen.json";
     public string Job(string stage, string id) => $"{Prefix}jobs/{stage}/{id}.json";
@@ -306,6 +319,10 @@ public sealed class JobDescriptor
     public int? Rejected { get; set; }
     /// <summary>0.10.1: how many times the AI left this upload out of its classify answer (given up at 3).</summary>
     public int? ClassifyMisses { get; set; }
+    /// <summary>0.13.26: what a refresh or classify run on a downloader hands back through the work queue (the service folds it into the full download queue); null in the old layout.</summary>
+    public RunResult? Result { get; set; }
+    /// <summary>0.13.26: the blob a work-queue availability sweep reads its input from (tracked videos, ingested channels), written by the download service when it adds the sweep.</summary>
+    public string? InputBlob { get; set; }
 
     public byte[] ToBytes() => JsonSerializer.SerializeToUtf8Bytes(this, Protocol.Json);
     public static JobDescriptor Parse(byte[] b) => JsonSerializer.Deserialize<JobDescriptor>(b, Protocol.Json) ?? throw new InvalidDataException("empty job");
@@ -343,8 +360,30 @@ public sealed class JobDescriptor
     };
 }
 
+/// <summary>0.13.26: the outcome of a refresh (new uploads, followed channels, the source's modified time) or a classify run (decisions), carried on the work queue's done line. Large ones are written to a blob (<see cref="Blob"/>) and only its path is on the line.</summary>
+public sealed class RunResult
+{
+    public List<JobDescriptor>? Videos { get; set; }
+    public List<JobDescriptor>? Follow { get; set; }
+    public List<RunDecision>? Decisions { get; set; }
+    public string? Modified { get; set; }
+    public string? Blob { get; set; }
+    public const int InlineMax = 24_000;
+}
+
+/// <summary>One classify decision: Candidate null means no answer (Misses counts them).</summary>
+public sealed class RunDecision
+{
+    public string Id { get; set; } = "";
+    public bool? Candidate { get; set; }
+    public string? Kind { get; set; }
+    public string? Reason { get; set; }
+    public int? Misses { get; set; }
+}
+
 public sealed class ClassifyEntry
 {
+    public string? Availability { get; set; }
     public string Id { get; set; } = "";
     public string? Title { get; set; }
     public double? Duration { get; set; }
@@ -378,6 +417,12 @@ public sealed class ControlFile
     public DownloadsControl? Downloads { get; set; }
     /// <summary>0.13.1: "on" lets nodes claim an AI-held drama (the pre-check flagged it AI); "off" or absent: they stay pending. Default off.</summary>
     public string? AiDramas { get; set; }
+    /// <summary>0.13.26: "on" lets the download service seed refreshes of sources with a dynamic schedule; "off" or absent (the default): it seeds none for them (explicit schedules, a manual refresh and a new source's first listing are always seeded).</summary>
+    public string? DynamicRefresh { get; set; }
+    /// <summary>0.13.26: "on" lets the download service seed the classify singleton and a node claim it; "off" or absent (the default): classify is paused (it needs an AI endpoint).</summary>
+    public string? Classify { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore] public bool ClassifyOn => string.Equals(Classify, "on", StringComparison.OrdinalIgnoreCase);
+    [System.Text.Json.Serialization.JsonIgnore] public bool DynamicRefreshOn => string.Equals(DynamicRefresh, "on", StringComparison.OrdinalIgnoreCase);
     /// <summary>0.13.17: the store's Azure region (e.g. "westus2"). Nodes with a region-only stage (RegionGate.OnlyStages) must run in it. Absent: no rule. Older nodes ignore the field.</summary>
     public string? Region { get; set; }
     /// <summary>0.13.18: "stop" is the global kill switch for storage use: every node stops claiming within one poll (running steps finish or fail on their own budget). Absent / "run": normal.</summary>

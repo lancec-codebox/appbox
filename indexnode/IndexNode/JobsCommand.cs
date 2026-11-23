@@ -26,8 +26,8 @@ public static class JobsCommand
                 return await ListAsync(a, await Load(store, paths));
             case "priority":
             {
-                var q = await Load(store, paths);
                 var id = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("jobs priority <subject> N");
+                var q = await JobQueue.OpenForVideoAsync(store, paths, "cli", id, default);   // processing first, then download
                 int p = PriorityTool.ParseOption(a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("jobs priority <subject> N"));
                 var r = await PriorityTool.SetAsync(q, p, [id], default);
                 Console.WriteLine($"{id}: {(r.Changed > 0 ? "priority " + p : "unchanged (" + string.Join(", ", r.Skipped.Keys) + ")")}");
@@ -35,8 +35,8 @@ public static class JobsCommand
             }
             case "retry":
             {
-                var q = await Load(store, paths);
                 var stage = a.Get("stage"); var subject = a.Positional.ElementAtOrDefault(1);
+                var q = subject != null ? await JobQueue.OpenForVideoAsync(store, paths, "cli", subject, default) : await Load(store, paths);
                 var at = Protocol.NowUtc();
                 var lines = q.Read(st => st.Subjects.Values.Where(s => subject == null || s.Id == subject).SelectMany(s => s.Entries.Values.Where(e => e.State == "failed" && (stage == null || e.Stage == stage) && e.Job?.Reason?.StartsWith("classify:", StringComparison.Ordinal) != true).Select(e => new QLine { T = "retry", S = s.Id, Stage = e.Stage, Due = at, At = at })).ToList());
                 if (lines.Count > 0) await q.AppendLinesAsync(lines, default);
@@ -144,7 +144,7 @@ public static class JobsCommand
         var id = a.Get("video") ?? a.Positional.FirstOrDefault() ?? throw new ArgumentException("video <id>");
         var (_, store, paths, http) = Commands.Open(a); using var _h = http;
         await JobQueue.RequireSnapshotAsync(store, paths, default);
-        var q = await Load(store, paths);
+        var q = await JobQueue.OpenForVideoAsync(store, paths, "cli", id, default);   // processing first, then download
         foreach (var l in Describe(q, id)) Console.WriteLine(l);
         return 0;
     }

@@ -4,6 +4,8 @@ using System.Text.Json.Serialization;
 namespace IndexNode;
 
 public sealed class ServeConfig { public string? Token { get; set; } }
+/// <summary>0.13.26 (config download.work-max, download.service-seconds): the download service's work queue size and loop interval.</summary>
+public sealed class DownloadConfig { public int? WorkMax { get; set; } public int? ServiceSeconds { get; set; } }
 public sealed class InlineCheckConfig
 {
     public string? Url { get; set; } public string? Token { get; set; } public int? TimeoutSeconds { get; set; }
@@ -37,12 +39,13 @@ public sealed class NodeConfig
     /// <summary>The storage account's Azure region (default westus2): reads from a node in the same region are free.</summary>
     public string? StorageRegion { get; set; }
     public static StorageLimits TryLoadStorageLimits() { try { return Load().StorageBreaker ?? new(); } catch (Exception e) when (e is not OperationCanceledException) { return new(); } }
-    /// <summary>0.13.18 (config storage.warn-per-min, max-per-min, max-per-step, max-failures-per-min, cooldown): the storage circuit breaker; null = the defaults (3,000 / 10,000 / 20,000 / 300 / 5 min).</summary>
+    /// <summary>0.13.18 (config storage.warn-per-min, max-per-min, max-per-step, max-failures-per-min, cooldown): the storage circuit breaker; null = the defaults (150 / 200 / 1,000 / 100 / 5 min).</summary>
     public StorageLimits? StorageBreaker { get; set; }
     /// <summary>0.13.21 (config serve.token): the bearer token POST /v1/check needs (the env INDEXNODE_SERVE_TOKEN overrides it).</summary>
     public ServeConfig? Serve { get; set; }
     /// <summary>0.13.21 (config check.url, check.token, check.timeout-seconds): the sample stage asks this serve instance for the check right after a sample download; null/empty url = the check entry as before.</summary>
     public InlineCheckConfig? Check { get; set; }
+    public DownloadConfig? Download { get; set; }
     public string? ModelUrl { get; set; }
     public string? ModelPath { get; set; }
     public BrowserConfig? Browser { get; set; }
@@ -54,6 +57,8 @@ public sealed class NodeConfig
     public int? DescribeMainMax { get; set; }
     /// <summary>0.13.1 (config key search.keep-versions): how many search-index versions to keep behind the head. Null = 3.</summary>
     public SearchSettings? Search { get; set; }
+    /// <summary>0.13.24 (config actors.*): when the actors-index singleton is ready.</summary>
+    public ActorsSettings? Actors { get; set; }
 
     /// <summary>Run limits (see LimitState). BudgetSetAt restarts the countdown when the budget is set again.</summary>
     public int? Budget { get; set; }
@@ -274,6 +279,14 @@ public sealed class BrowserConfig
 
     public string ResolveProfileDir() => string.IsNullOrWhiteSpace(ProfileDir) ? DefaultProfileDir() : ProfileDir;
     public int ResolvePort() => Port ?? DefaultPort;
+}
+
+public sealed class ActorsSettings
+{
+    /// <summary>actors.index-min-uploads: the actor index is built when this many finished actors uploads are not in it yet.</summary>
+    public int IndexMinUploads { get; set; } = 25;
+    /// <summary>actors.index-max-wait-minutes: ... or when the oldest of them has waited this long (a tail is never left).</summary>
+    public int IndexMaxWaitMinutes { get; set; } = 10;
 }
 
 public sealed class SearchSettings

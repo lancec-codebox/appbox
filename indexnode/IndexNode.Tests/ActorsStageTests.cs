@@ -173,20 +173,6 @@ public class ActorsStageTests
     }
 
     [Fact]
-    public async Task Backfill_queues_finished_group_steps_in_seq_order_as_normal_adds_and_leaves_AI_and_existing_out()
-    {
-        var fs = new FakeStore();
-        foreach (var id in new[] { "d1", "d2", "d3", "d4", "d5" }) await Drama(fs, id, WithCos(0.9, 1), (90, 90, 90), n: 14, seed: 1);
-        foreach (var id in new[] { "d1", "d2", "d3", "d4", "d5" }) await Group(fs, id); await SetAi(fs, "d2", true); await SetAi(fs, "d5", false);
-        var q = await Queue(fs, ("d3", 3, null, "done"), ("d1", 1, null, "done"), ("d2", 2, null, "done"), ("d4", 4, "done", "done"), ("d5", 5, null, "pending"));
-        var rep = await ActorsBackfill.PlanAsync(fs, P, q, 0, default);
-        Assert.Equal(new[] { "d1", "d3", "d5" }, rep.Lines.Select(l => l.S).ToArray()); Assert.Equal((3, 1, 1, 0), (rep.Queued, rep.AiFlagged, rep.HasEntry, rep.GroupNotDone));   // d5's queue group entry is pending, but it has a grouping record: the aggregate decides, not the queue state
-        Assert.All(rep.Lines, l => { Assert.Equal("actors", l.Stage); Assert.NotEqual(ActorsStage.ManualReason, l.Job!.Reason); });
-        Assert.Single((await ActorsBackfill.PlanAsync(fs, P, q, 1, default)).Lines);   // --limit
-        await q.AppendLinesAsync(rep.Lines, default); Assert.Empty((await ActorsBackfill.PlanAsync(fs, P, q, 0, default)).Lines);   // idempotent: now they have entries
-    }
-
-    [Fact]
     public async Task Preds_listed_keeps_only_the_listed_lower_seq_uploads_in_seq_order()
     {
         var fs = new FakeStore();
@@ -196,26 +182,24 @@ public class ActorsStageTests
     }
 
     [Fact]
-    public async Task A_200_upload_backfill_in_batches_of_50_reads_flat_per_upload_not_growing()
+    public async Task The_actors_stage_and_the_index_build_fit_the_storage_budget_and_the_build_reads_only_the_new_units_files()
     {
-        var fs = new FakeStore(); var io = new ActorsIO(fs, P); const int N = 200;
-        for (int k = 1; k <= N; k++) { var sd = k; await Drama(fs, "u" + k.ToString("D3"), WithCos(0.5 + (k % 7) * 0.01, 1), ((byte)(k % 251), (byte)((k * 7) % 251), (byte)((k * 13) % 251)), n: 14, seed: sd); await Group(fs, "u" + k.ToString("D3"), seq: k); }
-        var q = await Queue(fs); var st = StageOn(fs); var reads = new List<(string Id, int Gets, int Preds)>(); int builds = 0;
-        async Task Wait()
+        var fs = new FakeStore(); var m = new StoreMeter { Limits = new StorageLimits { MaxPerMin = 1000000, WarnPerMin = 1000000, MaxFailuresPerMin = 1000000 } }; var ms = new MeteredStore(fs, m);   // the steps run back to back here: only the per-step budget (1,000) is under test
+        var ids = Enumerable.Range(0, 30).Select(i => "u" + i.ToString("D2")).ToList();
+        for (int i = 0; i < ids.Count; i++) { await Drama(fs, ids[i], WithCos(0.30 + (i % 3) * 0.05, 1 + i % 7), ((byte)(i * 8), 40, 90), seed: i + 1); await Group(fs, ids[i], seq: i + 1); }
+        var st = new ActorsStage(ms, null, 0.64) { MakeR50 = () => new ColourEmbedder(), Decode = Imaging.DecodeJpeg }; var io = new ActorsIO(ms, P);
+        long worst = 0; string worstId = "";
+        for (int i = 0; i < ids.Count; i++)
         {
-            await q.LoadAsync(default);
-            foreach (var id in q.Read(s => s.Subjects.Values.Where(x => x.Entries.ContainsKey("actors")).Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList()))
-            {
-                if (reads.Any(r => r.Id == id)) continue;
-                int g0 = fs.Gets.Count; var r = await st.RunAsync(io, id, false, 1, default); reads.Add((id, fs.Gets.Count - g0, r.Predecessors));
-            }
-            var rep = await ActorsIndex.BuildAsync(io, default); builds++;
+            using (m.BeginStep()) { var before = m.Total; await st.RunAsync(io, ids[i], false, 2, default, ids.Take(i).ToList()); var ops = m.Total - before; if (ops > worst) { worst = ops; worstId = ids[i]; } }
         }
-        var br = await ActorsBackfillRun.RunAsync(fs, P, q, 50, 0, Wait, _ => { }, default, 5);
-        Assert.Equal(new[] { 50, 50, 50, 50 }, br.BatchSizes.ToArray()); Assert.Equal(4, builds); Assert.Equal(N, reads.Count);
-        var preds = reads.Select(r => r.Preds).ToList(); Assert.True(preds.Max() <= 50, "predecessors brute-forced per upload: " + preds.Max());
-        var batchAvg = Enumerable.Range(0, 4).Select(b => reads.Skip(b * 50).Take(50).Average(r => r.Gets)).ToList();
-        Console.WriteLine("READS/upload per batch: " + string.Join(", ", batchAvg.Select(x => x.ToString("F1"))) + " ; max preds " + preds.Max() + " ; mean preds " + preds.Average().ToString("F1"));
-        Assert.True(batchAvg[3] < batchAvg[1] * 1.5 + 5, "reads per upload must stay flat across batches: " + string.Join(", ", batchAvg));
+        Console.WriteLine($"BUDGET actors stage: worst step {worst} ops ({worstId}), predecessors up to 29");
+        Assert.True(worst <= 1000, $"an actors step made {worst} ops");
+        var b0 = m.Total; var rep = await ActorsIndex.BuildAsync(io, default); var buildOps = m.Total - b0;
+        Console.WriteLine($"BUDGET actors-index first build of 30 uploads: {buildOps} ops, read {rep.Read} units files");
+        await Drama(fs, "uNew", WithCos(0.5, 7), (9, 9, 9), seed: 99); await Group(fs, "uNew", seq: 31); await st.RunAsync(io, "uNew", false, 2, default, []);
+        var b1 = m.Total; var rep2 = await ActorsIndex.BuildAsync(io, default); var inc = m.Total - b1;
+        Console.WriteLine($"BUDGET actors-index next build (+1 upload): {inc} ops, reused {rep2.Reused}, read {rep2.Read}");
+        Assert.Equal(1, rep2.Read); Assert.Equal(30, rep2.Reused); Assert.True(inc <= 200, $"the incremental build made {inc} ops");
     }
 }

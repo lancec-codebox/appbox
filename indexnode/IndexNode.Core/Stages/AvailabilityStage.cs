@@ -27,7 +27,11 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
         var ct = ctx.Token; var paths = ctx.Paths; var job = ctx.Job; var at = Protocol.Utc(now());
         // 1. tracked videos: finished downloads
         var queue = ctx.Queue ?? throw new InvalidOperationException("availability runs on the queue");
-        var tracked = queue.Read(s => s.Subjects.Values.Where(x => x.Entries.TryGetValue("download", out var e) && e.State == "done").Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
+        bool onWork = queue.Paths.IsWorkQueue;   // 0.13.26: on a downloader the sweep reads its input from a blob the download service wrote and hands back only "done"; it writes no queue
+        var input = onWork && job.InputBlob != null ? await J(job.InputBlob, ct) : null;
+        if (onWork && input == null) throw new InvalidOperationException("availability on the work queue needs its input blob");
+        var ingested = input != null ? (input["ingest"] as JsonArray ?? []).Select(x => x!.ToString()).ToHashSet(StringComparer.Ordinal) : null;
+        var tracked = input != null ? (input["tracked"] as JsonArray ?? []).Select(x => x!.ToString()).OrderBy(x => x, StringComparer.Ordinal).ToList() : queue.Read(s => s.Subjects.Values.Where(x => x.Entries.TryGetValue("download", out var e) && e.State == "done").Select(x => x.Id).OrderBy(x => x, StringComparer.Ordinal).ToList());
         ctx.Report("availability", $"{tracked.Count} tracked videos");
         // 2. each video's channel, read once and remembered
         var members = await J(MembersBlob(paths), ct) ?? new JsonObject(); int learned = 0;
@@ -38,6 +42,9 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
         // 3. a channel is "ingest" when it has a watch job (its new uploads are classified and downloaded), else "check" only (owner, 2026-11-14):
         //    the sweep lists every channel of a tracked video either way, and never starts ingesting one by itself
         var channels = new JsonArray();
+        // the previous sweep's summary is the state: which videos were unavailable and since when (one read, not a GET per upload; most uploads have no state blob)
+        var goneSince = new Dictionary<string, string?>(StringComparer.Ordinal);
+        foreach (var o in ((await J(SummaryBlob(paths), ct))?["unavailable"] as JsonArray ?? []).OfType<JsonObject>().Where(o => o["id"] != null)) goneSince[o["id"]!.ToString()] = o["since"]?.ToString();
         // 4. one full listing per channel; only the missing are checked on their own
         var unavailable = new JsonArray(); int checkedAlone = 0, restored = 0, gone = 0, listingsFailed = 0;
         foreach (var (cid, ids) in byChannel)
@@ -45,12 +52,11 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
             var r = await tools.RunYtDlpAsync(["--flat-playlist", "--no-warnings", "--print", "%(id)s", $"https://www.youtube.com/channel/{cid}/videos"], ct);
             var listed = r.ExitCode == 0 ? r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToHashSet() : [];
             if (r.ExitCode != 0) listingsFailed++;
-            bool ingest = queue.Read(s => s.Entry("ch-" + cid, "refresh") != null);
+            bool ingest = ingested != null ? ingested.Contains(cid) : queue.Read(s => s.Entry("ch-" + cid, "refresh") != null);
             channels.Add(new JsonObject { ["id"] = cid, ["name"] = members[ids[0] + "|name"]?.ToString(), ["mode"] = ingest ? "ingest" : "check", ["tracked"] = ids.Count, ["listed"] = r.ExitCode == 0 ? listed.Count : null, ["listingOk"] = r.ExitCode == 0 });
             foreach (var id in ids)
             {
-                var state = await J(StateBlob(paths, id), ct);
-                bool wasGone = state?["available"]?.GetValue<bool>() == false;
+                bool wasGone = goneSince.ContainsKey(id);
                 if (listed.Contains(id))
                 {
                     if (wasGone) { await Put(StateBlob(paths, id), new JsonObject { ["available"] = true, ["checkedAt"] = at, ["since"] = at, ["evidence"] = "listed by its channel again" }, ct); restored++; }
@@ -62,7 +68,7 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
                 if (p.ExitCode == 0) { if (wasGone) { await Put(StateBlob(paths, id), new JsonObject { ["available"] = true, ["checkedAt"] = at, ["since"] = at, ["evidence"] = "plays again" }, ct); restored++; } continue; }
                 var reason = p.Stderr.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.StartsWith("ERROR", StringComparison.Ordinal)) ?? p.Stderr.Trim();
                 reason = reason.Length > 300 ? reason[..300] : reason;
-                var since = wasGone ? state?["since"]?.ToString() ?? at : at;
+                var since = wasGone ? goneSince[id] ?? at : at;
                 await Put(StateBlob(paths, id), new JsonObject { ["available"] = false, ["checkedAt"] = at, ["since"] = since, ["reason"] = reason, ["channel"] = cid }, ct);
                 unavailable.Add(new JsonObject { ["id"] = id, ["channel"] = cid, ["since"] = since, ["reason"] = reason });
                 if (!wasGone) gone++;
@@ -74,6 +80,7 @@ public sealed class AvailabilityStage(ITools tools, IStore store, Func<DateTimeO
             ["listingsFailed"] = listingsFailed, ["checkedAlone"] = checkedAlone, ["unavailable"] = unavailable, ["channelList"] = channels,
         }, ct);
         job.LastPolled = at; job.Attempts = 0; job.LastError = null;
+        if (onWork) job.Result = new RunResult();
         ctx.NextDue = Protocol.Utc(now() + RefreshStage.ParseEvery(job.Every ?? "1d"));
         Log.Info($"availability: {tracked.Count} tracked, {byChannel.Count} channels ({listingsFailed} listings failed), {checkedAlone} checked alone: {gone} newly unavailable, {restored} back, {unavailable.Count} unavailable in all");
     }

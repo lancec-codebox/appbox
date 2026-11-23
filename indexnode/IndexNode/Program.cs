@@ -9,7 +9,7 @@ public sealed class Args
 {
     public List<string> Positional { get; } = new();
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -75,7 +75,7 @@ public static class Program
         indexnode search-index build [--new-mean] | update [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (the global search table under index/search/vN/)
         indexnode search --vector <f32|f16 file of 512> | --image <file> [--trim] [--top-centers 300] [--top 20] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (screenshot search over the centers; "search <text> --job <id>" is the clip text search)
         indexnode ai score [--ids <file>] [--all-frames] [--threads N] [--input-local <dir>] [--output-local <dir>] [--local <dir>]   (0.12.0: the AI-drama probe on processed uploads' stored sscd.zip -> videos/<id>/ai.json)
-        indexnode status [--json]
+        indexnode status [--json] [--download]   (0.13.26: --download counts the full download queue, which only the download service otherwise reads)
         indexnode jobs migrate --to log [--dry-run]   (0.13.0: builds the first queue snapshot from today's job blobs; refuses while a job is running)
         indexnode jobs repair-steps [--dry-run]   (0.13.2: steps in a done list whose output is not on the store are taken out; a finished subject missing an output is re-opened with only the missing steps)
         indexnode jobs list [--stage S] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>   (the queue)
@@ -117,7 +117,7 @@ public static class Program
             a.Positional.RemoveAt(0);
             try { FramesCache.Configure(NodeConfig.Load()); } catch (Exception e) when (e is not OperationCanceledException) { }
             StoreMeter.Current.Limits = NodeConfig.TryLoadStorageLimits();   // 0.13.18: the breaker settings (config storage.*)
-            if (a.Get("storage-max") is { } smax) { var n = int.Parse(smax); StoreMeter.Current.Limits.MaxPerStep = n; StoreMeter.Current.Limits.MaxPerMin = Math.Max(StoreMeter.Current.Limits.MaxPerMin, n); StoreMeter.Current.CliMax = n; }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
+            if (a.Get("storage-max") is { } smax) { var n = int.Parse(smax); StoreMeter.Current.Limits.MaxPerStep = n; StoreMeter.Current.Limits.MaxPerMin = Math.Max(StoreMeter.Current.Limits.MaxPerMin, n); StoreMeter.Current.Limits.WarnPerMin = Math.Max(StoreMeter.Current.Limits.WarnPerMin, n); StoreMeter.Current.CliMax = n; }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
             var rc = await Dispatch(cmd, a);
             // 0.13.18: a write-free command (check --input-local, groups step --dry-run, whatif, region, ...) prints its per-site table at the end
             if (cmd is not ("run" or "serve" or "precheck-serve" or "status" or "config" or "control") && StoreMeter.Current.Total > 0 && !a.Has("json")) Console.WriteLine("\n" + StoreMeter.Current.TableText());
@@ -163,6 +163,7 @@ public static class Program
                 "search-index" => await CentersCommands.SearchIndexAsync(a),
                 "groups" => await GroupsCommand.RunAsync(a),
                 "seq" => await SeqCommand.RunAsync(a),
+                "queue" => await QueueCommand.RunAsync(a),
                 "frames" => await FramesCommand.RunAsync(a),
                 "status" => await Commands.StatusAsync(a),
                 "requeue" => await JobsCommand.RunAsync(Args.Parse(["retry", .. (a.Get("stage") is { } rs ? new[] { "--stage", rs } : [])])),
@@ -257,6 +258,8 @@ public static class Commands
         catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 2; }
         var gate = new DownloadGate();
         NodeEngine? engineRef = null;
+        var childProbe = await ActorsBuild.ResolveProbeAsync(store, paths, a.Get("child-probe"), default);
+        if (childProbe == null) Log.Info($"actors: this node does not claim the actors stage: no child probe (no --child-probe and no {ActorsBuild.StoreProbe(paths)} in the store); without it no child unit would be left out");
         bool aiStages = a.Has("ai-stages");
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
         var preStage = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths, b => FreshFromQueue(engineRef, b)), NoPre(a, cfg.PreCheck), Commands.VersionString);
@@ -271,10 +274,10 @@ public static class Commands
             ["availability"] = new AvailabilityStage(tools, store),
             ["group"] = new GroupStage(store, cfg.PreCheck),
             ["search-index"] = new SearchIndexStage(store, cfg.Search?.KeepVersions ?? 3, cfg.PreCheck),
-            ["actors"] = ActorsCommand.NewStage(store, http, a, false, null),
             ["actors-index"] = new ActorsIndexStage(store),
             ["classify"] = new ClassifyStage(store) { Ai = () => ProcessStage.Ai is { Configured: true } ai0 ? (new AiClient(http, ai0), ai0.TextModel ?? ai0.VisionModel!) : null },
         };
+        if (childProbe != null) handlers["actors"] = ActorsCommand.NewStage(store, http, a, false, null, childProbe);   // no probe: no handler, so the node never claims actors
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
         var limits = BuildLimits(a, cfg, nodeId);
         var ai = AiConfig.Resolve(cfg.Ai, k => a.Get(k), Environment.GetEnvironmentVariable);
@@ -283,11 +286,12 @@ public static class Commands
         var opts = new EngineOptions
         {
             Device = () => OrtOptions.Device,
-            NodeId = nodeId, Name = nodeName, AiStages = aiStages && ai.Configured,
+            NodeId = nodeId, Name = nodeName, AiStages = aiStages && ai.Configured, Ready = new ReadyOptions(cfg.Actors?.IndexMinUploads ?? 25, cfg.Actors?.IndexMaxWaitMinutes ?? 10),
             Version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0",
             Steps = ProcessStage.SupportedSteps(cfg),
             Stages = stages, Workers = workers, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
+            FetchNext = cfg.Check?.Url is { Length: > 0 } svcUrl ? (async (st, ct) => await DownloadServiceClient.NextAsync(http, svcUrl, cfg.Check.Token ?? Environment.GetEnvironmentVariable("INDEXNODE_CHECK_TOKEN"), nodeId, st, ct)) : null,
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
@@ -345,7 +349,7 @@ public static class Commands
     public static async Task<int> PriorityAsync(Args a)
     {
         var (_, store, paths, _) = Open(a);
-        var q = new JobQueue(store, paths, "cli"); await q.LoadAsync(default);
+        var q = await JobQueue.OpenAsync(store, paths, "cli", true, default);   // 0.13.26: the full download queue
         return await PriorityTool.RunAsync(a, q);
     }
 
@@ -354,7 +358,7 @@ public static class Commands
         int priority = PriorityTool.ParseOption(a.Get("priority"));
         var sub = a.Positional.FirstOrDefault();
         var (cfg, store, paths, http) = Open(a);
-        var queue = new JobQueue(store, paths, "cli"); await queue.LoadAsync(default);
+        var queue = await JobQueue.OpenAsync(store, paths, "cli", true, default);   // 0.13.26: sources live in the full download queue
         int maxHeight = a.Get("max-height") is { } h ? int.Parse(h) : 480;
         var every = a.Get("every") ?? a.Get("schedule"); // null: "once" (a lookup on add, then nothing unless scheduled)
         switch (sub)
@@ -532,7 +536,7 @@ public static class Commands
         if (a.Positional.Count == 0) throw new ArgumentException("enqueue needs at least one url");
         var format = a.Get("format"); int priority = PriorityTool.ParseOption(a.Get("priority"));
         var tools = new Tools(http, cfg);
-        var eq = new JobQueue(store, paths, "cli"); await eq.LoadAsync(default);
+        var eq = await JobQueue.OpenAsync(store, paths, "cli", true, default);   // 0.13.26: new downloads go to the full download queue
         int added = 0, existed = 0;
         var meta = new Dictionary<string, RefreshStage.Entry>();
         foreach (var input in a.Positional)
@@ -579,7 +583,7 @@ public static class Commands
     {
         if (a.Positional.FirstOrDefault() != "start") throw new ArgumentException("availability start [--every 1d]");
         var (_, store, paths, http) = Open(a); using var _h = http;
-        var aq = new JobQueue(store, paths, "cli"); await aq.LoadAsync(default);
+        var aq = await JobQueue.OpenAsync(store, paths, "cli", true, default);
         var job = AvailabilityStage.NewSweep(a.Get("every") ?? "1d"); RefreshStage.ParseEvery(job.Every);
         bool made = false;
         await aq.AppendLinesAsync(st => { made = false; if (st.Entry(AvailabilityStage.SweepId, "availability") != null) return null; made = true; return [QLine.Add(AvailabilityStage.SweepId, "availability", job, job.AddedAt)]; }, default);
@@ -617,6 +621,20 @@ public static class Commands
             var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control ai-dramas on|off");
             var ac = await ControlWatcher.SetAiDramasAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
             Console.WriteLine($"control: aiDramas = {(ac.AiDramasOn ? "on (AI-held dramas are claimable and resume from frames)" : "off (AI-held dramas stay pending)")}");
+            return 0;
+        }
+        if (level == "classify")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control classify on|off");
+            var cc = await ControlWatcher.SetClassifyAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: classify = {(cc.ClassifyOn ? "on (classify is seeded and claimed)" : "off (classify is paused: not seeded, not claimed)")}");
+            return 0;
+        }
+        if (level == "dynamic-refresh")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control dynamic-refresh on|off");
+            var dc = await ControlWatcher.SetDynamicRefreshAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: dynamicRefresh = {(dc.DynamicRefreshOn ? "on (sources with a dynamic schedule are refreshed)" : "off (no refresh is seeded for a dynamic-schedule source; explicit schedules, manual refreshes and first listings still run)")}");
             return 0;
         }
         if (level == "gpu-hold")
@@ -665,7 +683,9 @@ public static class Commands
                 Console.WriteLine($"      lane {r.Worker}: {r.Stage}/{r.JobId} {r.Step} {r.Progress}");
         }
 
-        var queue = new JobQueue(store, paths, "status"); await queue.LoadAsync(default);
+        bool fullDownload = a.Has("download") && !(await JobQueue.ResolveAsync(store, paths, default)).IsLegacyLayout;   // 0.13.26: status --download counts the FULL download queue (a host one-off: it reads the whole of it)
+        var queue = await JobQueue.OpenAsync(store, paths, "status", fullDownload, default);
+        if (fullDownload) Console.WriteLine($"\nFULL DOWNLOAD queue ({queue.Paths.QueueDir}): every sample / download / refresh / classify entry; processing and the work queue are not counted here");
         Console.WriteLine($"\nQueue (segment {queue.Segment}, {queue.Blocks} appends, {queue.Offset} bytes read)");
         var subjects = queue.Read(st => st.Subjects.Values.SelectMany(s => s.Entries.Values.Select(e => (Subject: s, Entry: e))).ToList());
         foreach (var stage in Protocol.Stages)
@@ -674,6 +694,12 @@ public static class Commands
             var counts = (stage == "download" ? new[] { Tags.Unclassified, "pending", "done", Tags.Duplicate, "failed" } : new[] { "pending", "done", "failed" }).Select(s => $"{s}={inStage.Count(x => x.Entry.State == s)}");
             int prio = inStage.Count(x => x.Entry.State == "pending" && x.Entry.Priority != 0);
             Console.WriteLine($"  {stage,-9} {string.Join("  ", counts)}  claimed={inStage.Count(x => x.Subject.ClaimBy != null && x.Subject.ClaimStages?.Contains(stage) == true)}{(prio > 0 ? $"  pending with priority={prio}" : "")}");
+        }
+        if (!queue.Paths.IsLegacyLayout && !fullDownload)
+        {   // 0.13.26: the split layout: this is the PROCESSING queue; the downloaders' work queue is small and shown too; the full download queue belongs to `indexnode serve --download-service` and is never read here
+            var wq = new JobQueue(store, paths.DownloadWork, "status"); await wq.LoadAsync(default);
+            var wc = wq.Read(st => st.Subjects.Values.SelectMany(x => x.Entries.Values).GroupBy(e => e.Stage + ":" + e.State).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}").ToList());
+            Console.WriteLine($"\nQueue split: the numbers above are the processing queue ({queue.Paths.QueueDir}).\nDownload work queue ({wq.Paths.QueueDir}): {(wc.Count == 0 ? "empty" : string.Join("  ", wc))}\n  (the full download queue is the download service's; see its log)");
         }
         var (cDay, cDone, cRejected) = ClassifyCommand.Today(queue, now);
         Console.WriteLine($"  classify  unclassified={subjects.Count(x => x.Entry.Stage == "download" && x.Entry.State == Tags.Unclassified)}  classified today={cDone}  rejected today={cRejected}  (UTC {cDay}; review: indexnode classify list --rejected)");
@@ -687,6 +713,8 @@ public static class Commands
 
         var ctl = ControlFile.Parse((await store.GetAsync(paths.Control, default))?.Data);
         Console.WriteLine($"\nAI dramas: {(ctl.AiDramasOn ? "on" : "off")}  held (pre-check flagged AI): {queue.Read(st => st.Subjects.Values.Count(s => s.Entries.Values.Any(e => e.Hold == "ai" && !e.Final)))}");
+        Console.WriteLine($"Classify: {(ctl.ClassifyOn ? "on" : "off (paused)")}");
+        Console.WriteLine($"Dynamic refresh: {(ctl.DynamicRefreshOn ? "on" : "off (dynamic-schedule sources are not refreshed)")}");
         Console.WriteLine($"\nControl: mode={ctl.Mode} download={ctl.Effective("download")} process={ctl.Effective("process")}  changed {ctl.ChangedAt} by {ctl.ChangedBy}{(ctl.Message != null ? "  \"" + ctl.Message + "\"" : "")}");
         return 0;
     }
@@ -859,6 +887,8 @@ public static class Commands
                 case "storage.region": file.StorageRegion = val.Trim(); break;
                 case "serve.token": (file.Serve ??= new()).Token = val.Trim(); break;
                 case "check.url": (file.Check ??= new()).Url = val.Trim().Length == 0 || val.Equals("off", StringComparison.OrdinalIgnoreCase) ? null : val.Trim().TrimEnd('/'); break;
+                case "download.work-max": { var n = int.Parse(val); if (n < 2) throw new ArgumentException("download.work-max must be 2 or more"); (file.Download ??= new()).WorkMax = n; break; }
+                case "download.service-seconds": { var n = int.Parse(val); if (n < 5) throw new ArgumentException("download.service-seconds must be 5 or more"); (file.Download ??= new()).ServiceSeconds = n; break; }
                 case "check.token": (file.Check ??= new()).Token = val.Trim(); break;
                 case "check.timeout-seconds": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("check.timeout-seconds must be 1 or more"); (file.Check ??= new()).TimeoutSeconds = n; break; }
                 case "storage.warn-per-min": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("storage.warn-per-min must be 1 or more"); (file.StorageBreaker ??= new()).WarnPerMin = n; break; }
@@ -868,6 +898,8 @@ public static class Commands
                 case "storage.cooldown": { var d = RefreshStage.ParseEvery(val); if (d <= TimeSpan.Zero) throw new ArgumentException("storage.cooldown must be a positive duration like 5m"); (file.StorageBreaker ??= new()).Cooldown = d; break; }
                 case "model-url": file.ModelUrl = val; break;
                 case "model-path": file.ModelPath = val; break;
+                case "actors.index-min-uploads": { var n = int.Parse(val); if (n < 1) throw new ArgumentException("actors.index-min-uploads must be 1 or more"); (file.Actors ??= new()).IndexMinUploads = n; break; }
+                case "actors.index-max-wait-minutes": { var n = int.Parse(val); if (n < 0) throw new ArgumentException("actors.index-max-wait-minutes must be 0 or more"); (file.Actors ??= new()).IndexMaxWaitMinutes = n; break; }
                 case "search.keep-versions": case "search.keepversions": { var kv = int.Parse(val); if (kv < 0) throw new ArgumentException("search.keep-versions must be 0 or more"); (file.Search ??= new()).KeepVersions = kv; break; }
                 case "index.local-cache-gb": { var gb = double.Parse(val, System.Globalization.CultureInfo.InvariantCulture); if (gb < 0) throw new ArgumentException("index.local-cache-gb must be 0 or more"); (file.Search ??= new()).LocalCacheGb = gb; break; }
                 case "scan.mode": { var m = val.Trim().ToLowerInvariant(); if (m is not ("fast" or "exact")) throw new ArgumentException("scan.mode must be fast or exact"); (file.Search ??= new()).ScanMode = m; break; }

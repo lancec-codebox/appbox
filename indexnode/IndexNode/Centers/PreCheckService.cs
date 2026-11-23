@@ -48,6 +48,10 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     /// <summary>The analyzer /v1/check runs (default: the server's own); tests put a fake one.</summary>
     public IPreCheckAnalyzer? CheckAnalyzer { get; init; }
     PreCheckStage? checkStage; long checks;
+    /// <summary>0.13.26: the download service (serve --download-service): set, the two /v1/download endpoints answer; otherwise 404.</summary>
+    public DownloadService? Downloads { get; set; }
+    /// <summary>Where the downloaders' work queue lives: the container URL (no SAS, no credential) and the path.</summary>
+    public string? ContainerUrl { get; set; }
 
     bool TokenOk(HttpContext c)
     {
@@ -216,6 +220,29 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             catch (OperationCanceledException) { return Results.StatusCode(499); }
             catch (Exception e) { Interlocked.Increment(ref failures); Log.Info("serve: request failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
         });
+        app.MapGet("/v1/download/queue", (HttpContext c) =>
+        {
+            if (!TokenOk(c)) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
+            if (Downloads == null || ContainerUrl == null) return Results.Json(new { error = "this serve does not run the download service" }, statusCode: 404);
+            return Results.Json(new { container = ContainerUrl, path = paths.DownloadWork.QueueDir, max = Downloads.WorkMax });   // no new credential: a downloader keeps its own SAS
+        });
+        app.MapPost("/v1/download/next", async (HttpContext c) =>
+        {
+            if (!TokenOk(c)) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
+            if (Downloads == null) return Results.Json(new { error = "this serve does not run the download service" }, statusCode: 404);
+            try
+            {
+                using var sr = new StreamReader(c.Request.Body); var body = JsonNode.Parse(await sr.ReadToEndAsync(c.RequestAborted)) as JsonObject ?? throw new ArgumentException("the body is not a JSON object");
+                var node = (string?)body["node"] ?? throw new ArgumentException("node is missing");
+                var stages = (body["stages"] as JsonArray)?.Select(x => x?.ToString() ?? "").Where(x => x.Length > 0).ToArray() ?? [];
+                var got = await Downloads.NextAsync(node, stages, c.RequestAborted);
+                return got == null ? Results.Json(new { none = true, retryAfterSeconds = 60 }) : Results.Json(new { subject = got.Subject, stage = got.Stage, epoch = got.Epoch, lease = got.Lease, active = got.Active });
+            }
+            catch (Exception e) when (e is ArgumentException or JsonException) { return Results.BadRequest(new { error = e.Message }); }
+            catch (OperationCanceledException) { return Results.StatusCode(499); }
+            catch (StorageBudgetExceeded e) { return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
+            catch (Exception e) { Log.Info("serve: download/next failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
+        });
         app.MapPost("/v1/check", async (HttpContext c) =>
         {
             Interlocked.Increment(ref requests);
@@ -286,6 +313,7 @@ public static class ServeCommand
         var bind = a.Get("bind") ?? "0.0.0.0";
         var app = server.Build($"http://{bind}:{port}");
         _ = server.RefreshLoopAsync(TimeSpan.FromMinutes(5), cts.Token);
+        if (a.Has("download-service")) await DownloadServiceHost.StartAsync(server, store, paths, cfg, a, cts.Token);
         await app.StartAsync(cts.Token);
         Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/health)");
         try { await Task.Delay(Timeout.Infinite, cts.Token); } catch (OperationCanceledException) { }
