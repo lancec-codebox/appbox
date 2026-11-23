@@ -43,12 +43,23 @@ public static class WhatIf
         {
             if (level != Level.Run) { Block($"the stage is off in control ({level.ToString().ToLowerInvariant()})"); continue; }
             var why = Blocker(st, s, leaseLive, stage, step, ctl, opts, nowUtc, out int pri);
+            if (why == null) why = NotRunnable(st, s, stage, step, ctl, opts, nowUtc);   // 0.13.36: what the claim would really do
             if (why == null) ready.Add((s, pri)); else Block(why);
         }
         bool bySeq = SeqOrdered.Contains(stage) || step;
         var order = (bySeq ? ready.OrderBy(x => x.S.Seq ?? long.MaxValue).ThenBy(x => x.S.Id, StringComparer.Ordinal) : ready.OrderByDescending(x => x.Pri).ThenBy(x => x.S.Id, StringComparer.Ordinal)).Select(x => x.S.Id).ToList();
         var notes = new List<string> { bySeq ? "claim order: grouping seq, then id" : "claim order: priority, then id" };
         return new Report(stage, subjects.Count, ready.Count, order.Take(top).ToList(), bl.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).ToDictionary(kv => kv.Key, kv => kv.Value), notes);
+    }
+
+    /// <summary>0.13.36: the claim's own answer (<see cref="StageDeps.ClaimStages"/>, the rule the node uses) for a subject the readiness view called ready: null = a claim would run the stage; else why it would find nothing. The node's group gate and local stage switches are not known here (control's levels are).</summary>
+    static string? NotRunnable(QueueState st, QSubject s, string stage, bool step, ControlFile ctl, ReadyOptions ro, string now)
+    {
+        if (s.Id == ActorsIndexJobs.Subject) return null;
+        var claimStage = step ? "process" : stage;
+        var stages = StageDeps.ClaimStages(st, s, now, x => ctl.Effective(x) == Level.Run, (sub, e) => !StageDeps.Held(e) && !(e.Hold == "ai" && !ctl.AiDramasOn) && !(e.Stage == "process" && sub.Entries.TryGetValue("check", out var ck) && !ck.Final), ro);
+        if (stages != null && stages.Contains(claimStage)) return null;
+        return "not runnable: a claim would find nothing to run" + (stages == null ? "" : " for " + claimStage + " (it would run " + string.Join(",", stages) + ")") + (!s.IsFull ? " (not a fully downloaded upload)" : "");
     }
 
     /// <summary>null = ready; else the one blocker (the first that applies, in a fixed order: lease, hold, then the stage's own).</summary>

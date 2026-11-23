@@ -48,6 +48,16 @@ public static class StageDeps
         return res;
     }
 
+    /// <summary>0.13.36: the stages a claim of <paramref name="s"/> would run, in order (null = nothing). The ONE rule the node's claim and `queue whatif` share: a subject the ready view offers is never one the claim then finds empty. <paramref name="stageOk"/> / <paramref name="canRun"/> are the node's stage switch and entry gate.</summary>
+    public static string[]? ClaimStages(QueueState state, QSubject s, string now, Func<string, bool> stageOk, Func<QSubject, QEntry, bool> canRun, ReadyOptions ro)
+    {
+        var st = s.Entries.Values.Where(e => e.Runnable(now) && stageOk(e.Stage) && canRun(s, e)).Select(e => e.Stage).ToList();
+        foreach (var d in Derived)   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
+            if (!st.Contains(d) && stageOk(d) && ReadyEntry(state, s, d, now, ro) is { } re && canRun(s, re)) st.Add(d);
+        if (!st.Contains("process") && s.IsFull && stageOk("process") && StaleEntry(s, ro) is { } sre && canRun(s, sre)) st.Add("process");   // 0.13.32: a step below the required version is ready again (0.13.36: IsFull, as the ready view: an upload with no data fact but a done download is repaired too)
+        return st.Count == 0 ? null : st.OrderBy(QueueState.Rank).ToArray();
+    }
+
     public const string VersionReason = "version";
     public static bool IsVersionEntry(QEntry e) => e.Stage == "process" && e.State == "pending" && e.Job?.Reason == VersionReason;
     /// <summary>The process entry a claim would re-open for the stale steps of <paramref name="s"/> (not stored: the claim line's Redo creates the real change), or null.</summary>

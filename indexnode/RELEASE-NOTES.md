@@ -1,5 +1,13 @@
 ## 0.13.32 (the cast step's repair mode, versioned steps, `queue whatif`)
 
+
+## 0.13.36
+
+- **Claim storm fixed.** The ready view and the claim now use one rule (`StageDeps.ClaimStages`). Before, the view offered a stale-step repair for any full upload (including one migrated with no data fact), but the claim required data=full, so it put the active file, took the lease, found nothing and deleted it, about 4 ops per attempt, in a loop.
+- A subject attempted and abandoned (nothing runnable, or none of its steps for this node) is not attempted again until a queue line touches it or control.json changes. No timer.
+- `queue whatif` reports the claim's real result (`not runnable: ...`).
+- The snapshot keeps the announced actors-index / search-index versions and the control ETag; the actors-index cache is shared across a claim's LocalCacheStore wrappers, so head.json is not read per claim.
+
 - `queue import-done process [--dry-run|--out-local FILE]` appends done process for processing subjects whose stored outputs show they were processed. `run --shadow` takes the `queue whatif` `--set` overrides (in memory, never written to control.json) and `--with-import process,group` (the import lines go to the shadow overlay only), so the whole rollout can run locally first.
 
 - **Every upload computes its own ResNet vectors; nobody else's.** The cast step (a fresh one, or its repair mode) builds the upload's repaired cast state from its stored faces (no mbf vector recomputed) and the r50 vector of EVERY unit (up to 30 faces: one per character-unit; child units are already left out by the probe), reading its own cast.zip and frames.zip once each. The state is plain files under `index/actors/` (ghost-ignored, so no hydrate): `units/<id>.bin` (generation 2: unit centres and representative mbf vectors, faces / rep / pick indices, child, first/last, the hash of the grouping record) and `r50/<id>.bin`. The crops stay in cast.zip; `pick` points at them. After the repair no actors job, index build or tiebreak reads a cast.zip or frames.zip, except for a predecessor still being repaired (below).

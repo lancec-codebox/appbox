@@ -14,6 +14,8 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     public ControlFile Current { get => current; private set => current = Override != null ? Override(value) : value; }
     public void SetOverride(Func<ControlFile, ControlFile> f) { Override = f; Current = current; }
     public event Action? Changed;
+    /// <summary>0.13.36: counts the control.json changes this watcher applied (a change signal for claims the node gave up on).</summary>
+    public int Changes => Volatile.Read(ref changes); private int changes;
 
     /// <summary>Calls with <paramref name="force"/> always hit storage; others are throttled to 1 s.</summary>
     public async Task RefreshAsync(CancellationToken ct, bool force = false)
@@ -31,7 +33,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
             var before = Current;
             Current = r.Exists ? ControlFile.Parse(r.Data) : new ControlFile();
             Log.Info($"control: mode={Current.Mode} stages={string.Join(',', (Current.Stages ?? new()).Select(s => s.Key + "=" + s.Value))}");
-            Changed?.Invoke();
+            Interlocked.Increment(ref changes); Changed?.Invoke();
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception e) { Log.Info($"control: read failed, keeping last setting ({e.Message})"); }

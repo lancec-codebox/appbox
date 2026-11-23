@@ -126,6 +126,8 @@ public sealed class QSubject
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public Dictionary<string, int>? StepVer { get; set; }
     /// <summary>0.13.32: a fully downloaded upload: data is full, or (a subject migrated by queue split carries no data fact) its download is done and it is not a precheck entry (check: duplicate).</summary>
     [JsonIgnore] public bool IsFull => Data == "full" || (Data == null && Entries.GetValueOrDefault("download") is { State: "done" } && Entries.GetValueOrDefault("check") is not { State: "duplicate" });
+    /// <summary>0.13.36: the value of <see cref="QueueState.Lines"/> when a line last touched this subject: a change signal (the node does not retry a claim that found nothing runnable until this moves).</summary>
+    [JsonIgnore] public long Rev { get; set; }
     public int VerOf(string step) => StepVer != null && StepVer.TryGetValue(step, out var v) ? v : 1;
     [JsonIgnore] public bool Active => Entries.Values.Any(e => !e.Final);
 }
@@ -151,6 +153,12 @@ public sealed class QueueState
     public QEntry? Entry(string subject, string stage) => Get(subject)?.Entries.GetValueOrDefault(stage);
 
     public void Apply(QLine l)
+    {
+        ApplyCore(l);
+        if (l.S != null && Subjects.TryGetValue(l.S, out var touched)) touched.Rev = Lines;
+    }
+
+    private void ApplyCore(QLine l)
     {
         Lines++;
         if (l.T == "done" && l.Ver is { } pv) { if (l.Stage == "actors-index") ActorsIndexVer = Math.Max(ActorsIndexVer, pv); else if (l.Stage == "search-index") SearchIndexVer = Math.Max(SearchIndexVer, pv); }
@@ -335,6 +343,10 @@ public sealed class QueueState
         public int Blocks { get; set; }
         public string At { get; set; } = "";
         public long MaxSeq { get; set; }
+        /// <summary>0.13.36: the newest actor-index / search-index version a done line announced, and the ETag the last ctl line announced: kept so a node that starts from the snapshot knows them without reading head.json / control.json again.</summary>
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public int ActorsIndexVer { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public int SearchIndexVer { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? ControlETag { get; set; }
         /// <summary>The segment before Seg and its final length: a reader checks it is sealed at exactly that length before it trusts this snapshot.</summary>
         public List<QSubject> Subjects { get; set; } = [];
     }
@@ -357,7 +369,7 @@ public sealed class QueueState
             if (s.Entries.ContainsKey("download") || s.Entries.ContainsKey("check")) list.Add(SlimFinished(s));
             else if (string.CompareOrdinal(s.LastAt ?? "", cut) >= 0) list.Add(s);
         }
-        return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { V = version, Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, Subjects = list }, Protocol.Json);
+        return JsonSerializer.SerializeToUtf8Bytes(new SnapshotDoc { V = version, Seg = seg, Off = off, Blocks = blocks, At = at, MaxSeq = MaxSeq, ActorsIndexVer = ActorsIndexVer, SearchIndexVer = SearchIndexVer, ControlETag = ControlETag, Subjects = list }, Protocol.Json);
     }
 
     /// <summary>A finished subject as the snapshot needs it: the stage states, priority, when it was added and finished, a cut-down error and a minimal job (id, url, reason, duplicate-of) so a retry or a duplicate check still works. Everything else (due, attempts, node, steps, network, titles, ...) is dropped.</summary>
@@ -396,7 +408,7 @@ public sealed class QueueState
             if (probe.RootElement.ValueKind == JsonValueKind.Object && probe.RootElement.TryGetProperty("v", out var vv) && vv.TryGetInt32(out var ver) && ver > SupportedSnapshotVersion) throw new QueueFormatException($"indexnode: the queue snapshot has format version {ver}; this binary reads up to {SupportedSnapshotVersion}. Update indexnode.");
         }
         var doc = JsonSerializer.Deserialize<SnapshotDoc>(data, Protocol.Json) ?? throw new InvalidDataException("empty queue snapshot");
-        var st = new QueueState(); foreach (var s in doc.Subjects) { st.Subjects[s.Id] = s; if (s.Seq > st.MaxSeq) st.MaxSeq = s.Seq.Value; } st.MaxSeq = Math.Max(st.MaxSeq, doc.MaxSeq);
+        var st = new QueueState(); foreach (var s in doc.Subjects) { st.Subjects[s.Id] = s; if (s.Seq > st.MaxSeq) st.MaxSeq = s.Seq.Value; } st.MaxSeq = Math.Max(st.MaxSeq, doc.MaxSeq); st.ActorsIndexVer = doc.ActorsIndexVer; st.SearchIndexVer = doc.SearchIndexVer; st.ControlETag = doc.ControlETag;
         return (st, doc);
     }
 }

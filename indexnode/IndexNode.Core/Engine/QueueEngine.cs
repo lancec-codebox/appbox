@@ -230,6 +230,7 @@ public sealed partial class NodeEngine
         var id = subject.Id;
         if (StorageHalted()) return false;   // 0.13.18: the breaker is open or control.json says storage: stop
         if (ignoreSubject.TryGetValue(id, out var until) && until > DateTimeOffset.UtcNow) return false;
+        if (IsAbandoned(subject)) return false;   // 0.13.36: attempted and released with nothing run: not again until a queue line for it, or a control change
         if (o.Shadow && shadowTaken.ContainsKey(id)) return false;   // 0.13.30: shadow claims are in-process: a subject is taken once per run, by one lane
         var first = runnable[0].Stage;
         if (o.Limits != null && !o.Limits.TryAcquire(first)) return false;
@@ -247,25 +248,24 @@ public sealed partial class NodeEngine
         try { h = await queue.TryClaimAsync(id, (st, s) => ClaimableStages(st, s), ct, null, ReadyNow); }
         catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); throw; }
         catch (Exception e) { Log.Info($"[{first}#{lane}] {id}: claim failed ({e.Message})"); h = null; }
-        if (h == null) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); return false; }
+        if (h == null) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); MarkAbandoned(subject); return false; }   // 0.13.36: lost the lease race, or the claim found nothing runnable
         bool finished = await RunClaimAsync(lane, h, ct);
         o.Limits?.Release(first, finished);
         return true;
     }
 
+    // 0.13.36: a subject attempted and abandoned (the claim found nothing runnable, or this node ran none of its steps) is not attempted again until a change signal: a log line that touched it (its Rev moves) or a control.json change. Not a timer.
+    private readonly ConcurrentDictionary<string, (long Rev, int Ctl)> abandoned = new(StringComparer.Ordinal);
+    private void MarkAbandoned(QSubject s) => abandoned[s.Id] = (s.Rev, Control.Changes);
+    private bool IsAbandoned(QSubject s) => abandoned.TryGetValue(s.Id, out var a) && (a.Rev == s.Rev && a.Ctl == Control.Changes ? true : abandoned.TryRemove(s.Id, out _) && false);
+    /// <summary>How many subjects this node is holding back until a change signal (for the status line and the tests).</summary>
+    internal int AbandonedCount => abandoned.Count;
+
     /// <summary>0.13.32: the readiness options with the versions control.json requires now.</summary>
     private ReadyOptions ReadyNow => o.Ready with { Required = s => Control.Current.RequiredVersion(s) };
 
     /// <summary>What this node would run of the subject right now (also the check, after the active file is ours, that the work is not done already).</summary>
-    private string[]? ClaimableStages(QueueState state, QSubject s)
-    {
-        var now = Protocol.Utc(NowUtc);
-        var st = s.Entries.Values.Where(e => e.Runnable(now) && StageEnabled(e.Stage) && CanRunEntry(s, e)).Select(e => e.Stage).ToList();
-        foreach (var d in StageDeps.Derived)   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
-            if (!st.Contains(d) && StageEnabled(d) && StageDeps.ReadyEntry(state, s, d, now, ReadyNow) is { } re && CanRunEntry(s, re)) st.Add(d);
-        if (!st.Contains("process") && s.Data == "full" && StageEnabled("process") && StageDeps.StaleEntry(s, ReadyNow) is { } sre && CanRunEntry(s, sre)) st.Add("process");   // 0.13.32: a step below the required version is ready again
-        return st.Count == 0 ? null : st.OrderBy(QueueState.Rank).ToArray();
-    }
+    private string[]? ClaimableStages(QueueState state, QSubject s) => StageDeps.ClaimStages(state, s, Protocol.Utc(NowUtc), StageEnabled, CanRunEntry, ReadyNow);
 
     // ---------------------------------------------------------------- one claim
 
@@ -519,7 +519,7 @@ public sealed partial class NodeEngine
             await h.AppendAsync(lines, !WillContinue(id, "process", lines), CancellationToken.None);
             return (Outcome.Done, null, ClaimEnded(id), ctx);
         }
-        if (ran.Count == 0) { ignoreSubject[id] = DateTimeOffset.UtcNow.AddMinutes(10); return (Outcome.Skipped, "no step of this video is ready for this node", false, ctx); }
+        if (ran.Count == 0) { return (Outcome.Skipped, "no step of this video is ready for this node", false, ctx); }
         return (Outcome.Done, null, false, ctx);   // some steps done; the rest are for another node: the claim ends without finishing the entry
     }
 
@@ -579,8 +579,7 @@ public sealed partial class NodeEngine
                         break;
                     }
                 case Outcome.Skipped:
-                    ignoreSubject[id] = DateTimeOffset.UtcNow.AddHours(1);   // this node cannot do it: left to another, looked at again in an hour; no line, no attempt
-                    await h.AbandonAsync(); break;
+                    await h.AbandonAsync(); if (queue.Read(s => s.Get(id)) is { } sk) MarkAbandoned(sk); break;   // this node cannot do it: left to another until a line for it or a control change; no line, no attempt
                 case Outcome.Released:
                     await h.AbandonAsync(); break;
             }

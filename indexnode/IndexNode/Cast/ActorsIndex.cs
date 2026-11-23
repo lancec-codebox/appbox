@@ -108,7 +108,7 @@ public sealed class ActorsIndex
     /// <summary>The index for the announced version (0 = none announced since this node started: one cold read of head.json, kept until an announcement arrives).</summary>
     public static async Task<ActorsIndex?> ForAnnouncedAsync(ActorsIO io, int announced, CancellationToken ct)
     {
-        var c = cache.GetValue(io.Writes ? io.Store : io, _ => new Cached()); await c.Gate.WaitAsync(ct);
+        var c = cache.GetValue(io.Writes ? (io.Store is LocalCacheStore lc ? lc.Inner : io.Store) : io, _ => new Cached()); await c.Gate.WaitAsync(ct);
         try
         {
             if (c.Ver >= 0 && (announced == 0 || c.Ver >= announced)) return c.Idx;   // already holding this version (or newer): nothing is read
