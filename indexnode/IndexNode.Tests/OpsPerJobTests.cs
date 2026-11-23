@@ -118,13 +118,19 @@ public class OpsPerJobTests(ITestOutputHelper output)
         Assert.True(Protocol.StepStages.Where(s => lim.StepLimits.ContainsKey("process:" + s)).Sum(s => lim.StepLimitFor("process:" + s)) >= 221);   // each step on its own budget; the sum clears the 221 ops measured live
     }
 
-    [Theory, InlineData(false), InlineData(true)]
-    public async Task A_full_repair_claim_on_an_upload_with_every_zip_costs_at_most_25_ops_plus_one_GET_each_of_cast_zip_and_frames_zip(bool ghosted)
+    [Theory, InlineData(false, 0), InlineData(true, 0), InlineData(false, 1), InlineData(true, 1), InlineData(false, 2)]   // landmarks: 0 = every face has kps, 1 = every other face has none (an older cast.zip), 2 = no face has any
+    public async Task A_full_repair_claim_on_an_upload_with_every_zip_costs_at_most_25_ops_plus_one_GET_each_of_cast_zip_and_frames_zip(bool ghosted, int landmarks)
     {
         var raw = new FakeStore(); var fs = new FakeStore(); var dir = Path.Combine(Path.GetTempPath(), "rc-" + Guid.NewGuid().ToString("N")[..6]);
         try
         {
             const string id = "rA"; await Drama(raw, id, Unit((0, 1)), (200, 150, 100), n: 150, seed: 4);
+            if (landmarks > 0)
+            {   // an older cast.zip: faces stored without kps
+                var fjn = JsonNode.Parse(System.Text.Encoding.UTF8.GetString((await raw.GetAsync(P.Video(id, "cast/faces.json"), default))!.Data))!; var fa = fjn["faces"]!.AsArray();
+                for (int i = 0; i < fa.Count; i++) if (landmarks == 2 || i % 2 == 1) fa[i]!.AsObject().Remove("kps");
+                await raw.PutAsync(P.Video(id, "cast/faces.json"), System.Text.Encoding.UTF8.GetBytes(fjn.ToJsonString()), null, null, false, default);
+            }
             var put = new StageZipStore(fs, Path.Combine(dir, "put"));
             foreach (var b in await raw.ListAsync(P.VideoDir(id), false, false, default)) await put.PutAsync(b.Name, (await raw.GetAsync(b.Name, default))!.Data, null, null, false, default);
             foreach (var (z, f) in new[] { ("sscd", "sscd/manifest.json"), ("centers", "centers/manifest.json"), ("thumbs", "thumbs/manifest.json"), ("transcribe", "asr/a.json"), ("ocrsubs", "ocr/lines.json"), ("sync", "sync.json"), ("describe", "describe.json"), ("translate", "subs/ai/x.json"), ("comments", "comments/c.json"), ("download", "info.json") })
@@ -157,6 +163,11 @@ public class OpsPerJobTests(ITestOutputHelper output)
             Assert.Equal(1, log.Count(l => l == "GET index/videos/rA/cast.zip")); Assert.Equal(1, log.Count(l => l == "GET index/videos/rA/frames.zip"));
             foreach (var other in new[] { "download", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "comments", "translate", "sync", "describe" }) Assert.DoesNotContain(log, l => l.Contains("rA/" + other + ".zip") && !l.StartsWith("GET c?list"));   // no other zip is read, headed, tagged or downloaded
             Assert.DoesNotContain(log, l => l.StartsWith("GET index/videos/rA/frames.zip") && l.Contains("range"));
+            var r50Blob = await shadow.GetAsync(ActorsData.R50File(P, id), default);
+            if (landmarks == 2) Assert.True(r50Blob == null || R50Doc.FromBytes(r50Blob.Data, "r50").Units.Count == 0);   // no landmarks anywhere: no r50 rows, and the repair still completed (the units file was written)
+            else Assert.Equal(1, R50Doc.FromBytes((r50Blob ?? throw new Xunit.Sdk.XunitException("no r50 file: the repair did not complete")).Data, "r50").Units.Count);   // r50 rows only for units with landmarked faces
+            Assert.NotNull(await shadow.GetAsync(ActorsData.UnitFile(P, id), default));
+            Assert.Equal(2, JsonNode.Parse(System.Text.Encoding.UTF8.GetString((await fs.GetAsync(P.Video(id, "video.json"), default))!.Data))!["versions"]?["cast"]?.GetValue<int>() ?? 2);
             Assert.True(m.Total <= 25 + 2, "ops " + m.Total + ": " + string.Join(" | ", by));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }

@@ -129,7 +129,7 @@ public static class ActorsBuild
             var all = pick.Values.SelectMany(x => x).Distinct().OrderBy(x => x).ToArray(); if (all.Length == 0) continue;
             var r = (await CastReembed.RunManyAsync(store, paths, dg.Key, [new("w600k_r50", makeR50)], decode, threads, ct, onlyFaces: all))[0]; res.TiebreakEmbedded += r.Faces;
             var row = new Dictionary<int, int>(); for (int k = 0; k < r.Idx!.Length; k++) row[r.Idx[k]] = k;
-            foreach (var (u, fs) in pick) { var vs = fs.Select(f => { var v = new float[r.Dim]; for (int d = 0; d < r.Dim; d++) v[d] = BitConverter.ToSingle(r.F32, (row[f] * r.Dim + d) * 4); return v; }).ToList(); if (vs.Count > 0) r50[u] = CastLogic.Centroid(vs); }
+            foreach (var (u, fs) in pick) { var vs = fs.Where(row.ContainsKey).Select(f => { var v = new float[r.Dim]; for (int d = 0; d < r.Dim; d++) v[d] = BitConverter.ToSingle(r.F32, (row[f] * r.Dim + d) * 4); return v; }).ToList(); if (vs.Count > 0) r50[u] = CastLogic.Centroid(vs); }
         }
         res.Seconds["tiebreak embed"] = sw.Elapsed.TotalSeconds;
         var parent = Enumerable.Range(0, units.Count).ToArray(); int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }

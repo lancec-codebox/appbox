@@ -277,8 +277,9 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         foreach (var u in units)
         {
             var vs = u.Pick.Where(row.ContainsKey).Select(f => { var v = new float[r.Dim]; for (int d = 0; d < r.Dim; d++) v[d] = BitConverter.ToSingle(r.F32, (row[f] * r.Dim + d) * 4); return v; }).ToList();
-            if (vs.Count > 0) res[u.Key] = CastLogic.Centroid(vs);
+            if (vs.Count > 0) res[u.Key] = CastLogic.Centroid(vs);   // a unit whose picked faces all lack landmarks gets no r50 row (the tiebreak reads it as no r50)
         }
+        if (r.NoLandmarks > 0) Log.Info($"cast repair: {r.NoLandmarks} of {all.Length} faces have no landmarks (no r50 for {units.Count(u => !res.ContainsKey(u.Key))} units)");   // {id}
         return (res, r.Dim);
     }
 

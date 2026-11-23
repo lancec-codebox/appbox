@@ -15,7 +15,7 @@ public static class CastReembed
     public sealed record Check(int Faces, double MaxAbsDiff, double MaxAbsDiffHalf, int FacesOver, double MinCosine);
     /// <summary>Change in pairwise cosine over random face pairs: Storage = our float32 against our own float16 rounding (what float16 storage alone does); Stored = our float32 against the stored faces.f16 (storage plus any decoder drift). Flips = pairs on the other side of a bar (0.70, 0.80) in the two.</summary>
     public sealed record PairStats(int Pairs, double MaxStorage, double MedianStorage, int FlipsStorage, double MaxStored, double MedianStored, int FlipsStored);
-    public sealed record Result(string Id, string Model, int Faces, int Dim, int Frames, byte[] F16, Timing Time, Check? Vs, byte[] F32, PairStats? Pairs, int[]? Idx = null);
+    public sealed record Result(string Id, string Model, int Faces, int Dim, int Frames, byte[] F16, Timing Time, Check? Vs, byte[] F32, PairStats? Pairs, int[]? Idx = null, int NoLandmarks = 0);
 
     public static readonly string[] Names = ["w600k_mbf", "w600k_r50", "w600k_r50_int8", "glintr100"];
 
@@ -62,7 +62,13 @@ public static class CastReembed
         }
         var keepSet = keep?.ToHashSet();
         var work = faces.Select((f, i) => (I: i, T: Math.Round(f["t"]!.GetValue<double>(), 3), Kps: (f["kps"] as JsonArray)?.Select(v => v!.GetValue<float>()).ToArray() ?? [])).Where(w => keepSet == null || keepSet.Contains(w.I)).ToList();
-        if (work.Any(w => w.Kps.Length < 10)) throw new InvalidOperationException($"{id}: a stored face has no landmarks (cast/faces.json kps)");
+        int noKps = 0;
+        if (work.Any(w => w.Kps.Length < 10))
+        {
+            if (keep == null) throw new InvalidOperationException($"{id}: a stored face has no landmarks (cast/faces.json kps)");   // the dev tool embeds every face and refuses
+            // 0.13.33: a chosen set of faces (repair, actors build): a face the old cast.zip stored without landmarks is skipped, not an error. No landmarks are recomputed. It has no row in the result (Idx lists the rows that exist).
+            noKps = work.Count(w => w.Kps.Length < 10); work = work.Where(w => w.Kps.Length >= 10).ToList(); var have = work.Select(w => w.I).ToHashSet(); keep = keep.Where(have.Contains).ToArray();
+        }
         var frames = work.GroupBy(w => w.T).OrderBy(g => g.Key).ToList();
         foreach (var g in frames) if (!rowOf.ContainsKey(g.Key)) throw new InvalidOperationException($"{id}: no stored frame at t={g.Key}");
         var chunks = frames.GroupBy(g => rowOf[g.Key].Chunk, StringComparer.Ordinal).OrderBy(c => c.Key, StringComparer.Ordinal).ToList();
@@ -113,7 +119,7 @@ public static class CastReembed
             var f32 = new byte[rows.Length * dim * 4]; for (int i = 0; i < rows.Length; i++) for (int d = 0; d < dim; d++) BitConverter.TryWriteBytes(f32.AsSpan((i * dim + d) * 4, 4), e[i][d]);
             bool same = keep == null && storedF16 is { Length: > 0 } && storedF16.Length == f16.Length;
             Check? vs = same ? Compare(e, storedF16!, dim) : null;
-            res[m] = new Result(id, models[m].Model, rows.Length, dim, frames.Count, f16, new Timing(S(tRead), S(tDec), S(tAlign), S(tEmb[m]), Math.Round(wall.Elapsed.TotalSeconds, 3)), vs, f32, PairChange(e, same ? storedF16 : null, dim, 10_000), keep);
+            res[m] = new Result(id, models[m].Model, rows.Length, dim, frames.Count, f16, new Timing(S(tRead), S(tDec), S(tAlign), S(tEmb[m]), Math.Round(wall.Elapsed.TotalSeconds, 3)), vs, f32, PairChange(e, same ? storedF16 : null, dim, 10_000), keep, noKps);
         }
         return res;
     }
