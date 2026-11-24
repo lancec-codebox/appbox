@@ -339,6 +339,26 @@ public class QueueEngineTests
     }
 
     [Fact]
+    public async Task An_upload_the_owner_marked_real_is_processed_although_the_pre_check_flagged_it_and_one_marked_ai_stays_held()
+    {
+        // real1: flagged by the pre-check, held, then the owner says it is real (ai set real). ai3: flagged and confirmed AI.
+        var s = new FakeStore(); await s.AddJob(P, "process", "real1", T(0)); await Downloaded(s, "real1"); await s.AddJob(P, "process", "ai3", T(1)); await Downloaded(s, "ai3");
+        var order = new List<string>();
+        await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        Assert.Equal("ai", Q(s).Entry("real1", "process")!.Hold); Assert.Equal("ai", Q(s).Entry("ai3", "process")!.Hold);
+        var q = new JobQueue(s, P, "cli"); await q.LoadAsync(default);
+        var r = await AiHold.SetVerdictAsync(q, null, s, P, "real1", "real", "looked at the sheet", "owner", false, default);
+        Assert.Equal(["processing/process"], r.Released);
+        await AiHold.SetVerdictAsync(q, null, s, P, "ai3", "ai", null, "owner", false, default);
+        VideoJson.ClearCache(s); order.Clear();
+        await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        Assert.DoesNotContain("precheck", order); Assert.Equal("frames", order[0]);          // the claim goes on to the steps; the pre-check is not run again and does not hold it again
+        var e = Q(s).Entry("real1", "process")!;
+        Assert.Equal("done", e.State); Assert.Null(e.Hold);
+        Assert.Equal("ai", Q(s).Entry("ai3", "process")!.Hold); Assert.Equal("pending", Q(s).Entry("ai3", "process")!.State);   // the other one was never claimed
+    }
+
+    [Fact]
     public async Task A_held_ai_drama_is_claimable_with_ai_dramas_on_and_resumes_at_frames_without_a_second_precheck()
     {
         var s = new FakeStore(); await s.AddJob(P, "process", "ai2", T(0)); await Downloaded(s, "ai2");

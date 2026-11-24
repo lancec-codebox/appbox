@@ -479,9 +479,10 @@ public sealed partial class NodeEngine
             await pre.RunAsync(pctx);   // throws DuplicateFound for a skip (nothing was deleted or rewritten: the done line marks the video for `indexnode trash empty`)
         }
         // the pre-check's decision (PASS included) goes on the final done line, read from the record the stage wrote
-        string? pcDecision = null; System.Text.Json.Nodes.JsonObject? pcRec = null;
-        if (handlers.ContainsKey("precheck")) { pcRec = (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject; pcDecision = (string?)pcRec?["decision"]; }   // 0.13.2: video.json holds the record; unreadable or missing fails the claim (retried), never a quiet null
-        bool pcAi = (bool?)pcRec?["ai"]?["flag"] == true; double pcScore = (double?)pcRec?["ai"]?["score"] ?? 0;
+        string? pcDecision = null; System.Text.Json.Nodes.JsonObject? pcRec = null, pcRoot = null;
+        if (handlers.ContainsKey("precheck")) { pcRoot = (await VideoJson.RequireAsync(store, paths, id, token)).Root; pcRec = pcRoot["precheck"] as System.Text.Json.Nodes.JsonObject; pcDecision = (string?)pcRec?["decision"]; }   // 0.13.2: video.json holds the record; unreadable or missing fails the claim (retried), never a quiet null
+        // 0.13.45: the owner's verdict (video.json ai.verdict, `ai set`) wins over the pre-check's own flag here too. 0.13.44 read the flag alone at this point and held an upload again the moment its claim started.
+        bool pcAi = AiHold.Flagged(pcRec, pcRoot); double pcScore = (double?)pcRec?["ai"]?["score"] ?? 0;
         // 0.13.1: an AI-flagged drama that is not a duplicate (that was decided first) is held, not skipped: the pre-check's done step goes on the log and the claim is released; with aiDramas on it just goes on
         if (noProcessing && pcAi && !PreCheckDecision.IsSkip(pcDecision) && !Control.Current.AiDramasOn)
         {
