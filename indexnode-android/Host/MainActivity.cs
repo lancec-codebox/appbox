@@ -60,7 +60,11 @@ public class MainActivity : Activity
     }
 
     // on app start: load the plugin and check for an update (a failure only goes to the log)
-    async Task StartupUpdateAsync() { try { var r = await _rt.CheckPluginAsync(); _rt.Host.Log($"plugin on start: {r.Outcome} {r.Version} {r.Detail}"); } catch (Exception e) { _rt.Host.Log("plugin check failed: " + e.Message); } }
+    async Task StartupUpdateAsync()
+    {
+        try { var r = await _rt.CheckPluginAsync(); _rt.Host.Log($"plugin on start: {r.Outcome} {r.Version} {r.Detail}"); } catch (Exception e) { _rt.Host.Log("plugin check failed: " + e.Message); }
+        await _rt.Updater.CheckAsync(default);   // 0.1.5: the app's own update; a failure is a state the page shows, never an exception
+    }
 
     string? SavedUiUrl => _rt.Prefs.Get("uiUrl");
 
@@ -96,6 +100,9 @@ public class MainActivity : Activity
             case "importSetup": _rt.ImportSetup(arg); RunWorker.Schedule(this); return _rt.StateJson();
             case "pairMedusa": case "pairStatus": return await _rt.PairAsync();
             case "checkPluginUpdate": { var r = await _rt.CheckPluginAsync(); return new JsonObject { ["outcome"] = r.Outcome, ["version"] = r.Version, ["detail"] = r.Detail }; }
+            case "checkAppUpdate": return await _rt.Updater.CheckAsync(default);
+            case "installAppUpdate": return await _rt.Updater.InstallAsync(default);
+            case "reloadUi": RunOnUiThread(() => { _web.ClearCache(true); LoadUi(); }); return true;   // 0.1.5: the page's reload button: the page again from its source (the app, or the UI URL), without the WebView's cache
             case "setUiUrl":
                 if (arg != "" && Bridge.OriginOf(arg) == null) throw new ArgumentException("UI URL must be https (or http on loopback)");
                 _rt.Prefs.Set("uiUrl", arg == "" ? null : arg); RunOnUiThread(() => LoadUi()); return true;

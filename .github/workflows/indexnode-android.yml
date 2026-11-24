@@ -125,8 +125,20 @@ jobs:
           NEW="${{ needs.build.outputs.plugin }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             CUR="$(gh release download "$TAG" --pattern manifest.json -O - 2>/dev/null | sed -nE 's/.*"version":"([^"]+)".*/\1/p')" || CUR=""
-            if [ "$CUR" = "$NEW" ]; then echo "plugin $NEW is already on $TAG"; exit 0; fi
-            gh release upload "$TAG" out/IndexNode.Plugin.dll out/manifest.json --clobber
+            if [ "$CUR" = "$NEW" ]; then echo "plugin $NEW is already on $TAG"; else
+              gh release upload "$TAG" out/IndexNode.Plugin.dll out/manifest.json --clobber
+            fi
           else
             gh release create "$TAG" out/IndexNode.Plugin.dll out/manifest.json --latest=false --title "IndexNode Android plugin (rolling)" --notes "The newest plugin DLL and its manifest. The app checks manifest.json before each run."
           fi
+      - name: host.json on the rolling release (when the published APK is this build's version and its hash differs from what is there)
+        run: |
+          set -euo pipefail
+          TAG="indexnode-android-plugin"; HOSTTAG="indexnode-android-v${{ needs.build.outputs.host }}"
+          # the hash must be the PUBLISHED apk's (an earlier run of the same version made that release; this run's APK is not what users download)
+          gh release download "$HOSTTAG" --pattern indexnode-android.apk -O published.apk
+          SHA="$(sha256sum published.apk | cut -d' ' -f1)"; BYTES="$(stat -c %s published.apk)"
+          printf '{"version":"%s","apk":"https://github.com/%s/releases/download/%s/indexnode-android.apk","sha256":"%s","bytes":%s}\n' "${{ needs.build.outputs.host }}" "$GH_REPO" "$HOSTTAG" "$SHA" "$BYTES" > host.json
+          cat host.json
+          CUR="$(gh release download "$TAG" --pattern host.json -O - 2>/dev/null || true)"
+          if [ "$CUR" = "$(cat host.json)" ]; then echo "host.json is current"; else gh release upload "$TAG" host.json --clobber; fi

@@ -8,7 +8,9 @@ namespace IndexNode.Host;
 /// <summary>The one place that ties the pieces together for the process: settings, host, plugin manager, Medusa, a run. The UI and WorkManager both call it.</summary>
 public sealed class NodeRuntime
 {
-    public const string HostVersion = "0.1.3";
+    /// <summary>The app's version, taken from the build (Host.csproj ApplicationDisplayVersion, as assembly metadata), so it cannot drift from the APK. 0.1.4 still said 0.1.3 here.</summary>
+    public static readonly string HostVersion = typeof(NodeRuntime).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false)
+        .Cast<System.Reflection.AssemblyMetadataAttribute>().FirstOrDefault(a => a.Key == "HostVersion")?.Value is { Length: > 0 } hv ? hv : "0.0.0";
     public const string AppName = "IndexNode";
     private static NodeRuntime? instance;
     public static NodeRuntime Get(Context ctx) => instance ??= new NodeRuntime(ctx.ApplicationContext!);
@@ -17,6 +19,8 @@ public sealed class NodeRuntime
     public Prefs Prefs { get; }
     public AndroidHost Host { get; }
     public PluginManager Plugins { get; }
+    /// <summary>0.1.5: the app's own update (find, download, verify, install).</summary>
+    public AppUpdater Updater { get; }
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(60) };
     private readonly object gate = new();
     private CancellationTokenSource? runCts;
@@ -36,6 +40,7 @@ public sealed class NodeRuntime
         Host = new AndroidHost(ctx, Prefs, CreateTools, (t, j, p) => { State = t; Job = j; Progress = p; Changed?.Invoke(); });
         Directory.CreateDirectory(Host.FilesDir);
         Plugins = new PluginManager(Path.Combine(ctx.FilesDir!.AbsolutePath, "plugins"), LoadBundled, HostVersion);
+        Updater = new AppUpdater(ctx, () => HostVersion, m => Host.Log(m), () => Running);
     }
 
     private (Manifest, byte[])? LoadBundled()
@@ -174,6 +179,7 @@ public sealed class NodeRuntime
                 ["pluginUrl"] = Prefs.Get("pluginUrl") ?? PluginManager.RollingManifestUrl, ["periodic"] = Prefs.Bool("periodic", true), ["periodMinutes"] = Prefs.Int("periodMinutes", 60),
             },
             ["medusaMode"] = MedusaMode(),
+            ["appUpdate"] = Updater.Json(),
         };
     }
 

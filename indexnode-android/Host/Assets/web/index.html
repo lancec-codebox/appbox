@@ -1,95 +1,210 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>IndexNode</title>
 <style>
- body{font:13px/1.35 system-ui,sans-serif;margin:0;background:#fafafa;color:#222}
- h1{font-size:15px;margin:0;padding:8px 10px;background:#222;color:#fff}
- section{background:#fff;border:1px solid #ddd;margin:8px;padding:8px}
- h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin:0 0 6px;color:#555}
- table{border-collapse:collapse;width:100%} td{padding:2px 4px;border-bottom:1px solid #eee;vertical-align:top} td:first-child{color:#666;width:38%}
- button{font:inherit;padding:6px 10px;margin:2px 2px 2px 0;border:1px solid #888;background:#eee} button.p{background:#222;color:#fff}
- input[type=text],input[type=number],textarea{font:inherit;width:100%;box-sizing:border-box;padding:4px;border:1px solid #bbb}
- label{display:block;margin:4px 0} .bad{color:#b00} .ok{color:#080}
- pre{max-height:240px;overflow:auto;background:#111;color:#ddd;padding:6px;font-size:11px;white-space:pre-wrap;margin:0}
- progress{width:100%}
+ :root{--bg:#f4f5f7;--card:#fff;--ink:#16181d;--mute:#5d6470;--line:#dfe2e8;--accent:#1f5fbf;--accent-ink:#fff;--ok:#1a7f43;--bad:#b3261e;--warn:#9a5b00;--chip:#e7eaf0;--log-bg:#11141a;--log-ink:#d5d9e0}
+ @media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#191d24;--ink:#e8eaee;--mute:#9aa3b2;--line:#2b313b;--accent:#6ea8ff;--accent-ink:#0b1220;--ok:#5fd08a;--bad:#ff8a80;--warn:#f0b45a;--chip:#252b35;--log-bg:#0a0c10;--log-ink:#cfd4dc}}
+ *{box-sizing:border-box} html,body{height:100%}
+ body{font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;background:var(--bg);color:var(--ink);display:flex;flex-direction:column;-webkit-text-size-adjust:100%}
+ header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--card);border-bottom:1px solid var(--line)}
+ header b{font-size:16px} header .v{color:var(--mute);font-size:12px} header .sp{flex:1}
+ header button{font:inherit;font-size:20px;line-height:1;border:0;background:none;color:var(--mute);padding:4px 6px;margin:-4px -4px -4px 0;min-width:36px;min-height:36px}
+ .chip{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--chip);font-size:12px;font-weight:600;white-space:nowrap}
+ .chip.ok{color:var(--ok)} .chip.bad{color:var(--bad)} .chip.warn{color:var(--warn)} .chip.run{background:var(--accent);color:var(--accent-ink)}
+ main{flex:1;overflow:auto;padding:10px 10px 16px} .tab{display:none} .tab.on{display:block}
+ nav{display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+ nav button{flex:1;border:0;background:none;color:var(--mute);font:inherit;font-size:12px;padding:8px 2px 9px;border-top:2px solid transparent}
+ nav button.on{color:var(--accent);border-top-color:var(--accent);font-weight:600} nav button .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--bad);margin-left:4px;vertical-align:middle}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:10px;margin:0 0 10px;overflow:hidden}
+ .card>h2{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--mute);margin:0;padding:9px 12px 4px}
+ .card>.pad{padding:6px 12px 12px}
+ .row{display:flex;gap:10px;align-items:baseline;padding:7px 12px;border-top:1px solid var(--line)} .card>h2+.row,.card>.row:first-child{border-top:0}
+ .row .k{flex:0 0 36%;color:var(--mute)} .row .val{flex:1;min-width:0;overflow-wrap:anywhere} .row .val small{color:var(--mute);display:block}
+ .mark{flex:0 0 14px;font-weight:700} .mark.ok{color:var(--ok)} .mark.bad{color:var(--bad)} .mark.na{color:var(--mute)}
+ .hero{padding:14px 12px} .hero .state{font-size:22px;font-weight:700;line-height:1.2} .hero .sub{color:var(--mute);margin-top:2px;overflow-wrap:anywhere}
+ .hero .why{color:var(--warn);margin-top:6px} .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+ button.b{font:inherit;font-weight:600;padding:9px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);min-height:40px}
+ button.b.p{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)} button.b:disabled{opacity:.45}
+ .msg{color:var(--mute);font-size:12px;margin-top:6px;min-height:1em;overflow-wrap:anywhere} .bad{color:var(--bad)} .ok{color:var(--ok)}
+ progress{width:100%;height:6px;margin-top:10px;accent-color:var(--accent)}
+ .banner{background:var(--accent);color:var(--accent-ink);border-radius:10px;padding:10px 12px;margin-bottom:10px;display:none} .banner.on{display:block} .banner b{display:block} .banner .btns{margin-top:8px}
+ .banner button.b{background:var(--accent-ink);color:var(--accent);border-color:var(--accent-ink)}
+ label.f{display:flex;align-items:center;gap:10px;padding:8px 12px;border-top:1px solid var(--line)} .card>h2+label.f{border-top:0}
+ label.f span{flex:1} label.f small{display:block;color:var(--mute)}
+ label.f input[type=number]{width:6.5em;text-align:right} label.f input[type=checkbox]{width:20px;height:20px;flex:0 0 20px;accent-color:var(--accent)}
+ input[type=text],input[type=number],input[type=search],textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px}
+ input[type=text],input[type=search],textarea{width:100%} textarea{resize:vertical;min-height:64px;font-family:ui-monospace,monospace;font-size:12px}
+ pre{margin:0;background:var(--log-bg);color:var(--log-ink);font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:8px 10px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:60vh;overflow:auto}
+ pre.small{max-height:200px} .steps .n{flex:0 0 22px;height:22px;border-radius:50%;background:var(--chip);text-align:center;font-weight:700;font-size:12px;line-height:22px}
+ .steps h3{font-size:14px;margin:0} .steps .head{display:flex;gap:10px;align-items:center;padding:10px 12px 0}
+ .savebar{position:sticky;bottom:-16px;background:var(--card);border-top:1px solid var(--line);margin:0 -10px -16px;padding:8px 10px;display:flex;gap:10px;align-items:center}
+ .msg:empty{display:none}
+ details>summary{padding:8px 12px;color:var(--accent);cursor:pointer}
 </style></head><body>
-<h1>IndexNode <span id="ver"></span></h1>
-<section id="diag"><h2>Diagnostics</h2>
- <div id="crashinfo">No crash recorded.</div>
- <pre id="crash" style="display:none"></pre>
- <button class="p" id="copyd">Copy diagnostics</button><button id="cleard">Clear</button> <span id="diagmsg"></span>
- <details><summary>Recent log</summary><pre id="dlog"></pre></details>
-</section>
-<section><h2>Status</h2>
- <table id="st"></table><progress id="pg" max="1" value="0" style="display:none"></progress>
- <div id="why" class="bad"></div>
- <button class="p" id="run">Run now</button><button id="stop">Stop</button>
-</section>
-<section><h2>Setup</h2>
- <div>Paste the node-setup link or the contents of the .medusa-node.json file, or open the QR with the phone camera.</div>
- <textarea id="setup" rows="3" placeholder="medusa://node-setup?d=..."></textarea>
- <button id="imp">Import setup</button> <span id="impmsg"></span>
-</section>
-<section><h2>Medusa</h2>
- <table id="md"></table>
- <button id="pair">Pair with Medusa</button> <span id="pairmsg"></span>
-</section>
-<section><h2>Settings</h2>
- <label><input type="checkbox" id="wifiOnly"> Wi-Fi only</label>
- <label><input type="checkbox" id="chargingOnly"> Charging only</label>
- <label>Daily cap (downloads, 0 = none) <input type="number" id="dailyCap" min="0"></label>
- <label>Budget (total downloads, blank = none) <input type="number" id="budget" min="0"></label>
- <label>Downloads per run <input type="number" id="runMax" min="1"></label>
- <label>Max video height <input type="number" id="maxHeight" min="144"></label>
- <label><input type="checkbox" id="periodic"> Run by itself (about every <input type="number" id="periodMinutes" min="15" style="width:5em"> min)</label>
- <label><input type="checkbox" id="v1Fallback"> Use Medusa /v1 (plain videos only) when not paired</label>
- <label><input type="checkbox" id="noRefresh"> No refresh (do not list followed sources, download only)</label>
- <label>UI URL (https; blank = bundled page) <input type="text" id="uiUrl"></label>
- <button class="p" id="save">Save</button> <span id="savemsg"></span>
-</section>
-<section><h2>Plugin</h2>
- <table id="pl"></table>
- <label>Manifest URL <input type="text" id="pluginUrl"></label>
- <button id="upd">Check for update</button> <span id="updmsg"></span>
-</section>
-<section><h2>Log</h2><pre id="log"></pre>
- <button id="share">Share</button><button id="clear">Clear</button><button id="reload">Refresh</button>
-</section>
+<header><b>IndexNode</b><span class="v" id="ver"></span><span class="sp"></span><span class="chip" id="chip">…</span><button id="reload" aria-label="Reload the page" title="Reload the page">↻</button></header>
+<main>
+<!-- ============ Status ============ -->
+<div class="tab on" id="t-status">
+ <div class="banner" id="upbanner"><b id="uptitle"></b><span id="upmsg"></span><progress id="uppg" max="1" value="0" style="display:none"></progress>
+  <div class="btns"><button class="b" id="upgo">Update</button></div></div>
+ <div class="card"><div class="hero">
+  <div class="state" id="state">…</div><div class="sub" id="sub"></div>
+  <progress id="pg" max="1" value="0" style="display:none"></progress>
+  <div class="why" id="why"></div>
+  <div class="btns"><button class="b p" id="run">Run now</button><button class="b" id="stop">Stop</button></div>
+  <div class="msg" id="runmsg"></div>
+ </div></div>
+ <div class="card"><h2>Ready to run</h2><div id="checks"></div></div>
+ <div class="card"><h2>Last run</h2><div id="last"></div></div>
+ <div class="card"><h2>This phone</h2><div id="phone"></div></div>
+</div>
+<!-- ============ Activity ============ -->
+<div class="tab" id="t-activity">
+ <div class="card"><h2>Log</h2><div class="pad" style="padding-bottom:8px"><input type="search" id="logq" placeholder="Filter the log (for example: failed, download, plugin)"></div>
+  <pre id="log"></pre>
+  <div class="pad"><div class="btns" style="margin-top:8px"><button class="b" id="share">Share</button><button class="b" id="clear">Clear</button></div><div class="msg" id="logmsg"></div></div></div>
+</div>
+<!-- ============ Setup ============ -->
+<div class="tab" id="t-setup">
+ <div class="card steps"><div class="head"><span class="n">1</span><h3>Store and node name</h3></div>
+  <div id="s-store"></div>
+  <div class="pad">On the desktop run <code>indexnode medusa-setup --name &lt;phone name&gt; --qr</code>, then scan the QR with the camera, or paste the link or the file's contents here.
+   <textarea id="setup" rows="3" placeholder="medusa://node-setup?d=…" style="margin-top:8px"></textarea>
+   <div class="btns" style="margin-top:8px"><button class="b p" id="imp">Import setup</button></div><div class="msg" id="impmsg"></div></div></div>
+ <div class="card steps"><div class="head"><span class="n">2</span><h3>Medusa (yt-dlp and ffmpeg)</h3></div>
+  <div id="s-medusa"></div>
+  <div class="pad"><div class="btns" style="margin-top:0"><button class="b p" id="pair">Pair with Medusa</button></div><div class="msg" id="pairmsg"></div></div></div>
+ <div class="card steps"><div class="head"><span class="n">3</span><h3>Check server</h3></div>
+  <div id="s-check"></div>
+  <div class="pad" style="color:var(--mute)">It comes with the setup QR when the desktop has a check server. Without it the phone still downloads from the work queue.</div></div>
+</div>
+<!-- ============ Settings ============ -->
+<div class="tab" id="t-settings">
+ <div class="card"><h2>App</h2><div id="app"></div>
+  <div class="pad"><div class="btns" style="margin-top:0"><button class="b" id="upcheck">Check for update</button><button class="b p" id="upgo2" style="display:none">Update</button></div><div class="msg" id="upmsg2"></div></div></div>
+ <div class="card"><h2>When to run</h2>
+  <label class="f"><span>Wi-Fi only</span><input type="checkbox" id="wifiOnly"></label>
+  <label class="f"><span>Only while charging</span><input type="checkbox" id="chargingOnly"></label>
+  <label class="f"><span>Run by itself<small>Every this many minutes (15 or more)</small></span><input type="number" id="periodMinutes" min="15"><input type="checkbox" id="periodic"></label>
+ </div>
+ <div class="card"><h2>Limits</h2>
+  <label class="f"><span>Downloads per day<small>0 = no cap</small></span><input type="number" id="dailyCap" min="0"></label>
+  <label class="f"><span>Downloads per run</span><input type="number" id="runMax" min="1"></label>
+  <label class="f"><span>Budget<small>Total downloads; blank = none</small></span><input type="number" id="budget" min="0"></label>
+  <label class="f"><span>Video height<small>The index's working copy</small></span><input type="number" id="maxHeight" min="144"></label>
+ </div>
+ <div class="card"><h2>Work</h2>
+  <label class="f"><span>Download only<small>Do not list followed sources (no refresh)</small></span><input type="checkbox" id="noRefresh"></label>
+  <label class="f"><span>Use Medusa /v1 when not paired<small>Plain videos only: no subtitles, listings or ffmpeg</small></span><input type="checkbox" id="v1Fallback"></label>
+ </div>
+ <div class="card"><h2>Plugin</h2><div id="plugin"></div>
+  <div class="pad"><div class="btns" style="margin-top:0"><button class="b" id="upd">Check for plugin update</button></div><div class="msg" id="updmsg"></div></div>
+  <details><summary>Advanced</summary><div class="pad">
+   <div style="color:var(--mute);margin-bottom:4px">Plugin manifest URL</div><input type="text" id="pluginUrl">
+   <div style="color:var(--mute);margin:10px 0 4px">UI URL (https; blank = the page in the app)</div><input type="text" id="uiUrl">
+  </div></details></div>
+ <div class="card"><h2>Diagnostics</h2><div id="diagrows"></div>
+  <pre id="crash" class="small" style="display:none"></pre>
+  <div class="pad"><div class="btns" style="margin-top:8px"><button class="b p" id="copyd">Copy diagnostics</button><button class="b" id="cleard">Clear</button></div><div class="msg" id="diagmsg"></div></div>
+  <details><summary>Recent log (kept across restarts)</summary><pre id="dlog" class="small"></pre></details></div>
+ <div class="savebar"><button class="b p" id="save">Save settings</button><span class="msg" id="savemsg" style="margin:0"></span></div>
+</div>
+</main>
+<nav>
+ <button data-t="status" class="on">Status</button><button data-t="activity">Activity</button><button data-t="setup">Setup<span class="dot" id="setupdot" style="display:none"></span></button><button data-t="settings">Settings<span class="dot" id="setdot" style="display:none"></span></button>
+</nav>
 <script>
 const $=id=>document.getElementById(id); let n=0; const pend={};
 const hasBridge = typeof hostBridge!=='undefined';
 if(hasBridge) hostBridge.onmessage=e=>{const r=JSON.parse(e.data);const p=pend[r.id];if(p){delete pend[r.id];r.ok?p.res(r.result):p.rej(new Error(r.error));}};
 const call=(m,a)=>new Promise((res,rej)=>{if(!hasBridge)return rej(new Error('no bridge'));const id=++n;pend[id]={res,rej};hostBridge.postMessage(JSON.stringify({id,m,a:a==null?'':(typeof a==='string'?a:JSON.stringify(a))}));});
-const row=(k,v)=>'<tr><td>'+k+'</td><td>'+(v==null||v===''?'-':String(v).replace(/[<&]/g,c=>c=='<'?'&lt;':'&amp;'))+'</td></tr>';
-let loaded=false;
-async function refresh(){
- try{
-  const s=await call('getState'); $('ver').textContent='host '+s.hostVersion;
-  $('st').innerHTML=row('State',s.state)+row('Job',s.job)+row('Today',s.doneToday+' / '+(s.settings.dailyCap||'no cap'))+row('Node',s.nodeId+(s.nodeName&&s.nodeName!==s.nodeId?' ('+s.nodeName+')':''))+row('Store',s.configured?s.storeUrl:'not set up')
-   +row('Network',(s.device.transport==='wifi'?'Wi-Fi':s.device.transport)+(s.device.via==='vpn'?' (via VPN)':s.device.vpn?' + VPN':'')+(s.device.metered?' (metered)':''))+row('Network facts','active='+s.device.activeTransport+', transport='+s.device.transport+', vpn='+s.device.vpn+', metered='+s.device.metered+', validated='+s.device.validated)+row('Rule (Wi-Fi only '+(s.settings.wifiOnly?'on':'off')+')',s.whyNot||'a run may start')+row('Charging / battery',(s.device.charging?'yes':'no')+' / '+s.device.battery+'%')+row('Free space',s.device.freeMb+' MB')+row('Last error',s.lastError);
-  $('pg').style.display=s.progress!=null?'':'none'; $('pg').value=s.progress||0;
-  $('why').textContent=s.whyNot?'Not running: '+s.whyNot:'';
-  const m=s.medusa||{}; $('md').innerHTML=row('Mode',s.medusaMode)+row('Paired',m.paired?'yes':'no')+row('Pairing request',m.pending?'waiting for approval in Medusa':'')+row('Medusa running',m.running===false?'no: '+(m.error||''):m.running);
-  $('pl').innerHTML=row('Plugin',(s.pluginVersion||'(not loaded)')+(s.pluginSource?' ['+s.pluginSource+']':''))+row('Plugin error',s.pluginError)+row('Rolling manifest',s.settings.pluginUrl);
-  if(!loaded){loaded=true;const c=s.settings;for(const k of ['wifiOnly','chargingOnly','periodic','v1Fallback','noRefresh'])$(k).checked=!!c[k];for(const k of ['dailyCap','budget','runMax','maxHeight','periodMinutes'])$(k).value=c[k]==null?'':c[k];$('uiUrl').value=c.uiUrl||'';$('pluginUrl').value=c.pluginUrl;}
-  $('log').textContent=(await call('getLog')).slice(-200).join('\n');
- }catch(e){$('st').innerHTML=row('Error',e.message);}
+const esc=v=>String(v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const row=(k,v,sub)=>'<div class="row"><span class="k">'+esc(k)+'</span><span class="val">'+(v==null||v===''?'–':esc(v))+(sub?'<small>'+esc(sub)+'</small>':'')+'</span></div>';
+const check=(ok,k,v,sub)=>'<div class="row"><span class="mark '+(ok==null?'na':ok?'ok':'bad')+'">'+(ok==null?'·':ok?'✓':'✕')+'</span><span class="k" style="flex-basis:30%">'+esc(k)+'</span><span class="val">'+esc(v)+(sub?'<small>'+esc(sub)+'</small>':'')+'</span></div>';
+const mb=b=>b>0?(b/1048576).toFixed(0)+' MB':'';
+
+// ---- tabs ----
+let tab='status';
+function show(t){tab=t;for(const b of document.querySelectorAll('nav button'))b.classList.toggle('on',b.dataset.t===t);for(const d of document.querySelectorAll('.tab'))d.classList.toggle('on',d.id==='t-'+t);if(location.hash!=='#'+t)location.hash=t;if(t==='activity')log();if(t==='settings')diag();}
+for(const b of document.querySelectorAll('nav button'))b.onclick=()=>show(b.dataset.t);
+window.onhashchange=()=>{const t=location.hash.slice(1);if(['status','activity','setup','settings'].includes(t)&&t!==tab)show(t);};
+
+// ---- state ----
+let S=null, loaded=false, dirty=false;
+const BOOLS=['wifiOnly','chargingOnly','periodic','v1Fallback','noRefresh'], NUMS=['dailyCap','budget','runMax','maxHeight','periodMinutes'];
+for(const k of BOOLS.concat(NUMS,['pluginUrl','uiUrl']))$(k).addEventListener('input',()=>{dirty=true;$('savemsg').textContent='Not saved yet';});
+function net(d){return (d.transport==='wifi'?'Wi-Fi':d.transport==='cellular'?'Mobile data':d.transport==='none'?'No network':d.transport)+(d.via==='vpn'?' through a VPN':d.vpn?' + VPN':'')+(d.metered?' (metered)':'');}
+function lastRun(s){try{const r=JSON.parse(s.lastResult||'null');if(!r)return null;if(r.skipped)return 'Skipped: '+r.skipped;return (r.jobsStarted||0)+' job'+(r.jobsStarted===1?'':'s')+' started'+(r.stages?' · '+r.stages.join(', '):'');}catch(e){return s.lastResult;}}
+function paint(s){
+ S=s; const c=s.settings, d=s.device, m=s.medusa||{}, u=s.appUpdate||{};
+ $('ver').textContent=s.hostVersion+(s.pluginVersion?' · plugin '+s.pluginVersion:'');
+ const waiting=!s.running&&!!s.whyNot, chip=$('chip');
+ chip.textContent=!s.configured?'Not set up':s.running?'Running':waiting?'Waiting':'Ready'; chip.className='chip '+(!s.configured?'bad':s.running?'run':waiting?'warn':'ok');
+ $('state').textContent=!s.configured?'Not set up yet':s.running?(s.state&&s.state!=='idle'?s.state[0].toUpperCase()+s.state.slice(1):'Running'):waiting?'Waiting':'Ready';
+ $('sub').textContent=!s.configured?'Open Setup and import the node setup.':s.job?s.job:s.running?'':'Runs by itself '+(c.periodic?'about every '+c.periodMinutes+' minutes':'only when you tap Run now')+'.';
+ $('pg').style.display=s.progress!=null?'':'none'; $('pg').value=s.progress||0;
+ $('why').textContent=s.configured&&s.whyNot?'Not running: '+s.whyNot:'';
+ $('run').disabled=!s.configured||s.running; $('stop').disabled=!s.running;
+ const medOk=m.running!==false&&(m.paired||c.v1Fallback), cap=c.dailyCap>0?c.dailyCap:0;
+ $('checks').innerHTML=
+   check(!!s.configured,'Store',s.configured?s.storeUrl:'Not set up',s.configured?'Node '+(s.nodeName||s.nodeId):'Setup, step 1')
+  +check(medOk,'Medusa',m.running===false?'Not running':m.paired?'Paired ('+(s.medusaMode||'')+')':'Not paired',m.running===false?(m.error||'Open Medusa once so its local server starts'):m.paired?'':m.pending?'Approve the request in Medusa':'Setup, step 2'+(c.v1Fallback?' (using /v1 for now)':''))
+  +check(!c.wifiOnly||(d.transport==='wifi'||d.transport==='ethernet'),'Network',net(d),c.wifiOnly?'Rule: Wi-Fi only':'Rule: any network')
+  +check(!c.chargingOnly||d.charging,'Power',(d.charging?'Charging':'On battery')+' · '+d.battery+'%',c.chargingOnly?'Rule: only while charging':'Rule: any')
+  +check(cap?s.doneToday<cap:null,'Today',s.doneToday+(cap?' of '+cap:'')+' downloads',cap?'':'No daily cap')
+  +check(c.checkUrl?true:null,'Check server',c.checkUrl||'None',c.checkUrl?(c.checkToken?'Token set':'No token'):'Work queue only')
+  +check(s.pluginVersion?!s.pluginError:false,'Plugin',s.pluginVersion?s.pluginVersion+' ('+(s.pluginSource||'')+')':'Not loaded',s.pluginError||'');
+ $('last').innerHTML=row('Result',lastRun(s))+(s.lastError?'<div class="row"><span class="k">Error</span><span class="val bad">'+esc(s.lastError)+'</span></div>':'');
+ $('phone').innerHTML=row('Model',d.model)+row('Free space',d.freeMb!=null?(d.freeMb>=1024?(d.freeMb/1024).toFixed(1)+' GB':d.freeMb+' MB'):'')+row('Network facts','active '+d.activeTransport+', validated '+d.validated+', metered '+d.metered+', vpn '+d.vpn);
+ // setup
+ $('s-store').innerHTML=check(!!s.configured,'Store',s.configured?s.storeUrl:'Not set up')+row('Node',s.nodeId,s.nodeName&&s.nodeName!==s.nodeId?s.nodeName:'');
+ $('s-medusa').innerHTML=check(m.running!==false,'Medusa app',m.running===false?'Not running':'Running'+(typeof m.running==='string'&&m.running!=='yes'?' '+m.running:''),m.running===false?(m.error||''):'')+check(!!m.paired,'Pairing',m.paired?'Paired':m.pending?'Waiting for your approval in Medusa':'Not paired',s.medusaMode?'API '+s.medusaMode:'');
+ $('s-check').innerHTML=check(c.checkUrl?true:null,'Server',c.checkUrl||'None')+row('Token',c.checkUrl?(c.checkToken?'Set':'None'):'');
+ $('setupdot').style.display=(!s.configured||!medOk)?'':'none';
+ // settings
+ $('app').innerHTML=row('Version',s.hostVersion)+row('Update',u.state==='available'||u.state==='needs-permission'||u.state==='confirm'?'Version '+(u.offer?u.offer.version:'')+' is available':u.state==='current'?'Up to date':u.state==='checking'?'Checking…':u.state==='downloading'?'Downloading…':u.state==='installing'?'Installing…':u.state==='done'?'Updated':u.state==='failed'?'Check failed':'Not checked yet',u.checkedAt?'Checked '+u.checkedAt:'');
+ $('plugin').innerHTML=row('Version',s.pluginVersion||'Not loaded',s.pluginSource||'')+(s.pluginError?'<div class="row"><span class="k">Error</span><span class="val bad">'+esc(s.pluginError)+'</span></div>':'');
+ update(u);
+ if(!loaded||!dirty&&tab!=='settings'){loaded=true;for(const k of BOOLS)$(k).checked=!!c[k];for(const k of NUMS)$(k).value=c[k]==null?'':c[k];$('uiUrl').value=c.uiUrl||'';$('pluginUrl').value=c.pluginUrl||'';}
 }
-const act=(id,f,msg)=>$(id).onclick=async()=>{try{const r=await f();if(msg)$(msg).textContent=r||'';}catch(e){if(msg)$(msg).textContent=e.message;}refresh();};
-act('run',()=>call('runNow'));act('stop',()=>call('stopRun'));
-act('imp',async()=>{await call('importSetup',$('setup').value);$('setup').value='';loaded=false;return 'imported';},'impmsg');
-act('pair',async()=>{const r=await call('pairMedusa');return r.state==='approved'?'paired':r.state==='denied'?'denied':'approve in Medusa, then tap again';},'pairmsg');
-act('save',async()=>{const o={};for(const k of ['wifiOnly','chargingOnly','periodic','v1Fallback','noRefresh'])o[k]=$(k).checked;for(const k of ['dailyCap','runMax','maxHeight','periodMinutes'])if($(k).value!=='')o[k]=+$(k).value;o.budget=$('budget').value;o.pluginUrl=$('pluginUrl').value;
- await call('saveSettings',o);await call('setUiUrl',$('uiUrl').value);return 'saved';},'savemsg');
-act('upd',async()=>{const r=await call('checkPluginUpdate');return r.outcome+(r.version?' '+r.version:'')+(r.detail?': '+r.detail:'');},'updmsg');
+function update(u){
+ const offer=u.offer, on=!!offer&&['available','downloading','installing','confirm','needs-permission','failed'].includes(u.state), busy=u.state==='downloading'||u.state==='installing';
+ $('upbanner').classList.toggle('on',on); $('setdot').style.display=on?'':'none';
+ if(on){$('uptitle').textContent='Version '+offer.version+' is available'+(offer.bytes>0?' ('+mb(offer.bytes)+')':'');$('upmsg').textContent=u.state==='available'?(u.message&&!u.message.startsWith('Version ')?u.message:(offer.notes||'')):(u.message||'');
+  $('uppg').style.display=u.state==='downloading'&&u.progress!=null?'':'none';$('uppg').value=u.progress||0;}
+ $('upgo').disabled=busy; $('upgo2').disabled=busy; $('upgo2').style.display=on?'':'none'; if(on)$('upgo2').textContent='Update to '+offer.version;
+ if(u.message&&tab==='settings')$('upmsg2').textContent=u.message;
+}
+async function refresh(){try{paint(await call('getState'));}catch(e){$('state').textContent='No connection to the app';$('sub').textContent=e.message;$('chip').textContent='Error';$('chip').className='chip bad';}}
+const act=(id,f,msg)=>$(id).onclick=async()=>{const b=$(id);b.disabled=true;try{const r=await f();if(msg)$(msg).textContent=r||'';}catch(e){if(msg){$(msg).textContent=e.message;}}b.disabled=false;refresh();};
+act('run',async()=>{await call('runNow');return 'Run requested';},'runmsg');act('stop',async()=>{await call('stopRun');return 'Stopping';},'runmsg');
+act('imp',async()=>{await call('importSetup',$('setup').value);$('setup').value='';loaded=false;dirty=false;return 'Imported';},'impmsg');
+act('pair',async()=>{const r=await call('pairMedusa');return r.state==='approved'?'Paired':r.state==='denied'?'Medusa refused the request':'Approve the request in Medusa, then tap again';},'pairmsg');
+act('save',async()=>{const o={};for(const k of BOOLS)o[k]=$(k).checked;for(const k of ['dailyCap','runMax','maxHeight','periodMinutes'])if($(k).value!=='')o[k]=+$(k).value;o.budget=$('budget').value;o.pluginUrl=$('pluginUrl').value;
+ await call('saveSettings',o);if(($('uiUrl').value||'')!==((S&&S.settings.uiUrl)||''))await call('setUiUrl',$('uiUrl').value);dirty=false;loaded=false;return 'Saved';},'savemsg');
+act('upd',async()=>{const r=await call('checkPluginUpdate');return (r.outcome==='current'?'The plugin is up to date':r.outcome==='updated'?'Plugin updated':r.outcome)+(r.version?' ('+r.version+')':'')+(r.detail?': '+r.detail:'');},'updmsg');
+act('upcheck',async()=>{const u=await call('checkAppUpdate');return u.message||u.state;},'upmsg2');
+const go=async()=>{const u=await call('installAppUpdate');return u.message||u.state;}; act('upgo',go,'upmsg'); act('upgo2',go,'upmsg2');
+
+// the reload button: the host loads the page again from its source (the app, or the UI URL) without the cache; a page opened outside the app just reloads
+$('reload').onclick=async()=>{try{await call('reloadUi');}catch(e){location.reload();}};
+
+// ---- activity ----
+let lines=[];
+function drawLog(){const q=$('logq').value.trim().toLowerCase();const l=q?lines.filter(x=>x.toLowerCase().includes(q)):lines;const p=$('log'),end=p.scrollTop+p.clientHeight>=p.scrollHeight-20;p.textContent=l.slice(-400).join('\n')||(q?'Nothing matches.':'The log is empty.');if(end)p.scrollTop=p.scrollHeight;}
+async function log(){try{lines=await call('getLog');drawLog();}catch(e){$('log').textContent=e.message;}}
+$('logq').oninput=drawLog;
+act('share',async()=>{await call('shareLog');},'logmsg');act('clear',async()=>{await call('clearLog');await log();return 'Cleared';},'logmsg');
+
+// ---- diagnostics ----
 let lastReport='';
 async function diag(){try{const d=await call('getDiagnostics');lastReport=d.report||'';
- $('crashinfo').textContent=d.lastCrash?'Last crash:':'No crash recorded.'; $('crashinfo').className=d.lastCrash?'bad':'';
- $('crash').style.display=d.lastCrash?'':'none'; $('crash').textContent=d.lastCrash||''; $('dlog').textContent=(d.log||[]).join('\n');}catch(e){$('crashinfo').textContent='Diagnostics unavailable: '+e.message;}}
+ $('diagrows').innerHTML=check(!d.lastCrash,'Last crash',d.lastCrash?'Recorded (below)':'None recorded');
+ $('crash').style.display=d.lastCrash?'':'none';$('crash').textContent=d.lastCrash||'';$('dlog').textContent=(d.log||[]).join('\n');}catch(e){$('diagrows').innerHTML=row('Diagnostics','Unavailable: '+e.message);}}
 async function copyText(t){try{await navigator.clipboard.writeText(t);return true;}catch(e){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();let ok=false;try{ok=document.execCommand('copy');}catch(_){}a.remove();return ok;}}
-act('copyd',async()=>{await diag();return (await copyText(lastReport))?'copied ('+lastReport.length+' chars)':'copy failed: use Share in the Log section';},'diagmsg');
-act('cleard',async()=>{await call('clearDiagnostics');await diag();return 'cleared';},'diagmsg');
-diag(); setInterval(diag,5000);
-act('share',()=>call('shareLog'));act('clear',()=>call('clearLog'));act('reload',async()=>{});
-refresh(); setInterval(refresh,3000);
+act('copyd',async()=>{await diag();return (await copyText(lastReport))?'Copied ('+lastReport.length+' characters; no storage key or token in it)':'Copy failed: use Share on the Activity tab';},'diagmsg');
+act('cleard',async()=>{await call('clearDiagnostics');await diag();return 'Cleared';},'diagmsg');
+
+const first=location.hash.slice(1); if(['activity','setup','settings'].includes(first))show(first);
+refresh(); setInterval(()=>{refresh();if(tab==='activity')log();},3000); setInterval(()=>{if(tab==='settings')diag();},6000);
 </script></body></html>
