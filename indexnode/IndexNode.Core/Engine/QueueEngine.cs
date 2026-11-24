@@ -50,14 +50,11 @@ public sealed partial class NodeEngine
         return StandardSteps.Where(s => !done.Contains(s) && (o.Stages.Contains("process") || o.Stages.Contains(s)) && (o.Steps == null || o.Steps.Contains(s)) && Control.Effective(s) == Level.Run).ToArray();
     }
 
-    // 0.13.12: the node-wide group gate (frames listing + L), refreshed before each look for work
-    private GroupSequencing.Gate? gate; private volatile GroupSequencing.Gate.View? gateView;
 
     private bool CanRunEntry(QSubject s, QEntry e) =>
         StageDeps.Held(e) ? false   // 0.13.24: an actors entry with a hold (AI) is never ready; a manual "actors add" replaces it
         : e.Hold == "ai" && !Control.Current.AiDramasOn ? false   // 0.13.23: an AI-held entry of any stage (a download too) waits for control aiDramas=on
         : e.Stage == "process" && s.Entries.TryGetValue("check", out var ck0) && !ck0.Final ? false   // 0.13.16: the check comes first (a process entry never runs the pre-check itself while a check is pending)
-        : e.Stage == "group" ? gateView is not { } gv || gv.Runnable_(s)   // a blocked group step is never claimed and nothing is appended for it (the claim-time BlockersAsync stays as the race safety net)
         : e.Stage != "process" || (PlanSteps(e).Length > 0 && !(e.Hold == "ai" && !Control.Current.AiDramasOn));   // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
    // an AI-held drama waits for control aiDramas=on (it stays pending, priority unchanged)
 
@@ -80,12 +77,6 @@ public sealed partial class NodeEngine
                     {
                         try
                         {
-                            if (StageEnabled("group"))
-                            {
-                                gate ??= new GroupSequencing.Gate(store, paths);
-                                var gv = await gate.RefreshAsync(queue, queue.Now, ct); gateView = gv;
-                                if (gate.Summary(gv, queue.Now) is { } gsum) Log.Info(gsum);
-                            }
                             look = await queue.LookAsync(StageEnabled, CanRunEntry, ct, ReadyNow);
                             await Control.RefreshIfAnnouncedAsync(queue.Read(st => st.ControlETag), ct);   // 0.13.28: control.json is read only when a "ctl" line says it changed
                         }
@@ -336,7 +327,7 @@ public sealed partial class NodeEngine
     private JobContext NewContext(int lane, ClaimWork w, string stage, JobDescriptor job, IStore jobStore, string[] stepsDone, CancellationToken token) => new()
     {
         Job = job, Stage = stage, BlobName = w.Id, LeaseId = w.Handle.Lease, Worker = lane, Store = jobStore, Paths = paths, NodeId = o.NodeId, Token = token, Queue = queue,
-        StepsDone = stepsDone, ThreadShare = () => o.ThreadsPerWorker, Frames = gateView?.Frames, AiDramasOn = () => Control.Current.AiDramasOn,
+        StepsDone = stepsDone, ThreadShare = () => o.ThreadsPerWorker, AiDramasOn = () => Control.Current.AiDramasOn,
         Report = (step, progress) => { if (step != null && step != w.Run.Info.Step) { w.Run.Info.Step = step; w.Run.Info.StartedAt = Protocol.NowUtc(); w.Run.Timer.Enter(step); } w.Run.Info.Progress = progress; },
     };
 
@@ -368,16 +359,12 @@ public sealed partial class NodeEngine
                             try { var aiNow = AiHold.Flagged((await VideoJson.ReadAsync(store, paths, id, token))?.Root); await SeqBlobs.AssignAsync(store, paths, seqTable, id, aiNow, token); }
                             catch (OperationCanceledException) { throw; }
                             catch (Exception e) when (e is not LeaseLostException) { Log.Info($"group {id}: could not assign the predecessor seq ({e.Message}); the step fails as Transient"); return (Outcome.Transient, "seq assignment failed: " + e.Message, false, ctx); }   // seq is the prerequisite of grouping: never mark the step done without it
-                        // 0.13.10: sequence order. A drama waits (the entry goes back to pending, due in two minutes, nothing else written) while an earlier one is still in flight.
-                        // a group entry of a drama without frames is not runnable (the gate keeps it from being claimed; this is the race safety net): a number is given only to a drama that has frames
-                        if (queue.Read(st => st.Get(id)?.Seq) == null && (gate?.Frames.Contains(id) == true || gate == null && await store.HeadAsync(paths.FramesFile(id), token) != null)) await h.AssignSeqAsync(token);
-                        var blockers = await GroupSequencing.BlockersAsync(queue, store, paths, id, token, gate?.Frames);
-                        if (blockers.Count == 0 && queue.Read(st => st.Get(id)?.Seq) == null) blockers = [id];   // no frames, so no number: not runnable yet
-                        if (blockers.Count > 0)
+                        // 0.13.43: the group step never waits. The number is given HERE, as the step's first action and only to a drama that has its vectors; the predecessors are the dramas numbered lower,
+                        // and each of them was numbered at its own group step, so each has its vectors. Nothing is in flight ahead of this drama, so there is nothing to wait for.
+                        if (queue.Read(st => st.Get(id)?.Seq) == null)
                         {
-                            Log.Info($"group {id}: waiting for {blockers.Count} earlier drama(s) ({string.Join(", ", blockers.Take(3))}{(blockers.Count > 3 ? ", ..." : "")})");
-                            await h.AppendAsync([new QLine { T = "done", Stage = "group", State = "pending", Due = Protocol.Utc(queue.Now + GroupSequencing.Wait) }], true, CancellationToken.None);
-                            return (Outcome.Done, null, true, null);
+                            if (await store.HeadAsync(paths.FramesFile(id), token) == null) return (Outcome.Permanent, "group: the drama has no vectors (no frames file), so there is nothing to group", false, ctx);
+                            await h.AssignSeqAsync(token);
                         }
                         var gj = JobDescriptor.NewStep("group", id); gj.Priority = entry.Priority;
                         ctx = NewContext(lane, w, "group", gj, store, [], token);
@@ -479,8 +466,7 @@ public sealed partial class NodeEngine
         w.Local ??= new LocalCacheStore(store, Path.Combine(Path.GetTempPath(), "indexnode", "c-" + instanceTag + "-" + id));
         // 0.13.0: the pre-check is the first step of a process claim, only for a drama with no processing done yet (a part-processed one resumes from its first unfinished step)
         bool ranPre = false;
-        // 0.13.10: the sequence number is assigned at the first pre-check line, under the claim (and so under the drama's lease)
-        if (queue.Read(s => s.Get(id)?.Seq) == null && handlers.ContainsKey("precheck")) await h.AssignSeqAsync(token);
+        // 0.13.43: no sequence number here any more. A drama is numbered when its group step starts (see the group case), so a drama that is started and then set aside holds up nobody.
         // 0.13.2: decided from the store only (no processing zip besides download/comments), never from the done set; the stage itself returns at once for a video.json that already has the record
         bool noProcessing = !HasProcessing(have);
         var vjPre = handlers.ContainsKey("precheck") && noProcessing ? (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject : null;

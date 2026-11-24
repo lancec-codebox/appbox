@@ -54,22 +54,6 @@ public class StorageSitesTests
     }
 
     [Fact]
-    public async Task Blockers_make_no_per_candidate_request()
-    {
-        var f = new FakeStore(); var m = new StoreMeter(); var s = new MeteredStore(f, m);
-        var q = new JobQueue(s, P, "n"); await q.LoadAsync(default);
-        for (int i = 0; i < 40; i++) await f.PutAsync(P.FramesFile("c" + i), [1], null, null, false, default);
-        var lines = Enumerable.Range(0, 80).Select(i => QLine.Add("c" + i, "process", new JobDescriptor { Stage = "process", JobId = "c" + i, AddedAt = "2026-11-21T08:00:00Z" }, "2026-11-21T08:00:00Z")).ToList();
-        await q.AppendLinesAsync(lines, default);
-        await q.AppendLinesAsync(Enumerable.Range(0, 80).Select(i => new QLine { T = "seq", S = "c" + i, Seq = i + 1 }).ToList(), default);
-        m.Reset();
-        var b = await GroupSequencing.BlockersAsync(q, s, P, "c79", default);
-        Assert.Equal(39, b.Count); Assert.True(m.Total <= 1, m.TableText());          // 0.13.11: 79 HEADs
-        m.Reset(); await GroupSequencing.BlockersAsync(q, s, P, "c79", default, new HashSet<string>());
-        Assert.Equal(0, m.Total);                                                   // the gate's in-memory set: no request at all
-    }
-
-    [Fact]
     public async Task Video_json_is_read_once_in_a_step_and_by_etag_afterwards()
     {
         var f = new FakeStore(); await VideoJsonSeed.PutAsync(f, P, "a", 600);

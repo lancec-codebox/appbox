@@ -57,7 +57,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var clock = Stopwatch.StartNew(); string joinSrc = ""; double tMember = 0, tDedup = 0, tIdx = 0, tOwn = 0, tSearch = 0, tScan = 0, tRead = 0, tScore = 0, tFresh = 0, tWrite = 0; int searched = 0;
         var head = await SearchData.LoadAsync(store, paths, null, ct);
         var q = ctx.Queue!;
-        bool Earlier(string other) => other != id && (q.Read(st => st.Get(other)?.Seq) is not { } o || o < seq);
+        bool Earlier(string other) => other != id && q.Read(st => GroupSequencing.IsEarlier(st.Get(other), seq));   // 0.13.43: numbered lower, or from before numbering; never a drama still on its way to its own group step
         var idx = head?.Restrict(u => Earlier(u.Id));
         // every earlier drama whose frames the index does not hold (not built yet, or finished after the build): searched by brute force from its retained file if it has one, else its frames file
         var inIndex = head?.Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal) ?? [];
@@ -123,7 +123,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         {
             // 0.13.13: DEDUP against the group only: every earlier member of the target's group, by its FULL frames file, brute force (no global index search)
             var td = Stopwatch.StartNew();
-            var frames = ctx.Frames ?? await GroupSequencing.ListFramesAsync(store, paths, ct);   // the gate's frames set (one list per refresh), else one listing
+            var frames = ctx.Frames ?? await GroupSequencing.ListFramesAsync(store, paths, ct);   // one listing per join (0.13.43: there is no gate holding a set any more)
             var earlierSeq = q.Read(st => EarlierDramas(st, id, seq, frames));
             var known = head != null ? await dedup.KnownAsync(paths, head.Version, ct) : null;
             var ms = await dedup.SetAsync(paths, prop.JoinUpload, earlierSeq, jid => q.Read(st => st.Get(jid) is { JoinKind: not null } js ? (js.JoinOf, js.JoinKind) : ((string?, string?)?)null), known, ct, jid => q.Read(st => st.Get(jid)?.LastAt));

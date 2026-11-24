@@ -69,10 +69,16 @@ public static class GroupsCommand
         await JobQueue.RequireSnapshotAsync(store, paths, ct);
         var q = new JobQueue(store, paths, "cli"); await q.LoadAsync(ct);
         double tQueue = total.Elapsed.TotalMilliseconds;
-        var seq = q.Read(st => st.Get(id)?.Seq);
-        if (seq == null) { o.WriteLine($"groups step {id}: no sequence number in the queue (run: indexnode seq assign)"); return 1; }
         var tl = Stopwatch.StartNew(); var frames = await GroupSequencing.ListFramesAsync(store, paths, ct); double tList = tl.Elapsed.TotalMilliseconds;
         if (!frames.Contains(id)) { o.WriteLine($"groups step {id}: no frames file (index/search/frames/{id}.bin)"); return 1; }
+        var seq = q.Read(st => st.Get(id)?.Seq);
+        if (seq == null)
+        {   // 0.13.43: a drama is numbered when its group step starts, so this command gives the number as a node would (never in a dry run)
+            if (dry) { o.WriteLine($"groups step {id}: no sequence number yet (a drama gets it when its group step starts); a dry run assigns none, so there is nothing to show. Run without --dry-run."); return 1; }
+            await q.AppendLinesAsync(st => st.Get(id) is { Seq: not null } ? [] : [new QLine { T = "seq", S = id, Seq = st.NextSeq(), At = q.NowUtc(), By = "cli" }], ct);
+            seq = q.Read(st => st.Get(id)?.Seq);
+            if (seq == null) { o.WriteLine($"groups step {id}: could not assign a sequence number"); return 1; }
+        }
         var stage = new GroupStage(store, s) { DryRun = dry };
         var ctx = new JobContext { Job = new JobDescriptor { Stage = "group", JobId = id }, Stage = "group", BlobName = id, Worker = 0, Store = store, Paths = paths, NodeId = "cli", Token = ct, Queue = q, ThreadShare = () => Math.Max(1, threads), Report = (_, _) => { }, Frames = frames };
         var run = Stopwatch.StartNew();

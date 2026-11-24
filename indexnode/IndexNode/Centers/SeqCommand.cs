@@ -114,6 +114,27 @@ int Cleared, int Started, List<string> First);
         return new ClearReport(clear.Count, started.Count, clear.Take(5).ToList());
     }
 
+    /// <summary>
+    /// 0.13.43, once, at the cutover and with no node running: the dramas that carry a number from the old rule (given when their pre-check started) but have not been grouped and are still on their way
+    /// (their process entry is not finished, or their group entry is not done). Their numbers are cleared, so each gets its number when its group step starts and then sees every drama grouped before it.
+    /// A drama whose group step is done keeps its number, and so does one from before numbering that has no entry in flight.
+    /// </summary>
+    public static bool NumberedUngrouped(QSubject s) =>
+        s.Seq != null && s.Entries.GetValueOrDefault(GroupSequencing.Stage) is not { State: "done" or "duplicate" } &&
+        (s.Entries.TryGetValue("process", out var p) && !p.Final || s.Entries.TryGetValue(GroupSequencing.Stage, out var g) && !g.Final);
+
+    public static async Task<ClearReport> ClearUngroupedAsync(JobQueue q, bool dry, CancellationToken ct)
+    {
+        await q.PollAsync(ct);
+        var (clear, keep) = q.Read(st => (st.Subjects.Values.Where(NumberedUngrouped).OrderBy(s => s.Seq).Select(s => s.Id).ToList(), st.Subjects.Values.Count(s => s.Seq != null && !NumberedUngrouped(s))));
+        if (!dry && clear.Count > 0)
+        {
+            var at = q.NowUtc();
+            foreach (var chunk in JobQueue.Chunks(clear, id => id.Length + 60)) { var ids = chunk; await q.AppendLinesAsync(st => ids.Where(id => st.Get(id) is { } x && NumberedUngrouped(x)).Select(id => new QLine { T = "seq", S = id, Force = true, At = at, By = "cli" }).ToList(), ct); }
+        }
+        return new ClearReport(clear.Count, keep, clear.Take(5).ToList());
+    }
+
     public sealed record Report(
 int Dramas, int Assigned, int Already, long First, long Last, int PreLog = 0, int Renumbered = 0);
 
@@ -219,6 +240,12 @@ int Dramas, int Assigned, int Already, long First, long Last, int PreLog = 0, in
             Console.WriteLine($"seq clear-unstarted{(dry ? " (dry run)" : "")}: {c.Cleared} unstarted dramas {(dry ? "would lose" : "lost")} their number ({c.Started} started dramas keep theirs){(c.First.Count > 0 ? "; first: " + string.Join(", ", c.First) : "")}");
             return 0;
         }
-        throw new ArgumentException("seq assign [--dry-run] [--renumber] | seq clear-unstarted [--dry-run]");
+        if (a.Positional.FirstOrDefault() == "clear-ungrouped")
+        {
+            var c = await ClearUngroupedAsync(q, dry, cts.Token);
+            Console.WriteLine($"seq clear-ungrouped{(dry ? " (dry run)" : "")}: {c.Cleared} dramas numbered under the old rule and not yet grouped {(dry ? "would lose" : "lost")} their number ({c.Started} numbered dramas keep theirs){(c.First.Count > 0 ? "; first: " + string.Join(", ", c.First) : "")}");
+            return 0;
+        }
+        throw new ArgumentException("seq assign [--dry-run] [--renumber] | seq clear-unstarted [--dry-run] | seq clear-ungrouped [--dry-run]");
     }
 }

@@ -36,24 +36,90 @@ public class GroupStepTests
         var late = await Node(s, c, "late"); Assert.Equal(seqs[5], late.Read(st => st.Get("v5")!.Seq!.Value)); Assert.Equal(9, late.Read(st => st.NextSeq()));
     }
 
-    static async Task<List<string>> Blockers(JobQueue q, IStore s, string id) => await GroupSequencing.BlockersAsync(q, s, P, id, default);
+    // ---- 0.13.43: the group step never waits
+    static QSubject Sub(long? seq, params (string Stage, string State)[] entries)
+    {
+        var x = new QSubject { Id = "x", Seq = seq };
+        foreach (var (stage, state) in entries) x.Entries[stage] = new QEntry { Stage = stage, State = state, Due = "", Added = "2026-11-21T08:00:00Z" };
+        return x;
+    }
 
     [Fact]
-    public async Task A_drama_waits_only_for_an_earlier_one_still_on_its_way_to_frames_and_a_stuck_group_step_blocks_nobody()
+    public void A_predecessor_is_a_drama_numbered_lower_or_one_from_before_numbering_never_one_still_on_its_way_to_its_own_group_step()
     {
-        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
-        await q.AppendLinesAsync([AddProcess("e1"), AddProcess("e2"), AddProcess("e3")], default);
-        await q.AppendLinesAsync([new QLine { T = "seq", S = "e1", Seq = 1 }, new QLine { T = "seq", S = "e2", Seq = 2 }, new QLine { T = "seq", S = "e3", Seq = 3 }], default);
-        Assert.Empty(await Blockers(q, s, "e1"));
-        Assert.Equal(["e1", "e2"], await Blockers(q, s, "e3"));                      // both mid-processing: no frames yet
-        await PutFrames(s, "e1", Make(40, 5, 1), 40);
-        Assert.Equal(["e2"], await Blockers(q, s, "e3"));                            // e1 has frames: it no longer blocks
-        var h = (await q.TryClaimAsync("e1", Pick, default))!;                       // e1's process is done and its GROUP step is pending/stuck
-        await h.AppendAsync([new QLine { T = "done", Stage = "process" }, QLine.Add("e1", "group", GroupSequencing.NewJob("e1", 0), "2026-11-21T08:00:00Z")], true, default);
-        Assert.Equal(["e2"], await Blockers(q, s, "e3"));
-        Assert.Empty(await Blockers(q, s, "e2"));
-        await PutFrames(s, "e2", Make(40, 5, 2), 40);                                // e2's frames now exist
-        Assert.Empty(await Blockers(q, s, "e3"));
+        Assert.True(GroupSequencing.IsEarlier(Sub(4, ("process", "done"), ("group", "done")), 5));
+        Assert.False(GroupSequencing.IsEarlier(Sub(6, ("process", "done"), ("group", "done")), 5));
+        Assert.True(GroupSequencing.IsEarlier(Sub(4, ("process", "done"), ("group", "pending")), 5));     // numbered at its group step, which has not finished: its vectors are there, that is all a later one needs
+        Assert.True(GroupSequencing.IsEarlier(null, 5));                                                   // only the index knows it: from before the queue
+        Assert.True(GroupSequencing.IsEarlier(Sub(null, ("process", "done")), 5));                         // from before numbering: processed, never had a group entry
+        Assert.True(GroupSequencing.IsEarlier(Sub(null, ("process", "done"), ("group", "done")), 5));
+        Assert.False(GroupSequencing.IsEarlier(Sub(null, ("process", "pending")), 5));                     // still processing (it may already have vectors): it will be numbered above this one and see it
+        Assert.False(GroupSequencing.IsEarlier(Sub(null, ("process", "done"), ("group", "pending")), 5));  // processed, group step not started
+        Assert.False(GroupSequencing.IsEarlier(Sub(null, ("process", "done"), ("group", "failed")), 5));   // a failed group step may be retried: it would then be numbered above this one
+    }
+
+    [Fact]
+    public async Task A_drama_that_was_processed_first_but_groups_second_is_not_seen_by_the_first_group_step_and_then_joins_it()
+    {
+        // x and d are copies. x was processed first (vectors, process done, group entry pending) but its group step has not started, so it has no number.
+        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a"); var v = Make(60, 8, 7);
+        await PutFrames(s, "x", v, 60); await PutFrames(s, "d", v, 60, 1.0, 1);
+        await q.AppendLinesAsync([AddProcess("x"), AddProcess("d")], default);
+        await q.AppendLinesAsync(new[] { "x", "d" }.Select(id => new QLine { T = "done", S = id, Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }), default);
+        await q.AppendLinesAsync(new[] { "x", "d" }.Select(id => QLine.Add(id, "group", GroupSequencing.NewJob(id, 0), "2026-11-21T08:01:00Z")), default);
+        var stage = new GroupStage(s);
+        Task Group(string id) => stage.RunAsync(new JobContext { Job = new JobDescriptor { Stage = "group", JobId = id }, Stage = "group", BlobName = id, Worker = 0, Store = s, Paths = P, NodeId = "t", Token = default, Queue = q, ThreadShare = () => 2, Report = (_, _) => { } });
+        async Task<JsonObject> Rec(string id) => (JsonObject)(await VideoJson.ReadAsync(s, P, id, default))!.Root["grouping"]!;
+        // d's group step starts first: it gets number 1 and does not wait for x, nor see it
+        await q.AppendLinesAsync([new QLine { T = "seq", S = "d", Seq = 1 }], default);
+        await Group("d");
+        Assert.Equal("new", (string)(await Rec("d"))["proposal"]!["kind"]!);
+        await q.AppendLinesAsync([new QLine { T = "done", S = "d", Stage = "group", State = "done", At = "2026-11-21T08:02:00Z" }], default);
+        // x's group step starts later: number 2, and d is its predecessor
+        await q.AppendLinesAsync([new QLine { T = "seq", S = "x", Seq = 2 }], default);
+        await Group("x");
+        var rx = await Rec("x");
+        Assert.Equal("join", (string)rx["proposal"]!["kind"]!); Assert.Equal("d", (string)rx["proposal"]!["joinUpload"]!);   // nothing points forward: d is new, x joins d
+    }
+
+    sealed class Fn(Func<JobContext, Task> f) : IStageHandler { public Task RunAsync(JobContext ctx) => f(ctx); }
+    static EngineOptions GroupNode() => new()
+    {
+        NodeId = "test-node", Name = "test", Stages = ["group"], Workers = 1, Threads = 4, Once = true,
+        PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
+        TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter(),
+    };
+
+    [Fact]
+    public async Task The_engine_runs_a_group_entry_at_once_and_numbers_it_then_although_a_drama_started_earlier_has_no_vectors()
+    {
+        // w1 was started earlier (it even carries an old pre-check number) and has no vectors; 0.13.42 made w2's group step wait for it
+        var s = new FakeStore(); var q = new JobQueue(s, P, "seed"); await q.LoadAsync(default);
+        await q.AppendLinesAsync([AddProcess("w1"), AddProcess("w2"), new QLine { T = "seq", S = "w1", Seq = 1 }], default);
+        await PutFrames(s, "w2", Make(20, 4, 3), 20);
+        await q.AppendLinesAsync([new QLine { T = "done", S = "w2", Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }, QLine.Add("w2", "group", GroupSequencing.NewJob("w2", 0), "2026-11-21T08:01:00Z")], default);
+        var ran = new List<(string Id, long? Seq)>();
+        var h = new Dictionary<string, IStageHandler> { ["group"] = new Fn(ctx => { lock (ran) ran.Add((ctx.Job.JobId, ctx.Queue!.Read(st => st.Get(ctx.Job.JobId)?.Seq))); return Task.CompletedTask; }) };
+        await new NodeEngine(s, P, GroupNode(), h).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal([("w2", (long?)2)], ran);                                                              // run at once, numbered as its first action (above every number given so far)
+        var st2 = s.Replay(P.Prefix);
+        Assert.Equal("done", st2.Entry("w2", "group")!.State); Assert.Equal(2, st2.Get("w2")!.Seq);
+        Assert.Equal("pending", st2.Entry("w1", "process")!.State);
+        var log = s.AppendText(P.Prefix + "jobs/queue.log");
+        Assert.Equal(1, log.Split('\n').Count(l => l.Contains("\"t\":\"claim\"")));                           // one claim, no put-back and re-claim
+    }
+
+    [Fact]
+    public async Task A_group_entry_of_a_drama_without_vectors_fails_once_with_the_reason_and_gets_no_number()
+    {
+        var s = new FakeStore(); var q = new JobQueue(s, P, "seed"); await q.LoadAsync(default);
+        await q.AppendLinesAsync([AddProcess("nf"), new QLine { T = "done", S = "nf", Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }, QLine.Add("nf", "group", GroupSequencing.NewJob("nf", 0), "2026-11-21T08:01:00Z")], default);
+        int runs = 0;
+        var h = new Dictionary<string, IStageHandler> { ["group"] = new Fn(_ => { Interlocked.Increment(ref runs); return Task.CompletedTask; }) };
+        await new NodeEngine(s, P, GroupNode(), h).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
+        var st2 = s.Replay(P.Prefix);
+        Assert.Equal(0, runs); Assert.Null(st2.Get("nf")!.Seq);
+        Assert.Equal("failed", st2.Entry("nf", "group")!.State);                                            // not put back to wait: there is nothing to wait for
     }
 
     [Fact]
@@ -65,15 +131,14 @@ public class GroupStepTests
         await q.AppendLinesAsync(ids.Select(AddProcess), default);
         await q.AppendLinesAsync(ids.Select((id, i) => new QLine { T = "seq", S = id, Seq = i + 1 }), default);
         await q.AppendLinesAsync(ids.Select(id => new QLine { T = "done", S = id, Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }), default);
-        var stage = new GroupStage(s); int inFlight = 0, peak = 0, waited = 0;
+        var stage = new GroupStage(s); int inFlight = 0, peak = 0;
         await Parallel.ForEachAsync(ids, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (id, ct) =>
         {
-            if ((await Blockers(q, s, id)).Count > 0) Interlocked.Increment(ref waited);
             int n = Interlocked.Increment(ref inFlight); int pk; while (n > (pk = Volatile.Read(ref peak))) Interlocked.CompareExchange(ref peak, n, pk);
             var ctx = new JobContext { Job = new JobDescriptor { Stage = "group", JobId = id }, Stage = "group", BlobName = id, Worker = 0, Store = s, Paths = P, NodeId = "t", Token = default, Queue = q, ThreadShare = () => 1, Report = (_, _) => { } };
             await stage.RunAsync(ctx); await Task.Delay(5); Interlocked.Decrement(ref inFlight);
         });
-        Assert.Equal(0, waited); Assert.True(peak > 1, "group steps ran one after another");
+        Assert.True(peak > 1, "group steps ran one after another");
         for (int i = 10; i < 50; i++)
         {
             var rec = (JsonObject)(await VideoJson.ReadAsync(s, P, ids[i], default))!.Root["grouping"]!;
@@ -390,70 +455,25 @@ public class GroupStepTests
     }
 
     [Fact]
-    public async Task Four_lanes_refreshing_and_checking_the_gate_at_once_throw_nothing_and_agree_on_L()
+    public async Task Clear_ungrouped_clears_only_numbered_dramas_still_on_their_way_and_they_are_numbered_again_at_their_group_step()
     {
         var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
-        var ids = Enumerable.Range(1, 150).Select(k => "d" + k).ToArray();
-        await q.AppendLinesAsync(ids.Select(AddProcess), default);
-        await q.AppendLinesAsync(ids.Select((id, k) => new QLine { T = "seq", S = id, Seq = k + 1 }), default);
-        await PutFrames(s, "d1", Make(20, 4, 1), 20);   // d2.. get frames while the lanes run, so the shared set keeps growing (and L moves up); d5 is the first to be missing
-        var gate = new GroupSequencing.Gate(s, P); var t0 = new DateTimeOffset(c.T.UtcDateTime, TimeSpan.Zero);
-        var subs = ids.Select(id => q.Read(st => st.Get(id)!)).ToArray();
-        var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>(); var ls = new System.Collections.Concurrent.ConcurrentBag<long?>();
-        await Task.WhenAll(Enumerable.Range(0, 4).Select(lane => Task.Run(async () =>
-        {
-            for (int i = 0; i < 2000; i++)
-                try
-                {
-                    if (lane == 0 && i is >= 1 and < 150 && i != 4) await PutFrames(s, ids[i], Make(20, 4, i), 20);
-                    var v = await gate.RefreshAsync(q, t0.AddMinutes(3 * i), default);
-                    ls.Add(v.L);
-                    foreach (var sub in subs) _ = v.Runnable_(sub);
-                }
-                catch (Exception e) { errors.Add(e); }
-        })));
-        Assert.Empty(errors);
-        Assert.All(ls, l => Assert.InRange(l!.Value, 2L, 5L));   // L climbs from 2 to 5 as frames appear; d5 never gets any
-        Assert.Equal(5L, (await gate.RefreshAsync(q, t0.AddDays(30), default)).L);
-    }
-
-    [Fact]
-    public async Task A_blocked_group_entry_produces_no_claim_line_and_becomes_runnable_when_the_lowest_unframed_drama_clears_and_group_entries_go_in_seq_order()
-    {
-        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
-        // seq 1 framed, 2 stuck in processing (no frames), 3 and 4 framed with group entries added in reverse order
-        await q.AppendLinesAsync(new[] { "d1", "d2", "d3", "d4" }.Select(AddProcess), default);
-        await q.AppendLinesAsync(new[] { "d1", "d2", "d3", "d4" }.Select((id, k) => new QLine { T = "seq", S = id, Seq = k + 1 }), default);
-        foreach (var id in new[] { "d1", "d3", "d4" }) await PutFrames(s, id, Make(20, 4, id.GetHashCode()), 20);
-        foreach (var id in new[] { "d1", "d3" }) await q.AppendLinesAsync([new QLine { T = "done", S = id, Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }], default);
-        c.T = c.T.AddMinutes(1);
-        await q.AppendLinesAsync([QLine.Add("d4", "group", GroupSequencing.NewJob("d4", 0), Protocol.Utc(c.T)), QLine.Add("d3", "group", GroupSequencing.NewJob("d3", 0), Protocol.Utc(c.T)), QLine.Add("d1", "group", GroupSequencing.NewJob("d1", 0), Protocol.Utc(c.T))], default);
-        var gate = new GroupSequencing.Gate(s, P); var now = new DateTimeOffset(c.T.UtcDateTime, TimeSpan.Zero);
-        var v = await gate.RefreshAsync(q, now, default);
-        Assert.Equal(2L, v.L); Assert.Equal("d2", v.LId);
-        var cands = q.Read(st => st.Candidates(Protocol.Utc(c.T), x => x == "group", (sub, e) => v.Runnable_(sub))).Select(x => x.Subject.Id).ToList();
-        Assert.Equal(["d1"], cands);                                                                                          // d3, d4 wait behind seq 2: not even a candidate, so no claim and no append
-        Assert.Equal(2, v.Waiting); Assert.Equal(1, v.Runnable);
-        Assert.NotNull(gate.Summary(v, now)); Assert.Null(gate.Summary(v, now.AddMinutes(1))); Assert.Contains("2 waiting behind seq 2 (d2), 1 runnable", gate.Summary(v, now.AddMinutes(6)));
-        // d2 gets its frames: L clears (the listing is re-done at most every two minutes)
-        await PutFrames(s, "d2", Make(20, 4, 9), 20);
-        var same = await gate.RefreshAsync(q, now.AddMinutes(1), default); Assert.Equal(2L, same.L);                          // listed 1 minute ago: not re-listed yet
-        var v2 = await gate.RefreshAsync(q, now.AddMinutes(3), default); Assert.Null(v2.L);
-        var order = q.Read(st => st.Candidates(Protocol.Utc(c.T), x => x == "group", (sub, e) => v2.Runnable_(sub))).Select(x => x.Subject.Id).ToList();
-        Assert.Equal(["d1", "d3", "d4"], order);                                                                              // lowest seq first, whatever the order they were added in
-    }
-
-    [Fact]
-    public async Task The_gate_runs_no_claim_for_a_blocked_group_entry_in_the_engine_log()
-    {
-        var c = new Clock(); var s = new FakeStore { Clock = c.Now }; var q = await Node(s, c, "a");
-        await q.AppendLinesAsync([AddProcess("w1"), AddProcess("w2"), new QLine { T = "seq", S = "w1", Seq = 1 }, new QLine { T = "seq", S = "w2", Seq = 2 }], default);
-        await PutFrames(s, "w2", Make(20, 4, 3), 20);
-        await q.AppendLinesAsync([QLine.Add("w2", "group", GroupSequencing.NewJob("w2", 0), "2026-11-21T08:00:00Z")], default);
+        // done: grouped. mid: numbered at its pre-check, still processing. ready: numbered at its pre-check, processed, group entry pending. old: numbered, processed, never had a group entry (from before the group step).
+        await q.AppendLinesAsync(new[] { "done", "mid", "ready", "old" }.Select(AddProcess), default);
+        await q.AppendLinesAsync(new[] { "done", "mid", "ready", "old" }.Select((id, k) => new QLine { T = "seq", S = id, Seq = k + 1 }), default);
+        await q.AppendLinesAsync(new[] { "done", "ready", "old" }.Select(id => new QLine { T = "done", S = id, Stage = "process", State = "done", At = "2026-11-21T08:01:00Z" }), default);
+        await q.AppendLinesAsync([QLine.Add("done", "group", GroupSequencing.NewJob("done", 0), "2026-11-21T08:01:00Z"), new QLine { T = "done", S = "done", Stage = "group", State = "done", At = "2026-11-21T08:02:00Z" }, QLine.Add("ready", "group", GroupSequencing.NewJob("ready", 0), "2026-11-21T08:01:00Z")], default);
         var before = s.AppendText("index/jobs/queue.log").Length;
-        var v = await new GroupSequencing.Gate(s, P).RefreshAsync(q, c.T, default);
-        Assert.Empty(q.Read(st => st.Candidates("2026-11-21T09:00:00Z", x => x == "group", (sub, e) => v.Runnable_(sub))));
-        Assert.Equal(before, s.AppendText("index/jobs/queue.log").Length);                                                    // looking appends nothing
+        var dry = await SeqCommand.ClearUngroupedAsync(q, true, default);
+        Assert.Equal(2, dry.Cleared); Assert.Equal(2, dry.Started); Assert.Equal(["mid", "ready"], dry.First); Assert.Equal(before, s.AppendText("index/jobs/queue.log").Length);   // a dry run appends nothing
+        var r = await SeqCommand.ClearUngroupedAsync(q, false, default);
+        Assert.Equal(2, r.Cleared);
+        Assert.Equal((1L, null, null, 4L), q.Read(st => (st.Get("done")!.Seq!.Value, st.Get("mid")!.Seq, st.Get("ready")!.Seq, st.Get("old")!.Seq!.Value)));
+        Assert.Equal(0, (await SeqCommand.ClearUngroupedAsync(q, false, default)).Cleared);   // a rerun finds nothing
+        // "ready" gets its number when its group step starts: above every number given so far, so the grouped drama is its predecessor
+        var h = (await q.TryClaimAsync("ready", Pick, default))!;
+        Assert.Equal(5, await h.AssignSeqAsync(default));
+        Assert.True(GroupSequencing.IsEarlier(q.Read(st => st.Get("done")), 5)); Assert.False(GroupSequencing.IsEarlier(q.Read(st => st.Get("mid")), 5));
     }
 
     // ---- 0.13.12: the group step samples first
@@ -529,7 +549,7 @@ public class GroupStepTests
         await q.PollAsync(default);
         Assert.Equal(("n1", "join"), q.Read(st => (st.Get("j1")!.JoinOf, st.Get("j1")!.JoinKind)));
         // an unknown drama and a drama without frames are refused with a message, no exception
-        var o3 = new StringWriter(); Assert.Equal(1, await GroupsCommand.StepAsync(s, P, new PreCheckSettings(), "nope", true, 2, o3, default)); Assert.Contains("no sequence number", o3.ToString());
+        var o3 = new StringWriter(); Assert.Equal(1, await GroupsCommand.StepAsync(s, P, new PreCheckSettings(), "nope", true, 2, o3, default)); Assert.Contains("no frames file", o3.ToString());   // 0.13.43: the vectors come first; the number is given by the step itself
     }
 
     [Fact]

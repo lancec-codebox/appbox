@@ -1,28 +1,27 @@
 namespace IndexNode;
 
-/// <summary>0.13.10: dramas are grouped in sequence order. A drama's group step waits while an earlier drama (lower seq) is still in flight (process or group not finished), so every drama is compared against all earlier ones, whatever order the nodes finish in.</summary>
+/// <summary>
+/// 0.13.43 (owner: "the group should never have to wait"): a drama gets its sequence number when its group step STARTS, as that step's first action, and only once its vectors exist.
+/// Its predecessors are the dramas with a lower number. Each of them was numbered at its own group step, so each has its vectors already: there is nothing to wait for, whatever order the nodes finish in.
+/// A drama that is processed but has not started its group step has no number: later group steps do not see it, and when its own step starts it gets a higher number and sees them. Nothing points forward, so there are no cycles.
+/// (0.13.10 to 0.13.42 numbered a drama when its pre-check started and made later group steps wait for it; one drama that was started and then set aside held up every group step after it.)
+/// </summary>
 public static class GroupSequencing
 {
-    public static readonly TimeSpan Wait = TimeSpan.FromMinutes(2);
     public const string Stage = "group";
 
     /// <summary>
-    /// The earlier dramas this one waits for. The group step needs only their VECTORS, not their grouping: a lower-seq drama blocks only while it has NO frames file yet AND its process entry is neither final nor held (it is still on its way to centers).
-    /// A lower drama stuck in its own group step, failed, held for AI or already holding frames never blocks, so group steps of a bootstrap run in parallel and one stuck step blocks nobody.
+    /// Is <paramref name="other"/> a predecessor of the drama numbered <paramref name="seq"/>? With a number: a lower one. Without a number: only a drama from before numbering
+    /// (nothing of it is in flight: no unfinished process entry, and its group entry is absent or done). A drama still on its way to its own group step is NOT a predecessor: it will be numbered above this one and see it.
+    /// A drama the queue does not know (only the index has it) is from before the queue, so it is a predecessor.
     /// </summary>
-    public static async Task<List<string>> BlockersAsync(JobQueue q, IStore store, Paths paths, string id, CancellationToken ct, IReadOnlySet<string>? frames = null)
+    public static bool IsEarlier(QSubject? other, long seq)
     {
-        var cands = q.Read(st =>
-        {
-            var me = st.Get(id)?.Seq; var res = new List<string>(); if (me == null) return res;
-            foreach (var s in st.Subjects.Values)
-                if (s.Id != id && s.Seq is { } sq && sq < me && s.Entries.TryGetValue("process", out var p) && !p.Final && p.Hold == null) res.Add(s.Id);
-            return res;
-        });
-        // 0.13.18: no HEAD per candidate. The node's in-memory frames set (the gate's) decides; without one, a single LIST of the frames folder does (0.13.11 made 242 HEADs per re-claimed waiting step).
-        if (cands.Count == 0) return [];
-        frames ??= await ListFramesAsync(store, paths, ct);
-        return cands.Where(c => !frames.Contains(c)).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        if (other == null) return true;
+        if (other.Seq is { } o) return o < seq;
+        if (other.Entries.TryGetValue("process", out var p) && !p.Final) return false;
+        if (other.Entries.TryGetValue(Stage, out var g) && g.State is not ("done" or "duplicate")) return false;
+        return true;
     }
 
     /// <summary>
@@ -39,78 +38,6 @@ public static class GroupSequencing
         var set = new HashSet<string>(StringComparer.Ordinal); var fp = paths.Prefix + "search/frames/";
         foreach (var b in await store.ListAsync(fp, false, false, ct)) if (b.Name.EndsWith(".bin", StringComparison.Ordinal)) { var id = b.Name[fp.Length..^4]; if (id.Length > 0 && !id.Contains('/')) set.Add(id); }
         return set;
-    }
-
-    /// <summary>
-    /// 0.13.12: the node-wide decision which group entries can run, kept in memory: the ids with a frames file (listed at start; re-listed at most every <see cref="Relist"/> when a would-be blocker is not in the set; a present id stays present), and L, the lowest sequence number among the dramas whose process entry is
-    /// not final, not held and that have no frames file. A group entry is runnable only if its drama has frames and its seq is below L (or there is no L): a blocked one is never claimed and nothing is appended for it.
-    /// </summary>
-    public sealed class Gate(IStore store, Paths paths)
-    {
-        public static readonly TimeSpan Relist = TimeSpan.FromMinutes(2), SummaryEvery = TimeSpan.FromMinutes(5);
-        // The published set is never mutated: a relist builds a new one and swaps it in (readers on other lanes hold Views over the old one).
-        volatile HashSet<string> frames = new(StringComparer.Ordinal); DateTimeOffset listedAt = DateTimeOffset.MinValue, summaryAt = DateTimeOffset.MinValue; bool listed;
-        readonly SemaphoreSlim refreshing = new(1, 1); volatile View? last; readonly object summaryLock = new();
-        int lists;
-        public int Lists => Volatile.Read(ref lists);
-        /// <summary>The ids known to have a frames file (the last listing, plus every id the gate saw). Never mutated.</summary>
-        public IReadOnlySet<string> Frames => frames;
-
-        public sealed record View(HashSet<string> Frames, long? L, string? LId, int Waiting, int Runnable)
-        {
-            public bool Runnable_(QSubject s) => Frames.Contains(s.Id) && (s.Seq is not { } sq || L is not { } l || sq < l);
-        }
-
-        /// <summary>One lane refreshes at a time; a lane that finds a refresh running reuses the last View (waits only when there is none yet).</summary>
-        public async Task<View> RefreshAsync(JobQueue q, DateTimeOffset now, CancellationToken ct)
-        {
-            if (!await refreshing.WaitAsync(0, ct))
-            {
-                if (last is { } lv) return lv;
-                await refreshing.WaitAsync(ct);
-            }
-            try { return last = await RefreshCoreAsync(q, now, ct); }
-            finally { refreshing.Release(); }
-        }
-
-        async Task<View> RefreshCoreAsync(JobQueue q, DateTimeOffset now, CancellationToken ct)
-        {
-            for (int pass = 0; pass < 2; pass++)
-            {
-                var (blockers, groupIds) = q.Read(st =>
-                {
-                    var bl = new List<(long Seq, string Id)>(); var gi = new List<string>();
-                    foreach (var s in st.Subjects.Values)
-                    {
-                        if (s.Seq is { } sq && s.Entries.TryGetValue("process", out var p) && !p.Final && p.Hold == null) bl.Add((sq, s.Id));
-                        if (s.Entries.TryGetValue("group", out var g) && !g.Final) gi.Add(s.Id);
-                    }
-                    return (bl, gi);
-                });
-                var frames = this.frames;
-                bool missing = blockers.Any(b => !frames.Contains(b.Id)) || groupIds.Any(id => !frames.Contains(id));
-                if (!listed || (missing && pass == 0 && now - listedAt >= Relist))
-                {
-                    var next = new HashSet<string>(frames, StringComparer.Ordinal);   // a present id stays present
-                    foreach (var id in await ListFramesAsync(store, paths, ct)) next.Add(id);
-                    this.frames = frames = next;
-                    listed = true; listedAt = now; Interlocked.Increment(ref lists); if (pass == 0) continue;
-                }
-                var low = blockers.Where(b => !frames.Contains(b.Id)).OrderBy(b => b.Seq).Cast<(long Seq, string Id)?>().FirstOrDefault();
-                var v = new View(frames, low?.Seq, low?.Id, 0, 0);
-                var (w, r) = q.Read(st => { int w = 0, r = 0; foreach (var s in st.Subjects.Values) if (s.Entries.TryGetValue("group", out var g) && g.State == "pending") { if (v.Runnable_(s)) r++; else w++; } return (w, r); });
-                return v with { Waiting = w, Runnable = r };
-            }
-            throw new InvalidOperationException("unreachable");
-        }
-
-        /// <summary>"group: N waiting behind seq L (id), M runnable", at most every <see cref="SummaryEvery"/>; null in between.</summary>
-        public string? Summary(View v, DateTimeOffset now)
-        {
-            if (v.Waiting == 0) return null;
-            lock (summaryLock) { if (now - summaryAt < SummaryEvery) return null; summaryAt = now; }
-            return $"group: {v.Waiting} waiting behind seq {(v.L?.ToString() ?? "-")} ({v.LId ?? "-"}), {v.Runnable} runnable";
-        }
     }
 
     public static JobDescriptor NewJob(string id, int priority) => new() { Stage = Stage, JobId = id, Priority = priority, AddedAt = Protocol.NowUtc() };
