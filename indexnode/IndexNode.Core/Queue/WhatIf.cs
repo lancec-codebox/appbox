@@ -97,7 +97,7 @@ public static class WhatIf
             if (stage == ActorsIndexJobs.Stage) return "fewer unindexed actors uploads than the threshold, and the oldest has not waited long enough";
             return "no entry";
         }
-        if (s.Entries.TryGetValue(stage, out var e2)) { if (e2.Runnable(now)) { pri = e2.Priority; return StageDeps.Held(e2) ? "hold: AI" : null; } return EntryBlocker(e2, now, stage, ro); }
+        if (s.Entries.TryGetValue(stage, out var e2)) { if (e2.Runnable(now)) { pri = e2.Priority; if (StageDeps.AiWait(s, e2, ro) is { } w) return $"dependency not done: {w} (the AI stages come after every processing stage)"; return StageDeps.Held(e2) ? "hold: AI" : null; } return EntryBlocker(e2, now, stage, ro); }
         return "no entry for the stage";
     }
 

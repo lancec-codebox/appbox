@@ -53,11 +53,24 @@ public static class StageDeps
     /// <summary>0.13.36: the stages a claim of <paramref name="s"/> would run, in order (null = nothing). The ONE rule the node's claim and `queue whatif` share: a subject the ready view offers is never one the claim then finds empty. <paramref name="stageOk"/> / <paramref name="canRun"/> are the node's stage switch and entry gate.</summary>
     public static string[]? ClaimStages(QueueState state, QSubject s, string now, Func<string, bool> stageOk, Func<QSubject, QEntry, bool> canRun, ReadyOptions ro)
     {
-        var st = s.Entries.Values.Where(e => e.Runnable(now) && stageOk(e.Stage) && canRun(s, e) && (!ro.RepairOnly || RepairStage(e.Stage))).Select(e => e.Stage).ToList();
+        var st = s.Entries.Values.Where(e => e.Runnable(now) && stageOk(e.Stage) && canRun(s, e) && AiWait(s, e, ro) == null && (!ro.RepairOnly || RepairStage(e.Stage))).Select(e => e.Stage).ToList();
         foreach (var d in Derived.Where(d => !ro.RepairOnly || RepairStage(d) && d != "process"))   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
             if (!st.Contains(d) && stageOk(d) && ReadyEntry(state, s, d, now, ro) is { } re && canRun(s, re)) st.Add(d);
         if (!st.Contains("process") && s.IsFull && stageOk("process") && StaleEntry(s, ro) is { } sre && canRun(s, sre)) st.Add("process");   // 0.13.32: a step below the required version is ready again (0.13.36: IsFull, as the ready view: an upload with no data fact but a done download is repaired too)
         return st.Count == 0 ? null : st.OrderBy(QueueState.Rank).ToArray();
+    }
+
+    /// <summary>
+    /// 0.13.38: the AI stages come after every processing stage of the upload. describe (whose entry is added when the process job ends) is not claimed until the upload's group step is done AND its actors stage is done at the
+    /// required version, or held (an AI-flagged upload never gets actors); translate follows describe as before. Returns the stage it waits for, or null when nothing is in the way. Only the order changes: the AI stages still run only on a node started with them.
+    /// </summary>
+    public static string? AiWait(QSubject s, QEntry e, ReadyOptions ro)
+    {
+        if (e.Stage != "describe") return null;
+        if (!NeedMet(s, "group", 1)) return "group";
+        if (!s.Entries.TryGetValue("actors", out var a)) return "actors";
+        if (a.Hold != null) return null;
+        return a.State == "done" && (a.Ver ?? 1) >= Math.Max(1, ro.Required("actors")) ? null : "actors";
     }
 
     /// <summary>0.13.37: the stages a --repair-only node may claim (process only through the stale-step path).</summary>

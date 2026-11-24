@@ -156,7 +156,7 @@ public sealed class ActorsIndex
         throw new IOException("actors/state.json kept changing");
     }
 
-    public sealed record BuildReport(bool UpToDate, int Version, int Uploads, int Units, int Vectors, int Reused, int Read, string Note) { public int R50Rows { get; init; } public int R50Read { get; init; } public int Resolved { get; init; } public int Pending { get; init; } }
+    public sealed record BuildReport(bool UpToDate, int Version, int Uploads, int Units, int Vectors, int Reused, int Read, string Note) { public int R50Rows { get; init; } public int R50Read { get; init; } public int Resolved { get; init; } public int Pending { get; init; } public int Actors { get; init; } public int ActorsMulti { get; init; } }
 
     /// <summary>Builds the next version from the units/ and r50/ listings, carrying forward the head's rows of every upload whose unit-file AND r50-file ETags did not change (only the changed files are read); head.json moves with If-Match. Band pairs a job had to skip (no r50 for a partner) are settled here from the r50 rows. <paramref name="full"/>: nothing is carried forward. Dry run: nothing written.</summary>
     public static async Task<BuildReport> BuildAsync(ActorsIO store, CancellationToken ct, Func<string, Task<bool>>? isAi = null, int keep = 2, double tiebreakCut = 0.64, bool full = false)
@@ -224,7 +224,8 @@ public sealed class ActorsIndex
         var actorOf = await FoldActorsAsync(store, ups.SelectMany(u => u.Units.Select(x => x.Key)).ToList(), links.Values.SelectMany(x => x).ToList(), prevActor, ct);
         ups = ups.Select(u => (u.Id, u.ETag, u.Units.Select(x => x with { Actor = actorOf[x.Key] }).ToList())).ToList();
         int ver = (head?.Version ?? 0) + 1; int nUnits = ups.Sum(u => u.Units.Count); int nPending = pending.Sum(kv => kv.Value.Count);
-        var rep = new BuildReport(false, ver, ups.Count, nUnits, row, reused, read, $"v{ver}: {ups.Count} uploads, {nUnits} units, {row} vectors, {row50} r50 rows ({reused} uploads carried forward, {read} read, {r50read} r50 files read; {resolved} skipped band pairs settled, {nPending} still pending)") { R50Rows = row50, R50Read = r50read, Resolved = resolved, Pending = nPending };
+        var actorStats = ActorRows.Stats(ups); int nActors = actorStats.Count, nMulti = ActorRows.Multi(actorStats);   // 0.13.38: the distinct actors (after the fold) and those in 2+ productions
+        var rep = new BuildReport(false, ver, ups.Count, nUnits, row, reused, read, $"v{ver}: {ups.Count} uploads, {nUnits} units, {row} vectors, {row50} r50 rows ({reused} uploads carried forward, {read} read, {r50read} r50 files read; {resolved} skipped band pairs settled, {nPending} still pending); {nActors} actors, {nMulti} in 2+ productions") { R50Rows = row50, R50Read = r50read, Resolved = resolved, Pending = nPending, Actors = nActors, ActorsMulti = nMulti };
         if (store.Dry) return rep with { Note = "would write " + rep.Note };
         var dir = ActorsData.VersionDir(paths, ver);
         var uj = new JsonArray(ups.Select(u => { var o = new JsonObject { ["id"] = u.Id, ["etag"] = u.ETag, ["units"] = new JsonArray(u.Units.Select(x => { var xo = new JsonObject { ["key"] = x.Key, ["actor"] = x.Actor, ["prod"] = x.Prod, ["n"] = x.N, ["row"] = x.Row, ["rows"] = x.Rows }; if (x.R50 >= 0) xo["r50"] = x.R50; return (JsonNode)xo; }).ToArray()) }; if (r50tag.TryGetValue(u.Id, out var rt)) o["r50etag"] = rt; if (r50dim > 0 && u.Units.Any(x => x.R50 >= 0)) o["r50dim"] = r50dim; return (JsonNode)o; }).ToArray());
@@ -234,9 +235,14 @@ public sealed class ActorsIndex
         await store.PutAsync(dir + "uploads.json", Encoding.UTF8.GetBytes(uj.ToJsonString()), null, false, false, ct); await store.PutAsync(dir + "mean.f32", mb, null, false, false, ct);
         await store.PutAsync(dir + "codes.bin", codes, null, false, false, ct); await store.PutAsync(dir + "vec.f16", vec, null, false, false, ct);
         if (row50 > 0) await store.PutAsync(dir + "r50.f16", vec50, null, false, false, ct);
-        var hb = Encoding.UTF8.GetBytes(new JsonObject { ["version"] = ver, ["dim"] = dim, ["r50dim"] = r50dim, ["uploads"] = ups.Count, ["units"] = nUnits, ["vectors"] = row, ["r50rows"] = row50, ["builtAt"] = Protocol.NowUtc() }.ToJsonString());
+        var hb = Encoding.UTF8.GetBytes(new JsonObject { ["version"] = ver, ["dim"] = dim, ["r50dim"] = r50dim, ["uploads"] = ups.Count, ["units"] = nUnits, ["vectors"] = row, ["r50rows"] = row50, ["actors"] = nActors, ["actorsMulti"] = nMulti, ["builtAt"] = Protocol.NowUtc() }.ToJsonString());
         if (!await store.PutAsync(ActorsData.HeadFile(paths), hb, headEtag, headEtag == null, false, ct)) throw new IOException("actors/head.json moved while this build ran (another build won); nothing is lost, run again");
         for (int o2 = ver - keep; o2 >= 1; o2--) { var names = (await store.ListAsync(ActorsData.VersionDir(paths, o2), ct)).Select(e => e.Name).ToList(); if (names.Count == 0) break; foreach (var n in names) await store.DeleteAsync(n, ct); }
+        // 0.13.38: the actors' rows follow the index (after head.json moved: the index is the source). Only the actors whose numbers changed in this build; a table fault is logged and never fails the build (`actors rows` rewrites them all).
+        if (store.Writes && MediaTables.For(store.Store) is { } table)
+            try { var rows = ActorRows.Rows(head == null ? null : ActorRows.Stats(head.Uploads), actorStats, ver); int reqs = await ActorRows.WriteAsync(table, rows, ct); rep = rep with { Note = rep.Note + $"; {rows.Count} actor rows written ({reqs} table requests)" }; }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception e) { Log.Info($"actors-index: the actor rows were not written ({e.Message}); 'indexnode actors rows' rewrites them"); }
         return rep;
     }
 }

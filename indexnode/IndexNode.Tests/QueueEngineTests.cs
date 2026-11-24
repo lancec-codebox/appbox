@@ -187,6 +187,11 @@ public class QueueEngineTests
         var ran = 0;
         await Run(Engine(s, Opts(["process", "describe"], ai: false), step: _ => { ran++; return Task.CompletedTask; }));
         Assert.Equal(0, ran); Assert.Equal("pending", Q(s).Entry("v1", "describe")!.State);
+        // 0.13.38: the AI stages come after every processing stage: even with the AI flag, describe waits for the upload's group and actors
+        await Run(Engine(s, Opts(["describe"], ai: true), step: _ => { ran++; return Task.CompletedTask; }));
+        Assert.Equal(0, ran); Assert.Equal("pending", Q(s).Entry("v1", "describe")!.State);
+        var dq = new JobQueue(s, P, "t"); await dq.LoadAsync(default);
+        await dq.AppendLinesAsync([QLine.Add("v1", "group", new JobDescriptor { Stage = "group", JobId = "v1" }, T(1), null, null, "done"), QLine.Add("v1", "actors", new JobDescriptor { Stage = "actors", JobId = "v1" }, T(1), null, null, "done")], default);
         await Run(Engine(s, Opts(["describe"], ai: true), step: _ => { ran++; return Task.CompletedTask; }));
         Assert.Equal(2, ran); Assert.Equal("done", Q(s).Entry("v1", "describe")!.State); Assert.Equal("done", Q(s).Entry("v1", "translate")!.State);   // describe's done adds translate, same claim
     }
