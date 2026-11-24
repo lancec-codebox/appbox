@@ -49,6 +49,9 @@ public static class WhatIf
         bool bySeq = SeqOrdered.Contains(stage) || step;
         var order = (bySeq ? ready.OrderBy(x => x.S.Seq ?? long.MaxValue).ThenBy(x => x.S.Id, StringComparer.Ordinal) : ready.OrderByDescending(x => x.Pri).ThenBy(x => x.S.Id, StringComparer.Ordinal)).Select(x => x.S.Id).ToList();
         var notes = new List<string> { bySeq ? "claim order: grouping seq, then id" : "claim order: priority, then id" };
+        // 0.13.37: the counts answer for a build that can make every version; say so when THIS build cannot make the required one (its nodes would claim none of them)
+        if (Array.IndexOf(StepVersions.Steps, stage) >= 0 || Array.IndexOf(StepVersions.Stages, stage) >= 0)
+        { int req = ctl.RequiredVersion(stage), code = StepVersions.Code(stage); if (req > code) notes.Add($"this build makes {stage} v{code}; v{req} is required: a node on this build claims none of these"); }
         return new Report(stage, subjects.Count, ready.Count, order.Take(top).ToList(), bl.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).ToDictionary(kv => kv.Key, kv => kv.Value), notes);
     }
 

@@ -9,6 +9,8 @@ public sealed class ClaimHandle
     internal ClaimHandle(JobQueue q, IStore store, string subject, int epoch, string lease, string activeName)
     { queue = q; this.store = store; Subject = subject; Epoch = epoch; Lease = lease; this.activeName = activeName; Cts = new(); }
     public string Subject { get; }
+    /// <summary>0.13.37: the server time of this claim's latest queue append (its claim line, then each done / failed line).</summary>
+    public DateTimeOffset? ServerTime => queue.LastServerTime;
     public int Epoch { get; }
     public string Lease { get; }
     /// <summary>Cancelled when the lease is lost: the worker stops (and appends nothing more).</summary>
@@ -291,6 +293,10 @@ public sealed class JobQueue
     /// Appends what <paramref name="decide"/> returns for the state as it is, conditional on the log length this node has read. A 412 (someone appended first) reads the new lines and asks <paramref name="decide"/> again with the new state;
     /// a sealed segment moves on to the next one. <paramref name="decide"/> returns null to give up (false). Runs under the queue's gate: keep it quick and free of I/O.
     /// </summary>
+    private DateTimeOffset? lastServerTime;
+    /// <summary>0.13.37: the server's Date of the last append this queue made (the stage marks' timestamp: a response already in hand, never the node clock). Null until one append answered with a Date.</summary>
+    public DateTimeOffset? LastServerTime => lastServerTime;
+
     public async Task<bool> AppendAsync(Func<QueueState, List<QLine>?> decide, CancellationToken ct)
     {
         await gate.WaitAsync(ct);
@@ -317,6 +323,7 @@ public sealed class JobQueue
                     case AppendOutcome.Ok:
                         lock (stateLock) foreach (var l in lines) state.Apply(l);
                         off = res.Length; blocks = res.Blocks > 0 ? res.Blocks : blocks + 1;
+                        if (res.Date is { } srv) lastServerTime = srv;
                         await MaintainAsync(ct);
                         return true;
                     case AppendOutcome.PositionMismatch:
@@ -443,6 +450,10 @@ public sealed class JobQueue
     /// <summary>0.13.24: the picker also sees the whole state (a stage that is READY on its own is decided from it, inside the conditional append). The actors-index singleton may not exist yet: it is offered as an empty subject.</summary>
     public async Task<ClaimHandle?> TryClaimAsync(string subject, Func<QueueState, QSubject, string[]?> pickStages, CancellationToken ct, string? by = null, ReadyOptions? ready = null)
     {
+        // 0.13.37: decide from the queue's own state first: a subject with nothing for this node to run (the version bump made it a candidate, the filter or a stale marker says otherwise) touches no blob at all.
+        // The active file (create + lease) is looked at only when a claim is really going to be made; lease liveness otherwise comes from the one listing of jobs/active/ per look.
+        bool anything = Read(state => { var s0 = state.Get(subject) ?? (subject == ActorsIndexJobs.Subject ? new QSubject { Id = subject } : null); var st0 = s0 == null ? null : pickStages(state, s0); return st0 is { Length: > 0 }; });
+        if (!anything) return null;
         var name = paths.Active(subject);
         var body = Encoding.UTF8.GetBytes($"{{\"subject\":\"{subject}\",\"node\":\"{NodeId}\",\"at\":\"{NowUtc()}\"}}");
         await store.PutAsync(name, body, null, null, true, ct);   // already there (a lapsed one we may take over): fine, the lease decides

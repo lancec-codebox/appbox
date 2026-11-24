@@ -405,7 +405,7 @@ public static class SearchIndexBuild
         var loaded = new Loaded?[uploads.Count]; var reuse = new bool[uploads.Count]; int done = 0;
         var old = keep?.Uploads.ToDictionary(u => u.Id, StringComparer.Ordinal);
         var view = await VideoAggregate.OpenViewAsync(raw, paths, ct);   // ONE Get Block List: the revs; the whole aggregate is read (one GET) only if an upload really needs reading
-        var etags = old != null && old.Count > 0 ? await ListVideoEtagsAsync(raw, paths, ct) : new Dictionary<string, string>();   // 0.13.22: one LIST tells which video.json changed since the head
+        var etags = old != null && old.Count > 0 && view?.FromTable != true ? await ListVideoEtagsAsync(raw, paths, ct) : new Dictionary<string, string>();   // 0.13.22: one LIST tells which video.json changed since the head
         for (int i = 0; i < uploads.Count; i++)
             if (old != null && mean != null && old.TryGetValue(uploads[i].Id, out var ou) && ou.Sha == uploads[i].Zip.Metadata.GetValueOrDefault("idx_sha256", "?") && ou.Sha != "") reuse[i] = true;
         await Parallel.ForEachAsync(Enumerable.Range(0, uploads.Count).Where(i => !reuse[i]), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, async (i, t) =>

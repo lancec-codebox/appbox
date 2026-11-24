@@ -262,7 +262,7 @@ public sealed partial class NodeEngine
     internal int AbandonedCount => abandoned.Count;
 
     /// <summary>0.13.32: the readiness options with the versions control.json requires now.</summary>
-    private ReadyOptions ReadyNow => o.Ready with { Required = s => Control.Current.RequiredVersion(s) };
+    private ReadyOptions ReadyNow => o.Ready with { RepairOnly = o.RepairOnly, Required = s => Control.Current.RequiredVersion(s) };
 
     /// <summary>What this node would run of the subject right now (also the check, after the active file is ours, that the work is not done already).</summary>
     private string[]? ClaimableStages(QueueState state, QSubject s) => StageDeps.ClaimStages(state, s, Protocol.Utc(NowUtc), StageEnabled, CanRunEntry, ReadyNow);
@@ -351,11 +351,18 @@ public sealed partial class NodeEngine
         try
         {
             w.Run.Info.Stage = stage; w.Run.Info.Step = null; w.Run.Info.StartedAt = Protocol.NowUtc(); RegistryChanged();
+            if (stage != "process") await MarkStartAsync(w, stage);
             switch (stage)
             {
                 case "process": return await RunProcessAsync(lane, w, entry, job, token);
                 case "group":
                     {
+                        // 0.13.37: the predecessor seq is the group job's FIRST action: no seq on the row -> append "<id>,<ai>" blindly, read the blobs, first occurrence wins, merge seq/seqBlob/seqPos/seqOff/aiFlag into the row.
+                        // (The queue's own seq below only orders the claims; it is not the predecessor list.)
+                        if (MarkTable is { } seqTable)
+                            try { var aiNow = AiHold.Flagged((await VideoJson.ReadAsync(store, paths, id, token))?.Root); await SeqBlobs.AssignAsync(store, paths, seqTable, id, aiNow, token); }
+                            catch (OperationCanceledException) { throw; }
+                            catch (Exception e) when (e is not LeaseLostException) { Log.Info($"group {id}: could not assign the predecessor seq ({e.Message}); the step fails as Transient"); return (Outcome.Transient, "seq assignment failed: " + e.Message, false, ctx); }   // seq is the prerequisite of grouping: never mark the step done without it
                         // 0.13.10: sequence order. A drama waits (the entry goes back to pending, due in two minutes, nothing else written) while an earlier one is still in flight.
                         // a group entry of a drama without frames is not runnable (the gate keeps it from being claimed; this is the race safety net): a number is given only to a drama that has frames
                         if (queue.Read(st => st.Get(id)?.Seq) == null && (gate?.Frames.Contains(id) == true || gate == null && await store.HeadAsync(paths.FramesFile(id), token) != null)) await h.AssignSeqAsync(token);
@@ -375,6 +382,7 @@ public sealed partial class NodeEngine
                         // 0.13.24: actors becomes ready on its own once this group step is done (nothing is added for it); an AI-flagged upload gets the hold on actors here, where the flag is known (the stage checks the flag again when it runs)
                         if (queue.Read(st => st.Entry(id, "actors") == null) && AiHold.Flagged((await VideoJson.ReadAsync(store, paths, id, token))?.Root)) gl.Add(new QLine { T = "add", S = id, Stage = "actors", Job = NewFollow("actors", id, entry.Priority), At = queue.NowUtc(), Pri = entry.Priority, Hold = "ai" });
                         await h.AppendAsync(gl, !WillContinue(id, "group", gl), CancellationToken.None);
+                        await MarkDoneAsync(w, "group");
                         return (Outcome.Done, null, ClaimEnded(id), ctx);
                     }
                 case "describe" or "translate":
@@ -385,6 +393,7 @@ public sealed partial class NodeEngine
                         var lines = new List<QLine> { new() { T = "done", Stage = stage } };
                         if (stage == "describe") lines.Add(QLine.Add(id, "translate", NewFollow("translate", id, entry.Priority), queue.NowUtc()));
                         await h.AppendAsync(lines, !WillContinue(id, stage, lines), CancellationToken.None);
+                        await MarkDoneAsync(w, stage);
                         return (Outcome.Done, null, ClaimEnded(id), ctx);
                     }
                 default:
@@ -398,6 +407,7 @@ public sealed partial class NodeEngine
                         if (ctx.NextDue is { } nd) { done.State = "pending"; done.Due = nd; }   // a source, the classifier, the sweep: pending again, due later
                         lines.Add(done); lines.AddRange(ctx.FollowUps);
                         await h.AppendAsync(lines, true, CancellationToken.None);
+                        await MarkDoneAsync(w, stage);
                         return (Outcome.Done, null, true, ctx);
                     }
             }
@@ -418,6 +428,14 @@ public sealed partial class NodeEngine
         }
         catch (Exception e) { Console.Error.WriteLine($"[{stage}#{lane}] {id}: {Redact.Trace(e)}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, e.Message, false, ctx); }
     }
+    // ---- 0.13.37: stage start/stop marks (see StageMarks): after the queue append, never failing the step
+    private IMediaTable? MarkTable => MediaTables.For(store);
+    private static int MarkVersion(string stageOrStep) => StepVersions.Code(stageOrStep);
+    /// <summary>The mode of a step: repair when it runs again only because its recorded version is below the required one (predicted at the start; the handler's own ctx.Mode wins at the done).</summary>
+    private string MarkMode(string id, string stage) => Array.IndexOf(StepVersions.Steps, stage) >= 0 && Control.Current.RequiredVersion(stage) is var rq && rq > 1 && StepVersions.Code(stage) >= rq && queue.Read(st => st.Get(id)?.VerOf(stage) ?? 1) < rq ? "repair" : "full";
+    private Task MarkStartAsync(ClaimWork w, string stage, string? mode = null) => StageMarks.RunAsync(MarkTable, stage, w.Id, "running", MarkVersion(stage), mode ?? MarkMode(w.Id, stage), o.NodeId, w.Handle.Epoch, w.Handle.ServerTime, CancellationToken.None);
+    private Task MarkDoneAsync(ClaimWork w, string stage, string? mode = null) => StageMarks.DoneAsync(MarkTable, stage, w.Id, MarkVersion(stage), mode ?? MarkMode(w.Id, stage), o.NodeId, w.Handle.Epoch, w.Handle.ServerTime, CancellationToken.None);
+    private Task MarkStopAsync(ClaimWork w, string stage, string state, string? mode = null) => StageMarks.RunAsync(MarkTable, stage, w.Id, state, MarkVersion(stage), mode ?? MarkMode(w.Id, stage), o.NodeId, w.Handle.Epoch, w.Handle.ServerTime, CancellationToken.None);
     private volatile string? diskFull; private int diskLogged; private CancellationTokenSource? runStop;
     /// <summary>0.13.34: why the node stopped for the local disk (null = it did not).</summary>
     public string? DiskStop => diskFull;
@@ -496,12 +514,17 @@ public sealed partial class NodeEngine
             w.Run.Info.Stage = step; w.Run.Info.Step = null; RegistryChanged();
             var sj = JobDescriptor.NewStep(step, id); sj.Priority = entry.Priority;
             ctx = NewContext(lane, w, step, sj, w.Local, done.ToArray(), token);
-            using (o.Meter.BeginStep(o.Meter.Limits.StepLimitFor("process:" + step), $"[process:{step}#{lane}] {id}")) await handlers[step].RunAsync(ctx);   // 0.13.32: each step has its own named budget
+            using (o.Meter.BeginStep(o.Meter.Limits.StepLimitFor("process:" + step), $"[process:{step}#{lane}] {id}"))   // the step's marks count against its own budget too
+            {
+                await MarkStartAsync(w, step);
+                await handlers[step].RunAsync(ctx);
+            }   // 0.13.32: each step has its own named budget
             done.Add(step); ran.Add(step); avail.Add(step + ".zip");
             var stepLines = new List<QLine> { new() { T = "done", Stage = "process", Step = step, StepVer = Array.IndexOf(StepVersions.Steps, step) >= 0 ? ctx.StepVersion ?? StepVersions.Code(step) : null } };
             // 0.13.1: a new centers.zip means the search index is behind: add the singleton, due in 15 minutes (nothing when one is pending)
             if (step == "centers" && handlers.ContainsKey("search-index") && queue.Read(st => SearchIndexJobs.AddLine(st, NowUtc, SearchIndexJobs.Delay)) is { } si) stepLines.Add(si);
             await h.AppendAsync(stepLines, false, CancellationToken.None);
+            await MarkDoneAsync(w, step, ctx.Mode);
             continue;
             notReady:;
         }
@@ -584,8 +607,11 @@ public sealed partial class NodeEngine
                     await h.AbandonAsync(); break;
             }
         }
-        catch (LeaseLostException) { Log.Info($"[claim#{lane}] {id}: lease lost before the outcome could be recorded; dropped"); }
+        catch (LeaseLostException) { Log.Info($"[claim#{lane}] {id}: lease lost before the outcome could be recorded; dropped"); return; }
         catch (Exception e) { Log.Info($"[claim#{lane}] could not record the outcome for {id}: {e.Message}"); }
+        // 0.13.37: the stop mark (run_* only: a failed or released run leaves the stored v alone), after the queue line
+        if (outcome is Outcome.Permanent or Outcome.Transient or Outcome.Bot or Outcome.Released or Outcome.Duplicate)
+            await MarkStopAsync(w, stage == "process" && ctx?.Stage is { } ms ? ms : stage, outcome switch { Outcome.Transient or Outcome.Bot => "transient", Outcome.Released => "released", _ => "failed" });
         if (stage is "process" or "describe" or "translate" || true) StageZipStore.Stage(store)?.DiscardStaged(id, Protocol.IsStep(stage) || stage is "download" ? stage : null);
         Log.Info($"[claim#{lane}] {id}: {stage} {outcome}{(error != null ? " (" + Redact.Sas(error) + ")" : "")}");
     }

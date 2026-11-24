@@ -424,6 +424,9 @@ public sealed class ControlFile
     public string? DynamicRefresh { get; set; }
     /// <summary>0.13.26: "on" lets the download service seed the classify singleton and a node claim it; "off" or absent (the default): classify is paused (it needs an AI endpoint).</summary>
     public string? Classify { get; set; }
+    /// <summary>0.13.37: control media-table-read on|off (default off): whether readers may use the media table.</summary>
+    public string? MediaTableRead { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore] public bool MediaTableReadOn => string.Equals(MediaTableRead, "on", StringComparison.OrdinalIgnoreCase);
     [System.Text.Json.Serialization.JsonIgnore] public bool ClassifyOn => string.Equals(Classify, "on", StringComparison.OrdinalIgnoreCase);
     [System.Text.Json.Serialization.JsonIgnore] public bool DynamicRefreshOn => string.Equals(DynamicRefresh, "on", StringComparison.OrdinalIgnoreCase);
     /// <summary>0.13.17: the store's Azure region (e.g. "westus2"). Nodes with a region-only stage (RegionGate.OnlyStages) must run in it. Absent: no rule. Older nodes ignore the field.</summary>

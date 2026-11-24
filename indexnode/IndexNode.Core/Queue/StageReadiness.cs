@@ -5,6 +5,8 @@ namespace IndexNode;
 /// <summary>0.13.24 settings of the readiness check (config actors.index-min-uploads / actors.index-max-wait-minutes).</summary>
 public sealed record ReadyOptions(int IndexMinUploads = 25, int IndexMaxWaitMinutes = 10)
 {
+    /// <summary>0.13.37 run --repair-only: a claim takes only the stale versioned-step repairs and actors / actors-index; never pending or missing process work (download, process steps, group...).</summary>
+    public bool RepairOnly { get; init; }
     /// <summary>0.13.32: the version control.json requires of a step or stage (0 / 1 = none) and the version this node's code can make.</summary>
     public Func<string, int> Required { get; init; } = _ => 0;
     public Func<string, int> Code { get; init; } = StepVersions.Code;
@@ -51,12 +53,15 @@ public static class StageDeps
     /// <summary>0.13.36: the stages a claim of <paramref name="s"/> would run, in order (null = nothing). The ONE rule the node's claim and `queue whatif` share: a subject the ready view offers is never one the claim then finds empty. <paramref name="stageOk"/> / <paramref name="canRun"/> are the node's stage switch and entry gate.</summary>
     public static string[]? ClaimStages(QueueState state, QSubject s, string now, Func<string, bool> stageOk, Func<QSubject, QEntry, bool> canRun, ReadyOptions ro)
     {
-        var st = s.Entries.Values.Where(e => e.Runnable(now) && stageOk(e.Stage) && canRun(s, e)).Select(e => e.Stage).ToList();
-        foreach (var d in Derived)   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
+        var st = s.Entries.Values.Where(e => e.Runnable(now) && stageOk(e.Stage) && canRun(s, e) && (!ro.RepairOnly || RepairStage(e.Stage))).Select(e => e.Stage).ToList();
+        foreach (var d in Derived.Where(d => !ro.RepairOnly || RepairStage(d) && d != "process"))   // 0.13.24: a stage that is ready on its own (no entry yet) is claimed too; the claim line creates its entry
             if (!st.Contains(d) && stageOk(d) && ReadyEntry(state, s, d, now, ro) is { } re && canRun(s, re)) st.Add(d);
         if (!st.Contains("process") && s.IsFull && stageOk("process") && StaleEntry(s, ro) is { } sre && canRun(s, sre)) st.Add("process");   // 0.13.32: a step below the required version is ready again (0.13.36: IsFull, as the ready view: an upload with no data fact but a done download is repaired too)
         return st.Count == 0 ? null : st.OrderBy(QueueState.Rank).ToArray();
     }
+
+    /// <summary>0.13.37: the stages a --repair-only node may claim (process only through the stale-step path).</summary>
+    public static bool RepairStage(string stage) => stage is "actors" or ActorsIndexJobs.Stage;
 
     public const string VersionReason = "version";
     public static bool IsVersionEntry(QEntry e) => e.Stage == "process" && e.State == "pending" && e.Job?.Reason == VersionReason;

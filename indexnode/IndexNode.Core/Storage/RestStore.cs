@@ -417,7 +417,7 @@ public sealed class RestStore : IStore
         using var r = await SendAsync(() =>
         {
             var q = Req(HttpMethod.Put, BlobUri(name, "comp=appendblock"));
-            q.Headers.TryAddWithoutValidation("x-ms-blob-condition-appendpos", appendPos.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (appendPos >= 0) q.Headers.TryAddWithoutValidation("x-ms-blob-condition-appendpos", appendPos.ToString(System.Globalization.CultureInfo.InvariantCulture));   // 0.13.37: a negative position = unconditional (the sequence blobs)
             q.Content = new ByteArrayContent(data);
             return q;
         }, ct);
@@ -425,7 +425,8 @@ public sealed class RestStore : IStore
         if (r.StatusCode == HttpStatusCode.NotFound) return new(AppendOutcome.NotFound);
         if (r.StatusCode == HttpStatusCode.Conflict && (ErrorCode(r) ?? "").Contains("Sealed", StringComparison.OrdinalIgnoreCase)) return new(AppendOutcome.Sealed);
         if (!r.IsSuccessStatusCode) throw await Fail(r, "Append Block");
-        return new(AppendOutcome.Ok, appendPos + data.Length, Blocks(r));
+        long start = appendPos >= 0 ? appendPos : r.Headers.TryGetValues("x-ms-blob-append-offset", out var ao) && long.TryParse(ao.FirstOrDefault(), out var aov) ? aov : 0;
+        return new(AppendOutcome.Ok, start + data.Length, Blocks(r), r.Headers.Date);
     }
 
     /// <summary>One ranged read from the last byte already known (offset - 1: always satisfiable, and it is the newline that ends the previous line), so an idle poll is one request that also says whether the segment is sealed. Offset 0 of an empty blob is a 416: its length comes from a HEAD.</summary>

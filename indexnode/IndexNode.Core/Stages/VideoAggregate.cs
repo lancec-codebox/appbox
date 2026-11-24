@@ -29,7 +29,7 @@ public static class VideoAggregate
     }
 
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, object> unsupported = new();
-    static IStore Identity(IStore s) { for (int i = 0; i < 8; i++) s = s switch { MeteredStore m => m.Inner, RecordingStore r => r.Inner, LocalCacheStore l => l.Inner, _ => s }; return s; }
+    static IStore Identity(IStore s) { for (int i = 0; i < 8; i++) s = s switch { MeteredStore m => m.Inner, RecordingStore r => r.Inner, LocalCacheStore l => l.Inner, StageZipStore z => z.Inner, _ => s }; return s; }
     static bool Off(IStore s) => !Enabled || unsupported.TryGetValue(Identity(s), out _);
 
     public static bool Supports(string id) => id.Length is >= 1 and <= IdLen && id.All(c => c < 128 && (char.IsLetterOrDigit(c) || c is '_' or '-'));
@@ -67,6 +67,7 @@ public static class VideoAggregate
     /// </summary>
     public static async Task<bool> WriteAsync(IStore store, Paths paths, string id, long rev, JsonObject root, CancellationToken ct, Func<long, CancellationToken, Task<bool>>? rebase = null)
     {
+        if (ShadowStore.Find(store) is { } shadow) { shadow.NoteBlockedWrite(); return true; }   // 0.13.37: a shadow run never changes videos.agg (and its dropped block writes would loop the commit)
         if (Off(store) || !Supports(id) || rev <= 0 || rev > 9_999_999_999) return false;
         Invalidate(store);
         var name = Name(paths); var mine = BlockId(id, rev); var bytes = BlockBytes(root);
@@ -241,16 +242,28 @@ public static class VideoAggregate
     {
         readonly IStore store; readonly Paths paths; readonly Dictionary<string, long> revs; Task<Dictionary<string, VideoJson.Doc>?>? docs; readonly object gate = new();
         internal AggView(IStore s, Paths p, Dictionary<string, long> r) { store = s; paths = p; revs = r; }
-        public bool Has(string id) => revs.ContainsKey(id);
-        public int Count => revs.Count;
+        /// <summary>0.13.37: a view over the media table: every upload row read by ONE query (the aggregate is not read).</summary>
+        internal AggView(Dictionary<string, VideoJson.Doc> rows) { store = null!; paths = null!; revs = new(StringComparer.Ordinal); preloaded = rows; }
+        readonly Dictionary<string, VideoJson.Doc>? preloaded;
+        /// <summary>True when the view is the media table (its "etag" is the row Timestamp).</summary>
+        public bool FromTable => preloaded != null;
+        public bool Has(string id) => preloaded != null ? preloaded.ContainsKey(id) : revs.ContainsKey(id);
+        public int Count => preloaded?.Count ?? revs.Count;
         /// <summary>The ETag a carried record is compared by when the aggregate holds the upload (its rev), else the per-upload file's.</summary>
-        public string EtagFor(string id, string? fileETag = null) => revs.TryGetValue(id, out var r) ? ETagOf(r) : fileETag ?? "";
-        public Task<Dictionary<string, VideoJson.Doc>?> AllAsync(CancellationToken ct) { lock (gate) return docs ??= ReadManyAsync(store, paths, null, ct); }
+        public string EtagFor(string id, string? fileETag = null) => preloaded != null ? (preloaded.TryGetValue(id, out var pd) ? pd.ETag ?? "" : fileETag ?? "") : revs.TryGetValue(id, out var r) ? ETagOf(r) : fileETag ?? "";
+        public Task<Dictionary<string, VideoJson.Doc>?> AllAsync(CancellationToken ct) { if (preloaded != null) return Task.FromResult<Dictionary<string, VideoJson.Doc>?>(preloaded); lock (gate) return docs ??= ReadManyAsync(store, paths, null, ct); }
         public async Task<VideoJson.Doc?> DocAsync(string id, CancellationToken ct) => (await AllAsync(ct))?.GetValueOrDefault(id);
     }
 
-    public static async Task<AggView?> OpenViewAsync(IStore store, Paths paths, CancellationToken ct)
+    /// <summary>The sections the bulk jobs read from a view (their $select when the view is the media table).</summary>
+    public static readonly string[] ViewSelect = ["s_youtube", "s_download", "s_precheck", "s_grouping", "s_speech", "s_ai", "inBlob", "docRev"];
+    public static async Task<AggView?> OpenViewAsync(IStore store, Paths paths, CancellationToken ct, IReadOnlyCollection<string>? select = null)
     {
+        if (MediaTables.ForRead(store) is { } table)
+        {
+            var rows = await VideoJson.QueryUploadsAsync(table, null, null, select ?? ViewSelect, ct);
+            return new AggView(rows.Where(MediaRecords.IsFull).ToDictionary(r => r.RowKey, r => new VideoJson.Doc(r.Timestamp, MediaRecords.DocOf(r)), StringComparer.Ordinal));
+        }
         if (Off(store)) return null;
         try
         {

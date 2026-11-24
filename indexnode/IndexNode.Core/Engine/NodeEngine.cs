@@ -17,6 +17,8 @@ public sealed class JobContext
     public JobQueue? Queue { get; init; }
     /// <summary>0.13.32: the version a versioned step finished at, when it differs from the node's code version (a cast step whose upload has no grouping record yet records v1; its repair runs once the group step is done and control requires v2).</summary>
     public int? StepVersion { get; set; }
+    /// <summary>0.13.37: how the step ran (repair: a stored output redone at a newer version, nothing else touched); null = full.</summary>
+    public string? Mode { get; set; }
     /// <summary>What the stage unlocks (add describe, add process ...): appended together with the final done, in one append.</summary>
     public List<QLine> FollowUps { get; } = new();
     /// <summary>The steps this claim already finished (a process claim resumes from the first unfinished step).</summary>
@@ -76,6 +78,8 @@ public sealed class EngineOptions
     public int? MaxJobs { get; init; }
     /// <summary>0.13.30: a shadow run records claims in-process: a subject taken once (done or failed) is never claimed again in this run, by any lane.</summary>
     public bool Shadow { get; init; }
+    /// <summary>0.13.37 run --repair-only.</summary>
+    public bool RepairOnly { get; init; }
     /// <summary>0.13.32: shadow run only: control overrides (queue whatif's --set) applied to the run's view of control.json, never written.</summary>
     public Func<ControlFile, ControlFile>? ControlOverride { get; init; }
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromSeconds(60);

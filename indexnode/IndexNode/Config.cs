@@ -16,6 +16,8 @@ public sealed class InlineCheckConfig
 public sealed class NodeConfig
 {
     public string? Sas { get; set; }
+    /// <summary>0.13.37: the SAS URL of the Azure Table `media` (https://account.table.core.windows.net/media?...): per-upload facts. Env INDEXNODE_MEDIA_TABLE_SAS_URL overrides it; `config set-media-table-sas` stores it.</summary>
+    public string? MediaTableSas { get; set; }
     public string? NodeId { get; set; }
     public string? NodeName { get; set; }
     public Dictionary<string, int>? Jobs { get; set; }
@@ -96,6 +98,8 @@ public sealed class NodeConfig
         var c = File.Exists(p) ? JsonSerializer.Deserialize<NodeConfig>(File.ReadAllText(p), Json) ?? new() : new();
         var envSas = Environment.GetEnvironmentVariable("INDEXNODE_SAS_URL");
         if (!string.IsNullOrWhiteSpace(envSas)) c.Sas = envSas.Trim();
+        var envTable = Environment.GetEnvironmentVariable("INDEXNODE_MEDIA_TABLE_SAS_URL");
+        if (!string.IsNullOrWhiteSpace(envTable)) c.MediaTableSas = envTable.Trim();
         SearchData.Configure(c.Search?.ScanMode, c.Search?.ScanRerank);
         Describe.ConfigMainMinScreen = c.DescribeMainMinScreen; Describe.ConfigMainMax = c.DescribeMainMax;
         Redact.Register(c.Ai?.Key); Redact.Register(c.Serve?.Token); Redact.Register(c.Check?.Token); Redact.Register(Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN"));

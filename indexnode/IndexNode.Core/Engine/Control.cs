@@ -11,7 +11,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     /// <summary>0.13.32 (run --shadow --set ...): in-memory overrides applied to every control.json this watcher reads; nothing is written back.</summary>
     public Func<ControlFile, ControlFile>? Override { get; set; }
     ControlFile current = new();
-    public ControlFile Current { get => current; private set => current = Override != null ? Override(value) : value; }
+    public ControlFile Current { get => current; private set { current = Override != null ? Override(value) : value; MediaTables.SetReads(store, current.MediaTableReadOn); } }
     public void SetOverride(Func<ControlFile, ControlFile> f) { Override = f; Current = current; }
     public event Action? Changed;
     /// <summary>0.13.36: counts the control.json changes this watcher applied (a change signal for claims the node gave up on).</summary>
@@ -112,6 +112,16 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
         if (!value.Equals("on", StringComparison.OrdinalIgnoreCase) && !value.Equals("off", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("ai-dramas must be on or off");
         cur.AiDramas = value.ToLowerInvariant(); cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
+        return cur;
+    }
+
+    /// <summary>indexnode control media-table-read on|off: whether readers use the media table (default off: 0.13.36 read behaviour).</summary>
+    public static async Task<ControlFile> SetMediaTableReadAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        if (!value.Equals("on", StringComparison.OrdinalIgnoreCase) && !value.Equals("off", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("media-table-read must be on or off");
+        cur.MediaTableRead = value.ToLowerInvariant(); cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
         await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
         return cur;
     }

@@ -101,7 +101,7 @@ public static class QueueCommand
         var ctl = WhatIf.Apply(ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data), a.Multi.GetValueOrDefault("set") ?? []);
         var liveLeases = new HashSet<string>(StringComparer.Ordinal);   // a claim counts only while its active file holds a live lease (or is brand new): a node that stopped leaves the file behind and the lease lapses
         foreach (var b in await store.ListAsync(paths.ActiveDir, false, false, ct)) if (b.LeaseState == "leased" || b.Created is { } cr && DateTimeOffset.UtcNow - cr < JobQueue.NewActiveGrace) liveLeases.Add(Path.GetFileNameWithoutExtension(b.Name));
-        var rep = q.Read(st => WhatIf.Run(st, stage, ctl, Protocol.Utc(DateTimeOffset.UtcNow), new ReadyOptions(), top, liveLeases.Contains));
+        var rep = q.Read(st => WhatIf.Run(st, stage, ctl, Protocol.Utc(DateTimeOffset.UtcNow), new ReadyOptions { RepairOnly = a.Has("repair-only") }, top, liveLeases.Contains));
         Console.WriteLine($"whatif {rep.Stage} (read-only; overrides: {(a.Multi.GetValueOrDefault("set") is { Count: > 0 } sets ? string.Join(", ", sets) : "none")}): {rep.Ready} of {rep.Total} subject(s) would be READY now");
         foreach (var n in rep.Notes) Console.WriteLine("  " + n);
         if (rep.Ready > 0) Console.WriteLine($"  first {rep.First.Count}: " + (a.Has("ids") ? string.Join(", ", rep.First) : $"{rep.First.Count} shown (add --ids to list them)"));

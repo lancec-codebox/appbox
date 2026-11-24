@@ -167,8 +167,8 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             {
                 ctx.Report("sscd", null);
                 var model = await Sscd.EnsureModelAsync(config, http, ct);
-                var fs = await FrameSet();
-                var fdir = await FramesDir(); var box = await FrameChunks.EnsureBoxAsync(wst, paths, id, fs, fdir, ct);
+                ChunkDir fs; string fdir; using (StageZipStore.WholeZips()) { fs = await FrameSet(); fdir = await FramesDir(); }   // 0.13.37: frames.zip comes down whole, once (not 43 ranged reads)
+                var box = await FrameChunks.EnsureBoxAsync(wst, paths, id, fs, fdir, ct);
                 var bytes = await Sscd.DescribeAsync(tools, model, fdir, fs.Count, ctx.ThreadShare(), p => ctx.Report("sscd", p), ct, box);
                 await FrameChunks.PutVectorsAsync(wst, paths, id, "sscd", fs, bytes, Sscd.Dim, new { model = Sscd.ModelId(model), inputSize = Sscd.ShortSide, prune = new { cosine = FrameSettings.From(config).SscdCosine, lookback = FrameSettings.From(config).LookbackSeconds } }, ct);
                 // second pruning pass: SSCD cosine over the same look-back window; the pruned frames stay stored, sscd/keep.json and the spans say which stand for which
@@ -247,7 +247,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             }
             if (steps.Contains("cast") && CastRepair != null && (need["cast"] || Has("cast/clusters.json")))
             {   // 0.13.32: the cast step builds the repaired cast state after a fresh cast, or alone (repair mode: no detection, no video) for an upload whose cast is stored and whose recorded version is below the required one
-                ctx.Report("cast", "repair"); bool made; using (StageZipStore.OnlyZips("cast.zip", "frames.zip")) made = await CastRepair(ctx, ct);   // the repair reads these two zips whole, once, and no other ctx.StepVersion = made ? StepVersions.CastRepaired : 1;
+                ctx.Report("cast", "repair"); if (stepJob && !need["cast"] && !Redo) ctx.Mode = "repair"; bool made; using (StageZipStore.OnlyZips("cast.zip", "frames.zip")) made = await CastRepair(ctx, ct);   // the repair reads these two zips whole, once, and no other ctx.StepVersion = made ? StepVersions.CastRepaired : 1;
                 if (stepJob && !need["cast"] && !Redo) { Log.Info($"process {id}: cast repair done (repair mode: no other output is touched)"); return; }   // 0.13.32: a repair claim touches cast.zip and frames.zip and its own files under index/actors/ only
             }
             if (need["describe"])

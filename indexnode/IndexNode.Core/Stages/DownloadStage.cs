@@ -167,7 +167,7 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
             await ctx.Store.PutAsync(paths.Video(id, "downloaded.json"), marker, null, null, false, ct);   // download.zip's summary
             // 0.13.2: the per-video descriptor, written by the holder of the video's lease (this claim): created here, updated by the process claim
             var markerNode = JsonNode.Parse(marker)!.AsObject();
-            await VideoJson.UpdateAsync(ctx.Store, paths, id, root => { root["youtube"] = VideoJson.YoutubeFrom(infoNode, id, job.Url, duration); root["download"] = markerNode.DeepClone(); }, ct);
+            await VideoJson.UpdateAsync(ctx.Store, paths, id, root => { root["youtube"] = VideoJson.YoutubeFrom(infoNode, id, job.Url, duration, fmt?.AudioLanguage); root["download"] = markerNode.DeepClone(); }, ct);
             await StageCommit.CommitAsync(ctx.Store, id, "download", ctx.NodeId, false, ct);   // video.mp4 is already up: the zip, last, marks the download complete
             await EnsureFollowUpJobs(ctx);
         }

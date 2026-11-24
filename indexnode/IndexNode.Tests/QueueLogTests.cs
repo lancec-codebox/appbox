@@ -143,7 +143,10 @@ public class QueueLogTests
         await h.AppendAsync([new QLine { T = "done", Stage = "process" }], true, default);
         c.Add(TimeSpan.FromMinutes(5));
         var b = await Node(s, c, "b");
-        Assert.Null(await b.TryClaimAsync("v1", Pick, default));
+        Assert.Null(await b.TryClaimAsync("v1", Pick, default));   // 0.13.37: nothing to run -> decided from the queue state, no blob touched
+        var look = await b.LookAsync(_ => true, null, default);     // the one listing of jobs/active/ per look names the abandoned file ...
+        Assert.Contains("v1", look.Stale);
+        await b.CleanStaleAsync(look.Stale, default);               // ... and it is cleaned there, not per candidate
         Assert.False(s.Exists("index/jobs/active/v1.json"));
     }
 

@@ -376,6 +376,9 @@ public sealed class FakeStore : IStore
         }
     }
 
+    /// <summary>The fake server's clock (the Date header of a response); a test can set it.</summary>
+    public Func<DateTimeOffset> ServerClock { get; set; } = () => DateTimeOffset.UtcNow;
+    DateTimeOffset ServerNow() => ServerClock();
     public Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct)
     {
         Seen.Enqueue(name);
@@ -386,10 +389,10 @@ public sealed class FakeStore : IStore
             Op("append");
             if (!Blobs.TryGetValue(name, out var b) || !b.Append) return Task.FromResult(new AppendResult(AppendOutcome.NotFound));
             if (b.Sealed) return Task.FromResult(new AppendResult(AppendOutcome.Sealed));
-            if (b.Data.Length != appendPos) return Task.FromResult(new AppendResult(AppendOutcome.PositionMismatch));
-            if (b.Blocks >= 50000) throw new StorageException(409, "BlockCountExceedsLimit", "append blob block limit");
+            if (appendPos >= 0 && b.Data.Length != appendPos) return Task.FromResult(new AppendResult(AppendOutcome.PositionMismatch));
+            if (b.Blocks >= (name.Contains("/data/seq/") ? SeqBlobs.BlockLimit : 50000)) throw new StorageException(409, "BlockCountExceedsLimit", "append blob block limit");
             b.Data = [.. b.Data, .. data]; b.Blocks++; b.Version++;
-            return Task.FromResult(new AppendResult(AppendOutcome.Ok, b.Data.Length, b.Blocks));
+            return Task.FromResult(new AppendResult(AppendOutcome.Ok, b.Data.Length, b.Blocks, ServerNow()));
         }
     }
 

@@ -17,7 +17,7 @@ public sealed record AppendRead(byte[] Data, long Length, bool Sealed, int Block
 public enum AppendOutcome { Ok, PositionMismatch, Sealed, NotFound }
 
 /// <summary>The answer to an Append Block: Ok (Length is the new length), PositionMismatch (412: someone appended first), Sealed (409: the segment is sealed) or NotFound.</summary>
-public sealed record AppendResult(AppendOutcome Outcome, long Length = 0, int Blocks = 0);
+public sealed record AppendResult(AppendOutcome Outcome, long Length = 0, int Blocks = 0, DateTimeOffset? Date = null);   // 0.13.37: Date = the response's Date header (the server's clock; never the node's)
 
 public sealed record AppendInfo(long Length, bool Sealed, int Blocks);
 
@@ -131,7 +131,7 @@ public interface IStore
     // ---- append blobs (0.13.0: the job queue log). Stores that cannot do them throw NotSupportedException.
     /// <summary>Creates an empty append blob; false when it exists (If-None-Match: *) and <paramref name="onlyIfNew"/> is set.</summary>
     Task<bool> CreateAppendBlobAsync(string name, bool onlyIfNew, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
-    /// <summary>Append Block with x-ms-blob-condition-appendpos = <paramref name="appendPos"/>: written only while the blob's length still equals it.</summary>
+    /// <summary>Append Block with x-ms-blob-condition-appendpos = <paramref name="appendPos"/>: written only while the blob's length still equals it. A negative position is unconditional (0.13.37, the sequence blobs): Length is then the end of this block and Blocks the committed block count.</summary>
     Task<AppendResult> AppendBlockAsync(string name, byte[] data, long appendPos, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");
     /// <summary>Bytes from <paramref name="offset"/> (at most <paramref name="maxLen"/>) of an append blob, with its length and sealed flag, in one ranged read.</summary>
     Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct) => throw new NotSupportedException("this store has no append blobs");

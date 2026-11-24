@@ -12,6 +12,10 @@ public sealed class ShadowStore : IStore
     sealed class Log0 { public byte[] Data = []; public bool Sealed; public readonly object Gate = new(); }
     public ShadowStore(IStore real, string dir) { this.real = real; this.dir = dir; Directory.CreateDirectory(dir); local = new LocalStore(Path.Combine(dir, "blobs")); }
 
+    /// <summary>The shadow under these wrappers, if any (the aggregate's commit loop waits to see its own block, which a shadow never stores: it asks first).</summary>
+    public static ShadowStore? Find(IStore? s) { for (int i = 0; i < 10 && s != null; i++) { if (s is ShadowStore sh) return sh; s = s switch { MeteredStore m => m.Inner, RecordingStore r => r.Inner, LocalCacheStore l => l.Inner, StageZipStore z => z.Inner, RedirectStore d => d.Inner, _ => null }; } return null; }
+    public void NoteBlockedWrite() => Interlocked.Increment(ref BlockedWrites);
+
     bool Gone(string n) => deleted.ContainsKey(n);
     async Task<Log0?> LogAsync(string name, CancellationToken ct)
     {
@@ -124,7 +128,7 @@ public sealed class ShadowStore : IStore
         var l = await LogAsync(name, ct); if (l == null) return new(AppendOutcome.NotFound);
         lock (l.Gate)
         {
-            if (l.Sealed) return new(AppendOutcome.Sealed); if (l.Data.Length != appendPos) return new(AppendOutcome.PositionMismatch);
+            if (l.Sealed) return new(AppendOutcome.Sealed); if (appendPos >= 0 && l.Data.Length != appendPos) return new(AppendOutcome.PositionMismatch);
             l.Data = [.. l.Data, .. data]; return new(AppendOutcome.Ok, l.Data.Length, 1);
         }
     }

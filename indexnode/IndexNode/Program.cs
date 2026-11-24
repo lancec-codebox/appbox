@@ -11,7 +11,7 @@ public sealed class Args
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>0.13.32: every value of a repeated option (--set a=1 --set b=2).</summary>
     public Dictionary<string, List<string>> Multi { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "ids", "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "ids", "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow", "repair-only", "no-table" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -99,14 +99,21 @@ public static class Program
         indexnode control run|drain|stop [--stage download|process|comments] [--message M] [--max-per-ip N|off] [gpu-hold <30m|off>]
         indexnode control gpu-hold <duration like 30m>|off
         indexnode control version <cast|actors> <n>|off   (0.13.32: the version a step must have finished at; raising it makes every done upload's step ready again in its repair mode, in seq order)
+        indexnode run --repair-only   (0.13.37: claims only stale versioned-step repairs and actors / actors-index; never pending or missing process work)
+        indexnode queue whatif --repair-only   (the same filter in the readiness check)
         indexnode queue whatif --stage <stage or step> [--set versions.cast=2] [--set stage.actors=run] [--top N] [--ids]   (0.13.32: read-only: what would be ready, and the blockers)
         indexnode queue rebuild-snapshot [--dry-run]   (0.13.35: replays the sealed log segments and puts back the done entries an older snapshot compaction dropped; writes only if the snapshot is unchanged)
+        indexnode control media-table-read on|off   (0.13.37: default off; readers use video.json and the aggregate; writes stay dual when a table is configured)
+        indexnode media selftest | media verify [--limit N]   (0.13.37: selftest: the table's calls against a scratch partition, then cleanup; verify: read-only, row against video.json section by section)
         indexnode control ai-dramas on|off
         indexnode region [--stages a,b]   (0.13.17: read-only: what this machine detects (IMDS, placement, env), control.json's region, and whether a node here could run the region-only stages)
         indexnode control region <name like westus2>|off   (0.13.17: check, process and its steps, group and search-index run only on nodes in this Azure region; run --allow-out-of-region for a one-item test)
         indexnode control --max-per-ip N|off
         indexnode --version
         indexnode config set-sas <url>
+        indexnode config set-media-table-sas <url>   (0.13.37: the Azure Table `media`; or INDEXNODE_MEDIA_TABLE_SAS_URL, or `media-table-sas` in the config file)
+        indexnode media import [--out-local DIR | --from-local DIR]   (0.13.37: the aggregate -> the table, once)
+        indexnode seq renumber [--out-local DIR | --from-local DIR]
         indexnode config set <budget|schedule|window|ai.base-url|ai.key|ai.text-model|ai.vision-model|ai.api|jobs|threads|model-url|model-path|node-name|ytdlp.command|ytdlp.js-runtime|browser.exe|browser.profile-dir|browser.port|serve.token|check.url|check.token|check.timeout-seconds|precheck.enabled|precheck.tau|precheck.skip-share|precheck.partial-share|precheck.duration-percent|precheck.duration-min|precheck.top-centers|precheck.vote-uploads|precheck.window-seconds|precheck.language-seconds|precheck.language-min-seconds|precheck.window-position|precheck.ai-flag|sample-budget> <value>
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
         """;
@@ -169,6 +176,8 @@ public static class Program
                 "centers" => await CentersCommands.CentersAsync(a),
                 "search-index" => await CentersCommands.SearchIndexAsync(a),
                 "groups" => await GroupsCommand.RunAsync(a),
+                "seq" when a.Positional.FirstOrDefault() == "renumber" => await MediaCommand.RenumberAsync(a),
+                "media" => await MediaCommand.RunAsync(a),
                 "seq" => await SeqCommand.RunAsync(a),
                 "queue" => await QueueCommand.RunAsync(a),
                 "frames" => await FramesCommand.RunAsync(a),
@@ -218,7 +227,14 @@ public static class Commands
         var http = NewHttp();
         IStore rest = new RestStore(http, cfg.Sas);
         if (a.Has("shadow")) { var od = a.Get("out-local") ?? throw new ArgumentException("--shadow needs --out-local <dir>: the run reads the real store and writes only there"); rest = Shadow = new ShadowStore(rest, od); Console.Error.WriteLine($"indexnode: SHADOW run: reads the real store, writes nothing to it; every write goes under {od}"); }
-        return (cfg, StageZipStore.Wrap(rest, Shadow != null ? Path.Combine(Shadow.Dir, "zips") : null), new Paths(a.Get("prefix") ?? "index/"), http);
+        var wrapped = StageZipStore.Wrap(rest, Shadow != null ? Path.Combine(Shadow.Dir, "zips") : null);
+        if (!string.IsNullOrWhiteSpace(cfg.MediaTableSas) && !a.Has("no-table"))
+        {
+            IMediaTable table = new RestMediaTable(http, cfg.MediaTableSas);
+            if (Shadow != null) { var overlay = new ShadowMediaTable(table, Shadow.Dir); MediaTables.Attach(Shadow, overlay); }   // the shadow's table: reads the real one, writes under <out-local>/table/
+            else { if (a.Has("out-local")) table = new ReadOnlyMediaTable(table); MediaTables.Attach(rest, table); }          // --out-local without --shadow: local only, a table write throws
+        }   // 0.13.37: per-upload facts live in the table `media`
+        return (cfg, wrapped, new Paths(a.Get("prefix") ?? "index/"), http);
     }
 
     public static string VersionString => typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
@@ -312,7 +328,7 @@ public static class Commands
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
-            Shadow = a.Has("shadow"), ControlOverride = a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (c => WhatIf.Apply(c, shadowSets)) : null, MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
+            RepairOnly = a.Has("repair-only"), Shadow = a.Has("shadow"), ControlOverride = a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (c => WhatIf.Apply(c, shadowSets)) : null, MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");
@@ -665,6 +681,13 @@ public static class Commands
             Console.WriteLine($"control: classify = {(cc.ClassifyOn ? "on (classify is seeded and claimed)" : "off (classify is paused: not seeded, not claimed)")}");
             return 0;
         }
+        if (level == "media-table-read")
+        {
+            var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control media-table-read on|off");
+            var mc = await ControlWatcher.SetMediaTableReadAsync(store, paths, v, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: media-table-read = {(mc.MediaTableReadOn ? "on (readers use the media table)" : "off (readers use video.json and the aggregate, as in 0.13.36)")}");
+            return 0;
+        }
         if (level == "dynamic-refresh")
         {
             var v = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("control dynamic-refresh on|off");
@@ -701,6 +724,7 @@ public static class Commands
         var now = DateTimeOffset.UtcNow;
         if (a.Has("json")) { Console.WriteLine(StatusSnapshot.Serialize(await StatusSnapshot.BuildAsync(store, paths, now, default))); return 0; }
         Console.WriteLine($"prefix {paths.Prefix}   this node: {cfg.NodeId ?? "(none yet)"}  threads={cfg.EffectiveThreads}");
+        Console.WriteLine(StatusLines.MediaTable(cfg.MediaTableSas, now));
 
         var layout = await Repack.CountAsync(Repack.Raw(store), paths, default);
         Console.WriteLine($"\nLayout: {layout.Repacked} repacked, {layout.Loose} loose, {layout.Mixed} mixed (0.10.0 nodes refuse loose and mixed dramas until `indexnode repack --delete-loose` has run){(layout.Loose + layout.Mixed > 0 ? "\n  " + string.Join(" ", layout.LooseIds.Concat(layout.MixedIds).Take(20)) : "")}");
@@ -894,6 +918,14 @@ public static class Commands
             file.Sas = url;
             file.Save();
             Console.WriteLine($"SAS stored in {NodeConfig.ConfigPath()} (permissions: {RestStore.Permissions(url) ?? "unknown"})");
+            return 0;
+        }
+        if (sub == "set-media-table-sas")
+        {
+            var url = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("config set-media-table-sas needs the table SAS URL");
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var u) || !u.Query.Contains("sig=") || !u.Host.Contains(".table.")) throw new ArgumentException("that does not look like a table SAS URL (https://<account>.table.core.windows.net/media?...&sig=...)");
+            file.MediaTableSas = url; file.Save();
+            Console.WriteLine($"table SAS stored in {NodeConfig.ConfigPath()} (expires {RestMediaTable.Expiry(url)?.ToString("u") ?? "unknown"})");
             return 0;
         }
         if (sub == "set")

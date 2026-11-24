@@ -30,13 +30,36 @@ public static class VideoJson
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, System.Collections.Concurrent.ConcurrentDictionary<string, Cached>> caches = new();
     static System.Collections.Concurrent.ConcurrentDictionary<string, Cached> CacheOf(IStore s) => caches.GetValue(StoreIdentity(s), _ => new(StringComparer.Ordinal));
     /// <summary>The store under the wrappers that do not change what a name means (metering, recording, local cache), so a node's lanes share one cache.</summary>
-    static IStore StoreIdentity(IStore s) { for (int i = 0; i < 8; i++) s = s switch { MeteredStore m => m.Inner, RecordingStore r => r.Inner, LocalCacheStore l => l.Inner, _ => s }; return s; }
+    static IStore StoreIdentity(IStore s) { for (int i = 0; i < 8; i++) s = s switch { MeteredStore m => m.Inner, RecordingStore r => r.Inner, LocalCacheStore l => l.Inner, StageZipStore z => z.Inner, _ => s }; return s; }
     /// <summary>How long a cached video.json is served without asking the store again (the same step reads it many times; a step is short). A write through <see cref="UpdateAsync"/> refreshes the entry.</summary>
     public static TimeSpan Fresh { get; set; } = TimeSpan.FromSeconds(20);
     public static Func<DateTimeOffset> Now { get; set; } = () => DateTimeOffset.UtcNow;
     public static void ClearCache(IStore store) => CacheOf(store).Clear();
 
+    // 0.13.37: with a media table attached an upload is one point read of its row (cached like the blob: a step reads it many times); the blob answers for an upload with no row yet and for sections too big for a property.
+    sealed record TableCached(Doc Doc, DateTimeOffset At);
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IStore, System.Collections.Concurrent.ConcurrentDictionary<string, TableCached>> tableCaches = new();
+    static System.Collections.Concurrent.ConcurrentDictionary<string, TableCached> TableCacheOf(IStore s) => tableCaches.GetValue(StoreIdentity(s), _ => new(StringComparer.Ordinal));
+
     public static async Task<Doc?> ReadAsync(IStore store, Paths paths, string id, CancellationToken ct, bool fresh)
+    {
+        if (MediaTables.ForRead(store) is { } table)
+        {
+            var tc = TableCacheOf(store);
+            if (!fresh && tc.TryGetValue(id, out var hit) && Now() - hit.At < Fresh) return Copy(hit.Doc);
+            var row = await table.GetAsync(MediaTables.Upload, id, null, ct);
+            if (row != null && MediaRecords.IsFull(row))
+            {
+                var d = new Doc(row.Timestamp, MediaRecords.DocOf(row)); tc[id] = new TableCached(d, Now()); return Copy(d);
+            }
+            tc.TryRemove(id, out _);
+        }
+        return await ReadBlobAsync(store, paths, id, ct, fresh);
+    }
+    static Doc Copy(Doc d) => d with { Root = (JsonObject)d.Root.DeepClone() };
+
+    /// <summary>The per-upload video.json blob itself (cached by ETag). The read-modify-write of <see cref="UpdateAsync"/> and the readers of an upload with no table row use this.</summary>
+    public static async Task<Doc?> ReadBlobAsync(IStore store, Paths paths, string id, CancellationToken ct, bool fresh)
     {
         var name = Name(paths, id); var key = name; var cache = CacheOf(store);
         if (!fresh && cache.TryGetValue(key, out var hit) && Now() - hit.At < Fresh) return Parse(name, hit.ETag, hit.Data, hit.Meta);
@@ -70,9 +93,9 @@ public static class VideoJson
         for (int attempt = 0; attempt < 20; attempt++)
         {
             var cache = CacheOf(store);
-            var cur = await ReadAsync(store, paths, id, ct, fresh: attempt > 0);
+            var cur = await ReadBlobAsync(store, paths, id, ct, fresh: attempt > 0);
             var root = cur?.Root ?? new JsonObject();
-            var before = StretchesOf(root);
+            var before = StretchesOf(root); var original = (JsonObject)root.DeepClone();
             root["v"] = Version; root["id"] = id;
             merge(root);
             long rev = (cur?.Rev ?? 0) + 1;   // monotonic per upload, kept in the blob METADATA (x-ms-meta-rev, set by the same put: no extra op): the If-Match below is what serialises the writers of one upload
@@ -92,6 +115,14 @@ public static class VideoJson
                     await store.SetMetadataAsync(Name(paths, id), new Dictionary<string, string>(h.Metadata, StringComparer.OrdinalIgnoreCase) { [RevMeta] = nr.ToString(System.Globalization.CultureInfo.InvariantCulture) }, null, t);
                     cache.TryRemove(Name(paths, id), out _); mine = nr; root["rev"] = nr; return true;
                 });   // dual write: the per-upload file above stays (always), the aggregate follows
+                if (MediaTables.For(store) is { } table)
+                {   // 0.13.37: the table follows with ONLY the sections this writer changed (and their flat fields): one Merge Entity, no read
+                    // docRev: the blob rev this row mirrors IN FULL. Every writer here holds the whole document, so it writes every section (one request, no read) and docRev; a partial row (a stage mark alone, a non-table writer's gap) has no docRev and no reader uses it
+                    var changed = MediaRecords.Changed(new JsonObject(), root);
+                    var props = MediaRecords.Props(root, changed); props[MediaRecords.DocRev] = rev;
+                    await table.InsertOrMergeAsync(MediaTables.Upload, id, props, ct);
+                    TableCacheOf(store).TryRemove(id, out _);
+                }
                 return root;
             }
         }
@@ -110,8 +141,16 @@ public static class VideoJson
     }
 
     /// <summary>Many uploads at once: the aggregate (one Get Block List + one GET for the whole blob), and only the uploads it does not hold are read one by one. Readers of every upload (the AI checks, the catalog, the search index) use this.</summary>
-    public static async Task<Dictionary<string, Doc?>> ReadManyAsync(IStore store, Paths paths, IReadOnlyCollection<string> ids, CancellationToken ct, int threads = 8, bool all = false)
+    public static async Task<Dictionary<string, Doc?>> ReadManyAsync(IStore store, Paths paths, IReadOnlyCollection<string> ids, CancellationToken ct, int threads = 8, bool all = false, IReadOnlyCollection<string>? select = null)
     {
+        if (MediaTables.ForRead(store) is { } table)
+        {   // 0.13.37: ONE query of the table ($select: just the fields the caller reads); the aggregate is not read. An upload with no row yet is read from its blob (a pre-import upload).
+            var rows = await QueryUploadsAsync(table, all ? null : ids, null, select, ct);
+            var got = new Dictionary<string, Doc?>(StringComparer.Ordinal);
+            foreach (var row in rows.Where(MediaRecords.IsFull)) got[row.RowKey] = new Doc(row.Timestamp, MediaRecords.DocOf(row));
+            if (!all) foreach (var id in ids.Distinct(StringComparer.Ordinal).Where(i => !got.ContainsKey(i)).ToList()) { try { got[id] = await ReadBlobAsync(store, paths, id, ct, false); } catch (InvalidDataException) { } }
+            return got;
+        }
         if (all) { var whole = await VideoAggregate.ReadManyAsync(store, paths, null, ct); return whole == null ? new() : whole.ToDictionary(kv => kv.Key, kv => (Doc?)kv.Value, StringComparer.Ordinal); }
         var res = new System.Collections.Concurrent.ConcurrentDictionary<string, Doc?>(StringComparer.Ordinal);
         var agg = await VideoAggregate.ReadManyAsync(store, paths, ids.Count < 50 ? ids : null, ct);
@@ -119,6 +158,24 @@ public static class VideoJson
         var rest = ids.Where(i => !res.ContainsKey(i)).Distinct(StringComparer.Ordinal).ToList();
         await Parallel.ForEachAsync(rest, new ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = ct }, async (id, t) => { try { res[id] = await ReadAsync(store, paths, id, t); } catch (InvalidDataException) { } });   // an unreadable file is left out: the caller's own read reports it
         return new Dictionary<string, Doc?>(res, StringComparer.Ordinal);
+    }
+
+    /// <summary>The upload rows of the table: every one (ids null), or the named ones (one request per 40 ids), optionally only those changed since a server Timestamp (the incremental readers: Timestamp ge).</summary>
+    public const int PointReadMax = 25;
+    public static async Task<List<TableRow>> QueryUploadsAsync(IMediaTable table, IReadOnlyCollection<string>? ids, DateTimeOffset? since, IReadOnlyCollection<string>? select, CancellationToken ct)
+    {
+        if (select != null) select = [.. select.Union([MediaRecords.DocRev, MediaRecords.InBlob])];   // IsFull needs both
+        string baseF = $"PartitionKey eq '{MediaTables.Upload}'" + (since is { } s ? $" and Timestamp ge datetime'{s.UtcDateTime:yyyy-MM-ddTHH:mm:ss.fffffffZ}'" : "");
+        if (ids == null) return await table.QueryAsync(baseF, select, ct);
+        var list = ids.Distinct(StringComparer.Ordinal).ToList();
+        if (since == null && list.Count <= PointReadMax)
+        {   // a few uploads: parallel point reads (a RowKey-or filter is a partition scan)
+            var got = new System.Collections.Concurrent.ConcurrentBag<TableRow>();
+            await Parallel.ForEachAsync(list, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (x, t) => { if (await table.GetAsync(MediaTables.Upload, x, select, t) is { } row) got.Add(row); });
+            return got.ToList();
+        }
+        var want = list.ToHashSet(StringComparer.Ordinal);   // a larger set: the one full query (paged by 1000), kept client-side
+        return (await table.QueryAsync(baseF, select, ct)).Where(r => want.Contains(r.RowKey)).ToList();
     }
 
     /// <summary>One upload for a bulk job: from the job's aggregate view when it holds the upload (one shared GET for the whole job), else the per-upload file (the aggregate lacks it yet).</summary>
@@ -130,8 +187,11 @@ public static class VideoJson
 
     public static JsonObject Section(JsonObject root, string name) => root[name] as JsonObject ?? (JsonObject)(root[name] = new JsonObject());
 
-    /// <summary>youtube: what the info JSON says (null fields left out).</summary>
-    public static JsonObject YoutubeFrom(JsonObject? info, string id, string? url, double? duration)
+    static readonly HashSet<string> YoutubeSkip = new(StringComparer.Ordinal) { "formats", "thumbnails", "http_headers", "heatmap", "subtitles", "automatic_captions", "requested_formats", "requested_downloads", "requested_subtitles", "_format_sort_fields", "description", "title", "channel", "channel_id", "uploader", "upload_date", "duration", "webpage_url", "language", "view_count", "like_count", "availability", "playable_in_embed" };
+    public const int DescriptionChars = 20000;
+
+    /// <summary>youtube: the curated yt-dlp metadata (0.13.37): the fields the section always had, the description (up to 20,000 characters), the counts, the availability, the language lists (subtitles, automatic captions, subtitle formats as codes; the audio tracks' languages from the audio-only formats), and every other scalar yt-dlp field under "info". Not kept: formats, thumbnails, http headers, heatmap, caption URL lists. Null fields are left out.</summary>
+    public static JsonObject YoutubeFrom(JsonObject? info, string id, string? url, double? duration, string? downloadAudioLanguage = null)
     {
         var y = new JsonObject();
         void Put(string k, JsonNode? v) { if (v != null) y[k] = v; }
@@ -140,6 +200,28 @@ public static class VideoJson
         var d = (double?)info?["duration"] ?? duration; if (d is > 0) y["durationSeconds"] = Math.Round(d.Value, 2);
         y["url"] = (string?)info?["webpage_url"] ?? url ?? "https://www.youtube.com/watch?v=" + id;
         Put("language", (string?)info?["language"]);
+        if (info == null) return y;
+        Put("uploader", (string?)info["uploader"]);
+        if ((string?)info["description"] is { Length: > 0 } desc) y["description"] = desc.Length > DescriptionChars ? desc[..DescriptionChars] : desc;
+        if (info["view_count"] is JsonValue vc && vc.TryGetValue<double>(out var vcd)) y["viewCount"] = (long)vcd;
+        if (info["like_count"] is JsonValue lc && lc.TryGetValue<double>(out var lcd)) y["likeCount"] = (long)lcd;
+        Put("availability", (string?)info["availability"]);
+        if (info["playable_in_embed"] is JsonValue pe && pe.TryGetValue<bool>(out var peb)) y["playableInEmbed"] = peb;
+        JsonArray Codes(JsonNode? n) => new(((n as JsonObject)?.Select(kv => (JsonNode?)JsonValue.Create(kv.Key)) ?? []).ToArray());
+        if (Codes(info["subtitles"]) is { Count: > 0 } sl) y["subtitleLanguages"] = sl;
+        if (Codes(info["automatic_captions"]) is { Count: > 0 } al) y["autoCaptionLanguages"] = al;
+        var fm = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var n in new[] { info["subtitles"], info["automatic_captions"] }) if (n is JsonObject so) foreach (var kv in so) if (kv.Value is JsonArray tracks) foreach (var tr in tracks) if ((string?)tr?["ext"] is { Length: > 0 } ext) fm.Add(ext);
+        if (fm.Count > 0) y["subtitleFormats"] = new JsonArray(fm.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray());
+        var audio = (info["formats"] as JsonArray ?? []).OfType<JsonObject>().Where(f => (string?)f["vcodec"] == "none" && (string?)f["acodec"] is { } ac && ac != "none").ToList();
+        var langs = audio.Select(f => (string?)f["language"]).Where(l => !string.IsNullOrEmpty(l)).Distinct(StringComparer.Ordinal).ToList();
+        if (langs.Count > 0) y["audioLanguages"] = new JsonArray(langs.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray());
+        var original = audio.FirstOrDefault(f => ((string?)f["format_note"] ?? "").Contains("original", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty((string?)f["language"]));
+        var al0 = (string?)original?["language"] ?? (string.IsNullOrEmpty(downloadAudioLanguage) ? null : downloadAudioLanguage) ?? (string?)info["language"];
+        if (!string.IsNullOrEmpty(al0)) y["audioLanguage"] = al0;
+        var rest = new JsonObject();
+        foreach (var kv in info) if (!YoutubeSkip.Contains(kv.Key) && kv.Value != null && !kv.Key.StartsWith('_') && (kv.Value is not JsonObject)) { var text = kv.Value.ToJsonString(); if (text.Length <= 2000) rest[kv.Key] = kv.Value.DeepClone(); }
+        if (rest.Count > 0 && rest.ToJsonString().Length < 12000) y["info"] = rest;
         return y;
     }
 

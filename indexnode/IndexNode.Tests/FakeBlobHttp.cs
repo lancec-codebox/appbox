@@ -55,6 +55,18 @@ public sealed class FakeBlobHttp(FakeStore fs) : HttpMessageHandler
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(new XDocument(new XElement("Tags", new XElement("TagSet", tags.Select(t => new XElement("Tag", new XElement("Key", t.Key), new XElement("Value", t.Value)))))).ToString(), Encoding.UTF8, "application/xml") };
         }
         if (q.Method == HttpMethod.Delete) { try { await fs.DeleteAsync(name, ct); return R(HttpStatusCode.Accepted); } catch (Exception) { return R(HttpStatusCode.NotFound); } }
+        if (q.Method == HttpMethod.Put && comp == "appendblock")
+        {   // 0.13.37: Append Block (the sequence blobs: no condition; the queue: x-ms-blob-condition-appendpos)
+            long pos = q.Headers.TryGetValues("x-ms-blob-condition-appendpos", out var ap) && long.TryParse(ap.First(), out var apv) ? apv : -1;
+            var res = await fs.AppendBlockAsync(name, await q.Content!.ReadAsByteArrayAsync(ct), pos, ct);
+            if (res.Outcome == AppendOutcome.NotFound) return R(HttpStatusCode.NotFound);
+            if (res.Outcome == AppendOutcome.PositionMismatch) return R(HttpStatusCode.PreconditionFailed);
+            if (res.Outcome == AppendOutcome.Sealed) { var c = R(HttpStatusCode.Conflict); c.Headers.TryAddWithoutValidation("x-ms-error-code", "BlobIsSealed"); return c; }
+            var ok = R(HttpStatusCode.Created); ok.Headers.TryAddWithoutValidation("x-ms-blob-committed-block-count", res.Blocks.ToString()); ok.Headers.TryAddWithoutValidation("x-ms-blob-append-offset", (res.Length - (await q.Content!.ReadAsByteArrayAsync(ct)).Length).ToString());
+            ok.Headers.Date = res.Date ?? DateTimeOffset.UtcNow; return ok;
+        }
+        if (q.Method == HttpMethod.Put && q.Headers.TryGetValues("x-ms-blob-type", out var bt) && bt.First() == "AppendBlob")
+            return await fs.CreateAppendBlobAsync(name, q.Headers.TryGetValues("If-None-Match", out var cn) && cn.First() == "*", ct) ? R(HttpStatusCode.Created) : R(HttpStatusCode.Conflict);
         if (q.Method == HttpMethod.Put)
         {
             var data = await q.Content!.ReadAsByteArrayAsync(ct); var ifm = q.Headers.TryGetValues("If-Match", out var a) ? a.First() : null; var inm = q.Headers.TryGetValues("If-None-Match", out var b) ? b.First() : null;
@@ -67,6 +79,7 @@ public sealed class FakeBlobHttp(FakeStore fs) : HttpMessageHandler
         if (q.Method == HttpMethod.Head) { var h = R(HttpStatusCode.OK, null, props.ETag, props.Metadata); h.Content.Headers.ContentLength = props.Size; return h; }
         if (q.Headers.Range?.Ranges.FirstOrDefault() is { } rg)
         {
+            if ((rg.From ?? 0) >= props.Size) return R(HttpStatusCode.RequestedRangeNotSatisfiable);
             long from = rg.From ?? 0, to = Math.Min(rg.To ?? props.Size - 1, props.Size - 1);
             if (q.Headers.TryGetValues("If-Match", out var im) && im.First() != props.ETag) return R(HttpStatusCode.PreconditionFailed);
             var bytes = (await fs.GetRangeAsync(name, from, (int)(to - from + 1), null, ct)).Data ?? []; var r = R(HttpStatusCode.PartialContent, bytes, props.ETag, props.Metadata);
