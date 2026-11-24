@@ -91,6 +91,8 @@ public static class Program
         indexnode jobs repair-steps [--dry-run]   (0.13.2: steps in a done list whose output is not on the store are taken out; a finished subject missing an output is re-opened with only the missing steps)
         indexnode jobs list [--stage S] | priority <subject> N | retry [--stage S] [<subject>] | release <subject>   (the queue)
         indexnode video <id>   (what the queue knows about one video)
+        indexnode sheet <id>... [--at s,s,...] [--count 12] [--sample]   (0.13.47: a contact sheet of real frames per upload, from its stored frames or its sample; JPEG of at most --max-kb 100 under --output-local ./sheets)
+        indexnode sheet pair <duplicate id>... [--match <id>] [--match-times s,s] [--per-segment 2] [--align 20]   (0.13.47: one two-row sheet per duplicate: top its sample, bottom the upload it matched at the corresponding moments; the match and its times come from the queue)
         indexnode videos aggregate [--dry-run] [--threads N]   (builds index/data/videos.agg, one block per upload, from the per-upload video.json files, and writes videos/<id>/stretches.json; per-upload files are never changed)
         indexnode videos backfill [--dry-run] [--threads N]   (0.13.2: create index/videos/<id>/video.json for every upload that has none, from idx_summary, info.json, precheck.json, transcribe.zip and the AI probe; create-only; a video under an active claim is skipped and reported. Run once, from a westus2 node, before the search-index job relies on it)
         (a video id that starts with '-': --video=<id>, or put it after a bare --, e.g. indexnode classify set drama -- --QfpuGhs0U)
@@ -179,6 +181,7 @@ public static class Program
                 "jobs" => await JobsCommand.RunAsync(a),
                 "trash" => await JobsCommand.TrashAsync(a),
                 "video" => await JobsCommand.VideoAsync(a),
+                "sheet" => await SheetCommand.RunAsync(a),
                 "videos" => await VideosBackfill.RunAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
                 "search" => a.Has("vector") || a.Has("image") ? await CentersCommands.SearchAsync(a) : await Commands.SearchAsync(a),
