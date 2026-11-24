@@ -62,6 +62,7 @@ public static class Program
         indexnode sources lookup <id>   (full listing again: every member recorded, every unknown video queued)
         indexnode sources refresh <id>|--all-due   (incremental: only videos new since the last run; due now at priority 500)
         indexnode ai test [--ai-base-url ...]
+        indexnode ai set <videoId>... real|ai [--reason R] [--dry-run]   (0.13.44: the owner's verdict on an upload; it wins over the probe's flag. real releases its AI holds, ai holds its pending entries)
         indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F] [--priority N]
         indexnode priority set <N> --job <id>... | --from <file> | --channel <id|url> [--stage download] [--with-steps]
         indexnode priority list [--stage S] [--top 20]
@@ -199,7 +200,7 @@ public static class Program
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
                 "priority" => await Commands.PriorityAsync(a),
-                "ai" => a.Positional.FirstOrDefault() == "score" ? await CentersCommands.AiScoreAsync(a) : await Commands.AiAsync(a),
+                "ai" => a.Positional.FirstOrDefault() == "score" ? await CentersCommands.AiScoreAsync(a) : a.Positional.FirstOrDefault() == "set" ? await Commands.AiSetAsync(a) : await Commands.AiAsync(a),
                 "publish" => await SiteCommands.PublishAsync(a),
                 "cast-candidates" => await CastCandidates.RunAsync(a),
                 "cast" => a.Positional.FirstOrDefault() == "recluster" ? await CastRecluster.RunAsync(a) : a.Positional.FirstOrDefault() == "reembed" ? await CastReembed.Main2(a) : Fail("cast: recluster <id>|--ids <file> [--merge-at D] [--split] [--out-local <dir>]"),
@@ -504,6 +505,26 @@ public static class Commands
             }
             default: throw new ArgumentException("sources add <url> | list | remove <id> | import <channels.json> | schedule <id> off|once|6h|1d|daily@03:00 | lookup <id> | refresh <id>|--all-due | priority <source id|url> N");
         }
+    }
+
+    public static async Task<int> AiSetAsync(Args a)
+    {
+        var rest = a.Positional.Skip(1).ToList();
+        if (rest.Count < 2 || rest[^1] is not ("real" or "ai")) throw new ArgumentException("ai set <videoId>... real|ai [--reason R] [--dry-run]");
+        var verdict = rest[^1]; var ids = rest.Take(rest.Count - 1).ToList(); if (a.Get("video") is { } one) ids.Add(one);
+        bool dry = a.Has("dry-run");
+        var (cfg, store, paths, http) = Open(a); using var _h = http;
+        await JobQueue.RequireSnapshotAsync(store, paths, default);
+        var processing = await JobQueue.OpenAsync(store, paths, "cli", false, default);
+        var download = await JobQueue.OpenAsync(store, paths, "cli", true, default);
+        var by = cfg.NodeName ?? Environment.UserName;
+        foreach (var id in ids)
+        {
+            var r = await AiHold.SetVerdictAsync(processing, download, store, paths, id, verdict, a.Get("reason"), by, dry, default);
+            Console.WriteLine($"{id}: {(dry ? "would be" : "is")} marked {verdict}{(r.Known ? "" : " (no video.json: nothing recorded)")}; released: {(r.Released.Count == 0 ? "none" : string.Join(", ", r.Released))}; held: {(r.Held.Count == 0 ? "none" : string.Join(", ", r.Held))}");
+        }
+        if (dry) Console.WriteLine("dry run: nothing written");
+        return 0;
     }
 
     public static async Task<int> AiAsync(Args a)

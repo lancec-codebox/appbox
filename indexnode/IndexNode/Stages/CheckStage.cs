@@ -38,9 +38,9 @@ public sealed class CheckStage(PreCheckStage pre) : IStageHandler
         {
             var d = new JobDescriptor { Stage = "download", JobId = id, Url = ctx.Job.Url ?? "https://www.youtube.com/watch?v=" + id, MaxHeight = ctx.Job.MaxHeight, Format = ctx.Job.Format, Subs = ctx.Job.Subs, MaxComments = ctx.Job.MaxComments, Priority = ctx.Job.Priority, AddedAt = Protocol.NowUtc() };
             await PubTime.StampAsync(store, paths, id, ctx.Job, d, ct);
-            if (!ctx.FollowUps.Any(l => l.T == "add" && l.Stage == "download")) { var dl = QLine.Add(id, "download", d, Protocol.NowUtc()); AiHold.Apply(ctx, rec, dl); ctx.FollowUps.Add(dl); }
+            if (!ctx.FollowUps.Any(l => l.T == "add" && l.Stage == "download")) { var dl = QLine.Add(id, "download", d, Protocol.NowUtc()); AiHold.Apply(ctx, rec, dl, vj?.Root); ctx.FollowUps.Add(dl); }
         }
-        else if (AiHold.Flagged(rec) && !ctx.AiDramasOn()) { var sc = (double?)(rec["ai"] as JsonObject)?["score"]; ctx.FollowUps.Add(new QLine { T = "hold", S = id, Stage = "process", Hold = "ai", AiScore = sc, At = Protocol.NowUtc() }); Log.Info($"sample {id}: check {(string?)rec["decision"]}, AI (score {sc:0.000}): held, aiDramas is off"); }
+        else if (AiHold.Flagged(rec, vj?.Root) && !ctx.AiDramasOn()) { var sc = (double?)(rec["ai"] as JsonObject)?["score"]; ctx.FollowUps.Add(new QLine { T = "hold", S = id, Stage = "process", Hold = "ai", AiScore = sc, At = Protocol.NowUtc() }); Log.Info($"sample {id}: check {(string?)rec["decision"]}, AI (score {sc:0.000}): held, aiDramas is off"); }
         Log.Info($"check {id}: {(string?)rec["decision"]}; {(stored ? "the stored video goes on to process" : "the full download is queued")}");
     }
 

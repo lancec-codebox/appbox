@@ -189,6 +189,7 @@ public sealed class QueueState
                 }
             case "hold":   // 0.13.23 (jobs hold-ai): a pending entry gets the hold
                 if (Get(l.S)?.Entries.GetValueOrDefault(l.Stage ?? "") is { Final: false } he && he.State == "pending" && l.Hold != null) { he.Hold = l.Hold; he.HoldAiScore = l.AiScore; }
+                else if (l.Hold == null && l.Force == true && Get(l.S)?.Entries.GetValueOrDefault(l.Stage ?? "") is { Final: false } rel) { rel.Hold = null; rel.HoldAiScore = null; }   // 0.13.44 (ai set real): a forced hold line with no hold releases the entry (an older node ignores the line and keeps the hold: it claims nothing it should not)
                 break;
             case "pub":
                 if (Get(l.S) is { } pubSub && l.PubTime != null) pubSub.Pub = l.PubTime;

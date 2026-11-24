@@ -86,7 +86,7 @@ public static class ActorsBuild
     public static async Task<Drama> LoadDramaAsync(IStore store, Paths paths, string id, Dictionary<string, string> groupOf, Probe? probe, CancellationToken ct, Func<FaceRec, bool>? use = null, bool manual = false)
     {
         var d = new Drama { Id = id, Prod = groupOf.TryGetValue(id, out var g) ? g : id };
-        if (!manual && await VideoJson.ReadAsync(store, paths, id, ct) is { } vj && (vj.Root["ai"] as JsonObject)?["flag"]?.GetValue<bool>() == true) { d.Ai = true; d.Skip = "AI"; return d; }   // AI dramas are skipped completely
+        if (!manual && await VideoJson.ReadAsync(store, paths, id, ct) is { } vj && AiHold.Flagged(vj.Root)) { d.Ai = true; d.Skip = "AI"; return d; }   // AI dramas are skipped completely
         var fj = StoredJson.Object(await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.json"), ct, false) ?? throw new InvalidOperationException($"{id}: no cast/faces.json (cast has not run)"), $"{id}/cast/faces.json");
         var f16 = await FrameChunks.ReadAsync(store, paths.Video(id, "cast/faces.f16"), ct, true);
         _ = await FrameChunks.ReadAsync(store, paths.Video(id, "cast/clusters.json"), ct, false) ?? throw new InvalidOperationException($"{id}: no cast/clusters.json");

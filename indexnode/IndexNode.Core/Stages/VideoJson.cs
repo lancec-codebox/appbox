@@ -226,7 +226,14 @@ public static class VideoJson
     }
 
     public static void SetSpeech(JsonObject root, string? language, bool? dubbed, string source) => root["speech"] = new JsonObject { ["language"] = language, ["dubbed"] = dubbed, ["source"] = source };
-    public static void SetAi(JsonObject root, double? score, bool? flag, string source) => root["ai"] = new JsonObject { ["score"] = score == null ? null : Math.Round(score.Value, 4), ["flag"] = flag, ["source"] = source };
+    public static void SetAi(JsonObject root, double? score, bool? flag, string source)
+    {
+        var old = root["ai"] as JsonObject;
+        var ai = new JsonObject { ["score"] = score == null ? null : Math.Round(score.Value, 4), ["flag"] = flag, ["source"] = source };
+        // 0.13.44: the owner's verdict (ai set real|ai) outlives every probe result
+        if (old != null) foreach (var k in new[] { "verdict", "verdictBy", "verdictAt", "verdictReason" }) if (old[k] is { } v) ai[k] = v.DeepClone();
+        root["ai"] = ai;
+    }
 
     /// <summary>The duration of the upload: youtube.durationSeconds, else download.durationSeconds; null when the document says neither.</summary>
     public static double? Duration(JsonObject root) => (double?)(root["youtube"] as JsonObject)?["durationSeconds"] is > 0 and var y ? y : (double?)(root["download"] as JsonObject)?["durationSeconds"] is > 0 and var d ? d : null;

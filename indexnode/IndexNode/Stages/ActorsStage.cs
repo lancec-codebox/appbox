@@ -19,7 +19,7 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
     public sealed record RunResult(string Id, string? Skipped, int FacesUsed, int Units, int ChildUnits, int Links, int Band, int BandLinked, int R50Units, int Predecessors, int PredecessorsAi, int IndexRouted, string Kind, string Prod, List<string> Actors, List<string> Writes) { public string Timing { get; init; } = ""; public int PairsSkipped { get; init; } public int PartnerR50 { get; init; } public bool Reused { get; init; } }
     sealed record Cand(string Id, string Key, string Actor, string Prod, double Cos, UnitRec? Rec, int IUp = -1, int IUnit = -1);
 
-    public static bool AiFlag(JsonObject? root) => (root?["ai"] as JsonObject)?["flag"] is JsonNode f && (bool?)f == true;
+    public static bool AiFlag(JsonObject? root) => AiHold.Flagged(root);   // 0.13.44: the owner's verdict wins over the probe's flag
 
     /// <summary>0.13.28: the one path the node and `actors run` share: predecessors, AI flags, groups and the announced index version all come from the processing queue's state (snapshot + tail, loaded once). No groups file, no head.yaml, no aggregate.</summary>
     public async Task<RunResult> RunWithQueueAsync(ActorsIO io, JobQueue q, string id, bool manual, int threads, CancellationToken ct)
