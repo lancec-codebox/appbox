@@ -23,6 +23,24 @@ public class DownloadServiceTests
     static QLine Add(string id, string stage, string pub, int pri = 0, string? state = null) => QLine.Add(id, stage, new JobDescriptor { Stage = stage, JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = At, Pub = pub }, At, pri, At, state);
 
     [Fact]
+    public async Task A_prioritised_item_joins_a_full_work_queue_at_once_and_is_the_next_one_handed_out()
+    {
+        var lines = Enumerable.Range(0, 30).Select(i => Add("v" + i.ToString("00"), "sample", $"2026-11-{1 + i % 28:00}T00:00:00Z", i == 3 ? 9 : 0)).ToList();
+        var r = await Rig.Make(10, lines.ToArray());
+        Assert.Equal(10, await r.Svc.TopUpAsync(default));   // the work queue is full (10 of 10), its highest priority is 9
+        await r.Full.AppendLinesAsync([Add("asked", "download", "2020-01-01T00:00:00Z", 1000), Add("same9", "sample", "2026-11-30T00:00:00Z", 9), Add("low", "sample", "2026-11-30T00:00:00Z", 1)], default);
+        Assert.Equal(1, await r.Svc.TopUpAsync(default));    // only the item above every live priority jumps; an equal or lower one waits for the ordinary top-up
+        var ids = r.Work.Read(w => w.Subjects.Values.Select(s => s.Id).ToList());
+        Assert.Contains("asked", ids); Assert.DoesNotContain("same9", ids); Assert.DoesNotContain("low", ids); Assert.Equal(11, ids.Count);
+        Assert.Equal(0, await r.Svc.TopUpAsync(default));    // idempotent: it is in the work queue now
+        var next = await r.Svc.NextAsync("laptop", ["download", "sample"], default);
+        Assert.Equal("asked", next!.Subject); Assert.Equal("download", next.Stage);   // and it is what a downloader gets next
+        var many = Enumerable.Range(0, 80).Select(i => Add("hi" + i.ToString("00"), "sample", "2026-11-30T00:00:00Z", 5000)).ToArray();
+        await r.Full.AppendLinesAsync(many, default);
+        Assert.Equal(DownloadService.JumpMax, await r.Svc.TopUpAsync(default));   // bounded per pass
+    }
+
+    [Fact]
     public async Task Top_up_stops_at_the_max_goes_newest_first_keeps_priority_and_leaves_listed_and_hold_items()
     {
         var lines = Enumerable.Range(0, 30).Select(i => Add("v" + i.ToString("00"), "sample", $"2026-11-{1 + i % 28:00}T00:00:00Z", i == 3 ? 9 : 0)).ToList();

@@ -186,12 +186,19 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     /// <summary>"done download" is in the full log (fold-back ran first); now each such upload enters processing (create-only; the repair covers a crash between the two appends).</summary>
     public Task<int> EnterDownloadsAsync(CancellationToken ct) => Handoff.RepairAsync(full, processing, ct);
 
-    /// <summary>When ready items drop below half of the max, the next ready ones of the full queue (priority, then newest) join the work queue, up to the max.</summary>
+    /// <summary>0.13.39: how many prioritised items one pass may put into the work queue over its max.</summary>
+    public const int JumpMax = 50;
+
+    /// <summary>
+    /// When ready items drop below half of the max, the next ready ones of the full queue (priority, then newest) join the work queue, up to the max.
+    /// 0.13.39: a ready item whose priority is HIGHER than every live item of the work queue joins at once, whatever the fill (at most <see cref="JumpMax"/> a pass, even over the max): an upload somebody asked for by hand
+    /// (enqueue --priority, priority set) is the next thing a downloader takes, not something that waits for half the work queue to drain.
+    /// </summary>
     public async Task<int> TopUpAsync(CancellationToken ct)
     {
         var now = work.NowUtc(); int addedRuns = await TopUpRunsAsync(now, ct);   // due refresh and classify go first (they are few and need no room)
         int live = work.Read(w => w.Subjects.Values.Count(s => s.Entries.Values.Any(e => !e.Final && !IsRun(e.Stage))));   // the few due runs do not count against the max
-        if (live >= WorkMax / 2) return addedRuns;
+        if (live >= WorkMax / 2) return addedRuns + await JumpAsync(now, ct);
         int room = WorkMax - live;
         var pick = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Id != null && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-"))
             .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" or "download" && Ready(e, now)).OrderByDescending(e => QueueState.Rank(e.Stage)).FirstOrDefault()))   // a download before a sample of the same subject
@@ -203,6 +210,21 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         foreach (var chunk in JobQueue.Chunks(take, _ => 700))
             await work.AppendLinesAsync(st => { var at = work.NowUtc(); var l = chunk.Where(x => st.Entry(x.Id, x.E.Stage) == null).Select(x => { var j = x.E.Job ?? new JobDescriptor { Stage = x.E.Stage, JobId = x.Id }; j.Pub ??= x.Pub; return QLine.Add(x.Id, x.E.Stage, j, at, x.E.Priority, x.E.Due.Length > 0 ? x.E.Due : at); }).ToList(); added += l.Count; return l; }, ct);
         return added + addedRuns;
+    }
+
+    /// <summary>0.13.39: the ready items of the full queue with a priority above the work queue's highest live priority join the work queue (see <see cref="TopUpAsync"/>).</summary>
+    async Task<int> JumpAsync(string now, CancellationToken ct)
+    {
+        int top = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => !e.Final && !IsRun(e.Stage))).Select(e => e.Priority).DefaultIfEmpty(int.MinValue).Max());
+        var have = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Keys.Select(k => s.Id + "/" + k)).ToHashSet(StringComparer.Ordinal));
+        var jump = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Id != null && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-"))
+            .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" or "download" && Ready(e, now) && e.Priority > top).OrderByDescending(e => QueueState.Rank(e.Stage)).FirstOrDefault()))
+            .Where(x => x.E != null && !have.Contains(x.S.Id + "/" + x.E!.Stage)).OrderByDescending(x => x.E!.Priority).ThenByDescending(x => x.S.Pub ?? x.E!.Job?.Pub ?? "", StringComparer.Ordinal).ThenBy(x => x.S.Id, StringComparer.Ordinal)
+            .Take(JumpMax).Select(x => (x.S.Id, E: x.E!, x.S.Pub)).ToList());
+        if (jump.Count == 0) return 0;
+        int added = 0;
+        await work.AppendLinesAsync(st => { var at = work.NowUtc(); var l = jump.Where(x => st.Entry(x.Id, x.E.Stage) == null).Select(x => { var j = x.E.Job ?? new JobDescriptor { Stage = x.E.Stage, JobId = x.Id }; j.Pub ??= x.Pub; return QLine.Add(x.Id, x.E.Stage, j, at, x.E.Priority, x.E.Due.Length > 0 ? x.E.Due : at); }).ToList(); added = l.Count; return l; }, ct);
+        return added;
     }
 
     /// <summary>The refresh entries (channel / playlist subjects) and the classify singleton that are due and not in the work queue yet; classify carries its batch of unclassified uploads on the job.</summary>
