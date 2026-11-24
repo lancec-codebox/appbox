@@ -11,7 +11,8 @@ public static class MedusaSetup
     public const string Kind = "medusa-node-settings", Scheme = "medusa://node-setup?d=";
     public const string Warning = "contains your storage key; delete after use";
 
-    public sealed record Options(string? Sas, string? NodeName, string Conditions = "wifi+charging", int DailyCap = 20, int? Budget = null, string? Schedule = null, string? Window = null, int MaxHeight = 480);
+    /// <summary>CheckUrl and CheckToken (0.13.42): the check server of the downloader (`indexnode serve`), read by IndexNode for Android 0.1.4+. The token is a secret like the SAS.</summary>
+    public sealed record Options(string? Sas, string? NodeName, string Conditions = "wifi+charging", int DailyCap = 20, int? Budget = null, string? Schedule = null, string? Window = null, int MaxHeight = 480, string? CheckUrl = null, string? CheckToken = null);
 
     public static JsonObject Build(Options o)
     {
@@ -19,11 +20,14 @@ public static class MedusaSetup
         if (o.DailyCap < 0) throw new ArgumentException("--daily-cap must be 0 or more");
         if (o.Schedule != null) CronExpr.Parse(o.Schedule);
         if (o.Window != null) RefreshStage.ParseEvery(o.Window);
-        return new JsonObject
+        if (o.CheckUrl != null && !(Uri.TryCreate(o.CheckUrl, UriKind.Absolute, out var cu) && cu.Scheme is "https" or "http")) throw new ArgumentException("the check server is not a URL");
+        var j = new JsonObject
         {
             ["v"] = 1, ["kind"] = Kind, ["sas"] = o.Sas, ["nodeName"] = o.NodeName, ["conditions"] = o.Conditions, ["dailyCap"] = o.DailyCap,
             ["budget"] = o.Budget, ["schedule"] = o.Schedule, ["window"] = o.Window, ["maxHeight"] = o.MaxHeight,
         };
+        if (!string.IsNullOrWhiteSpace(o.CheckUrl)) { j["checkUrl"] = o.CheckUrl.Trim().TrimEnd('/'); if (!string.IsNullOrEmpty(o.CheckToken)) j["checkToken"] = o.CheckToken; }   // only when set: older setups stay byte for byte the same
+        return j;
     }
 
     public const string WebBase = "https://lancec-codebox.github.io/appbox/setup/#d=";
@@ -92,7 +96,7 @@ public static class MedusaSetup
     {
         if (!noSas && string.IsNullOrWhiteSpace(o.Sas)) throw new InvalidOperationException("no SAS in this node's config: run 'indexnode config set-sas <url>' or use --no-sas");
         if (!noSas && string.IsNullOrWhiteSpace(o.NodeName)) throw new ArgumentException("--name is required when the SAS is included: each helper's node needs its own name");
-        var settings = Build(noSas ? o with { Sas = null } : o);
+        var settings = Build(noSas ? o with { Sas = null, CheckToken = null } : o);   // --no-sas: no secret at all, so no check token either
         var link = WebLink(settings); var sb = new StringBuilder(); var folder = dir ?? DefaultDir(); bool secret = !noSas;
         if (!qr && file == null) qr = true;
         if (qr)

@@ -88,7 +88,8 @@ public sealed class NodeRuntime
         if (!string.IsNullOrWhiteSpace(s.NodeName)) Prefs.Set("nodeName", s.NodeName);
         Prefs.Set("wifiOnly", "true"); Prefs.Set("chargingOnly", s.Conditions == "wifi+charging" ? "true" : "false");
         Prefs.Set("dailyCap", s.DailyCap.ToString()); Prefs.Set("budget", s.Budget?.ToString()); Prefs.Set("maxHeight", s.MaxHeight.ToString());
-        Host.Log($"setup imported: store {Host.StoreUrl}, name {Host.NodeName}, conditions {s.Conditions}, daily cap {s.DailyCap}");
+        Prefs.Set("checkUrl", string.IsNullOrWhiteSpace(s.CheckUrl) ? null : s.CheckUrl.Trim()); Prefs.CheckToken = string.IsNullOrWhiteSpace(s.CheckToken) ? null : s.CheckToken;   // 0.1.4: a setup without a check server clears an earlier one
+        Host.Log($"setup imported: store {Host.StoreUrl}, name {Host.NodeName}, conditions {s.Conditions}, daily cap {s.DailyCap}, check server {Prefs.Get("checkUrl") ?? "(none)"}");
     }
 
     // ---- plugin ----
@@ -134,7 +135,7 @@ public sealed class NodeRuntime
             return JsonNode.Parse(res)!;
         }
         catch (OperationCanceledException) { Host.Log("run stopped"); Host.SetStatus("stopped", null, null); throw; }
-        catch (Exception e) { LastError = HostRedact.Text(e.GetType().Name + ": " + e.Message, Prefs.Sas, Prefs.MedusaToken); Host.Log("run failed: " + LastError); Host.SetStatus("failed", null, null); throw; }
+        catch (Exception e) { LastError = HostRedact.Text(e.GetType().Name + ": " + e.Message, Prefs.Secrets); Host.Log("run failed: " + LastError); Host.SetStatus("failed", null, null); throw; }
         finally { lock (gate) { runCts = null; } cts.Dispose(); guard.Exit(); Changed?.Invoke(); }
     }
 
@@ -149,7 +150,7 @@ public sealed class NodeRuntime
         var state = new Dictionary<string, string?>(); foreach (var (k, v) in s) if (k is not ("settings" or "device")) state[k] = S(v);
         foreach (var (k, v) in s["device"]!.AsObject()) state["device." + k] = S(v);
         settings["storeConfigured"] = (Prefs.Sas != null).ToString();
-        var crash = CrashRecorder.LastCrash(); var log = CrashRecorder.LogFileLines(); var secrets = new[] { Prefs.Sas, Prefs.MedusaToken };
+        var crash = CrashRecorder.LastCrash(); var log = CrashRecorder.LogFileLines(); var secrets = Prefs.Secrets;
         var device = (Android.OS.Build.Manufacturer + " " + Android.OS.Build.Model).Trim(); var os = Android.OS.Build.VERSION.Release + " (API " + (int)Android.OS.Build.VERSION.SdkInt + ")";
         var report = Diagnostics.Report(HostVersion, Plugins.Current?.Version, device, os, settings, state, crash, log, secrets);
         return new JsonObject { ["lastCrash"] = crash == null ? null : HostRedact.Text(crash, secrets), ["log"] = new JsonArray(Diagnostics.TrimLog(log, 100, 400, secrets).Select(l => (JsonNode?)JsonValue.Create(l)).ToArray()), ["report"] = report };
@@ -169,7 +170,7 @@ public sealed class NodeRuntime
             ["settings"] = new JsonObject
             {
                 ["wifiOnly"] = c.WifiOnly, ["chargingOnly"] = c.ChargingOnly, ["dailyCap"] = c.DailyCap, ["budget"] = Prefs.Get("budget"), ["runMax"] = Prefs.Int("runMax", 5),
-                ["maxHeight"] = Prefs.Int("maxHeight", 480), ["uiUrl"] = Prefs.Get("uiUrl"), ["v1Fallback"] = Prefs.Bool("v1Fallback", false), ["noRefresh"] = Prefs.Bool("noRefresh", false), ["medusaApi"] = Prefs.Get("medusaApi") ?? "auto",
+                ["maxHeight"] = Prefs.Int("maxHeight", 480), ["checkUrl"] = Prefs.Get("checkUrl"), ["checkToken"] = Prefs.CheckToken != null ? "set" : null, ["uiUrl"] = Prefs.Get("uiUrl"), ["v1Fallback"] = Prefs.Bool("v1Fallback", false), ["noRefresh"] = Prefs.Bool("noRefresh", false), ["medusaApi"] = Prefs.Get("medusaApi") ?? "auto",
                 ["pluginUrl"] = Prefs.Get("pluginUrl") ?? PluginManager.RollingManifestUrl, ["periodic"] = Prefs.Bool("periodic", true), ["periodMinutes"] = Prefs.Int("periodMinutes", 60),
             },
             ["medusaMode"] = MedusaMode(),

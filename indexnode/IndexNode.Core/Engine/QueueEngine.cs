@@ -196,7 +196,7 @@ public sealed partial class NodeEngine
             try { got = await o.FetchNext(o.Stages.Where(StageEnabled).ToArray(), ct); }
             catch (OperationCanceledException) { throw; }
             catch (Exception e) { Log.Info($"download: the service did not answer ({e.Message}); working from the work queue only"); got = null; nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); }
-            if (got == null) { nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); return false; }
+            if (got == null) { nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); Interlocked.Decrement(ref reserved); return false; }   // 0.13.42: nothing was handed over, so no job started (the slot leaked before: it counted against --max-jobs and a phone's daily cap)
             await queue.PollAsync(ct);
             h = queue.AdoptClaim(got.Subject, got.Epoch, got.Lease);
         }

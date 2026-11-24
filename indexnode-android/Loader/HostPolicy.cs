@@ -26,9 +26,13 @@ public sealed record RunConditions(bool WifiOnly = true, bool ChargingOnly = tru
         get("wifiOnly") != "false", get("chargingOnly") != "false", int.TryParse(get("dailyCap"), out var c) ? c : 20);
 }
 
-/// <summary>The node-setup link or file of `indexnode medusa-setup` (kind medusa-node-settings): SAS, node name, conditions, cap, budget.</summary>
+/// <summary>The node-setup link or file of `indexnode medusa-setup` (kind medusa-node-settings): SAS, node name, conditions, cap, budget, and (0.1.4) the check server and its token.</summary>
 public sealed record SetupSettings(string? Sas, string? NodeName, string Conditions, int DailyCap, int? Budget, string? Schedule, string? Window, int MaxHeight)
 {
+    /// <summary>0.1.4: the check server (`indexnode serve`) of the downloader: its URL and bearer token. Null when the setup has none.</summary>
+    public string? CheckUrl { get; init; }
+    public string? CheckToken { get; init; }
+
     public const string Kind = "medusa-node-settings", Scheme = "medusa://node-setup?d=", WebBase = "https://lancec-codebox.github.io/appbox/setup/#d=";
 
     /// <summary>Accepts the medusa:// link, the https hand-off page link, or the JSON of a .medusa-node.json file.</summary>
@@ -46,7 +50,9 @@ public sealed record SetupSettings(string? Sas, string? NodeName, string Conditi
         if (cond is not ("wifi+charging" or "wifi")) throw new FormatException("unknown conditions " + cond);
         var sas = (string?)j["sas"];
         if (sas != null && !Uri.TryCreate(sas, UriKind.Absolute, out var u)) throw new FormatException("the SAS is not a URL");
-        return new SetupSettings(sas, (string?)j["nodeName"], cond, (int?)j["dailyCap"] ?? 20, (int?)j["budget"], (string?)j["schedule"], (string?)j["window"], (int?)j["maxHeight"] ?? 480);
+        var checkUrl = (string?)j["checkUrl"];
+        if (checkUrl != null && !(Uri.TryCreate(checkUrl, UriKind.Absolute, out var cu) && cu.Scheme is "https" or "http")) throw new FormatException("the check server is not a URL");
+        return new SetupSettings(sas, (string?)j["nodeName"], cond, (int?)j["dailyCap"] ?? 20, (int?)j["budget"], (string?)j["schedule"], (string?)j["window"], (int?)j["maxHeight"] ?? 480) { CheckUrl = checkUrl, CheckToken = (string?)j["checkToken"] };
     }
 
     static string Decode(string b64)
@@ -71,7 +77,7 @@ public static class NodeIdentity
     public static string NewId(string model) => "android-" + Slug(model) + "-" + Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(3)).ToLowerInvariant();
 }
 
-/// <summary>Redacts what must never reach a log or the UI: SAS signatures and Medusa tokens.</summary>
+/// <summary>Redacts what must never reach a log or the UI: SAS signatures, Medusa tokens and the check server token.</summary>
 public static class HostRedact
 {
     public static string Text(string? s, params string?[] secrets)

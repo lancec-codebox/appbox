@@ -97,7 +97,7 @@ public static class Program
         indexnode describe ending --backfill [--dry-run N] [--limit N]   (0.10.4: adds the story ending to existing describe.zip; several dramas per AI call; --dry-run N prints the first prompt of N dramas, no AI call, nothing written)
         indexnode describe --local <job folder> [--dry] [--out <file>]   (AI step; --dry writes the request it would send, no AI call)
         indexnode publish [--out <dir>] [--job <id>] [--since <time>] [--local <dir>] [--force]   (site packs per PACK.md; default out: %LOCALAPPDATA%\indexnode\site)
-        indexnode medusa-setup [--qr] [--file <path>.medusa-node.json] [--name N] [--conditions wifi+charging|wifi] [--daily-cap N] [--budget N] [--schedule C] [--window W] [--no-sas]
+        indexnode medusa-setup [--qr] [--file <path>.medusa-node.json] [--name N] [--conditions wifi+charging|wifi] [--daily-cap N] [--budget N] [--schedule C] [--window W] [--no-sas] [--no-check]
         indexnode dev cast --video <file> --out <dir> [--model buffalo_l|yunet-sface] [--threshold D] [--merge D] [--border D]
         indexnode requeue [--stage S]
         indexnode classify set <videoId> drama|not [--reason R]   (owner override: writes the decision and sets the download job)
@@ -259,7 +259,7 @@ public static class Commands
         var requested = (a.Get("stages") ?? (gpu ? string.Join(',', GpuRouting.MarkerStages) : string.Join(',', Protocol.DefaultNodeStages))).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var stages = Protocol.ExpandStages(requested);
         foreach (var s in stages) if (!Protocol.Stages.Contains(s)) throw new ArgumentException($"unknown stage '{s}'");
-        if (!gpu && stages.Contains("download") && !stages.Contains("refresh") && !a.Has("no-refresh")) stages = [.. stages, "refresh"]; // 0.10.3: a download node also lists sources (a lookup on add, scheduled refreshes), unless --no-refresh
+        if (!gpu) stages = DownloaderNode.WithRefresh(stages, a.Has("no-refresh")); // 0.10.3: a download node also lists sources (a lookup on add, scheduled refreshes), unless --no-refresh
         if (gpu)
         {
             stages = GpuRouting.GpuNodeStages(stages);
@@ -297,15 +297,12 @@ public static class Commands
         bool aiStages = a.Has("ai-stages");
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
         var preStage = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths, b => FreshFromQueue(engineRef, b)), NoPre(a, cfg.PreCheck), Commands.VersionString);
-        var handlers = new Dictionary<string, IStageHandler>
+        var downloader = cfg.Downloader();
+        var handlers = new Dictionary<string, IStageHandler>(DownloaderNode.Handlers(tools, store, gate, http, downloader))   // 0.13.42: download, sample, refresh, availability: the handlers a phone node runs too
         {
-            ["download"] = new DownloadStage(tools, store, gate),
             ["precheck"] = preStage,
-            ["sample"] = new SampleStage(tools, store, gate, cfg.PreCheck ?? new()) { Inline = InlineCheckConfig.From(cfg, http) },
             ["check"] = new CheckStage(preStage),
             ["process"] = new ProcessStage(tools, store, cfg, http) { GpuFlag = gpuFlag },
-            ["refresh"] = new RefreshStage(tools, store),
-            ["availability"] = new AvailabilityStage(tools, store),
             ["group"] = new GroupStage(store, cfg.PreCheck),
             ["search-index"] = new SearchIndexStage(store, cfg.Search?.KeepVersions ?? 3, cfg.PreCheck),
             ["actors-index"] = new ActorsIndexStage(store),
@@ -331,7 +328,7 @@ public static class Commands
             Steps = ProcessStage.SupportedSteps(cfg),
             Stages = stages, Workers = workers, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
-            FetchNext = cfg.Check?.Url is { Length: > 0 } svcUrl ? (async (st, ct) => await DownloadServiceClient.NextAsync(http, svcUrl, cfg.Check.Token ?? Environment.GetEnvironmentVariable("INDEXNODE_CHECK_TOKEN"), nodeId, st, ct)) : null,
+            FetchNext = DownloaderNode.FetchNext(http, downloader, nodeId),
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",

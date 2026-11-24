@@ -174,6 +174,8 @@ public static class SiteCommands
         var cfg = NodeConfig.Load(); bool noSas = a.Has("no-sas");
         var o = new MedusaSetup.Options(cfg.Sas, a.Get("name"), a.Get("conditions") ?? "wifi+charging", a.Get("daily-cap") is { } dc ? int.Parse(dc) : 20,
             a.Get("budget") is { } b ? int.Parse(b) : null, a.Get("schedule"), a.Get("window"), a.Get("max-height") is { } mh ? int.Parse(mh) : 480);
+        // 0.13.42: the phone is a downloader like this node, so it gets this node's check server (config check.url and its token) unless --no-check
+        if (!a.Has("no-check") && cfg.Downloader() is { HasCheck: true } dl) o = o with { CheckUrl = dl.CheckUrl, CheckToken = dl.CheckToken };
         Console.Write(IndexNode.MedusaSetup.Run(o, a.Has("qr"), a.Get("file"), a.Get("dir"), noSas));
         return 0;
     }

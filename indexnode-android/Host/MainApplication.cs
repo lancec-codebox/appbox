@@ -11,6 +11,6 @@ public class MainApplication(IntPtr handle, JniHandleOwnership ownership) : Appl
     {
         base.OnCreate();
         var prefs = new Prefs(this);
-        CrashRecorder.Install(this, () => [prefs.Sas, prefs.MedusaToken], () => { try { return NodeRuntime.Get(this).Plugins.Current?.Version; } catch { return null; } });
+        CrashRecorder.Install(this, () => prefs.Secrets, () => { try { return NodeRuntime.Get(this).Plugins.Current?.Version; } catch { return null; } });
     }
 }

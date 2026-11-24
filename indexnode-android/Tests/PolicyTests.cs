@@ -101,6 +101,20 @@ public class PolicyTests
     }
 
     [Fact]
+    public void A_setup_carries_the_check_server_and_its_token_and_one_without_them_has_none()
+    {
+        Assert.Null(SetupSettings.Parse(Json).CheckUrl); Assert.Null(SetupSettings.Parse(Json).CheckToken);
+        var with = Json.Replace("\"maxHeight\":360", "\"maxHeight\":360,\"checkUrl\":\"https://check.example.net\",\"checkToken\":\"TOKEN-abc123\"");
+        foreach (var text in new[] { Link(with), with })
+        {
+            var s = SetupSettings.Parse(text);
+            Assert.Equal("https://check.example.net", s.CheckUrl); Assert.Equal("TOKEN-abc123", s.CheckToken); Assert.Equal(360, s.MaxHeight);
+        }
+        Assert.Throws<FormatException>(() => SetupSettings.Parse(Json.Replace("\"maxHeight\":360", "\"maxHeight\":360,\"checkUrl\":\"not a url\"")));
+        Assert.Equal("the token TOKEN-abc123 is gone".Replace("TOKEN-abc123", "REDACTED"), HostRedact.Text("the token TOKEN-abc123 is gone", "TOKEN-abc123"));
+    }
+
+    [Fact]
     public void Other_json_and_odd_conditions_are_refused()
     {
         Assert.Throws<FormatException>(() => SetupSettings.Parse("""{"kind":"something-else"}"""));

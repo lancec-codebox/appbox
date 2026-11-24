@@ -18,7 +18,13 @@ public sealed class FakeHost(ITools? tools = null, string? dir = null) : IHost
     public Func<string, string, HostResponse>? Http;
     public Func<string, string, HostResponse>? Store;
     public Task<HostResponse> StoreAsync(string method, string pq, IReadOnlyDictionary<string, string>? h, byte[]? body, int max, CancellationToken ct) => Task.FromResult(Store!(method, pq));
-    public Task<HostResponse> HttpAsync(string method, string url, IReadOnlyDictionary<string, string>? h, byte[]? body, int max, CancellationToken ct) => Task.FromResult(Http != null ? Http(method, url) : new HostResponse { Status = 404 });
+    /// <summary>Every HttpAsync call, with its headers and body.</summary>
+    public readonly List<(string Method, string Url, IReadOnlyDictionary<string, string>? Headers, string Body)> HttpCalls = new();
+    public Task<HostResponse> HttpAsync(string method, string url, IReadOnlyDictionary<string, string>? h, byte[]? body, int max, CancellationToken ct)
+    {
+        lock (HttpCalls) HttpCalls.Add((method, url, h, body == null ? "" : System.Text.Encoding.UTF8.GetString(body)));
+        return Task.FromResult(Http != null ? Http(method, url) : new HostResponse { Status = 404 });
+    }
     public void Log(string m) { lock (Logs) Logs.Add(m); }
     public void SetStatus(string t, string? job = null, double? p = null) { lock (Statuses) Statuses.Add(t); }
     public string? GetSetting(string k) => Settings.GetValueOrDefault(k);

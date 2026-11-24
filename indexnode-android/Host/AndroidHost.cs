@@ -50,13 +50,13 @@ public sealed class AndroidHost(Context ctx, Prefs prefs, Func<ITools> tools, Ac
         catch (Exception e) when (e is HttpRequestException or IOException)
         {
             // the exception text can carry the request URL: never with the signature
-            throw new HttpRequestException(HostRedact.Text(e.Message, secret, prefs.MedusaToken));
+            throw new HttpRequestException(HostRedact.Text(e.Message, [secret, .. prefs.Secrets]));
         }
     }
 
     public void Log(string message)
     {
-        var line = DateTime.Now.ToString("MM-dd HH:mm:ss") + " " + HostRedact.Text(message, prefs.Sas, prefs.MedusaToken);
+        var line = DateTime.Now.ToString("MM-dd HH:mm:ss") + " " + HostRedact.Text(message, prefs.Secrets);
         lock (gate) { log.Add(line); if (log.Count > 1000) log.RemoveAt(0); }
         Android.Util.Log.Info("indexnode", line);
         CrashRecorder.AppendLog(line);

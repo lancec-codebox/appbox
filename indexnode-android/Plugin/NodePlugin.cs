@@ -13,10 +13,13 @@ internal sealed class HostLogWriter(IHost host) : TextWriter
     public override void Write(string? value) { if (!string.IsNullOrEmpty(value)) host.Log(value.TrimEnd('\n', '\r')); }
 }
 
-/// <summary>The node loop for phones: IndexNode.Core's engine with the download stage (and, when asked, refresh and availability; comments are part of the download since 0.13.0), over IHost and ITools only.</summary>
+/// <summary>
+/// The node loop for phones. 0.1.2: it is the downloader node of the desktop (<see cref="DownloaderNode"/> in IndexNode.Core: the same stages, handlers, sample step and check-server calls);
+/// only the tools (Medusa instead of local yt-dlp and ffmpeg), the store transport (the host adds the SAS) and the settings (the host's) differ.
+/// </summary>
 public sealed class NodePlugin : IPlugin
 {
-    public const string Version = "0.1.1";
+    public const string Version = "0.1.2";
 
     public Task<string> SmokeAsync(IHost host)
     {
@@ -45,8 +48,7 @@ public sealed class NodePlugin : IPlugin
     {
         var a = string.IsNullOrWhiteSpace(args) ? new JsonObject() : JsonNode.Parse(args)!.AsObject();
         var stages = (a["stages"] as JsonArray)?.Select(x => (string)x!).ToArray() ?? ["download"];
-        // 0.10.3 semantics of a desktop download node: it also lists sources (a lookup on add, scheduled refreshes) unless "noRefresh" is set
-        if (stages.Contains("download") && !stages.Contains("refresh") && !((bool?)a["noRefresh"] ?? false)) stages = [.. stages, "refresh"];
+        stages = DownloaderNode.WithRefresh(stages, (bool?)a["noRefresh"] ?? false);   // like the desktop download node: it also lists sources unless "noRefresh" is set
         foreach (var s in stages) if (!Protocol.Stages.Contains(s)) throw new ArgumentException("unknown stage " + s);
         int? maxJobs = (int?)a["maxJobs"];
         bool once = (bool?)a["once"] ?? true;
@@ -58,21 +60,20 @@ public sealed class NodePlugin : IPlugin
         var paths = new Paths(prefix);
         var tools = host.Tools;
         var gate = new DownloadGate();
-        var handlers = new Dictionary<string, IStageHandler>();
-        foreach (var st in stages)
-            handlers[st] = st switch
-            {
-                "download" => new DownloadStage(tools, store, gate),
-                "refresh" => new RefreshStage(tools, store),
-                "availability" => new AvailabilityStage(tools, store),
-                _ => throw new ArgumentException("this node does not run stage " + st),
-            };
+        // the check server (`indexnode serve`): from the setup (host settings checkUrl and checkToken); without it the node works from the work queue only and a sample's check runs in a processing node
+        var settings = new DownloaderSettings { CheckUrl = host.GetSetting("checkUrl"), CheckToken = host.GetSetting("checkToken") };
+        Redact.Register(settings.CheckToken);
+        var http = new HttpClient(new HostHttpHandler(host)) { Timeout = TimeSpan.FromMinutes(5) };
+        var all = DownloaderNode.Handlers(tools, store, gate, http, settings);
+        foreach (var st in stages) if (!all.ContainsKey(st)) throw new ArgumentException("this node does not run stage " + st);
+        var handlers = stages.Contains("download") ? all : all.Where(kv => stages.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);   // a node that downloads also takes samples (the engine's rule)
         var limits = new LimitState(host.NodeId, new NodeLimits { Budget = budget }, "host", Path.Combine(host.FilesDir, "state.json"));
         var opts = new EngineOptions
         {
             NodeId = host.NodeId, Name = host.NodeName, Kind = host.Kind, Version = Version, InstanceId = InstanceId(host),
             Stages = stages, Workers = 1, Lanes = 1, Threads = 1, Once = once, MaxJobs = maxJobs, Limits = limits,
             Conditions = host.GetSetting("conditions"),
+            FetchNext = DownloaderNode.FetchNext(http, settings, host.NodeId),
             StorageHost = Uri.TryCreate(host.StoreUrl, UriKind.Absolute, out var su) ? su.Host : null, PollInterval = TimeSpan.FromSeconds(30),
             PlacementProbe = _ => Task.FromResult(new Placement { Provider = "phone", Reason = "phone", CheckedAt = Protocol.NowUtc() }),
             NetworkFetch = async (url, c) => { var r = await host.HttpAsync("GET", url, null, null, 65536, c); return r.Status == 200 ? r.Text : null; },
@@ -82,7 +83,7 @@ public sealed class NodePlugin : IPlugin
         host.SetStatus("running", null, null);
         await engine.RunAsync(ct);
         host.SetStatus("idle", null, null);
-        return new JsonObject { ["jobsStarted"] = engine.JobsStarted, ["version"] = Version, ["stages"] = new JsonArray(stages.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()) }.ToJsonString();
+        return new JsonObject { ["jobsStarted"] = engine.JobsStarted, ["version"] = Version, ["checkServer"] = settings.HasCheck, ["stages"] = new JsonArray(stages.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()) }.ToJsonString();
     }
 
     /// <summary>One instance per phone: the id is made once and kept in the app's settings, so the app, WorkManager and a restart after an update all report as the same instance.</summary>

@@ -13,6 +13,10 @@ public sealed class Prefs(Context ctx)
 
     public string? Sas { get => Get("sas"); set => Set("sas", value); }
     public string? MedusaToken { get => Get("medusaToken"); set => Set("medusaToken", value); }
+    /// <summary>0.1.4: the check server's bearer token (from the setup). The plugin reads it as the setting "checkToken".</summary>
+    public string? CheckToken { get => Get("checkToken"); set => Set("checkToken", value); }
+    /// <summary>Everything that must never reach a log, an exception text or the UI.</summary>
+    public string?[] Secrets => [Sas, MedusaToken, CheckToken];
 
     /// <summary>Jobs started today (local date): the daily cap counts these.</summary>
     public int DoneToday { get => Get("day") == DateTime.Now.ToString("yyyy-MM-dd") ? Int("done", 0) : 0; }

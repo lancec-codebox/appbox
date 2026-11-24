@@ -118,6 +118,34 @@ public class PluginTests
     }
 
     [Fact]
+    public async Task With_a_check_server_in_the_settings_an_idle_node_asks_the_download_service_with_its_token()
+    {
+        var s = new FakeStore(); var tools = new FakeTools(); var host = Host(tools);
+        var ip = host.Http!;
+        host.Http = (m, url) => url.EndsWith("/v1/download/next") ? new HostResponse { Status = 200, ContentType = "application/json", Body = Encoding.UTF8.GetBytes("""{"none":true,"retryAfterSeconds":60}""") } : ip(m, url);
+        host.Settings["checkUrl"] = "https://check.example.net/"; host.Settings["checkToken"] = "TOKEN-abc123";
+        var res = JsonNode.Parse(await new NodePlugin().RunWithStoreAsync(host, s, """{"stages":["download"],"noRefresh":true,"once":true}""", default))!;
+        Assert.True((bool)res["checkServer"]!); Assert.Equal(0, (int)res["jobsStarted"]!);
+        var call = Assert.Single(host.HttpCalls, c => c.Url.EndsWith("/v1/download/next"));
+        Assert.Equal("POST", call.Method); Assert.Equal("https://check.example.net/v1/download/next", call.Url);
+        Assert.Equal("Bearer TOKEN-abc123", call.Headers!["Authorization"]);
+        var body = JsonNode.Parse(call.Body)!; Assert.Equal("android-pixel-abc123", (string)body["node"]!); Assert.Contains("download", body["stages"]!.AsArray().Select(x => (string)x!));
+        Assert.DoesNotContain(host.Logs, l => l.Contains("TOKEN-abc123"));
+        // no check server in the settings: no call, and the result says so
+        var plain = Host(tools);
+        var res2 = JsonNode.Parse(await new NodePlugin().RunWithStoreAsync(plain, new FakeStore(), """{"stages":["download"],"noRefresh":true,"once":true}""", default))!;
+        Assert.False((bool)res2["checkServer"]!); Assert.DoesNotContain(plain.HttpCalls, c => c.Url.Contains("/v1/download/"));
+    }
+
+    [Fact]
+    public async Task A_stage_a_downloader_has_no_handler_for_is_refused()
+    {
+        var host = Host(new FakeTools());
+        var e = await Assert.ThrowsAsync<ArgumentException>(() => new NodePlugin().RunWithStoreAsync(host, new FakeStore(), """{"stages":["process"],"once":true}""", default));
+        Assert.Contains("does not run stage process", e.Message);
+    }
+
+    [Fact]
     public async Task Control_stop_keeps_the_node_from_claiming()
     {
         var s = new FakeStore(); var tools = new FakeTools(); var host = Host(tools);

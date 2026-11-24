@@ -9,12 +9,13 @@ public sealed class DownloadConfig { public int? WorkMax { get; set; } public in
 public sealed class InlineCheckConfig
 {
     public string? Url { get; set; } public string? Token { get; set; } public int? TimeoutSeconds { get; set; }
-    public static InlineCheckClient? From(NodeConfig cfg, HttpClient http) =>
-        cfg.Check?.Url is { Length: > 0 } u ? new InlineCheckClient(http, u.TrimEnd('/'), cfg.Check.Token ?? Environment.GetEnvironmentVariable("INDEXNODE_CHECK_TOKEN"), TimeSpan.FromSeconds(Math.Max(1, cfg.Check.TimeoutSeconds ?? 90))) : null;
+    public static InlineCheckClient? From(NodeConfig cfg, HttpClient http) => DownloaderNode.CheckClient(http, cfg.Downloader());
 }
 
 public sealed class NodeConfig
 {
+    /// <summary>0.13.42: the downloader settings of this config (the check server and its token, env INDEXNODE_CHECK_TOKEN when the config has none; the pre-check settings).</summary>
+    public DownloaderSettings Downloader() => new() { CheckUrl = Check?.Url, CheckToken = Check?.Token ?? Environment.GetEnvironmentVariable("INDEXNODE_CHECK_TOKEN"), CheckTimeoutSeconds = Check?.TimeoutSeconds, PreCheck = PreCheck };
     public string? Sas { get; set; }
     /// <summary>0.13.37: the SAS URL of the Azure Table `media` (https://account.table.core.windows.net/media?...): per-upload facts. Env INDEXNODE_MEDIA_TABLE_SAS_URL overrides it; `config set-media-table-sas` stores it.</summary>
     public string? MediaTableSas { get; set; }
