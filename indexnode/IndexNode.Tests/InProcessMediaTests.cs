@@ -54,6 +54,40 @@ public class InProcessMediaTests
         finally { Directory.Delete(dir, true); }
     }
 
+    static string? Ffmpeg()
+    {
+        if (File.Exists("/usr/bin/ffmpeg")) return "/usr/bin/ffmpeg";
+        foreach (var d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            foreach (var n in new[] { "ffmpeg", "ffmpeg.exe" }) { try { var p = Path.Combine(d.Trim('"'), n); if (File.Exists(p)) return p; } catch (ArgumentException) { } }
+        return null;
+    }
+
+    /// <summary>0.13.46: a 16x12 lossless WebP of the pattern below (made with ffmpeg's libwebp).</summary>
+    const string WebpFixture = "UklGRkwAAABXRUJQVlA4TEAAAAAvD8ACAM1VIKL/sYuI/geMtI2k7628k2mck/GnjwmybWpyf4LzzIQg26Ym47k/wU2iDPNJcVQucROBXYAD/JkI";
+
+    [Fact]
+    public void Webp_is_sniffed_and_png_and_jpeg_are_not()
+    {
+        var im = Noise(16, 12, 9);
+        Assert.True(InProcessMedia.IsWebp(Convert.FromBase64String(WebpFixture)));
+        Assert.False(InProcessMedia.IsWebp(MakePng(im))); Assert.False(InProcessMedia.IsWebp(Imaging.EncodeJpeg(im))); Assert.False(InProcessMedia.IsWebp([(byte)'R', (byte)'I', (byte)'F', (byte)'F']));
+        Assert.Throws<InvalidDataException>(() => InProcessMedia.DecodeImage(Convert.FromBase64String(WebpFixture)));   // in-process there is no WebP decoder: the caller converts first
+    }
+
+    [Fact]
+    public async Task Webp_becomes_a_png_with_the_same_pixels_and_a_broken_one_is_refused()
+    {
+        if (Ffmpeg() is not { } ff) return;
+        var want = new byte[16 * 12 * 3]; for (int i = 0; i < want.Length; i++) want[i] = (byte)((i * 73 + (i / 7) * 31) & 0xFF);
+        var png = await InProcessMedia.WebpToPngAsync(ff, Convert.FromBase64String(WebpFixture), default);
+        var back = InProcessMedia.DecodeImage(png);
+        Assert.Equal((16, 12), (back.W, back.H)); Assert.Equal(want, back.Data);
+        var broken = Convert.FromBase64String(WebpFixture); Array.Fill(broken, (byte)0x5A, 12, broken.Length - 12);   // the RIFF/WEBP header with rubbish behind it
+        var e = await Assert.ThrowsAsync<InvalidDataException>(() => InProcessMedia.WebpToPngAsync(ff, broken, default));
+        Assert.Equal("webp: the image could not be decoded", e.Message);   // no temp path or ffmpeg text in what a caller is told
+        Assert.Empty(Directory.GetDirectories(Path.GetTempPath(), "indexnode-webp-*"));
+    }
+
     [Fact]
     public void Jpeg_and_png_are_sniffed_and_garbage_is_refused()
     {

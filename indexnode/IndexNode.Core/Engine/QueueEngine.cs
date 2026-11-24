@@ -331,10 +331,12 @@ public sealed partial class NodeEngine
         Report = (step, progress) => { if (step != null && step != w.Run.Info.Step) { w.Run.Info.Step = step; w.Run.Info.StartedAt = Protocol.NowUtc(); w.Run.Timer.Enter(step); } w.Run.Info.Progress = progress; },
     };
 
-    private static JobDescriptor BodyOf(QEntry e, string id)
+    /// <summary>The job a handler gets: the entry's body with the entry's own facts. 0.13.46: a source's lookup or refresh that is claimed at <see cref="Protocol.RefreshNowPriority"/> (just added, or made due by hand)
+    /// keeps the body's priority, which is the SOURCE's and what its videos inherit. 0.13.45 copied the claim priority into the job here: a playlist added at 100 queued its videos at 500 and came back as a 500 source.</summary>
+    internal static JobDescriptor BodyOf(QEntry e, string id)
     {
         var j = e.Job ?? new JobDescriptor();
-        j.JobId = id; j.Stage = e.Stage; j.Priority = e.Priority; j.Attempts = e.Attempts; j.LastError = e.LastError; if (j.AddedAt.Length == 0) j.AddedAt = e.Added;
+        j.JobId = id; j.Stage = e.Stage; j.Priority = e.Stage == "refresh" && e.Priority == Protocol.RefreshNowPriority ? j.Priority : e.Priority; j.Attempts = e.Attempts; j.LastError = e.LastError; if (j.AddedAt.Length == 0) j.AddedAt = e.Added;
         return j;
     }
 

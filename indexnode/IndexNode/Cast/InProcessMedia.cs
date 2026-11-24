@@ -10,7 +10,27 @@ public static class InProcessMedia
     {
         if (b.Length > 8 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return DecodePng(b);
         if (b.Length > 3 && b[0] == 0xFF && b[1] == 0xD8) { try { return Imaging.DecodeJpeg(b); } catch (Exception e) when (e is not InvalidDataException) { throw new InvalidDataException("jpeg: " + e.Message); } }
-        throw new InvalidDataException("not a JPEG or PNG image");
+        throw new InvalidDataException(IsWebp(b) ? "a WebP image is converted first (WebpToPngAsync)" : "not a JPEG, PNG or WebP image");
+    }
+
+    /// <summary>"RIFF" size "WEBP": what phones and browsers often save a screenshot as (0.13.46).</summary>
+    public static bool IsWebp(byte[] b) => b.Length > 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P';
+
+    /// <summary>0.13.46: a WebP image to a PNG through ffmpeg, a child process, with the input format forced to WebP (nothing else is probed); an animated WebP gives its first frame, alpha is dropped.
+    /// The PNG then takes the in-process path (<see cref="DecodeImage"/>), so a WebP screenshot is embedded exactly like a PNG of the same pixels.
+    /// No managed WebP decoder is bundled: the free ImageSharp line (3.1) has open advisories and the patched lines need a licence key at build time.</summary>
+    public static async Task<byte[]> WebpToPngAsync(string ffmpeg, byte[] webp, CancellationToken ct)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "indexnode-webp-" + Guid.NewGuid().ToString("N")[..8]); Directory.CreateDirectory(dir);
+        try
+        {
+            string src = Path.Combine(dir, "in.webp"), dst = Path.Combine(dir, "out.png");
+            await File.WriteAllBytesAsync(src, webp, ct);
+            var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "webp_pipe", "-i", src, "-frames:v", "1", "-pix_fmt", "rgb24", "-c:v", "png", dst], ct);
+            if (r.ExitCode != 0 || !File.Exists(dst)) throw new InvalidDataException("webp: the image could not be decoded");   // ffmpeg's own words (addresses, temp paths) are not for a caller
+            return await File.ReadAllBytesAsync(dst, ct);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     /// <summary>PNG: all colour types, 1/2/4/8/16 bit, non-interlaced (alpha is dropped over black-free: the colour channels are used as they are).</summary>

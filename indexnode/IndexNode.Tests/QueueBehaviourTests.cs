@@ -18,6 +18,31 @@ public class QueueBehaviourTests
     }
 
     [Fact]
+    public async Task A_source_keeps_its_own_priority_for_its_videos_while_its_lookup_is_claimed_at_500()
+    {
+        // 0.13.46: found on 2026-11-24 with the owner's playlist added at priority 100: its videos were queued at 500
+        var (s, q) = await Q();
+        var src = Src("pl-1"); src.Priority = 100;
+        await Sources.AddAsync(q, src, default);
+        var e = q.Read(st => st.Entry("pl-1", "refresh"))!;
+        Assert.Equal(Protocol.RefreshNowPriority, e.Priority); Assert.Equal(100, e.Job!.Priority);
+        Assert.Equal(100, NodeEngine.BodyOf(e, "pl-1").Priority);                       // what the refresh stage reads, and what its videos get
+        // the run ends: the entry goes back to the source's priority and its next refresh
+        await q.AppendLinesAsync([new QLine { T = "retry", S = "pl-1", Stage = "refresh", Due = Protocol.Utc(Now.AddDays(1)) }, new QLine { T = "pri", S = "pl-1", Pri = 100 }], default);
+        e = q.Read(st => st.Entry("pl-1", "refresh"))!; Assert.Equal(100, e.Priority); Assert.Equal(100, e.Job!.Priority);
+        // made due by hand: claimed at 500 again, still a priority-100 source
+        Assert.True(await Sources.TriggerAsync(q, "pl-1", "refresh", default, () => Now));
+        e = q.Read(st => st.Entry("pl-1", "refresh"))!; Assert.Equal(Protocol.RefreshNowPriority, e.Priority); Assert.Equal(100, e.Job!.Priority);
+        Assert.Equal(100, NodeEngine.BodyOf(e, "pl-1").Priority);
+        // a node that starts later replays the same lines and sees the same
+        var late = new JobQueue(s, P, "late", () => Now); await late.LoadAsync(default);
+        Assert.Equal(100, late.Read(st => st.Entry("pl-1", "refresh"))!.Job!.Priority);
+        // any other stage: the entry's priority is the job's, as before
+        await q.AppendLinesAsync([QLine.Add("v1", "sample", new JobDescriptor { Stage = "sample", JobId = "v1", AddedAt = Protocol.Utc(Now) }, Protocol.Utc(Now), 100, Protocol.Utc(Now))], default);
+        Assert.Equal(100, NodeEngine.BodyOf(q.Read(st => st.Entry("v1", "sample"))!, "v1").Priority);
+    }
+
+    [Fact]
     public async Task Setting_a_schedule_keeps_a_lookup_that_is_due_now_and_off_or_once_ends_a_finished_source()
     {
         var (s, q) = await Q();

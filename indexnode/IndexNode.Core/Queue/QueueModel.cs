@@ -263,7 +263,8 @@ public sealed class QueueState
                     break;
                 }
             case "pri":
-                if (Get(l.S) is { } ps) foreach (var e in ps.Entries.Values.Where(e => !e.Final)) { e.Priority = l.Pri ?? 0; if (e.Job != null) e.Job.Priority = e.Priority; }
+                // 0.13.46: making a source due by hand raises its refresh entry to RefreshNowPriority for the claim; that is not the source's priority, so the body keeps its own (its videos inherit the body's)
+                if (Get(l.S) is { } ps) foreach (var e in ps.Entries.Values.Where(e => !e.Final)) { e.Priority = l.Pri ?? 0; if (e.Job != null && !(e.Stage == "refresh" && e.Priority == Protocol.RefreshNowPriority)) e.Job.Priority = e.Priority; }
                 break;
             case "due":
                 if (l.Stage != null && Entry(l.S, l.Stage) is { } de) de.Due = l.Due ?? de.Due;

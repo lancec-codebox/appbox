@@ -168,6 +168,8 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     async Task<(float[] Vector, BarCrop Crop)> EmbedImageAsync(byte[] image, bool trim, CancellationToken ct)
     {
         var model = await Sscd.EnsureModelAsync(ImageConfig!, ImageHttp!, ct);
+        // 0.13.46: a WebP screenshot becomes a PNG first (ffmpeg, one child process); JPEG and PNG stay in-process as before
+        if (InProcessMedia.IsWebp(image)) image = await InProcessMedia.WebpToPngAsync(await (Tools ?? throw new InvalidOperationException("no tools: WebP needs ffmpeg")).FfmpegAsync(ct), image, ct);
         var im = InProcessMedia.DecodeImage(image); var crop = BarCrop.None;
         if (trim)
         {
@@ -196,7 +198,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             catch (Exception e) when (e is InvalidOperationException or InvalidDataException) { throw new ArgumentException("the image could not be read: " + e.Message); }
             finally { slots.Release(); }
         }
-        else throw new ArgumentException("send an image (multipart 'image', JPEG/PNG) or a vector (multipart 'vector', 512 f32/f16)");
+        else throw new ArgumentException("send an image (multipart 'image', JPEG/PNG/WebP) or a vector (multipart 'vector', 512 f32/f16)");
         // 0.13.31: a search makes no head.yaml / uploads.yaml / catalog read (the loaded version; the refresh loop moves it) and is ONE step of the storage budget: a warm search is 0 ops, a cold file is one whole GET
         var idx = index.Loaded ?? await IndexAsync(ct) ?? throw new InvalidOperationException("no search index");
         var meter = StoreMeter.Current;
