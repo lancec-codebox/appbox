@@ -11,7 +11,7 @@ public sealed class Args
     public Dictionary<string, string?> Options { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>0.13.32: every value of a repeated option (--set a=1 --set b=2).</summary>
     public Dictionary<string, List<string>> Multi { get; } = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "ids", "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow", "repair-only", "no-table" };
+    private static readonly HashSet<string> Flags = new(StringComparer.OrdinalIgnoreCase) { "ids", "once", "keep-sample", "exclude-self", "help", "gpu", "follow-channels", "dry", "qr", "no-sas", "local-analyzer", "force", "json", "delete-loose", "split", "fp32", "download", "shadow", "repair-only", "no-table", "warm", "download-service" };
 
     public static Args Parse(IEnumerable<string> argv)
     {
@@ -27,7 +27,7 @@ public sealed class Args
                 var key = t[2..]; string? val = null;
                 var eq = key.IndexOf('=');
                 if (eq >= 0) { val = key[(eq + 1)..]; key = key[..eq]; }
-                else if (!Flags.Contains(key) && q.Count > 0) val = q.Dequeue();
+                else if (!Flags.Contains(key) && q.Count > 0 && !LooksLikeOption(q.Peek())) val = q.Dequeue();   // 0.13.40: an option never takes the NEXT OPTION as its value (`--warm --download-service` lost the second one; `--repair-only --stages x` lost the stages). A value that starts with "--" (a video id) is written --key=value, or after a bare "--"
                 a.Options[key] = val ?? "true"; (a.Multi.TryGetValue(key, out var ml) ? ml : a.Multi[key] = []).Add(val ?? "true");
             }
             else a.Positional.Add(t);
@@ -38,6 +38,13 @@ public sealed class Args
     /// <summary>--video=&lt;id&gt; is accepted wherever a video id is taken (--job, --videos): an id may start with '-', which no other spelling can carry.</summary>
     public string? Get(string key) => Options.TryGetValue(key, out var v) ? v : key is "job" or "videos" && Options.TryGetValue("video", out var vid) ? vid : null;
     public bool Has(string key) => Options.ContainsKey(key);
+    /// <summary>"--name" or "--name=value" where name starts with a lowercase letter and holds only lowercase letters, digits and '-': an option, not a value. A YouTube id that starts with "--" (11 characters, e.g. --QfpuGhs0U, --DL3_0DNjg) is taken as an option only when it looks exactly like one; such ids are written --video=&lt;id&gt; anyway.</summary>
+    internal static bool LooksLikeOption(string t)
+    {
+        if (!t.StartsWith("--", StringComparison.Ordinal) || t.Length < 4) return false;
+        var name = t[2..]; var eq = name.IndexOf('='); if (eq >= 0) name = name[..eq];
+        return name.Length >= 2 && name[0] is >= 'a' and <= 'z' && name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-');
+    }
 }
 
 public static class Program

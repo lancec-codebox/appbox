@@ -88,10 +88,11 @@ public class OpsPerJobTests(ITestOutputHelper output)
         var fs = new FakeStore(); for (int i = 0; i < 40; i++) await fs.PutAsync("index/x/" + i, [1], null, null, false, default);
         var m = new StoreMeter { Limits = new StorageLimits { Lanes = 2 } }; var rs = FakeBlobHttp.Rest(fs, m, out var http);
         Assert.Equal(25, m.Limits.MaxPerStep); Assert.Equal(400, m.Limits.MaxPerMin); Assert.Equal(300, m.Limits.WarnPerMin);
-        var ex = await Assert.ThrowsAsync<StorageBudgetExceeded>(async () => { using (m.BeginStep(m.Limits.StepLimitFor("actors"), "job")) for (int i = 0; i < 30; i++) await rs.GetAsync("index/x/" + i, default); });
+        var ex = await Assert.ThrowsAsync<StorageBudgetExceeded>(async () => { using (m.BeginStep(m.Limits.StepLimitFor("refresh"), "job")) for (int i = 0; i < 30; i++) await rs.GetAsync("index/x/" + i, default); });
         Assert.Contains("max-per-step 25", ex.Message); Assert.Contains("Top sites", ex.Message); Assert.Equal(25, http.Requests); Assert.True(m.Tripped, "a runaway step opens the breaker so the node stops claiming");   // the 26th op never left the node
         m.Reset();   // the cooldown is not what this part is about
         Assert.True(m.Limits.StepLimitFor("actors-index") > 25 && m.Limits.StepLimitFor("search-index") > 25);
+        Assert.Equal(45, m.Limits.StepLimitFor("actors")); Assert.Equal(80, m.Limits.StepLimitFor("group"));   // 0.13.40: a cold node's first actors job also loads the actor index; the group step reads one frames file per uncached candidate
         using (m.BeginStep(m.Limits.StepLimitFor("actors-index"), "idx")) for (int i = 0; i < 30; i++) await rs.GetAsync("index/x/" + (i + 1 > 39 ? 0 : i + 1) + "", default);
     }
 

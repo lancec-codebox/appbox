@@ -25,6 +25,24 @@ public class ClaimProbeTests
     }
 
     [Fact]
+    public void An_option_never_takes_the_next_option_as_its_value()
+    {
+        // 0.13.40: `serve --warm --download-service` started no download service (warm = "--download-service"); the parser no longer lets that happen for any option, listed as a flag or not
+        var s = Args.Parse(["serve", "--port", "8080", "--threads", "8", "--warm", "--download-service"]);
+        Assert.True(s.Has("warm")); Assert.True(s.Has("download-service")); Assert.Equal("8080", s.Get("port")); Assert.Equal("8", s.Get("threads"));
+        var u = Args.Parse(["run", "--some-new-option", "--stages", "cast,actors", "--lanes", "2"]);   // an option nobody listed as a flag
+        Assert.True(u.Has("some-new-option")); Assert.Equal("cast,actors", u.Get("stages")); Assert.Equal("2", u.Get("lanes"));
+        var v = Args.Parse(["describe", "ending", "--dry-run", "5", "--limit", "3"]);   // a value that is not an option is still taken
+        Assert.Equal("5", v.Get("dry-run")); Assert.Equal("3", v.Get("limit"));
+        var w = Args.Parse(["process", "--video=--QfpuGhs0U", "--steps", "cast"]);   // an id that starts with "--": the = form, as the usage says
+        Assert.Equal("--QfpuGhs0U", w.Get("video")); Assert.Equal("cast", w.Get("steps"));
+        var x = Args.Parse(["process", "--job", "--DL3_0DNjg"]);   // an id with an uppercase letter or '_' does not look like an option: still taken as the value
+        Assert.Equal("--DL3_0DNjg", x.Get("job"));
+        var y = Args.Parse(["classify", "set", "drama", "--", "--QfpuGhs0U"]);   // after a bare "--" everything is positional
+        Assert.Equal(new[] { "classify", "set", "drama", "--QfpuGhs0U" }.Skip(0).ToArray(), y.Positional.ToArray());
+    }
+
+    [Fact]
     public void Repair_only_is_a_flag_it_keeps_the_stages_given_and_the_printed_stage_line_matches()
     {
         var a = Args.Parse(["run", "--shadow", "--out-local", "shadow38", "--set", "versions.cast=3", "--repair-only", "--stages", "process,cast,actors,actors-index", "--lanes", "2", "--max-jobs", "6"]);

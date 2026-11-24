@@ -225,6 +225,7 @@ public sealed partial class NodeEngine
     private static IEnumerable<string> QueueStages() => new[] { "sample", "check", "download", "process", "group", "actors", "describe", "translate", "refresh", "classify", "availability", "search-index", "actors-index" };
 
     /// <summary>Claims one candidate subject (limits, per-IP cap, then the protocol's claim) and runs it. False when nothing was claimed.</summary>
+    private int limitNoted; private string? lastLimitStage;
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
     {
         var id = subject.Id;
@@ -233,7 +234,11 @@ public sealed partial class NodeEngine
         if (IsAbandoned(subject)) return false;   // 0.13.36: attempted and released with nothing run: not again until a queue line for it, or a control change
         if (o.Shadow && shadowTaken.ContainsKey(id)) return false;   // 0.13.30: shadow claims are in-process: a subject is taken once per run, by one lane
         var first = runnable[0].Stage;
-        if (o.Limits != null && !o.Limits.TryAcquire(first)) return false;
+        if (o.Limits != null && !o.Limits.TryAcquire(first))
+        {   // 0.13.40: never silent: a node whose limit refuses the stage of the best candidate says so once (a hand-prioritised download sat unclaimed behind an exhausted full-download budget while the node went on taking samples)
+            if (Interlocked.Exchange(ref limitNoted, 1) == 0 || lastLimitStage != first) { lastLimitStage = first; Log.Info($"limits: {first} work is ready ({id} first) but this node's limit refuses {first} now ({(o.Limits.Budget is { } bd ? $"full-download budget {o.Limits.Remaining} of {bd} left" : "no budget set")}; schedule window or sample budget otherwise): it is skipped until the limit allows it"); }
+            return false;
+        }
         if (runnable.Any(e => e.Stage is "download" or "sample"))
         {
             bool allowed;
