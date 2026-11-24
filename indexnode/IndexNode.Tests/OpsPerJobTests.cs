@@ -92,7 +92,18 @@ public class OpsPerJobTests(ITestOutputHelper output)
         Assert.Contains("max-per-step 25", ex.Message); Assert.Contains("Top sites", ex.Message); Assert.Equal(25, http.Requests); Assert.True(m.Tripped, "a runaway step opens the breaker so the node stops claiming");   // the 26th op never left the node
         m.Reset();   // the cooldown is not what this part is about
         Assert.True(m.Limits.StepLimitFor("actors-index") > 25 && m.Limits.StepLimitFor("search-index") > 25);
-        Assert.Equal(45, m.Limits.StepLimitFor("actors")); Assert.Equal(80, m.Limits.StepLimitFor("group"));   // 0.13.40: a cold node's first actors job also loads the actor index; the group step reads one frames file per uncached candidate
+        Assert.Equal(45, m.Limits.StepLimitFor("actors")); Assert.Equal(80, m.Limits.StepLimitFor("group"));
+        foreach (var (st, n) in new[] { ("check", 80), ("download", 60), ("sample", 40), ("describe", 80), ("translate", 80) }) Assert.Equal(n, m.Limits.StepLimitFor(st));   // 0.13.41
+        // 0.13.41: a singleton index build is bounded by its own budget and does not use up the lane's minute: one lane (200/min), a 230-op build, then ordinary jobs still run
+        var m1 = new StoreMeter { Limits = new StorageLimits { Lanes = 1 } }; var rs1 = FakeBlobHttp.Rest(fs, m1, out _);
+        Assert.Equal(200, m1.Limits.MaxPerMin);
+        using (m1.BeginStep(m1.Limits.StepLimitFor("actors-index"), "idx")) for (int i = 0; i < 230; i++) await rs1.GetAsync("index/x/" + (i % 40), default);
+        Assert.False(m1.Tripped);
+        using (m1.BeginStep(m1.Limits.StepLimitFor("actors"), "job")) for (int i = 0; i < 20; i++) await rs1.GetAsync("index/x/" + i, default);
+        Assert.False(m1.Tripped);
+        var m2 = new StoreMeter { Limits = new StorageLimits { Lanes = 1 } }; var rs2 = FakeBlobHttp.Rest(fs, m2, out _);   // ordinary steps still add up to the per-minute limit
+        await Assert.ThrowsAsync<StorageBudgetExceeded>(async () => { for (int j = 0; j < 12; j++) using (m2.BeginStep(m2.Limits.StepLimitFor("refresh"), "job" + j)) for (int i = 0; i < 20; i++) await rs2.GetAsync("index/x/" + i, default); });
+        Assert.True(m2.Tripped);   // 0.13.40: a cold node's first actors job also loads the actor index; the group step reads one frames file per uncached candidate
         using (m.BeginStep(m.Limits.StepLimitFor("actors-index"), "idx")) for (int i = 0; i < 30; i++) await rs.GetAsync("index/x/" + (i + 1 > 39 ? 0 : i + 1) + "", default);
     }
 
@@ -114,7 +125,7 @@ public class OpsPerJobTests(ITestOutputHelper output)
             Assert.True(http.Log.Count <= 10, string.Join(" | ", http.Log));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
-        var lim = new StorageLimits(); Assert.Equal(25, lim.StepLimitFor("describe"));   // unclassified work keeps the default
+        var lim = new StorageLimits(); Assert.Equal(25, lim.StepLimitFor("refresh"));   // unclassified work keeps the default
         foreach (var s in new[] { "frames", "sscd", "centers", "thumbs", "transcribe", "ocrsubs", "cast", "sync" }) Assert.True(lim.StepLimitFor("process:" + s) > 25, s);
         Assert.True(Protocol.StepStages.Where(s => lim.StepLimits.ContainsKey("process:" + s)).Sum(s => lim.StepLimitFor("process:" + s)) >= 221);   // each step on its own budget; the sum clears the 221 ops measured live
     }

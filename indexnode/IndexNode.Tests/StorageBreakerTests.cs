@@ -93,7 +93,7 @@ public class StorageBreakerTests
     {
         var f = new FakeStore(); var m = Meter(new Clock(), step: 5); var s = new MeteredStore(f, m);
         await f.AddJob(P, "download", "v1", "2026-11-21T08:00:00Z");
-        var h = new Dictionary<string, IStageHandler> { ["download"] = new Fn(async ctx => { for (int i = 0; i < 50; i++) await ctx.Store.HeadAsync("x", ctx.Token); }) };
+        var h = new Dictionary<string, IStageHandler> { ["download"] = new Fn(async ctx => { for (int i = 0; i < 100; i++) await ctx.Store.HeadAsync("x", ctx.Token); })   /* 0.13.41: over the download stage's own budget (60) */ };
         await new NodeEngine(s, P, Opts(m), h).RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15));
         var e = f.Replay(P.Prefix).Entry("v1", "download")!;
         Assert.NotEqual("done", e.State); Assert.True(e.Attempts >= 1, "attempts " + e.Attempts); Assert.Contains("max-per-step", e.LastError); Assert.True(m.Tripped, "tripped");   // an ordinary failure: counted as an attempt and retried (zero backoff here, so the attempts run out)
