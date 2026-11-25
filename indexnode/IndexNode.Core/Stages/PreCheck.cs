@@ -27,6 +27,10 @@ public sealed class PreCheckSettings
     public int TopCenters { get; set; } = 100;
     /// <summary>0.13.21 (config precheck.vote-uploads): vote-first lookup: after the bit scan the uploads are ranked by how many frames have them among their top rows, and only the top this-many are read and scored exactly. 0 = read every upload with a top row (the old behaviour). Applies to the pre-check, the check and the group step.</summary>
     public int VoteUploads { get; set; } = 20;
+    /// <summary>0.13.58: the screenshot search (/v1/search, `indexnode search`) opens the frames of at most this many uploads, the ones whose centers stand best; a request may ask for another number (maxUploads). 0 = every upload behind the top centers.</summary>
+    public int SearchUploads { get; set; } = 0;   // off: see CenterSearch.QueryAsync (measured 2026-11-25: the right upload can stand last among the 200 behind the centers)
+    /// <summary>0.13.58: the screenshot search reads only the blocks of the matched centers by range instead of whole frames files. For a search service with no local copy of the frames (a container that scales to zero). Off: whole files, kept in the local cache.</summary>
+    public bool SearchRanged { get; set; }
     public double WindowSeconds { get; set; } = 300;
     /// <summary>Centre of the sample window as a fraction of the duration (0.5 = the middle).</summary>
     public double WindowPosition { get; set; } = 0.5;

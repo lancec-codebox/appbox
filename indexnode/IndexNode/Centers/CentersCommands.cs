@@ -199,9 +199,10 @@ public static class CentersCommands
         var sw = Stopwatch.StartNew();
         var idx = await SearchData.LoadAsync(store, paths, a.Get("version") is { } v ? int.Parse(v) : null, cts.Token) ?? throw new InvalidOperationException("no search index: run search-index build");
         Console.WriteLine($"index v{idx.Version}: {idx.Uploads.Count} uploads, {idx.Count} centers (loaded in {sw.Elapsed.TotalSeconds:F1}s)");
-        var (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topC, top, threads, cts.Token);
-        foreach (var h in hits) Console.WriteLine($"{h.Upload}  {Clip.Stamp(h.Time)}  {h.Time:F1}s  {h.Score:F4}  (row {h.Row}, center {h.Center})");
-        Console.WriteLine($"timings: scan {tm.ScanMs:F1} ms, reads {tm.ReadMs:F1} ms ({tm.Requests} requests, {tm.Bytes / 1048576.0:F1} MB, {tm.Uploads} uploads), scoring {tm.ScoreMs:F1} ms");
+        int maxUp = a.Get("max-uploads") is { } mu ? int.Parse(mu) : (cfg.PreCheck ?? new()).SearchUploads;   // 0.13.58: the uploads opened (0: all)
+        var (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topC, top, threads, cts.Token, maxUp, a.Has("ranged") || (cfg.PreCheck ?? new()).SearchRanged);
+        foreach (var h in hits) Console.WriteLine($"{h.Upload}  {Clip.Stamp(h.Time)}  {h.Time:F1}s  {h.Score:F4}  (row {h.Row}, center {h.Center}, vote {h.Vote})");
+        Console.WriteLine($"timings: scan {tm.ScanMs:F1} ms, reads {tm.ReadMs:F1} ms ({tm.Requests} requests, {tm.Bytes / 1048576.0:F1} MB, {tm.Opened} of {tm.Uploads} uploads opened), scoring {tm.ScoreMs:F1} ms");
         return 0;
     }
 

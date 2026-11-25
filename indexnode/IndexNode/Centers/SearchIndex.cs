@@ -449,8 +449,10 @@ public static class SearchIndexBuild
     }
 }
 
-public sealed record Hit(string Upload, double Time, int Row, float Score, int Center);
-public sealed record QueryTimings(double ScanMs, double ReadMs, double ScoreMs, int Uploads, int Requests, long Bytes);
+/// <param name="Vote">0.13.58: where the hit's upload stood among the uploads behind the best centers (1 = the upload of the best center), and how many of those centers were its own.</param>
+public sealed record Hit(string Upload, double Time, int Row, float Score, int Center, int Vote = 0, int VoteCenters = 0);
+/// <param name="Uploads">The uploads behind the best centers. <paramref name="Opened"/> (0.13.58): how many of them were opened and scored exactly.</param>
+public sealed record QueryTimings(double ScanMs, double ReadMs, double ScoreMs, int Uploads, int Requests, long Bytes, int Opened = 0);
 
 /// <summary>The query path (reusable by the download pre-check): bit scan of every center, range reads of the best centers' member blocks, exact cosine.</summary>
 public static class CenterSearch
@@ -459,22 +461,33 @@ public static class CenterSearch
 
     public static float[] MinusMean(float[] q, float[] mean) { var r = new float[q.Length]; for (int i = 0; i < r.Length; i++) r[i] = q[i] - mean[i]; return r; }
 
-    public static async Task<(List<Hit> Hits, QueryTimings Timings)> QueryAsync(IStore raw, Paths paths, SearchData idx, float[] query, int topCenters, int top, int threads, CancellationToken ct)
+    /// <param name="maxUploads">0.13.58 (owner, 2026-11-24: "if one search is tripping that, there's a problem in how search is done"): the uploads behind the best centers are ranked by their best center
+    /// (then by how many of the best centers are theirs) and only the first this-many are opened and scored exactly. Before, every one of them was opened: 172 to 182 frames files for one screenshot,
+    /// each a whole GET when it is not on local disk. 0: all of them. MEASURED 2026-11-25 on the two real phone screenshots we have: the right upload was found first with everything opened, but it stood
+    /// 12th of 199 and 195th of 200 in this ranking, so a small number loses real matches. It is a parameter for experiments, off by default; the bit scan of the centers is not a ranking to cut by.</param>
+    public static async Task<(List<Hit> Hits, QueryTimings Timings)> QueryAsync(IStore raw, Paths paths, SearchData idx, float[] query, int topCenters, int top, int threads, CancellationToken ct, int maxUploads = 0, bool ranged = false)
     {
         var q = (float[])query.Clone(); Vec.Normalize(q);
         var sw = Stopwatch.StartNew();
         var rows = idx.Scan(MinusMean(q, idx.Mean), topCenters, threads);
         double scanMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
-        var byUpload = rows.GroupBy(r => idx.RefUpload[r]).ToList();
-        long bytes = 0; int requests = 0; var perUpload = new List<(SearchUpload U, int Center, CentersFile.Members M)>[byUpload.Count];
+        // the scan returns the centers best first: an upload stands where its best center stands
+        var ranked = rows.Select((r, i) => (Row: r, Rank: i)).GroupBy(x => idx.RefUpload[x.Row]).Select(g => (Key: g.Key, Best: g.Min(x => x.Rank), Rows: g.Select(x => x.Row).ToList()))
+            .OrderBy(g => g.Best).ThenByDescending(g => g.Rows.Count).ThenBy(g => g.Key).ToList();
+        int candidates = ranked.Count;
+        var vote = new Dictionary<int, (int Pos, int Centers)>(); for (int i = 0; i < ranked.Count; i++) vote[ranked[i].Key] = (i + 1, ranked[i].Rows.Count);
+        var byUpload = (maxUploads > 0 ? ranked.Take(maxUploads) : ranked).Select(g => (g.Key, Rows: (IEnumerable<int>)g.Rows)).ToList();
+        long bytes = 0; int requests = 0; var perUpload = new List<(SearchUpload U, int Center, CentersFile.Members M)>[byUpload.Count]; var votes = new (int Pos, int Centers)[byUpload.Count];
         await Parallel.ForEachAsync(Enumerable.Range(0, byUpload.Count), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(32, threads * 4)), CancellationToken = ct }, async (g, t) =>
         {
-            var up = idx.Uploads[byUpload[g].Key]; var centers = byUpload[g].Select(r => idx.RefCenter[r]).ToList();
+            var up = idx.Uploads[byUpload[g].Key]; var centers = byUpload[g].Rows.Select(r => idx.RefCenter[r]).ToList(); votes[g] = vote[byUpload[g].Key];
             for (int attempt = 0; ; attempt++)
             {
                 try
                 {
-                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t, whole: true);   // 0.13.31: never a range read of a frames file: the cached copy, else ONE whole GET kept in the cache, then local reads
+                    // 0.13.31: the cached copy, else ONE whole GET kept in the cache, then local reads. 0.13.58 (ranged): a service with no local copy reads only the blocks of the matched centers by range
+                    // (about 200 uploads stand behind the centers of one screenshot: 200 whole files are over a gigabyte, their matched blocks a few megabytes)
+                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t, whole: !ranged);
                     var res = await z.ReadBlocksAsync(centers, MergeGap, MaxMerged, t);
                     Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests);
                     perUpload[g] = res.Select(x => (up, x.Center, x.Members)).ToList(); return;
@@ -484,13 +497,13 @@ public static class CenterSearch
         });
         double readMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
         var hits = new List<Hit>(); var vec = new float[CentersFile.Dim];
-        foreach (var list in perUpload) foreach (var (u, c, m) in list)
+        for (int g = 0; g < perUpload.Length; g++) foreach (var (u, c, m) in perUpload[g])
             for (int i = 0; i < m.Count; i++)
             {
                 Vec.FromHalf(m.Vectors.AsSpan(i * CentersFile.Dim * 2, CentersFile.Dim * 2), vec);
-                hits.Add(new Hit(u.Id, m.Times[i], m.Rows[i], Vec.Dot(q, vec), c));
+                hits.Add(new Hit(u.Id, m.Times[i], m.Rows[i], Vec.Dot(q, vec), c, votes[g].Pos, votes[g].Centers));
             }
         var best = hits.OrderByDescending(h => h.Score).ThenBy(h => h.Upload, StringComparer.Ordinal).ThenBy(h => h.Row).Take(top).ToList();
-        return (best, new QueryTimings(scanMs, readMs, sw.Elapsed.TotalMilliseconds, byUpload.Count, requests, bytes));
+        return (best, new QueryTimings(scanMs, readMs, sw.Elapsed.TotalMilliseconds, candidates, requests, bytes, byUpload.Count));
     }
 }

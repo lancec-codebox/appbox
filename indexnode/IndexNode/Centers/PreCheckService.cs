@@ -65,6 +65,8 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
 
     /// <summary>0.13.21 (POST /v1/check): the bearer token (serve.token / INDEXNODE_SERVE_TOKEN); null or empty: /v1/check answers 401 to everyone.</summary>
     public string? Token { get; init; }
+    /// <summary>0.13.58: when set (env INDEXNODE_SEARCH_TOKEN), POST /v1/search needs `Authorization: Bearer <it>`: the site's Worker is the only caller. Not set: /v1/search is open, as before.</summary>
+    public string? SearchToken { get; init; }
     public Tools? Tools { get; init; }
     /// <summary>The analyzer /v1/check runs (default: the server's own); tests put a fake one.</summary>
     public IPreCheckAnalyzer? CheckAnalyzer { get; init; }
@@ -183,7 +185,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     }
 
     /// <summary>The screenshot query: an image (SSCD with the CLI's preprocessing, optional bar trim) or a ready vector, then the CLI's lookup (CenterSearch.QueryAsync). Writes nothing.</summary>
-    public async Task<JsonObject> SearchAsync(byte[]? image, string imageName, byte[]? vector, bool trim, int topCenters, int top, CancellationToken ct)
+    public async Task<JsonObject> SearchAsync(byte[]? image, string imageName, byte[]? vector, bool trim, int topCenters, int top, CancellationToken ct, int maxUploads = -1, bool? ranged = null)
     {
         var sw = Stopwatch.StartNew(); double embedMs = 0; BarCrop crop = BarCrop.None; float[] q; string kind;
         if (vector is { Length: > 0 }) { q = CentersCommands.ReadVector(vector); kind = "vector"; }
@@ -206,14 +208,15 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         var meter = StoreMeter.Current;
         if (meter.Tripped) throw new StorageBudgetExceeded(meter.TripMessage ?? "the storage breaker is open");
         List<Hit> hits; QueryTimings tm; long ops;
-        using (var scope = meter.BeginStep(0, null)) { (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct); ops = meter.StepOps; }
+        if (maxUploads < 0) maxUploads = settings.SearchUploads;
+        using (var scope = meter.BeginStep(meter.Limits.StepLimitFor("search"), null)) { (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct, maxUploads, ranged ?? settings.SearchRanged); ops = meter.StepOps; }
         Interlocked.Increment(ref searches);
         return new JsonObject
         {
             ["indexVersion"] = idx.Version,
-            ["query"] = new JsonObject { ["kind"] = kind, ["trim"] = trim, ["crop"] = trim && kind == "image" ? new JsonObject { ["top"] = crop.Top, ["bottom"] = crop.Bottom, ["left"] = crop.Left, ["right"] = crop.Right } : null, ["topCenters"] = topCenters, ["top"] = top },
-            ["hits"] = new JsonArray(hits.Select(h => (JsonNode?)new JsonObject { ["upload"] = h.Upload, ["time"] = Math.Round(h.Time, 2), ["timestamp"] = Clip.Stamp(h.Time), ["score"] = Math.Round(h.Score, 4), ["row"] = h.Row, ["center"] = h.Center }).ToArray()),
-            ["timings"] = new JsonObject { ["embedMs"] = Math.Round(embedMs, 1), ["scanMs"] = Math.Round(tm.ScanMs, 1), ["readMs"] = Math.Round(tm.ReadMs, 1), ["scoreMs"] = Math.Round(tm.ScoreMs, 1), ["uploads"] = tm.Uploads, ["storeOps"] = ops, ["requests"] = tm.Requests, ["bytes"] = tm.Bytes, ["totalMs"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1) },
+            ["query"] = new JsonObject { ["kind"] = kind, ["trim"] = trim, ["crop"] = trim && kind == "image" ? new JsonObject { ["top"] = crop.Top, ["bottom"] = crop.Bottom, ["left"] = crop.Left, ["right"] = crop.Right } : null, ["topCenters"] = topCenters, ["top"] = top, ["maxUploads"] = maxUploads, ["ranged"] = ranged ?? settings.SearchRanged },
+            ["hits"] = new JsonArray(hits.Select(h => (JsonNode?)new JsonObject { ["upload"] = h.Upload, ["time"] = Math.Round(h.Time, 2), ["timestamp"] = Clip.Stamp(h.Time), ["score"] = Math.Round(h.Score, 4), ["row"] = h.Row, ["center"] = h.Center, ["voteRank"] = h.Vote, ["voteCenters"] = h.VoteCenters }).ToArray()),
+            ["timings"] = new JsonObject { ["embedMs"] = Math.Round(embedMs, 1), ["scanMs"] = Math.Round(tm.ScanMs, 1), ["readMs"] = Math.Round(tm.ReadMs, 1), ["scoreMs"] = Math.Round(tm.ScoreMs, 1), ["uploads"] = tm.Uploads, ["uploadsOpened"] = tm.Opened, ["storeOps"] = ops, ["requests"] = tm.Requests, ["bytes"] = tm.Bytes, ["totalMs"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1) },
         };
     }
 
@@ -306,6 +309,8 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         app.MapPost("/v1/search", async (HttpContext c) =>
         {
             Interlocked.Increment(ref requests);
+            if (!string.IsNullOrEmpty(SearchToken) && !(c.Request.Headers.Authorization.ToString() is { } auth && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+                && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(System.Text.Encoding.UTF8.GetBytes(auth[7..].Trim()), System.Text.Encoding.UTF8.GetBytes(SearchToken)))) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
             try
             {
                 if (!c.Request.HasFormContentType) return Results.BadRequest(new { error = "multipart/form-data expected" });
@@ -314,7 +319,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
                 string Field(string n) => form.TryGetValue(n, out var v) && v.ToString().Length > 0 ? v.ToString() : c.Request.Query[n].ToString();
                 int Int(string n, int d, int max) => Field(n) is { Length: > 0 } s ? Math.Clamp(int.Parse(s, System.Globalization.CultureInfo.InvariantCulture), 1, max) : d;
                 bool trim = Field("trim") is var tv && (tv.Equals("true", StringComparison.OrdinalIgnoreCase) || tv == "1");
-                var res = await SearchAsync(await Part("image"), form.Files.GetFile("image")?.FileName ?? "", await Part("vector"), trim, Int("topCenters", 300, 5000), Int("top", 20, 200), c.RequestAborted);
+                var res = await SearchAsync(await Part("image"), form.Files.GetFile("image")?.FileName ?? "", await Part("vector"), trim, Int("topCenters", 300, 5000), Int("top", 20, 200), c.RequestAborted, Field("maxUploads") is { Length: > 0 } mu ? Math.Clamp(int.Parse(mu, System.Globalization.CultureInfo.InvariantCulture), 0, 5000) : -1, Field("ranged") is { Length: > 0 } rg ? rg.Equals("true", StringComparison.OrdinalIgnoreCase) || rg == "1" : null);
                 return Results.Text(res.ToJsonString(), "application/json");
             }
             catch (Exception e) when (e is ArgumentException or FormatException or OverflowException or InvalidDataException or BadHttpRequestException) { Interlocked.Increment(ref failures); return Results.BadRequest(new { error = e.Message }); }
@@ -353,7 +358,7 @@ public static class ServeCommand
         var cache = new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes(5));
         var blocks = new BlockCache((a.Get("block-cache-mb") is { } m ? long.Parse(m) : 512) * 1024 * 1024);
         var analyzer = new PreCheckAnalyzer(tools, cfg, http, store, paths, cache) { Blocks = blocks, InProcess = true };
-        var server = new PreCheckServer(analyzer, cache, store, paths, blocks, st, threads, Commands.VersionString, a.Get("concurrency") is { } c ? int.Parse(c) : 2) { ImageConfig = cfg, ImageHttp = http, Tools = tools, Token = Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN") is { Length: > 0 } et ? et.Trim() : cfg.Serve?.Token };
+        var server = new PreCheckServer(analyzer, cache, store, paths, blocks, st, threads, Commands.VersionString, a.Get("concurrency") is { } c ? int.Parse(c) : 2) { ImageConfig = cfg, ImageHttp = http, Tools = tools, SearchToken = Environment.GetEnvironmentVariable("INDEXNODE_SEARCH_TOKEN") is { Length: > 0 } stok ? stok.Trim() : null, Token = Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN") is { Length: > 0 } et ? et.Trim() : cfg.Serve?.Token };
         if (string.IsNullOrEmpty(server.Token)) Console.WriteLine("serve: no serve.token / INDEXNODE_SERVE_TOKEN: POST /v1/check answers 401 to everyone");
         using var cts = new CancellationTokenSource();
         // 0.13.21: SIGINT and SIGTERM stop serve gracefully; if the stop has not finished in 8 s the process exits anyway (a hung shutdown must not keep the port or the old binary alive)

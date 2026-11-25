@@ -321,6 +321,9 @@ public class CentersTests
             Assert.True(hits.Zip(hits.Skip(1)).All(p => p.First.Score >= p.Second.Score)); Assert.True(tm.Requests > 0);
             // more centers never lose the best one; the exact score is the plain cosine
             var (hits2, _) = await CenterSearch.QueryAsync(raw, P, loaded, query, 300, 1, 1, default); Assert.Equal(hits[0].Row, hits2[0].Row);
+            // 0.13.58: only the best-voted upload is opened, and the answer is the same; the timings say how many stood behind the centers and how many were opened
+            var (hits3, tm3) = await CenterSearch.QueryAsync(raw, P, loaded, query, 300, 1, 1, default, maxUploads: 1);
+            Assert.Equal(hits[0].Row, hits3[0].Row); Assert.Equal(planted.Id, hits3[0].Upload); Assert.Equal(1, hits3[0].Vote); Assert.Equal(1, tm3.Opened); Assert.Equal(2, tm3.Uploads); Assert.Equal(2, tm.Opened);
 
             // update: c3 appended with the same mean; the old rows are copied, not rebuilt
             var upd = await SearchIndexBuild.BuildAsync(raw, P, ups, loaded.Mean, loaded, 2, loaded.MeanVersion, 2, _ => { }, default);
