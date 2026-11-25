@@ -180,22 +180,31 @@ public sealed partial class NodeEngine
     {
         if (o.FetchNext == null || !o.DownloaderOnly || DateTimeOffset.UtcNow < nextFetch || StorageHalted()) return false;
         if (!TryReserve()) return false;
-        ClaimHandle? h = null;
+        // 0.13.48: the hand-over respects this node's limits. Only the stages the limit has room for are asked for, and the job that comes back counts like one the node claimed itself.
+        // 0.13.47 asked for every enabled stage: a node whose full-download budget was used up logged "limit refuses download" and was handed a download each time it asked (2026-11-24: 110 downloads on a budget of 97).
+        var asked = new List<string>();
+        foreach (var s in o.Stages.Where(StageEnabled)) if (o.Limits == null || o.Limits.TryAcquire(s)) asked.Add(s);
+        void GiveBack(string? keep) { if (o.Limits != null) foreach (var s in asked) if (s != keep) o.Limits.Release(s, false); }
+        if (asked.Count == 0) { Interlocked.Decrement(ref reserved); nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); return false; }   // an empty list would mean "any stage" to the service
+        ClaimHandle? h = null; string? stage = null;
         try
         {
             NextClaim? got;
-            try { got = await o.FetchNext(o.Stages.Where(StageEnabled).ToArray(), ct); }
+            try { got = await o.FetchNext(asked.ToArray(), ct); }
             catch (OperationCanceledException) { throw; }
             catch (Exception e) { Log.Info($"download: the service did not answer ({e.Message}); working from the work queue only"); got = null; nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); }
-            if (got == null) { nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); Interlocked.Decrement(ref reserved); return false; }   // 0.13.42: nothing was handed over, so no job started (the slot leaked before: it counted against --max-jobs and a phone's daily cap)
+            if (got == null) { nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); Interlocked.Decrement(ref reserved); GiveBack(null); return false; }   // 0.13.42: nothing was handed over, so no job started (the slot leaked before: it counted against --max-jobs and a phone's daily cap)
+            stage = got.Stage;
             await queue.PollAsync(ct);
             h = queue.AdoptClaim(got.Subject, got.Epoch, got.Lease);
         }
-        catch { Interlocked.Decrement(ref reserved); throw; }
-        if (h == null) { Interlocked.Decrement(ref reserved); return false; }
-        Interlocked.Increment(ref busyClaims);
-        try { Log.Info($"download: the service handed over {h.Subject}"); await RunClaimAsync(lane, h, ct); return true; }
-        finally { Interlocked.Decrement(ref busyClaims); }
+        catch { Interlocked.Decrement(ref reserved); GiveBack(null); throw; }
+        bool counted = stage != null && asked.Contains(stage);
+        GiveBack(counted ? stage : null);   // the stages that were asked for and not handed over
+        if (h == null) { Interlocked.Decrement(ref reserved); if (counted) o.Limits?.Release(stage!, false); return false; }
+        Interlocked.Increment(ref busyClaims); bool finished = false;
+        try { Log.Info($"download: the service handed over {h.Subject}"); finished = await RunClaimAsync(lane, h, ct); return true; }
+        finally { Interlocked.Decrement(ref busyClaims); if (counted) o.Limits?.Release(stage!, finished); }
     }
 
     private DateTimeOffset nextSearchIndexRetry;

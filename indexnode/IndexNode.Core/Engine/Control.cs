@@ -47,7 +47,7 @@ public sealed class ControlWatcher(IStore store, Paths paths)
         if (queueEtag == announced) return; announced = queueEtag; await RefreshAsync(ct, force: true);
     }
 
-    /// <summary>After a control write: one "ctl" line on the processing queue (a node reading the queue learns of it at its next tail).</summary>
+    /// <summary>After a control write: one "ctl" line on the processing queue and (0.13.48) one on the downloaders' work queue: a node reading either learns of it at its next tail.</summary>
     public static async Task AnnounceAsync(IStore store, Paths paths, string by, CancellationToken ct)
     {
         try
@@ -55,6 +55,14 @@ public sealed class ControlWatcher(IStore store, Paths paths)
             var et = (await store.HeadAsync(paths.Control, ct))?.ETag ?? Guid.NewGuid().ToString("N");
             var q = await JobQueue.OpenAsync(store, paths, by, false, ct);
             await q.AppendLinesAsync([new QLine { T = "ctl", S = "control", Ets = et, By = by }], ct);
+            // 0.13.48: and on the downloaders' work queue. A download node tails that log, not the processing queue's, so it never learned of a change while it ran
+            // (2026-11-24: a node went on downloading for 12 minutes after download=stop; its log had one "control:" line, from its start).
+            var root = await JobQueue.ResolveAsync(store, paths, ct);
+            if (!root.IsLegacyLayout)
+            {
+                var w = new JobQueue(store, new Paths(paths.Prefix).DownloadWork, by); await w.LoadAsync(ct);
+                await w.AppendLinesAsync([new QLine { T = "ctl", S = "control", Ets = et, By = by }], ct);
+            }
         }
         catch (Exception e) when (e is not OperationCanceledException) { Log.Info("control: written, but the queue line failed (" + e.Message + "); nodes pick it up at their next start"); }
     }

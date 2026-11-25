@@ -195,6 +195,7 @@ public static class CentersCommands
         if (a.Get("vector") is { } vf) q = ReadVector(File.ReadAllBytes(vf));
         else if (a.Get("image") is { } img) q = await EmbedImageAsync(new Tools(http, cfg), cfg, http, img, cts.Token, a.Has("trim"));
         else throw new ArgumentException("search --vector <f32 or f16 file of 512 values> | --image <file> [--top-centers 300] [--top 20]");
+        if (a.Get("save-vector") is { } sv) { var qb = new byte[q.Length * 4]; Buffer.BlockCopy(q, 0, qb, 0, qb.Length); File.WriteAllBytes(sv, qb); }   // 0.13.48: the query's vector as f32, for experiments on other rankings
         var sw = Stopwatch.StartNew();
         var idx = await SearchData.LoadAsync(store, paths, a.Get("version") is { } v ? int.Parse(v) : null, cts.Token) ?? throw new InvalidOperationException("no search index: run search-index build");
         Console.WriteLine($"index v{idx.Version}: {idx.Uploads.Count} uploads, {idx.Count} centers (loaded in {sw.Elapsed.TotalSeconds:F1}s)");

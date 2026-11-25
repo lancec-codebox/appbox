@@ -244,4 +244,22 @@ public class QueueSplitTests
         Assert.Equal(1, s.Gets.Skip(gets).Count(g => g.Contains("classify/")));   // the one still-unclassified id's blob; the unknown id is never read
         Assert.Equal(2, rep.StoredListed); Assert.Equal(1, rep.StoredApplied);
     }
+
+    [Fact]
+    public async Task A_control_change_is_announced_on_the_work_queue_as_well_as_the_processing_queue()
+    {
+        // 0.13.48: a download node tails the work queue's log; 0.13.47 wrote the "ctl" line to the processing queue only, so a running downloader never saw download=stop (2026-11-24)
+        var (s, q) = await Legacy(); var dir = Path.Combine(Path.GetTempPath(), "split-" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            await QueueSplit.WriteLocalAsync(q, P, dir, false, 2, default); await QueueSplit.ApplyAsync(s, P, dir, () => T0, default);
+            await ControlWatcher.SetAiDramasAsync(s, P, "on", "tester", default);
+            var et = (await s.HeadAsync(P.Control, default))!.ETag;
+            var proc = new JobQueue(s, P.ProcessQueue, "reader"); await proc.LoadAsync(default);
+            var work = new JobQueue(s, P.DownloadWork, "reader"); await work.LoadAsync(default);
+            Assert.Equal(et, proc.Read(st => st.ControlETag));
+            Assert.Equal(et, work.Read(st => st.ControlETag));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
 }

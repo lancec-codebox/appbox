@@ -239,6 +239,36 @@ public static class SheetCommand
         public ValueTask DisposeAsync() { try { if (Directory.Exists(tmp)) Directory.Delete(tmp, true); } catch { } return ValueTask.CompletedTask; }
     }
 
+    /// <summary>0.13.48: an upload that only has its downloaded video (a duplicate found after the full download has no sample and no stored frames): the video is fetched once to a temporary file and frames are cut from it.</summary>
+    public sealed class VideoSource : ISource
+    {
+        readonly IStore store; readonly Paths paths; readonly string id; readonly Tools tools; readonly string tmp = Path.Combine(Path.GetTempPath(), "indexnode-sheet-" + Guid.NewGuid().ToString("N")[..8]); string? file;
+        public string Kind => "video"; public double Duration { get; private set; }
+        VideoSource(IStore store, Paths paths, string id, Tools tools) { this.store = store; this.paths = paths; this.id = id; this.tools = tools; }
+
+        public static async Task<VideoSource?> OpenAsync(IStore store, Paths paths, string id, Tools tools, CancellationToken ct)
+        {
+            if (await store.HeadAsync(paths.Video(id, "video.mp4"), ct) == null) return null;
+            var v = new VideoSource(store, paths, id, tools); await v.FetchAsync(ct); return v;
+        }
+
+        async Task FetchAsync(CancellationToken ct)
+        {
+            var data = await FrameChunks.ReadAsync(store, paths.Video(id, "video.mp4"), ct) ?? throw new InvalidOperationException($"{id}: video.mp4 is missing");
+            if (data.Length == 0) throw new InvalidOperationException($"{id}: video.mp4 reads as 0 bytes (a ghost that could not be made readable)");
+            Directory.CreateDirectory(tmp); file = Path.Combine(tmp, "video.mp4"); await File.WriteAllBytesAsync(file, data, ct);
+            var r = await Proc.RunAsync(await tools.FfprobeAsync(ct), ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], ct);
+            Duration = double.TryParse(r.Stdout.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : 0;
+        }
+
+        public async Task<Shot?> AtAsync(double t, CancellationToken ct)
+        {
+            double at = Math.Clamp(t, 0, Math.Max(0, Duration - 1));
+            return await Cut(tools, file!, at, tmp, ct) is { } im ? new Shot(t, at, im) : null;
+        }
+        public ValueTask DisposeAsync() { try { if (Directory.Exists(tmp)) Directory.Delete(tmp, true); } catch { } return ValueTask.CompletedTask; }
+    }
+
     /// <summary>One frame of a local video file at <paramref name="offset"/> seconds (ffmpeg, PNG, decoded in-process); null when ffmpeg gives none.</summary>
     static async Task<Rgb?> Cut(Tools tools, string file, double offset, string tmp, CancellationToken ct)
     {
@@ -256,7 +286,8 @@ public static class SheetCommand
     {
         if (preferSample && await SampleSource.OpenAsync(store, paths, id, tools, ct) is { } s0) return s0;
         if (await FramesSource.OpenAsync(store, paths, id, tools, ct) is { } f) return f;
-        return preferSample ? null : await SampleSource.OpenAsync(store, paths, id, tools, ct);
+        if (!preferSample && await SampleSource.OpenAsync(store, paths, id, tools, ct) is { } s1) return s1;
+        return preferSample ? null : await VideoSource.OpenAsync(store, paths, id, tools, ct);
     }
 
     // ---- the duplicate's record
@@ -310,7 +341,7 @@ public static class SheetCommand
         await using var src = await OpenSourceAsync(store, paths, id, tools, ct, a.Has("sample")) ?? throw new InvalidOperationException("the store has neither stored frames nor a sample for it");
         int count = a.Get("count") is { } n ? int.Parse(n) : 12;
         var times = Times(a.Get("at")) ?? (src is SampleSource ss ? ss.Segments.SelectMany(s => Spread(s.Start, s.End, Math.Max(1, count / ss.Segments.Count))).ToList()
-            : Spread(((FramesSource)src).Duration * 0.03, ((FramesSource)src).Duration * 0.97, count));
+            : Spread((src is FramesSource f1 ? f1.Duration : ((VideoSource)src).Duration) * 0.03, (src is FramesSource f2 ? f2.Duration : ((VideoSource)src).Duration) * 0.97, count));
         var shots = new List<Shot?>(); foreach (var t in times) shots.Add(await src.AtAsync(t, ct));
         var rows = shots.Chunk(cols).Select(r => (IReadOnlyList<Shot?>)r).ToList();
         var (jpg, q, cw) = Fit(rows, width, maxKb * 1024);
@@ -322,13 +353,15 @@ public static class SheetCommand
     {
         var (found, foundTimes, reason) = await DuplicateOfAsync(store, paths, id, ct);
         var match = a.Get("match") ?? found ?? throw new InvalidOperationException("the queue does not name the upload it duplicates; give --match <id>");
-        await using var dup = await SampleSource.OpenAsync(store, paths, id, tools, ct) is { } s ? s : await OpenSourceAsync(store, paths, id, tools, ct) ?? throw new InvalidOperationException("the store has neither a sample nor stored frames for it");
+        await using var dup = await SampleSource.OpenAsync(store, paths, id, tools, ct) is { } s ? s : await OpenSourceAsync(store, paths, id, tools, ct) ?? throw new InvalidOperationException("the store has no sample, no stored frames and no video for it");
         await using var other = await OpenSourceAsync(store, paths, match, tools, ct) ?? throw new InvalidOperationException($"the store has neither stored frames nor a sample for the matched upload {match}");
         int per = a.Get("per-segment") is { } p ? int.Parse(p) : Math.Max(1, cols / 2);
         double align = a.Get("align") is { } al ? double.Parse(al, CultureInfo.InvariantCulture) : 20;   // seconds around the recorded time in which the matched upload's most similar frame is taken; 0: the recorded time as it is
-        var segs = dup is SampleSource sd ? sd.Segments.Select(x => (x.Start, x.End)).ToList() : [(((FramesSource)dup).Duration * 0.25, ((FramesSource)dup).Duration * 0.35), (((FramesSource)dup).Duration * 0.65, ((FramesSource)dup).Duration * 0.75)];
+        static double Dur(ISource x) => x switch { SampleSource a1 => a1.Duration, FramesSource a2 => a2.Duration, VideoSource a3 => a3.Duration, _ => 0 };
+        // without a sample: the two 5-minute windows the pre-check itself looks at (30% and 70% of the video)
+        var segs = dup is SampleSource sd ? sd.Segments.Select(x => (x.Start, x.End)).ToList() : new[] { 0.3, 0.7 }.Select(f => (Start: Math.Max(0, Dur(dup) * f - 150), End: Math.Min(Dur(dup), Dur(dup) * f + 150))).ToList();
         var mt = Times(a.Get("match-times"))?.ToArray() ?? foundTimes; string how = mt != null ? (a.Has("match-times") ? "given" : "from the check's record") : "same position in the video (no record of the matched times was found)";
-        double dupDur = dup is SampleSource sdd ? sdd.Duration : ((FramesSource)dup).Duration, otherDur = other is FramesSource fo ? fo.Duration : ((SampleSource)other).Duration;
+        double dupDur = Dur(dup), otherDur = Dur(other);
         var top = new List<Shot?>(); var bottom = new List<Shot?>();
         for (int i = 0; i < segs.Count; i++)
         {
