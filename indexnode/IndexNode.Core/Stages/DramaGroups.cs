@@ -255,14 +255,21 @@ public static class DramaGroups
     /// Join the group with the largest share of matched frames when it has at least <see cref="PreCheckSettings.GroupMinHits"/> distinct-frame hits. MIXED: those hits cover one contiguous part of the sample, under
     /// <see cref="PreCheckSettings.MixedMaxShare"/> of the samples, at a consistent time offset: flagged, never canonical, its own group. Otherwise NEW. An upload with no group yet counts as a group of its own.
     /// </summary>
-    public static GroupProposal Propose(PreCheckAnalysis a, double windowStart, double windowLength, PreCheckSettings s, Func<int, double>? ownTime = null)
+    /// <param name="ownStart">0.13.57: the times of the upload's first and last compared frame when its WHOLE length was compared (with <paramref name="ownTime"/>): the group is then chosen and admitted on the hits in the middle
+    /// part of the upload only (<see cref="PreCheckSettings.GroupMiddleFrom"/> to <see cref="PreCheckSettings.GroupMiddleTo"/>), so shared opening titles and closing credits join nothing.
+    /// Once a group is admitted, every hit of it counts for the shares and the offset, as before. Not given (the pre-check's sample windows): every hit counts.</param>
+    public static GroupProposal Propose(PreCheckAnalysis a, double windowStart, double windowLength, PreCheckSettings s, Func<int, double>? ownTime = null, double ownStart = 0, double ownEnd = 0)
     {
         int n = a.Frames;
         string Key(string up) => a.UploadGroups.TryGetValue(up, out var g) && g != null ? g : "u:" + up;
-        var by = a.Hits.GroupBy(h => Key(h.Upload)).Select(g => (Key: g.Key, Hits: g.OrderBy(h => h.Frame).ToList()))
+        bool middleOnly = ownTime != null && ownEnd > ownStart && (s.GroupMiddleFrom > 0 || s.GroupMiddleTo < 1);
+        double lo = ownStart + s.GroupMiddleFrom * (ownEnd - ownStart), hi = ownStart + s.GroupMiddleTo * (ownEnd - ownStart);
+        var counted = middleOnly ? a.Hits.Where(h => ownTime!(h.Frame) is var t && t >= lo && t <= hi).ToList() : a.Hits;
+        var by = counted.GroupBy(h => Key(h.Upload)).Select(g => (Key: g.Key, Hits: g.OrderBy(h => h.Frame).ToList()))
             .OrderByDescending(x => x.Hits.Count).ThenByDescending(x => x.Hits.Average(h => h.Cosine)).ThenBy(x => x.Key, StringComparer.Ordinal).ToList();
         if (n <= 0 || by.Count == 0 || by[0].Hits.Count < s.GroupMinHits) return GroupProposal.None;
-        var (key, hits) = by[0];
+        var key = by[0].Key;
+        var hits = middleOnly ? a.Hits.Where(h => Key(h.Upload) == key).OrderBy(h => h.Frame).ToList() : by[0].Hits;
         var join = hits.GroupBy(h => h.Upload).OrderByDescending(g => g.Count()).ThenByDescending(g => g.Max(h => h.Cosine)).ThenBy(g => g.Key, StringComparer.Ordinal).First().Key;
         double share = (double)hits.Count / n;
         var offs = hits.Select(h => h.Time - (ownTime?.Invoke(h.Frame) ?? windowStart + (h.Frame + 0.5) / n * windowLength)).OrderBy(x => x).ToList();

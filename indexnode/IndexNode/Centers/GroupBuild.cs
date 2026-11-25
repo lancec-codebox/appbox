@@ -116,7 +116,7 @@ public static class GroupBuild
         var ug = hits.Select(x => x.Upload).Distinct(StringComparer.Ordinal).ToDictionary(x => x, x => of.GetValueOrDefault(x), StringComparer.Ordinal);
         var gm = set.Groups.Where(g => ug.Values.Contains(g.Id)).ToDictionary(g => g.Id, g => (IReadOnlyList<GroupCopy>)g.Members.Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed)).ToList(), StringComparer.Ordinal);
         var a = new PreCheckAnalysis(null, next.Version, frames.Count, best.Count(b => b == null), [], 0, new Dictionary<string, double>()) { Hits = hits, UploadGroups = ug, GroupMembers = gm };
-        return DramaGroups.Propose(a, 0, 0, s, i => frames[i].T);
+        return DramaGroups.Propose(a, 0, 0, s, i => frames[i].T, frames[0].T, frames[^1].T);   // 0.13.57: sorted by time: the upload's middle lies between the first and the last frame time
     }
 
     /// <summary>"groups: checked N of M (r/min, ETA hh:mm)".</summary>

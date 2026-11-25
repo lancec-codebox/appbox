@@ -64,6 +64,11 @@ public sealed class PreCheckSettings
     public int IndexRecheckMinutes { get; set; } = 10;
     /// <summary>0.13.2 drama groups. Join the group with the most matched frames at >= this many distinct-frame hits (config precheck.group-min-hits).</summary>
     public int GroupMinHits { get; set; } = 5;
+    /// <summary>0.13.57 (owner, 2026-11-25: "we may only want to scan frames between the 25% and 75% marks to sort of avoid the ends when we're doing joins"; "we shouldn't be classifying things strictly based off of end credits"):
+    /// where the WHOLE upload is compared (the group step, the groups build), a group is admitted on the hit frames between these two marks of the upload's length only. 0 and 1 switch the rule off.
+    /// On 2026-11-25 six episodes of one series had joined each other on their closing credits alone (19 to 22 of 240 sampled frames, all in the last minutes).</summary>
+    public double GroupMiddleFrom { get; set; } = 0.25;
+    public double GroupMiddleTo { get; set; } = 0.75;
     /// <summary>0.13.6 (config groups.check-frames): the full check of an upload searches at most this many of its frames, evenly spaced over the upload; 0 = all.</summary>
     public int GroupCheckFrames { get; set; } = 240;
     /// <summary>0.13.10 (config retain.enabled / retain.t / retain.f): a drama whose frames are covered (best cosine >= T against earlier dramas) for at least F of them, and that joins a group, keeps only its uncovered frames in index/search/retained/. 0.13.22: T defaults to 0.80 (was 0.90): real screenshots score about 0.62 against their own frame and at most about 0.49 against another drama, so a frame with a >= 0.80 match in its group is a duplicate.</summary>

@@ -110,7 +110,7 @@ public sealed class GroupStage(IStore store, PreCheckSettings? settings = null) 
         var hits = new List<FrameHit>();
         for (int k = 0; k < pick.Length; k++) if (best[pick[k]] is { } bb && bb.Cosine >= s.Tau) hits.Add(new FrameHit(k, IdOf(bb.Upload), bb.Time, bb.Cosine));
         var a = new PreCheckAnalysis(null, idx.Version, pick.Length, 0, [], 0, new Dictionary<string, double>()) { Hits = hits };
-        var prop = DramaGroups.Propose(a, 0, 0, s, k => times[pick[k]]);
+        var prop = DramaGroups.Propose(a, 0, 0, s, k => times[pick[k]], times.Count > 0 ? times.Min() : 0, times.Count > 0 ? times.Max() : 0);   // 0.13.57: the frames cover all of the upload: its middle lies between the first and the last frame time
         if (prop.Kind != GroupProposal.JoinKind && prop.Kind != GroupProposal.MixedKind)
         {
             // new / none: nothing is retained and no stretch matters: the record is written from the sample

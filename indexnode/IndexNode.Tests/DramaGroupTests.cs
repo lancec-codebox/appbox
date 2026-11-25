@@ -30,6 +30,28 @@ public class DramaGroupTests
         Assert.Equal(8 / 60.0, p.MatchShare, 3); Assert.Equal(4 / 60.0, p.DupShare, 3);   // only B's four reach 0.85
     }
 
+    [Fact] public void A_whole_upload_joins_on_the_hits_in_its_middle_half_and_shared_credits_join_nothing()
+    {
+        // 0.13.57 (owner, 2026-11-25): 240 frames sampled over a 48-minute episode; frame f is at f * 12 s. The last 20 frames (the closing credits) match another episode of the series.
+        const double Len = 2880; double Own(int f) => f * 12.0;
+        FrameHit At(int f, string up) => new(f, up, Own(f) - 77, 0.9);
+        var credits = An(240, Enumerable.Range(220, 20).Select(f => At(f, "E31")), new() { ["E31"] = "g1" });
+        Assert.Equal("new", DramaGroups.Propose(credits, 0, 0, S, Own, 0, Len).Kind);                       // none of the 20 hits is between the 25% and 75% marks
+        Assert.NotEqual("new", DramaGroups.Propose(credits, 0, 0, S, Own).Kind);                         // without the length (the pre-check's windows) every hit counts, as before (one contiguous part at one offset: "mixed")
+        Assert.NotEqual("new", DramaGroups.Propose(credits, 0, 0, new PreCheckSettings { GroupMiddleFrom = 0, GroupMiddleTo = 1 }, Own, 0, Len).Kind);   // switched off
+        // opening titles the same way; and four stray frames in the middle are still under the five a join needs
+        var titles = An(240, Enumerable.Range(0, 30).Select(f => At(f, "E31")).Concat(new[] { 100, 110, 120, 130 }.Select(f => At(f, "E31"))), new() { ["E31"] = "g1" });
+        Assert.Equal("new", DramaGroups.Propose(titles, 0, 0, S, Own, 0, Len).Kind);
+        // a real copy: hits all along. The group is admitted on its 121 middle hits, and then every hit counts for the shares and the offset
+        var copy = An(240, Enumerable.Range(0, 240).Select(f => At(f, "A")), new() { ["A"] = "g2" });
+        var p = DramaGroups.Propose(copy, 0, 0, S, Own, 0, Len);
+        Assert.Equal("join", p.Kind); Assert.Equal("g2", p.Group); Assert.Equal(240, p.Hits); Assert.Equal(1.0, p.Share, 3); Assert.Equal(-77, p.Offset, 1);
+        // the group is CHOSEN on the middle hits too: credits shared with g1 (30 frames at the end) do not outvote the drama it copies in the middle (20 frames)
+        var both = An(240, Enumerable.Range(210, 30).Select(f => At(f, "E31")).Concat(Enumerable.Range(100, 20).Select(f => At(f, "A"))), new() { ["E31"] = "g1", ["A"] = "g2" });
+        var q = DramaGroups.Propose(both, 0, 0, S, Own, 0, Len);
+        Assert.Equal("g2", q.Group); Assert.Equal(20, q.Hits);
+    }
+
     [Fact] public void Fewer_than_five_hits_is_new()
     {
         var p = DramaGroups.Propose(An(60, Enumerable.Range(0, 4).Select(f => H(f, "A", 0)), new() { ["A"] = "g1" }), WStart, WLen, S);
