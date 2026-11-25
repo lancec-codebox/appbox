@@ -93,10 +93,14 @@ public sealed class NodeConfig
     public static string ConfigPath() => Path.Combine(ConfigDir(), "config.json");
     public static string ToolsDir() => Path.Combine(ConfigDir(), "tools");
 
+    /// <summary>The AI flag's default before 0.13.51 (see <see cref="Load"/>).</summary>
+    public const double OldAiFlag = 0.479;
     public static NodeConfig Load()
     {
         var p = ConfigPath();
         var c = File.Exists(p) ? JsonSerializer.Deserialize<NodeConfig>(File.ReadAllText(p), Json) ?? new() : new();
+        // 0.13.51: any `config set precheck.*` wrote the whole section, old defaults included, so such a node kept the old AI flag (0.479) for ever. A stored 0.479 was the default, never a choice: it follows the default.
+        if (c.PreCheck is { AiFlag: OldAiFlag }) c.PreCheck.AiFlag = new PreCheckSettings().AiFlag;
         var envSas = Environment.GetEnvironmentVariable("INDEXNODE_SAS_URL");
         if (!string.IsNullOrWhiteSpace(envSas)) c.Sas = envSas.Trim();
         var envTable = Environment.GetEnvironmentVariable("INDEXNODE_MEDIA_TABLE_SAS_URL");

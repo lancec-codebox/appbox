@@ -45,7 +45,9 @@ public sealed class PreCheckSettings
     public double LanguageMinSeconds { get; set; } = 10;
     public static double ParseLanguageSeconds(string v) => v.Trim().Equals("all", StringComparison.OrdinalIgnoreCase) ? 0 : Math.Max(0, double.Parse(v, CultureInfo.InvariantCulture));
     /// <summary>The AI flag: score &gt;= AiFlag (flag_max1) sets ai=true; AiStrict (flag_max0) is recorded next to it.</summary>
-    public double AiFlag { get; set; } = 0.479;
+    /// 0.13.51 (owner, 2026-11-24): the flag is 0.62, no longer the calibration's flag_max1 (0.479). Of 46 uploads held in one run at 0.479 the owner judged 36 live action (all scored 0.65 or less, heavy beauty filters)
+    /// and 10 AI (all 0.63 or more): 0.62 would have held the 10 and 4 of the 36. AiStrict stays the calibration's flag_max0 and is only recorded; it is now BELOW the flag.
+    public double AiFlag { get; set; } = 0.62;
     public double AiStrict { get; set; } = 0.529;
     /// <summary>The frame count the AI thresholds above were calibrated at (60 evenly subsampled frames). With another precheck.frames they do not apply: the record says so and a warning is logged.</summary>
     public const int AiThresholdFrames = 60;

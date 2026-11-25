@@ -89,9 +89,27 @@ public class PreCheckTests : IDisposable
     }
 
     [Fact]
+    public void A_config_that_stored_the_old_default_ai_flag_follows_the_new_default_and_a_chosen_value_is_kept()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "aiflag-" + Guid.NewGuid().ToString("N")[..6]); Directory.CreateDirectory(root);
+        var old = Environment.GetEnvironmentVariable("INDEXNODE_CONFIG_DIR"); Environment.SetEnvironmentVariable("INDEXNODE_CONFIG_DIR", root);
+        try
+        {
+            // what any `config set precheck.*` wrote before 0.13.51: the whole section, the old default among it
+            File.WriteAllText(Path.Combine(root, "config.json"), "{\"PreCheck\":{\"Frames\":60,\"AiFlag\":0.479,\"AiStrict\":0.529}}");
+            Assert.Equal(0.62, NodeConfig.Load().PreCheck!.AiFlag);
+            File.WriteAllText(Path.Combine(root, "config.json"), "{\"PreCheck\":{\"Frames\":60,\"AiFlag\":0.55,\"AiStrict\":0.529}}");
+            Assert.Equal(0.55, NodeConfig.Load().PreCheck!.AiFlag);   // somebody's own value stays
+            File.WriteAllText(Path.Combine(root, "config.json"), "{}");
+            Assert.Equal(0.62, (NodeConfig.Load().PreCheck ?? new()).AiFlag);
+        }
+        finally { Environment.SetEnvironmentVariable("INDEXNODE_CONFIG_DIR", old); try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
     public void Frames_height_and_audio_format_are_settings_and_shape_the_sample_call()
     {
-        var d = new PreCheckSettings(); Assert.Equal(60, d.Frames); Assert.Equal(0.479, d.AiFlag); Assert.Equal(0.529, d.AiStrict); Assert.Null(PreCheckSettings.AiThresholdWarning(d, 60)); Assert.NotNull(PreCheckSettings.AiThresholdWarning(new PreCheckSettings { Frames = 0 }, 300)); Assert.NotNull(PreCheckSettings.AiThresholdWarning(d, 20));
+        var d = new PreCheckSettings(); Assert.Equal(60, d.Frames); Assert.Equal(0.62, d.AiFlag); Assert.Equal(0.529, d.AiStrict); Assert.Null(PreCheckSettings.AiThresholdWarning(d, 60)); Assert.NotNull(PreCheckSettings.AiThresholdWarning(new PreCheckSettings { Frames = 0 }, 300)); Assert.NotNull(PreCheckSettings.AiThresholdWarning(d, 20));
         var ai = (System.Text.Json.Nodes.JsonObject)PreCheck.Record("x", new PreCheckDecision(PreCheckDecision.New, [], null), new PreCheckAnalysis(null, 1, 300, 0, [], 0.3, new Dictionary<string, double>()), new System.Text.Json.Nodes.JsonObject(), null, (0, 1), 1, new PreCheckSettings { Frames = 0 }, "n", "v", false, 0, false)["ai"]!;
         Assert.False((bool)ai["thresholdsApply"]!); Assert.Equal(60, (int)ai["thresholdFrames"]!); Assert.Equal(300, (int)ai["framesScored"]!); Assert.NotNull((string?)ai["warning"]); Assert.Equal(360, d.VideoHeight); Assert.Equal("wa", d.AudioFormat);
         Assert.Equal(0, PreCheckSettings.ParseFrames("all")); Assert.Equal(40, PreCheckSettings.ParseFrames("40"));
@@ -644,7 +662,7 @@ public class PreCheckTests : IDisposable
         var rows = AiProbe.RowsFromF16(File.Exists(Path.Combine(root, "x")) ? [] : F16(Make(300, 20, 42)));
         var expect = AiProbe.Default.Score(CentersCommands.AiSample("b2", 300, 230, false).Select(i => rows[i]).ToList());
         Assert.Equal(expect, ai.GetProperty("score").GetDouble(), 3);
-        Assert.Equal(expect >= 0.479, ai.GetProperty("flag").GetBoolean());
+        Assert.Equal(expect >= new PreCheckSettings().AiFlag, ai.GetProperty("flag").GetBoolean());
     }
 
     // ------------------------------------------------------------------ timing (opt-in: INDEXNODE_BENCH=1)

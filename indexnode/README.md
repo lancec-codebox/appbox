@@ -86,7 +86,7 @@ indexnode config set precheck.frames 60             # max SSCD frames per sample
 indexnode config set precheck.video-height 360       # sample video: best stream up to this height
 indexnode config set precheck.audio-format wa        # sample audio for the language ID: lowest-bitrate audio-only (wa; a format id such as 249 also works)
 indexnode config set precheck.window-position 0.5    # centre of the window, fraction of the duration
-indexnode config set precheck.ai-flag 0.479          # ai=true at or above this score (0.529 is also recorded); calibrated at precheck.frames 60: with another frame count the record says thresholdsApply=false and a warning is logged
+indexnode config set precheck.ai-flag 0.62           # ai=true at or above this score (default 0.62 since 0.13.51, the owner's choice; the calibration's 0.529 is also recorded); calibrated at precheck.frames 60: with another frame count the record says thresholdsApply=false and a warning is logged
 indexnode config set precheck.index-recheck-minutes 10
 indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--keep-sample] [--exclude-self] [--threads N]   # ONLY the pre-check, read-only on the store -> <dir>/<id>/precheck.json (default ./precheck-out); one line per id with the timings
 indexnode ai score [--ids <file>] [--all-frames] [--redo] [--local <dir>]   # score processed uploads from their sscd.zip -> videos/<id>/ai.json
