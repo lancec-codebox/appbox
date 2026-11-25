@@ -303,7 +303,7 @@ public static class Commands
         if (childProbe == null) Log.Info($"actors: this node does not claim the actors stage: no child probe (no --child-probe and no {ActorsBuild.StoreProbe(paths)} in the store); without it no child unit would be left out");
         bool aiStages = a.Has("ai-stages");
         TimeSpan? gpuFlag = a.Get("gpu-fallback") is { } gfv ? GpuRouting.ParseFlag(gfv) : null; // null: follow control.json gpu.hold (absent = no hold)
-        var preStage = new PreCheckStage(tools, MakePreCheck(tools, cfg, http, store, paths, b => FreshFromQueue(engineRef, b)), NoPre(a, cfg.PreCheck), Commands.VersionString);
+        var preStage = new PreCheckStage(tools, MakeNodePreCheck(tools, cfg, http, store, paths), NoPre(a, cfg.PreCheck), Commands.VersionString);
         var downloader = cfg.Downloader();
         var handlers = new Dictionary<string, IStageHandler>(DownloaderNode.Handlers(tools, store, gate, http, downloader))   // 0.13.42: download, sample, refresh, availability: the handlers a phone node runs too
         {
@@ -947,11 +947,12 @@ public static class Commands
     public static IPreCheckAnalyzer MakePreCheck(Tools tools, NodeConfig cfg, HttpClient http, IStore store, Paths paths, Func<DateTimeOffset?, IReadOnlyList<string>>? fresh = null) =>
         new PreCheckAnalyzer(tools, cfg, http, store, paths, new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes((cfg.PreCheck ?? new()).IndexRecheckMinutes))) { FreshUploads = fresh };
 
-    /// <summary>The uploads whose process `centers` step finished (queue log) after the index build time.</summary>
-    static IReadOnlyList<string> FreshFromQueue(NodeEngine? e, DateTimeOffset? builtAt)
-    {
-        try { return e?.Queue is { } q ? SearchIndexJobs.FreshUploads(q, builtAt) : []; } catch (NullReferenceException) { return []; }
-    }
+    /// <summary>
+    /// 0.13.54 (owner, 2026-11-24: "it shouldn't be fetching frame files"; "I'm not sure we need to optimize for concurrently downloading duplicates that have not already been added to the index"):
+    /// the pre-check a node runs at the start of processing compares with the PUBLISHED index only. Until 0.13.53 it also merged the uploads processed since the last build, which made a box fetch
+    /// their vector files (index/search/frames/&lt;id&gt;.bin, about 7 MB each) and tipped it over the per-minute store limit. The group step is different and keeps its scan of fresh uploads (it needs them for the index).
+    /// </summary>
+    public static IPreCheckAnalyzer MakeNodePreCheck(Tools tools, NodeConfig cfg, HttpClient http, IStore store, Paths paths) => MakePreCheck(tools, cfg, http, store, paths, null);
 
     static PreCheckSettings NoPre(Args a, PreCheckSettings? s) { s ??= new(); if (a.Has("no-precheck")) s.Enabled = false; return s; }
 

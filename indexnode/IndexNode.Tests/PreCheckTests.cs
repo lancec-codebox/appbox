@@ -89,6 +89,17 @@ public class PreCheckTests : IDisposable
     }
 
     [Fact]
+    public void The_pre_check_a_node_runs_at_processing_looks_at_the_published_index_only()
+    {
+        // 0.13.54 (owner, 2026-11-24): no fresh uploads are merged there, so a box fetches no vector files of uploads processed since the last build; the analyzer itself can still do it (the group step's own scan is separate)
+        using var http = new HttpClient(); var cfg = new NodeConfig(); var paths = new Paths("index/");
+        var node = (PreCheckAnalyzer)Commands.MakeNodePreCheck(new Tools(http, cfg), cfg, http, new FakeStore(), paths);
+        Assert.Null(node.FreshUploads);
+        var other = (PreCheckAnalyzer)Commands.MakePreCheck(new Tools(http, cfg), cfg, http, new FakeStore(), paths, _ => ["x"]);
+        Assert.NotNull(other.FreshUploads);
+    }
+
+    [Fact]
     public void A_config_that_stored_the_old_default_ai_flag_follows_the_new_default_and_a_chosen_value_is_kept()
     {
         var root = Path.Combine(Path.GetTempPath(), "aiflag-" + Guid.NewGuid().ToString("N")[..6]); Directory.CreateDirectory(root);

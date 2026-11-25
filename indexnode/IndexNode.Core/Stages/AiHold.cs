@@ -80,12 +80,8 @@ public static class AiHold
             if (score >= threshold) { keptAbove++; continue; }
             release.Add((h.Q, h.Dl, h.Id, h.Stage));
         }
-        if (!dry)
-            foreach (var g in release.GroupBy(r => r.Q))
-            {
-                var lines = g.Select(r => new QLine { T = "hold", S = r.Id, Stage = r.Stage, Force = true, At = g.Key.NowUtc(), By = by }).ToList();
-                for (int i = 0; i < lines.Count; i += 500) { await g.Key.AppendLinesAsync(lines.Skip(i).Take(500).ToList(), ct); say?.Invoke($"  released {Math.Min(i + 500, lines.Count)} of {lines.Count} hold(s) in the {(g.First().Dl ? "download" : "processing")} queue"); }
-            }
+        // 0.13.54: the records FIRST, the holds second. 0.13.52 released the holds and then set the records (30 a minute, 8 minutes): 15 uploads had their actors job run in between,
+        // read "AI-flagged", wrote no units and finished for good; every later actors job then rebuilt their units and went over its store budget (2026-11-25).
         // the records: flag false, so nothing downstream (actors, grouping, the catalog) goes on treating a released upload as AI
         var flip = release.Select(r => r.Id).Distinct(StringComparer.Ordinal).Where(id => (docs.GetValueOrDefault(id)?.Root["ai"] as JsonObject)?["flag"] is JsonNode f && (bool?)f == true).ToList(); int n = 0;
         if (!dry)
@@ -94,6 +90,13 @@ public static class AiHold
                 await VideoJson.UpdateAsync(store, paths, id, root => { if (root["ai"] is JsonObject ai && Verdict(root) != "ai") ai["flag"] = false; }, ct);
                 if (++n % 50 == 0) say?.Invoke($"  {n} of {flip.Count} record(s) updated");
                 if (gap > TimeSpan.Zero && n < flip.Count) await Task.Delay(gap, ct);
+            }
+        if (!dry && flip.Count > 0) say?.Invoke($"  {flip.Count} record(s) set to flag false; now the holds");
+        if (!dry)
+            foreach (var g in release.GroupBy(r => r.Q))
+            {
+                var lines = g.Select(r => new QLine { T = "hold", S = r.Id, Stage = r.Stage, Force = true, At = g.Key.NowUtc(), By = by }).ToList();
+                for (int i = 0; i < lines.Count; i += 500) { await g.Key.AppendLinesAsync(lines.Skip(i).Take(500).ToList(), ct); say?.Invoke($"  released {Math.Min(i + 500, lines.Count)} of {lines.Count} hold(s) in the {(g.First().Dl ? "download" : "processing")} queue"); }
             }
         return new BelowReport(release.Count(r => r.Dl), release.Count(r => !r.Dl), keptAbove, keptAi, noScore, flip.Count, release.Select(r => r.Id).Distinct(StringComparer.Ordinal).ToList());
     }

@@ -88,7 +88,10 @@ public class AiVerdictTests
         Assert.Equal((1, 2, 2, 1, 0, 2), (dry.Download, dry.Process, dry.KeptAtOrAbove, dry.KeptVerdictAi, dry.KeptNoScore, dry.Records));
         Assert.Equal(["ghost", "low1", "low2"], dry.Ids);
         Assert.Equal("ai", dl.Read(st => st.Entry("low1", "download")!.Hold)); VideoJson.ClearCache(s); Assert.True(AiHold.Flagged((await VideoJson.ReadAsync(s, P, "low1", default))!.Root));   // nothing written
-        var r = await AiHold.ReleaseBelowAsync(proc, dl, s, P, 0.62, "cli", false, TimeSpan.Zero, default);
+        var said = new List<string>(); var r = await AiHold.ReleaseBelowAsync(proc, dl, s, P, 0.62, "cli", false, TimeSpan.Zero, default, said.Add);
+        // 0.13.54: the records are written before the holds are released (an actors job that runs in between must not read "AI-flagged")
+        int recAt = said.FindIndex(x => x.Contains("record(s) set to flag false")), relAt = said.FindIndex(x => x.Contains("released"));
+        Assert.True(recAt >= 0 && relAt > recAt, string.Join(" | ", said));
         Assert.Equal((1, 2, 2, 1, 0, 2), (r.Download, r.Process, r.KeptAtOrAbove, r.KeptVerdictAi, r.KeptNoScore, r.Records));
         Assert.Null(dl.Read(st => st.Entry("low1", "download")!.Hold)); Assert.Null(proc.Read(st => st.Entry("low2", "process")!.Hold)); Assert.Null(proc.Read(st => st.Entry("ghost", "process")!.Hold));
         Assert.Equal("ai", dl.Read(st => st.Entry("edge", "download")!.Hold));    // at the threshold is AI, as the flag itself (score >= flag)
