@@ -111,11 +111,19 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         finally { slots.Release(); }
     }
 
+    /// <summary>0.13.59: false while `serve` is still loading its models and the index. /v1/health then says ready false at once, and every other route answers 503 with Retry-After,
+    /// so a caller that woke a scaled-to-zero service can show "waking" and try again instead of waiting on a closed port. True for a server built directly (tests, tools).</summary>
+    public volatile bool Ready = true;
+    /// <summary>How long the load took, once ready (the cold start a caller waits for, without the container's own start).</summary>
+    public double? ReadyAfterSeconds;
+    public const int StartingRetryAfterSeconds = 5;
+
     public JsonObject Health()
     {
         var b = blocks.Stats();
         return new JsonObject
         {
+            ["ready"] = Ready, ["readyAfterSeconds"] = ReadyAfterSeconds == null ? null : Math.Round(ReadyAfterSeconds.Value, 1),
             ["ok"] = true, ["name"] = "indexnode", ["version"] = version, ["pid"] = Environment.ProcessId, ["indexVersion"] = indexVersion < 0 ? null : indexVersion, ["models"] = new JsonArray(analyzer.Loaded.Select(m => (JsonNode?)m).ToArray()),
             ["uptimeSeconds"] = Math.Round((DateTimeOffset.UtcNow - started).TotalSeconds, 1), ["threads"] = threads, ["requests"] = Interlocked.Read(ref requests), ["searches"] = Interlocked.Read(ref searches), ["failures"] = Interlocked.Read(ref failures),
             ["framesCache"] = FramesCache.Current?.Stats(),
@@ -229,6 +237,12 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         b.Services.Configure<FormOptions>(o => { o.MultipartBodyLengthLimit = maxBody; o.ValueCountLimit = MaxFrames + 20; o.MemoryBufferThreshold = 8 * 1024 * 1024; });
         var app = b.Build();
         app.Use(async (c, next) => { c.Response.Headers.Server = "indexnode"; await next(); });
+        app.Use(async (c, next) =>
+        {   // 0.13.59: still loading: only /v1/health answers; the rest says when to come back
+            if (Ready || c.Request.Path.StartsWithSegments("/v1/health")) { await next(); return; }
+            c.Response.StatusCode = 503; c.Response.Headers.RetryAfter = StartingRetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            await c.Response.WriteAsJsonAsync(new { error = "starting: the models and the search index are loading", ready = false, retryAfterSeconds = StartingRetryAfterSeconds });
+        });
         app.MapGet("/v1/health", () => Results.Json(Health()));
         app.MapPost("/v1/precheck", async (HttpContext c) =>
         {
@@ -365,19 +379,22 @@ public static class ServeCommand
         void Stop(string why) { if (cts.IsCancellationRequested) return; Console.WriteLine($"serve: {why}: stopping"); cts.Cancel(); _ = Task.Run(async () => { await Task.Delay(TimeSpan.FromSeconds(8)); Console.WriteLine("serve: shutdown did not finish in 8 s: exiting"); Environment.Exit(1); }); }
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop("SIGINT"); };
         using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, c => { c.Cancel = true; Stop("SIGTERM"); });
+        // 0.13.59: the port opens BEFORE the load, answering "not ready" (see PreCheckServer.Ready), so a caller is told to wait instead of meeting a closed port
+        var bind = a.Get("bind") ?? "0.0.0.0";
+        var app = server.Build($"http://{bind}:{port}"); server.Ready = false;
+        await app.StartAsync(cts.Token);
+        Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/health); answering 503 until the load is done");
         Console.WriteLine($"serve: loading models and the search index ({threads} threads)...");
         var sw = Stopwatch.StartNew();
         await analyzer.WarmAsync(threads, cts.Token);
         Console.WriteLine($"serve: warm in {sw.Elapsed.TotalSeconds:0.0}s: models [{string.Join(", ", analyzer.Loaded)}], index v{(await server.IndexAsync(cts.Token))?.Version.ToString() ?? "none"}");
         try { await FramesListing.For(store).EnsureAsync(store, paths, cts.Token); } catch (Exception e) when (e is not OperationCanceledException) { Console.WriteLine("serve: frames listing not loaded: " + e.Message); }   // warm: the check's lookup needs no LIST of its own
-        var bind = a.Get("bind") ?? "0.0.0.0";
-        var app = server.Build($"http://{bind}:{port}");
         _ = server.RefreshLoopAsync(TimeSpan.FromMinutes(5), cts.Token);
         if (a.Has("warm"))   // 0.13.31: every frames file into the local cache once (paced at 80% of the per-minute cap); from then on a search reads nothing from the store
             _ = Task.Run(async () => { var w = Stopwatch.StartNew(); var r = await PreCheckServer.WarmFramesAsync(store, await server.IndexAsync(cts.Token), new OpPacer(() => StoreMeter.Current.Total, () => StoreMeter.Current.Limits.MaxPerMin), Console.WriteLine, cts.Token); Console.WriteLine($"serve: warm done in {w.Elapsed.TotalMinutes:0.0} min: {r.Fetched} fetched, {r.Cached} already cached, {r.Failed} failed"); });
         if (a.Has("download-service")) await DownloadServiceHost.StartAsync(server, store, paths, cfg, a, cts.Token);
-        await app.StartAsync(cts.Token);
-        Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/health)");
+        server.ReadyAfterSeconds = sw.Elapsed.TotalSeconds; server.Ready = true;
+        Console.WriteLine($"serve: ready after {sw.Elapsed.TotalSeconds:0.0}s");
         try { await Task.Delay(Timeout.Infinite, cts.Token); } catch (OperationCanceledException) { }
         using (var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5))) { try { await app.StopAsync(stopTimeout.Token); } catch (OperationCanceledException) { } }
         return 0;
