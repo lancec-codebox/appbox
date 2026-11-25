@@ -92,7 +92,7 @@ public class OpsPerJobTests(ITestOutputHelper output)
         Assert.Contains("max-per-step 25", ex.Message); Assert.Contains("Top sites", ex.Message); Assert.Equal(25, http.Requests); Assert.True(m.Tripped, "a runaway step opens the breaker so the node stops claiming");   // the 26th op never left the node
         m.Reset();   // the cooldown is not what this part is about
         Assert.True(m.Limits.StepLimitFor("actors-index") > 25 && m.Limits.StepLimitFor("search-index") > 25);
-        Assert.Equal(45, m.Limits.StepLimitFor("actors")); Assert.Equal(80, m.Limits.StepLimitFor("group"));
+        Assert.Equal(135, m.Limits.StepLimitFor("actors")); Assert.Equal(80, m.Limits.StepLimitFor("group"));
         foreach (var (st, n) in new[] { ("check", 80), ("download", 60), ("sample", 40), ("describe", 80), ("translate", 80) }) Assert.Equal(n, m.Limits.StepLimitFor(st));   // 0.13.41
         // 0.13.41: a singleton index build is bounded by its own budget and does not use up the lane's minute: one lane (200/min), a 230-op build, then ordinary jobs still run
         var m1 = new StoreMeter { Limits = new StorageLimits { Lanes = 1 } }; var rs1 = FakeBlobHttp.Rest(fs, m1, out _);
