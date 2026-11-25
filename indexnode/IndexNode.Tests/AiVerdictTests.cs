@@ -74,6 +74,40 @@ public class AiVerdictTests
     }
 
     [Fact]
+    public async Task Release_below_frees_the_holds_under_the_threshold_in_both_queues_sets_the_flag_false_and_records_no_verdict()
+    {
+        var s = new FakeStore();
+        await Doc(s, "low1", true, 0.53); await Doc(s, "low2", true, 0.6199); await Doc(s, "edge", true, 0.62); await Doc(s, "high", true, 0.8); await Doc(s, "said", true, 0.5);
+        await VideoJson.UpdateAsync(s, P, "said", r => ((JsonObject)r["ai"]!)["verdict"] = "ai", default);   // the owner looked at it: AI, whatever it scores
+        var proc = new JobQueue(s, P, "t"); await proc.LoadAsync(default);
+        var dl = new JobQueue(s, P.DownloadQueue, "t"); await dl.LoadAsync(default);
+        await dl.AppendLinesAsync([Add("low1", "download", "ai"), Add("edge", "download", "ai"), Add("high", "download", "ai"), Add("said", "download", "ai"), Add("free", "download")], default);
+        await proc.AppendLinesAsync([Add("low2", "process", "ai"), Add("ghost", "process", "ai")], default);   // ghost: no record; its line carries 0.53
+        VideoJson.ClearCache(s);
+        var dry = await AiHold.ReleaseBelowAsync(proc, dl, s, P, 0.62, "cli", true, TimeSpan.Zero, default);
+        Assert.Equal((1, 2, 2, 1, 0, 2), (dry.Download, dry.Process, dry.KeptAtOrAbove, dry.KeptVerdictAi, dry.KeptNoScore, dry.Records));
+        Assert.Equal(["ghost", "low1", "low2"], dry.Ids);
+        Assert.Equal("ai", dl.Read(st => st.Entry("low1", "download")!.Hold)); VideoJson.ClearCache(s); Assert.True(AiHold.Flagged((await VideoJson.ReadAsync(s, P, "low1", default))!.Root));   // nothing written
+        var r = await AiHold.ReleaseBelowAsync(proc, dl, s, P, 0.62, "cli", false, TimeSpan.Zero, default);
+        Assert.Equal((1, 2, 2, 1, 0, 2), (r.Download, r.Process, r.KeptAtOrAbove, r.KeptVerdictAi, r.KeptNoScore, r.Records));
+        Assert.Null(dl.Read(st => st.Entry("low1", "download")!.Hold)); Assert.Null(proc.Read(st => st.Entry("low2", "process")!.Hold)); Assert.Null(proc.Read(st => st.Entry("ghost", "process")!.Hold));
+        Assert.Equal("ai", dl.Read(st => st.Entry("edge", "download")!.Hold));    // at the threshold is AI, as the flag itself (score >= flag)
+        Assert.Equal("ai", dl.Read(st => st.Entry("high", "download")!.Hold)); Assert.Equal("ai", dl.Read(st => st.Entry("said", "download")!.Hold));
+        Assert.Null(dl.Read(st => st.Entry("free", "download")!.Hold)); Assert.Equal("pending", dl.Read(st => st.Entry("low1", "download")!.State));
+        VideoJson.ClearCache(s);
+        foreach (var id in new[] { "low1", "low2" })
+        {
+            var ai = (JsonObject)(await VideoJson.ReadAsync(s, P, id, default))!.Root["ai"]!;
+            Assert.False((bool)ai["flag"]!); Assert.Null(ai["verdict"]); Assert.Equal("precheck", (string)ai["source"]!); Assert.True((double)ai["score"]! < 0.62);   // the score and its source stay; no verdict
+        }
+        Assert.True(AiHold.Flagged((await VideoJson.ReadAsync(s, P, "high", default))!.Root)); Assert.True(AiHold.Flagged((await VideoJson.ReadAsync(s, P, "said", default))!.Root));
+        // a rerun finds nothing more, and a node that starts later sees the same
+        var again = await AiHold.ReleaseBelowAsync(proc, dl, s, P, 0.62, "cli", false, TimeSpan.Zero, default);
+        Assert.Equal((0, 0, 2, 1, 0), (again.Download, again.Process, again.KeptAtOrAbove, again.KeptVerdictAi, again.Records));
+        var late = new JobQueue(s, P.DownloadQueue, "late"); await late.LoadAsync(default); Assert.Null(late.Read(st => st.Entry("low1", "download")!.Hold));
+    }
+
+    [Fact]
     public void An_unforced_hold_line_without_a_hold_changes_nothing()
     {
         var st = new QueueState();

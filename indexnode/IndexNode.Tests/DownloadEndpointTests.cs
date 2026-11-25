@@ -15,7 +15,7 @@ public class DownloadEndpointTests
         if (service)
         {
             var full = new JobQueue(s, P.DownloadQueue, "svc", () => T0); await full.LoadAsync(default); var work = new JobQueue(s, P.DownloadWork, "svc", () => T0); await work.LoadAsync(default); var proc = new JobQueue(s, P.ProcessQueue, "svc", () => T0); await proc.LoadAsync(default);
-            await full.AppendLinesAsync([QLine.Add("v1", "download", new JobDescriptor { Stage = "download", JobId = "v1", AddedAt = "x", Pub = "2026-11-01T00:00:00Z" }, Protocol.Utc(T0))], default);
+            await full.AppendLinesAsync([QLine.Add("v1", "sample", new JobDescriptor { Stage = "sample", JobId = "v1", AddedAt = "x" }, Protocol.Utc(T0), 0, null, "done") /* 0.13.52: a download is handed out only for an upload that was sampled */, QLine.Add("v1", "download", new JobDescriptor { Stage = "download", JobId = "v1", AddedAt = "x", Pub = "2026-11-01T00:00:00Z" }, Protocol.Utc(T0))], default);
             server.Downloads = new DownloadService(full, work, proc, (_, _) => Task.FromResult<JsonObject?>(null), 10); server.ContainerUrl = "https://acct.blob.core.windows.net/c";
         }
         var app = server.Build("http://127.0.0.1:0"); await app.StartAsync(); return (app, app.Urls.First().Replace("[::]", "127.0.0.1"), server, s);

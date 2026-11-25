@@ -20,7 +20,45 @@ public class DownloadServiceTests
             return r;
         }
     }
+    /// <summary>0.13.52: a download the service may hand out belongs to an upload that was sampled (a pending download of a never-sampled upload becomes a sample entry): the finished sample that goes with a download in these tests.</summary>
+    static QLine Sampled(string id) => Add(id, "sample", "2020-01-01T00:00:00Z", 0, "done");
     static QLine Add(string id, string stage, string pub, int pri = 0, string? state = null) => QLine.Add(id, stage, new JobDescriptor { Stage = stage, JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = At, Pub = pub }, At, pri, At, state);
+
+    [Fact]
+    public async Task A_pending_download_of_an_upload_never_sampled_becomes_a_sample_first_and_no_node_is_handed_such_a_download()
+    {
+        // plain: a classify decision or `enqueue` made it; checked: its sample is done and the check added the download; uncl: not a drama yet; held: an AI hold; inwork/busy: plain ones already in the work queue
+        var r = await Rig.Make(10, Add("plain", "download", "2026-11-05T00:00:00Z", 7), Sampled("checked"), Add("checked", "download", "2026-11-04T00:00:00Z"), Add("uncl", "download", "2026-11-03T00:00:00Z", 0, "unclassified"),
+            new QLine { T = "add", S = "held", Stage = "download", Job = new JobDescriptor { Stage = "download", JobId = "held", AddedAt = At }, At = At, Due = At, Hold = "ai" },
+            Add("inwork", "download", "2026-11-02T00:00:00Z"), Add("busy", "download", "2026-11-01T00:00:00Z"));
+        await r.Work.AppendLinesAsync([Add("inwork", "download", "2026-11-02T00:00:00Z"), Add("busy", "download", "2026-11-01T00:00:00Z")], default);   // topped up by an older service
+        var node = new JobQueue(r.S, P.DownloadWork, "dl1", () => T0); await node.LoadAsync(default);
+        var mine = await node.TryClaimAsync("busy", s => ["download"], default); Assert.NotNull(mine);   // a node is downloading this one right now
+        Assert.Equal(2, await r.Svc.SampleFirstAsync(default));   // plain and inwork; busy is left to finish, the others are not its business
+        foreach (var id in new[] { "plain", "inwork" })
+        {
+            Assert.Null(r.Full.Read(f => f.Entry(id, "download"))); Assert.Equal("pending", r.Full.Read(f => f.Entry(id, "sample"))!.State);
+            Assert.Equal("https://www.youtube.com/watch?v=" + id, r.Full.Read(f => f.Entry(id, "sample"))!.Job!.Url);
+        }
+        Assert.Equal(7, r.Full.Read(f => f.Entry("plain", "sample"))!.Priority);                       // priority kept
+        Assert.Null(r.Work.Read(w => w.Entry("inwork", "download")));                                  // its idle copy left the work queue
+        Assert.Equal("pending", r.Full.Read(f => f.Entry("checked", "download"))!.State); Assert.Equal("unclassified", r.Full.Read(f => f.Entry("uncl", "download"))!.State);
+        Assert.Equal("ai", r.Full.Read(f => f.Entry("held", "download"))!.Hold); Assert.Null(r.Full.Read(f => f.Entry("held", "sample")));
+        Assert.Equal("pending", r.Full.Read(f => f.Entry("busy", "download"))!.State); Assert.NotNull(r.Work.Read(w => w.Entry("busy", "download")));
+        Assert.Equal(0, await r.Svc.SampleFirstAsync(default));   // idempotent
+        // what nodes are handed: samples for the two, the download only for the upload that was checked
+        var got = new List<(string, string)>();
+        for (int i = 0; i < 4; i++) if (await r.Svc.NextAsync("n" + i, ["sample", "download"], default) is { } c) got.Add((c.Subject, c.Stage));
+        Assert.Equal([("checked", "download"), ("inwork", "sample"), ("plain", "sample")], got.OrderBy(x => x.Item1).ToList());
+        // a plain download added later (classify set, enqueue) is converted by the very next hand-over, before it can be given out
+        await r.Full.AppendLinesAsync([Add("later", "download", "2026-11-06T00:00:00Z", 1000)], default);
+        var next = await r.Svc.NextAsync("n9", ["sample", "download"], default);
+        Assert.Equal(("later", "sample"), (next!.Subject, next.Stage));
+        // the node that was downloading finishes; it folds back and enters processing as the download it was
+        await mine!.AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default); await mine.FinishAsync();
+        await r.Svc.RunOnceAsync(default);
+        Assert.Equal("done", r.Full.Read(f => f.Entry("busy", "download"))!.State); Assert.Null(r.Full.Read(f => f.Entry("busy", "sample")));
+    }
 
     [Fact]
     public async Task A_prioritised_item_joins_a_full_work_queue_at_once_and_is_the_next_one_handed_out()
@@ -28,7 +66,7 @@ public class DownloadServiceTests
         var lines = Enumerable.Range(0, 30).Select(i => Add("v" + i.ToString("00"), "sample", $"2026-11-{1 + i % 28:00}T00:00:00Z", i == 3 ? 9 : 0)).ToList();
         var r = await Rig.Make(10, lines.ToArray());
         Assert.Equal(10, await r.Svc.TopUpAsync(default));   // the work queue is full (10 of 10), its highest priority is 9
-        await r.Full.AppendLinesAsync([Add("asked", "download", "2020-01-01T00:00:00Z", 1000), Add("same9", "sample", "2026-11-30T00:00:00Z", 9), Add("low", "sample", "2026-11-30T00:00:00Z", 1)], default);
+        await r.Full.AppendLinesAsync([Sampled("asked"), Add("asked", "download", "2020-01-01T00:00:00Z", 1000), Add("same9", "sample", "2026-11-30T00:00:00Z", 9), Add("low", "sample", "2026-11-30T00:00:00Z", 1)], default);
         Assert.Equal(1, await r.Svc.TopUpAsync(default));    // only the item above every live priority jumps; an equal or lower one waits for the ordinary top-up
         var ids = r.Work.Read(w => w.Subjects.Values.Select(s => s.Id).ToList());
         Assert.Contains("asked", ids); Assert.DoesNotContain("same9", ids); Assert.DoesNotContain("low", ids); Assert.Equal(11, ids.Count);
@@ -163,7 +201,7 @@ public class DownloadServiceTests
     [Fact]
     public async Task A_downloaded_item_enters_processing_with_data_full_and_a_crash_before_enter_is_repaired()
     {
-        var r = await Rig.Make(10, Add("n1", "download", "2026-11-01T00:00:00Z"));
+        var r = await Rig.Make(10, Sampled("n1"), Add("n1", "download", "2026-11-01T00:00:00Z"));
         await r.Svc.TopUpAsync(default);
         var dl = new JobQueue(r.S, P.DownloadWork, "dl1", () => T0, downloader: true); await dl.LoadAsync(default);
         var h = await dl.TryClaimAsync("n1", s => ["download"], default); await h!.AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default); await h.FinishAsync();
@@ -189,7 +227,7 @@ public class DownloadServiceTests
     [Fact]
     public async Task A_claim_the_service_made_for_a_node_is_adopted_renewed_and_finished_by_that_node()
     {
-        var r = await Rig.Make(10, Add("v1", "download", "2026-11-01T00:00:00Z"));
+        var r = await Rig.Make(10, Sampled("v1"), Add("v1", "download", "2026-11-01T00:00:00Z"));
         var got = await r.Svc.NextAsync("dl1", ["download"], default); Assert.NotNull(got);
         Assert.Equal("dl1", r.Work.Read(w => w.Get("v1"))!.ClaimBy);   // the claim line names the node
         var dl = new JobQueue(r.S, P.DownloadWork, "dl1", () => T0, downloader: true); await dl.LoadAsync(default);
@@ -197,7 +235,7 @@ public class DownloadServiceTests
         await r.S.RenewLeaseAsync(got.Active, got.Lease, default);   // what the heartbeat does
         await h.AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default); await h.FinishAsync();
         Assert.Equal("done", dl.Read(w => w.Entry("v1", "download"))!.State); Assert.Null(dl.Read(w => w.Get("v1"))!.ClaimBy); Assert.False(r.S.Exists(got.Active));
-        var other = await Rig.Make(10, Add("v2", "download", "2026-11-01T00:00:00Z")); var g2 = await other.Svc.NextAsync("dl1", [], default);
+        var other = await Rig.Make(10, Sampled("v2"), Add("v2", "download", "2026-11-01T00:00:00Z")); var g2 = await other.Svc.NextAsync("dl1", [], default);
         var wrong = new JobQueue(other.S, P.DownloadWork, "dl2", () => T0, downloader: true); await wrong.LoadAsync(default);
         await Assert.ThrowsAsync<LeaseLostException>(() => wrong.AdoptClaim(g2!.Subject, g2.Epoch, g2.Lease).AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default));   // another node cannot use it
     }

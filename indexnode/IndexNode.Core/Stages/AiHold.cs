@@ -51,6 +51,53 @@ public static class AiHold
         return new VerdictReport(id, verdict, doc != null, released, held);
     }
 
+    public sealed record BelowReport(int Download, int Process, int KeptAtOrAbove, int KeptVerdictAi, int KeptNoScore, int Records, List<string> Ids);
+
+    /// <summary>
+    /// 0.13.52 (`indexnode ai release-below [T]`; owner, 2026-11-24: the flag went from 0.479 to 0.62 and the uploads held under the old one are released): every AI hold whose upload scores BELOW
+    /// <paramref name="threshold"/> is released, in the processing queue and in the full download queue, and the upload's video.json says flag false (the score and its source stay). No verdict is recorded:
+    /// this is the threshold's decision, not the owner's look at the upload, so a later probe result (the pre-check at processing) still decides. Kept: uploads the owner marked ai, uploads at or above the
+    /// threshold, uploads with no score anywhere. One read of the records (the aggregate), batched queue lines, then one record write per upload with <paramref name="gap"/> between them (the store limit). Idempotent.
+    /// </summary>
+    public static async Task<BelowReport> ReleaseBelowAsync(JobQueue processing, JobQueue? download, IStore store, Paths paths, double threshold, string by, bool dry, TimeSpan gap, CancellationToken ct, Action<string>? say = null)
+    {
+        var held = new List<(JobQueue Q, bool Dl, string Id, string Stage, double? Score)>();
+        foreach (var (q, dl) in new[] { (processing, false), (download, true) })
+        {
+            if (q == null) continue;
+            await q.PollAsync(ct);
+            held.AddRange(q.Read(st => st.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => !e.Final && e.Hold == "ai").Select(e => (q, dl, s.Id, e.Stage, e.HoldAiScore))).ToList()));
+        }
+        var ids = held.Select(h => h.Id).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var docs = ids.Count == 0 ? new Dictionary<string, VideoJson.Doc?>() : await VideoJson.ReadManyAsync(store, paths, ids, ct);
+        int keptAbove = 0, keptAi = 0, noScore = 0; var release = new List<(JobQueue Q, bool Dl, string Id, string Stage)>();
+        foreach (var h in held.OrderBy(h => h.Id, StringComparer.Ordinal).ThenBy(h => h.Stage, StringComparer.Ordinal))
+        {
+            var root = docs.GetValueOrDefault(h.Id)?.Root;
+            if (Verdict(root) == "ai") { keptAi++; continue; }
+            var score = (double?)(root?["ai"] as JsonObject)?["score"] ?? h.Score;
+            if (score == null) { noScore++; continue; }
+            if (score >= threshold) { keptAbove++; continue; }
+            release.Add((h.Q, h.Dl, h.Id, h.Stage));
+        }
+        if (!dry)
+            foreach (var g in release.GroupBy(r => r.Q))
+            {
+                var lines = g.Select(r => new QLine { T = "hold", S = r.Id, Stage = r.Stage, Force = true, At = g.Key.NowUtc(), By = by }).ToList();
+                for (int i = 0; i < lines.Count; i += 500) { await g.Key.AppendLinesAsync(lines.Skip(i).Take(500).ToList(), ct); say?.Invoke($"  released {Math.Min(i + 500, lines.Count)} of {lines.Count} hold(s) in the {(g.First().Dl ? "download" : "processing")} queue"); }
+            }
+        // the records: flag false, so nothing downstream (actors, grouping, the catalog) goes on treating a released upload as AI
+        var flip = release.Select(r => r.Id).Distinct(StringComparer.Ordinal).Where(id => (docs.GetValueOrDefault(id)?.Root["ai"] as JsonObject)?["flag"] is JsonNode f && (bool?)f == true).ToList(); int n = 0;
+        if (!dry)
+            foreach (var id in flip)
+            {
+                await VideoJson.UpdateAsync(store, paths, id, root => { if (root["ai"] is JsonObject ai && Verdict(root) != "ai") ai["flag"] = false; }, ct);
+                if (++n % 50 == 0) say?.Invoke($"  {n} of {flip.Count} record(s) updated");
+                if (gap > TimeSpan.Zero && n < flip.Count) await Task.Delay(gap, ct);
+            }
+        return new BelowReport(release.Count(r => r.Dl), release.Count(r => !r.Dl), keptAbove, keptAi, noScore, flip.Count, release.Select(r => r.Id).Distinct(StringComparer.Ordinal).ToList());
+    }
+
     /// <summary>Marks the add line of the full download held when the record says AI and aiDramas is off; logs why.</summary>
     public static bool Apply(JobContext ctx, JsonObject rec, QLine add, JsonObject? root = null)
     {

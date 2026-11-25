@@ -243,6 +243,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     /// </summary>
     public async Task<int> TopUpAsync(CancellationToken ct)
     {
+        await SampleFirstAsync(ct);   // 0.13.52: before anything can be handed out
         var now = work.NowUtc(); int addedRuns = await TopUpRunsAsync(now, ct);   // due refresh and classify go first (they are few and need no room)
         int live = work.Read(w => w.Subjects.Values.Count(s => s.Entries.Values.Any(e => !e.Final && !IsRun(e.Stage))));   // the few due runs do not count against the max
         if (live >= WorkMax / 2) return addedRuns + await JumpAsync(now, ct);
@@ -257,6 +258,34 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         foreach (var chunk in JobQueue.Chunks(take, _ => 700))
             await work.AppendLinesAsync(st => { var at = work.NowUtc(); var l = chunk.Where(x => st.Entry(x.Id, x.E.Stage) == null).Select(x => { var j = x.E.Job ?? new JobDescriptor { Stage = x.E.Stage, JobId = x.Id }; j.Pub ??= x.Pub; return QLine.Add(x.Id, x.E.Stage, j, at, x.E.Priority, x.E.Due.Length > 0 ? x.E.Due : at); }).ToList(); added += l.Count; return l; }, ct);
         return added + addedRuns;
+    }
+
+    /// <summary>
+    /// 0.13.52 (owner, 2026-11-24: "Everything should get a sample check"): no download is handed out for an upload that was never sampled. Every pending, unheld download of the full queue whose upload has
+    /// no sample and no check entry becomes a sample entry (same body, priority, due and added time: <see cref="SampleFirst.Plan"/>); its check adds the download again when the upload is new.
+    /// It runs at the start of every top-up, so it covers every way such a download comes to be (a classify decision, `classify set`, `enqueue`, an old entry) without each of them knowing the rule.
+    /// A copy already in the work queue is dropped there first when nobody holds it; one a node is working on (or has finished, not folded back yet) is left to finish as it is.
+    /// In 1,000 downloads on 2026-11-24 only 242 uploads had been sampled: the others were pending downloads from classify decisions, and their duplicates were found only after the download.
+    /// </summary>
+    public async Task<int> SampleFirstAsync(CancellationToken ct)
+    {
+        var at = full.NowUtc();
+        var plan = full.Read(st => SampleFirst.Plan(st, at, out _, out _, out _, out _).Where(l => st.Entry(l.S, "download") is { State: "pending", Hold: null }).ToList());   // a held download stays a held download
+        var ids = plan.Where(l => l.T == "add" && l.Stage == "sample").Select(l => l.S).ToHashSet(StringComparer.Ordinal);
+        if (ids.Count == 0) return 0;
+        static bool Idle(QSubject? s) => s is { ClaimBy: null } && s.Entries.GetValueOrDefault("download") is { Final: false };
+        if (work.Read(w => ids.Any(id => Idle(w.Get(id)))))
+            foreach (var chunk in JobQueue.Chunks(ids.ToList(), _ => 120))
+                await work.AppendLinesAsync(w => { var l = chunk.Where(id => Idle(w.Get(id))).Select(id => new QLine { T = "drop", S = id, Stage = "download" }).ToList(); return l.Count == 0 ? null : l; }, ct);
+        ids.RemoveWhere(id => work.Read(w => w.Entry(id, "download") != null));   // claimed or finished there: it ends as the download it is
+        var lines = plan.Where(l => ids.Contains(l.S)).ToList();
+        for (int i = 0; i < lines.Count; )
+        {   // an add and its drop stay in one append
+            int n = Math.Min(JobQueue.BatchChunk, lines.Count - i); if (i + n < lines.Count && lines[i + n - 1].T == "add") n++;
+            await full.AppendLinesAsync(lines.GetRange(i, n), ct); i += n;
+        }
+        if (ids.Count > 0) Log.Info($"download service: {ids.Count} pending download(s) of uploads never sampled became sample entries (sample first)");
+        return ids.Count;
     }
 
     /// <summary>0.13.39: the ready items of the full queue with a priority above the work queue's highest live priority join the work queue (see <see cref="TopUpAsync"/>).</summary>

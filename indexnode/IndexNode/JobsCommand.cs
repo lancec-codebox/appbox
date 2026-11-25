@@ -56,6 +56,26 @@ public static class JobsCommand
             case "sample-first":
             {
                 bool dry = a.Has("dry-run");
+                if (a.Has("download"))
+                {   // 0.13.52: the full download queue is the service's (it converts at every top-up); this only counts what it would convert
+                    var dq = await JobQueue.OpenAsync(store, paths, "cli", true, default);
+                    var (n, withSample, held, uncl) = dq.Read(st => (
+                        SampleFirst.Plan(st, Protocol.NowUtc(), out _, out _, out _, out _).Count(l => l.T == "add" && l.Stage == "sample" && st.Entry(l.S, "download") is { State: "pending", Hold: null }),
+                        st.Subjects.Values.Count(s => s.Entries.GetValueOrDefault("download") is { State: "pending" } && (s.Entries.ContainsKey("sample") || s.Entries.ContainsKey("check"))),
+                        st.Subjects.Values.Count(s => s.Entries.GetValueOrDefault("download") is { State: "pending", Hold: not null }),
+                        st.Subjects.Values.Count(s => s.Entries.GetValueOrDefault("download") is { State: Tags.Unclassified })));
+                    Console.WriteLine($"download queue: {n} pending download(s) of uploads never sampled (the service turns them into sample entries at its next top-up); {withSample} pending download(s) already sampled or checked; {held} held; {uncl} unclassified; pending samples: {dq.Read(st => st.Subjects.Values.Count(s => s.Entries.GetValueOrDefault("sample") is { State: "pending" }))}");
+                    if (a.Get("since") is { } since)
+                    {   // the downloads finished since then: was each upload sampled or checked first, and when
+                        var rows = dq.Read(st => st.Subjects.Values.Where(s => s.Entries.GetValueOrDefault("download") is { State: "done" } d && string.CompareOrdinal(d.FinishedAt ?? "", since) >= 0)
+                            .Select(s => (Sample: s.Entries.GetValueOrDefault("sample"), Check: s.Entries.GetValueOrDefault("check"))).ToList());
+                        int both = rows.Count(r => r.Sample != null || r.Check != null), none = rows.Count - both;
+                        int sampledBefore = rows.Count(r => r.Sample is { State: "done" } sm && string.CompareOrdinal(sm.FinishedAt ?? "", since) < 0), sampledAfter = rows.Count(r => r.Sample is { State: "done" } sm && string.CompareOrdinal(sm.FinishedAt ?? "", since) >= 0);
+                        Console.WriteLine($"downloads finished since {since}: {rows.Count}; with a sample or check entry: {both} (sample done before then: {sampledBefore}, since then: {sampledAfter}; check entry only: {rows.Count(r => r.Sample == null && r.Check != null)}); with neither: {none}");
+                        foreach (var g in rows.Where(r => r.Sample is { State: "done" }).GroupBy(r => (r.Sample!.FinishedAt ?? "")[..Math.Min(10, (r.Sample!.FinishedAt ?? "").Length)]).OrderBy(g => g.Key)) Console.WriteLine($"  sampled on {g.Key}: {g.Count()}");
+                    }
+                    return 0;
+                }
                 var q = await Load(store, paths);
                 var ops0 = StoreMeter.Current.Total;
                 var rep = await SampleFirst.RunAsync(q, dry, default, store, paths);

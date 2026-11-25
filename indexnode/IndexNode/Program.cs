@@ -62,6 +62,7 @@ public static class Program
         indexnode sources lookup <id>   (full listing again: every member recorded, every unknown video queued)
         indexnode sources refresh <id>|--all-due   (incremental: only videos new since the last run; due now at priority 500)
         indexnode ai test [--ai-base-url ...]
+        indexnode ai release-below [T] [--dry-run] [--ids-out file] [--per-minute 50]   (0.13.52: releases every AI hold whose upload scores under T (default: the AI flag in force) and sets its record to flag false; no verdict is recorded. Kept: at or above T, marked ai by the owner, no score)
         indexnode ai set <videoId>... real|ai [--reason R] [--dry-run]   (0.13.44: the owner's verdict on an upload; it wins over the probe's flag. real releases its AI holds, ai holds its pending entries)
         indexnode enqueue <url|playlist-url>... [--max-height 480] [--format F] [--priority N]
         indexnode priority set <N> --job <id>... | --from <file> | --channel <id|url> [--stage download] [--with-steps]
@@ -74,6 +75,7 @@ public static class Program
         indexnode precheck <id|url>... [--ids <file>] [--output-local <dir>] [--window-position 0.5] [--order-tolerance-seconds 120] [--keep-sample] [--exclude-self] [--threads N] [--input-local <dir>]   (0.12.0: ONLY the pre-check, read-only on the store: sample, frames, SSCD, lookup, AI probe -> <dir>/<id>/precheck.json, default ./precheck-out)
         indexnode sample <id|url> --output-local <dir> [--timebox 120]   (0.13.16: ONLY the sample download (two 5-minute segments at 0.30/0.70, 360p, the first segment's audio, info, description, thumbnail) into <dir>/<id>/; writes no store or queue; prints the time split; run it on lancecl1, never the hexad host)
         indexnode check <id|url> --input-local <dir> [--exclude-self] [--output-local <dir>] [--timebox 120] [--threads N]   (0.13.16: ONLY the check on those local sample files (the search index is read from the store, read-only): record and time split; writes no store or queue; run it on the hexad host)
+        indexnode jobs sample-first --download   (0.13.52: counts the pending downloads of uploads never sampled in the full download queue; the download service converts them itself, sample first)
         indexnode jobs sample-first [--dry-run]   (0.13.16: pending downloads become sample entries, pending process entries get a check entry; priority and due kept; batched, idempotent; prints the counts)
         indexnode seq assign [--dry-run]   (0.13.10: give every existing drama its sequence number, by first pre-check)
         indexnode seq clear-ungrouped [--dry-run]   (0.13.43, once at the cutover with no node running: numbers given at a pre-check to dramas not yet grouped are cleared; a drama is numbered when its group step starts)
@@ -203,7 +205,7 @@ public static class Program
                 "tools" => await Commands.ToolsAsync(a),
                 "sources" => await Commands.SourcesAsync(a),
                 "priority" => await Commands.PriorityAsync(a),
-                "ai" => a.Positional.FirstOrDefault() == "score" ? await CentersCommands.AiScoreAsync(a) : a.Positional.FirstOrDefault() == "set" ? await Commands.AiSetAsync(a) : await Commands.AiAsync(a),
+                "ai" => a.Positional.FirstOrDefault() == "score" ? await CentersCommands.AiScoreAsync(a) : a.Positional.FirstOrDefault() == "set" ? await Commands.AiSetAsync(a) : a.Positional.FirstOrDefault() == "release-below" ? await Commands.AiReleaseBelowAsync(a) : await Commands.AiAsync(a),
                 "publish" => await SiteCommands.PublishAsync(a),
                 "cast-candidates" => await CastCandidates.RunAsync(a),
                 "cast" => a.Positional.FirstOrDefault() == "recluster" ? await CastRecluster.RunAsync(a) : a.Positional.FirstOrDefault() == "reembed" ? await CastReembed.Main2(a) : Fail("cast: recluster <id>|--ids <file> [--merge-at D] [--split] [--out-local <dir>]"),
@@ -509,6 +511,22 @@ public static class Commands
             }
             default: throw new ArgumentException("sources add <url> | list | remove <id> | import <channels.json> | schedule <id> off|once|6h|1d|daily@03:00 | lookup <id> | refresh <id>|--all-due | priority <source id|url> N");
         }
+    }
+
+    /// <summary>0.13.52: `ai release-below [T] [--dry-run] [--ids-out file] [--per-minute N]`: see <see cref="AiHold.ReleaseBelowAsync"/>. T defaults to the AI flag in force.</summary>
+    public static async Task<int> AiReleaseBelowAsync(Args a)
+    {
+        var (cfg, store, paths, http) = Open(a); using var _h = http;
+        double t = a.Positional.ElementAtOrDefault(1) is { } tv ? double.Parse(tv, System.Globalization.CultureInfo.InvariantCulture) : (cfg.PreCheck ?? new()).AiFlag;
+        bool dry = a.Has("dry-run"); int perMin = a.Get("per-minute") is { } pm ? Math.Max(1, int.Parse(pm)) : 50;
+        await JobQueue.RequireSnapshotAsync(store, paths, default);
+        var processing = await JobQueue.OpenAsync(store, paths, "cli", false, default);
+        var download = await JobQueue.OpenAsync(store, paths, "cli", true, default);
+        var r = await AiHold.ReleaseBelowAsync(processing, download, store, paths, t, cfg.NodeName ?? Environment.UserName, dry, TimeSpan.FromSeconds(60.0 / perMin), default, Console.WriteLine);
+        Console.WriteLine($"AI holds under {t.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}: {(dry ? "would release" : "released")} {r.Download} in the download queue and {r.Process} in the processing queue ({r.Ids.Count} upload(s), {r.Records} record(s) {(dry ? "to set" : "set")} to flag false); kept: {r.KeptAtOrAbove} at or above it, {r.KeptVerdictAi} the owner marked ai, {r.KeptNoScore} without a score");
+        if (a.Get("ids-out") is { } f) File.WriteAllLines(f, r.Ids);
+        if (dry) Console.WriteLine("dry run: nothing written");
+        return 0;
     }
 
     public static async Task<int> AiSetAsync(Args a)
