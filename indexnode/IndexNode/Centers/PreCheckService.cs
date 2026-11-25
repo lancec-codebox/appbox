@@ -268,6 +268,22 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             catch (StorageBudgetExceeded e) { return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
             catch (Exception e) { Log.Info("serve: download/next failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
         });
+        app.MapPost("/v1/download/sampled", async (HttpContext c) =>
+        {   // 0.13.49: a node just sampled an upload: check it now and hand that node its download
+            if (!TokenOk(c)) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
+            if (Downloads == null) return Results.Json(new { error = "this serve does not run the download service" }, statusCode: 404);
+            try
+            {
+                using var sr = new StreamReader(c.Request.Body); var body = JsonNode.Parse(await sr.ReadToEndAsync(c.RequestAborted)) as JsonObject ?? throw new ArgumentException("the body is not a JSON object");
+                var node = (string?)body["node"] ?? throw new ArgumentException("node is missing"); var id = (string?)body["id"] ?? throw new ArgumentException("id is missing");
+                var got = await Downloads.SampledAsync(node, id, c.RequestAborted);
+                return got.Claim is { } k ? Results.Json(new { subject = k.Subject, stage = k.Stage, epoch = k.Epoch, lease = k.Lease, active = k.Active, outcome = got.Outcome }) : Results.Json(new { none = true, outcome = got.Outcome });
+            }
+            catch (Exception e) when (e is ArgumentException or JsonException) { return Results.BadRequest(new { error = e.Message }); }
+            catch (OperationCanceledException) { return Results.StatusCode(499); }
+            catch (StorageBudgetExceeded e) { return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
+            catch (Exception e) { Log.Info("serve: download/sampled failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
+        });
         app.MapPost("/v1/check", async (HttpContext c) =>
         {
             Interlocked.Increment(ref requests);

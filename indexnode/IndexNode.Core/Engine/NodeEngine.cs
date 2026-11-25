@@ -102,6 +102,8 @@ public sealed class EngineOptions
     public Func<JobDescriptor, bool>? CanRun { get; init; }
     /// <summary>0.13.26: the fallback of a downloader whose work queue has nothing ready: asks the download service (POST /v1/download/next) for one item, already claimed for this node. Null answer: nothing (the node retries later).</summary>
     public Func<string[], CancellationToken, Task<NextClaim?>>? FetchNext { get; init; }
+    /// <summary>0.13.49: after a finished sample, asks the download service for the same upload's download (checked there, claimed for this node). Null: samples and downloads stay separate jobs, as before.</summary>
+    public Func<string, CancellationToken, Task<(NextClaim? Claim, string Outcome)>>? FetchSampled { get; init; }
     /// <summary>0.13.26: a node whose stages are only download and sample works from the work queue (jobs/download/work/) after the split, and never reads the processing queue.</summary>
     public bool DownloaderOnly => Stages.Length > 0 && Stages.All(x => x is "download" or "sample" or "refresh" or "classify" or "availability");   // 0.13.26: refresh and classify (the YouTube and AI work of the download side) also come from the work queue
     /// <summary>0.13.3: builds a missing video.json for a video whose lease the claim holds (the backfill's builder); null: a missing descriptor fails the claim as before.</summary>

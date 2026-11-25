@@ -334,6 +334,7 @@ public static class Commands
             Stages = stages, Workers = workers, WorkerThreads = workerThreads, Threads = threads, Once = a.Has("once"), Gpu = gpu, ExitWhenIdle = exitIdle,
             GpuFallback = gpuFlag,
             FetchNext = DownloaderNode.FetchNext(http, downloader, nodeId),
+            FetchSampled = DownloaderNode.FetchSampled(http, downloader, nodeId),
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",

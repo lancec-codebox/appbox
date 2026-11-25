@@ -203,8 +203,47 @@ public sealed partial class NodeEngine
         GiveBack(counted ? stage : null);   // the stages that were asked for and not handed over
         if (h == null) { Interlocked.Decrement(ref reserved); if (counted) o.Limits?.Release(stage!, false); return false; }
         Interlocked.Increment(ref busyClaims); bool finished = false;
-        try { Log.Info($"download: the service handed over {h.Subject}"); finished = await RunClaimAsync(lane, h, ct); return true; }
+        try { Log.Info($"download: the service handed over {h.Subject}"); finished = await RunClaimAsync(lane, h, ct); }
         finally { Interlocked.Decrement(ref busyClaims); if (counted) o.Limits?.Release(stage!, finished); }
+        if (finished && stage == "sample") await ChainDownloadAsync(lane, h.Subject, ct);
+        return true;
+    }
+
+    private bool chainOff;
+    /// <summary>
+    /// 0.13.49 (owner, 2026-11-24: "Sampling a sample should immediately proceed with its download ... batched onto a node, like processing"): right after a finished sample the node asks the download service for
+    /// the same upload's download. The service checks the sample in that call and, when the upload is new and not held, hands its download back already claimed for this node, which runs it before taking anything else.
+    /// It counts like any download (budget, --max-jobs). Nothing to hand over (duplicate, AI hold, no budget, an older service): the node goes on as before and says why.
+    /// </summary>
+    private async Task ChainDownloadAsync(int lane, string id, CancellationToken ct)
+    {
+        if (o.FetchSampled == null || chainOff || !o.DownloaderOnly || !o.Stages.Contains("download") || !StageEnabled("download") || StorageHalted()) return;
+        if (o.Limits != null && !o.Limits.TryAcquire("download")) return;   // no room in the budget or outside the window: its download stays queued for whoever may take it
+        bool finished = false;
+        try
+        {
+            if (!TryReserve()) return;
+            ClaimHandle? h;
+            try
+            {
+                var (got, outcome) = await o.FetchSampled(id, ct);
+                if (got == null) { Interlocked.Decrement(ref reserved); Log.Info($"sample {id}: {outcome}"); return; }
+                await queue.PollAsync(ct);
+                h = queue.AdoptClaim(got.Subject, got.Epoch, got.Lease);
+            }
+            catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); throw; }
+            catch (Exception e)
+            {
+                Interlocked.Decrement(ref reserved);
+                if (e is HttpRequestException { StatusCode: System.Net.HttpStatusCode.NotFound }) { chainOff = true; Log.Info("sample: the download service is older than 0.13.49 (no /v1/download/sampled): samples and downloads stay separate jobs on this node"); }
+                else Log.Info($"sample {id}: the service did not answer for its download ({e.Message}); it stays queued");
+                return;
+            }
+            Interlocked.Increment(ref busyClaims);
+            try { Log.Info($"sample {id}: new; its download follows on this node"); finished = await RunClaimAsync(lane, h, ct); }
+            finally { Interlocked.Decrement(ref busyClaims); }
+        }
+        finally { o.Limits?.Release("download", finished); }
     }
 
     private DateTimeOffset nextSearchIndexRetry;
@@ -256,6 +295,7 @@ public sealed partial class NodeEngine
         if (h == null) { Interlocked.Decrement(ref reserved); o.Limits?.Release(first, false); MarkAbandoned(subject); return false; }   // 0.13.36: lost the lease race, or the claim found nothing runnable
         bool finished = await RunClaimAsync(lane, h, ct);
         o.Limits?.Release(first, finished);
+        if (finished && first == "sample") await ChainDownloadAsync(lane, id, ct);
         return true;
     }
 

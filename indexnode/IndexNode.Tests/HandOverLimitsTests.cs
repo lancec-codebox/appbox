@@ -39,4 +39,39 @@ public class HandOverLimitsTests
         await Run(new NodeEngine(new FakeStore(), P, Opts(limits, asked), Handlers()));
         Assert.Empty(asked);                                                   // nothing the limits allow: the service is not asked at all (an empty list would mean any stage)
     }
+
+    sealed class Rec(List<string> ran, string stage) : IStageHandler { public Task RunAsync(JobContext ctx) { lock (ran) ran.Add(stage + ":" + ctx.Job.JobId); return Task.CompletedTask; } }
+
+    [Fact]
+    public async Task After_a_sample_the_node_runs_the_same_uploads_download_before_the_next_sample_and_not_when_the_budget_is_used_up()
+    {
+        // 0.13.49: the engine side of "a sample proceeds straight to its download": after each finished sample it asks FetchSampled; a claim that comes back is adopted and run before anything else
+        var s = new FakeStore(); var ran = new List<string>(); var asked = new List<string>();
+        var seed = new JobQueue(s, P, "seed"); await seed.LoadAsync(default);
+        QLine Add(string id, string stage) => QLine.Add(id, stage, new JobDescriptor { Stage = stage, JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = "2026-11-24T08:00:00Z" }, "2026-11-24T08:00:00Z", 0, "2026-11-24T08:00:00Z");
+        await seed.AppendLinesAsync([Add("v1", "sample"), Add("v2", "sample"), Add("v3", "sample"), Add("v4", "sample")], default);
+        var svc = new JobQueue(s, P, "service"); await svc.LoadAsync(default);
+        // the stand-in for the service: v1, v3 and v4 are new (their download is added and claimed for the node), v2 is a duplicate
+        async Task<(NextClaim?, string)> Sampled(string id, CancellationToken ct)
+        {
+            lock (asked) asked.Add(id);
+            if (id == "v2") return (null, "duplicate of orig: nothing to download");
+            await svc.PollAsync(ct); await svc.AppendLinesAsync([Add(id, "download")], ct);
+            var h = await svc.TryClaimForAsync(id, "test-node", (_, sub) => ["download"], ct);
+            return (new NextClaim(id, "download", h!.Epoch, h.Lease), "new");
+        }
+        var limits = new LimitState("test-node", new NodeLimits { Budget = 2 }, "", TempState());
+        var o = new EngineOptions
+        {
+            NodeId = "test-node", Name = "test", Stages = ["sample", "download"], Workers = 1, Threads = 2, Once = true,
+            PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
+            BotBackoff = TimeSpan.FromHours(1), TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter(), Limits = limits, FetchSampled = Sampled,
+        };
+        await Run(new NodeEngine(s, P, o, new Dictionary<string, IStageHandler> { ["sample"] = new Rec(ran, "sample"), ["download"] = new Rec(ran, "download") }));
+        Assert.Equal(["sample:v1", "download:v1", "sample:v2", "sample:v3", "download:v3", "sample:v4"], ran.ToArray());
+        // v1: its download follows its own sample, before the next sample. v2: a duplicate, nothing to download. v3: the same again.
+        // v4: the budget of two full downloads is used up, so its download is not even asked for and stays queued.
+        Assert.Equal(["v1", "v2", "v3"], asked.ToArray());
+        Assert.Equal(0, limits.Remaining);
+    }
 }

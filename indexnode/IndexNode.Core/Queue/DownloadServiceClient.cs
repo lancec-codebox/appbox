@@ -19,6 +19,20 @@ public static class DownloadServiceClient
         return new NextClaim(s, (string?)j["stage"] ?? "download", (int)(j["epoch"] ?? 0), (string?)j["lease"] ?? "");
     }
 
+    /// <summary>0.13.49: POST /v1/download/sampled: the download of the upload this node just sampled, claimed for it, or why there is none. A service older than 0.13.49 answers 404 (an HttpRequestException with that status).</summary>
+    public static async Task<(NextClaim? Claim, string Outcome)> SampledAsync(HttpClient http, string url, string? token, string node, string id, TimeSpan timeout, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Post, url.TrimEnd('/') + "/v1/download/sampled") { Content = new StringContent(new JsonObject { ["node"] = node, ["id"] = id }.ToJsonString(), Encoding.UTF8, "application/json") };
+        if (!string.IsNullOrEmpty(token)) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct); cts.CancelAfter(timeout);
+        using var res = await http.SendAsync(req, cts.Token);
+        if (!res.IsSuccessStatusCode) throw new HttpRequestException($"the download service answered {(int)res.StatusCode}", null, res.StatusCode);
+        var j = JsonNode.Parse(await res.Content.ReadAsStringAsync(cts.Token)) as JsonObject;
+        var outcome = (string?)j?["outcome"] ?? "no answer";
+        if (j == null || (string?)j["subject"] is not { } s) return (null, outcome);
+        return (new NextClaim(s, (string?)j["stage"] ?? "download", (int)(j["epoch"] ?? 0), (string?)j["lease"] ?? ""), outcome);
+    }
+
     public static async Task<(string Container, string Path)?> QueueAsync(HttpClient http, string url, string? token, CancellationToken ct)
     {
         using var req = new HttpRequestMessage(HttpMethod.Get, url.TrimEnd('/') + "/v1/download/queue");

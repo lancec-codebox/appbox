@@ -18,14 +18,52 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
 
     static bool Ready(QEntry e, string now) => e.State == "pending" && e.Hold == null && string.CompareOrdinal(e.Due, now) <= 0;
 
+    /// <summary>0.13.49: one at a time for the things that decide an upload (the pass, and a node's "I sampled this" call): two of them checking the same sample would write its check twice.</summary>
+    readonly SemaphoreSlim deciding = new(1, 1);
+
     public async Task<Pass> RunOnceAsync(CancellationToken ct)
     {
         await full.PollAsync(ct); await work.PollAsync(ct); await processing.PollAsync(ct);
         await ResolveRequestsAsync(ct);
-        int folded = await FoldRunsAsync(ct) + await FoldBackAsync(ct), checks = await CheckSamplesAsync(ct);
+        int folded, checks;
+        await deciding.WaitAsync(ct);
+        try { folded = await FoldRunsAsync(ct) + await FoldBackAsync(ct); checks = await CheckSamplesAsync(ct); }
+        finally { deciding.Release(); }
         int entered = await EnterDownloadsAsync(ct);
         int top = await TopUpAsync(ct), cleared = await ClearOutAsync(ct);
         return new Pass(folded, checks, entered, top, cleared);
+    }
+
+    /// <summary>What <see cref="SampledAsync"/> answers: the download of the same upload, claimed for the node, or why there is none (duplicate of ..., held: ai, ...).</summary>
+    public sealed record Sampled(Claimed? Claim, string Outcome);
+
+    /// <summary>
+    /// 0.13.49 (owner, 2026-11-24: "Sampling a sample should immediately proceed with its download ... batched onto a node, like processing"): POST /v1/download/sampled.
+    /// A node that has just finished a sample asks what is next for THAT upload. The service folds the finished sample back, runs its check now (the same check and the same lines as the pass),
+    /// and when the answer is a download that may run (new, not held), puts it on the work queue and claims it for the asking node. So a video is sampled, checked and downloaded by one node, back to back,
+    /// and nothing waits behind a wall of other samples. A duplicate or an AI hold is settled as in the pass; the node is told why it got nothing.
+    /// </summary>
+    public async Task<Sampled> SampledAsync(string node, string id, CancellationToken ct)
+    {
+        await deciding.WaitAsync(ct);
+        try
+        {
+            await work.PollAsync(ct); await full.PollAsync(ct); await processing.PollAsync(ct);
+            await FoldBackAsync(ct);
+            var (sm, pub) = full.Read(st => (st.Entry(id, "sample"), st.Get(id)?.Pub));
+            if (sm is not { State: "done" }) return new Sampled(null, "its sample is not recorded as done");
+            if (full.Read(st => st.Entry(id, "check") == null && st.Entry(id, "download") == null) && !await CheckOneAsync(id, sm, pub, ct)) return new Sampled(null, "the check could not run; the service asks again on its next pass");
+            var (chk, dl) = full.Read(st => (st.Entry(id, "check"), st.Entry(id, "download")));
+            if (chk?.State == "duplicate") return new Sampled(null, "duplicate of " + (chk.Job?.DuplicateOf ?? "an indexed upload") + ": nothing to download");
+            if (dl == null) return new Sampled(null, "the check added no download");
+            if (dl.Hold != null) return new Sampled(null, $"its download is held ({dl.Hold})");
+            if (dl.State != "pending") return new Sampled(null, "its download is already " + dl.State);
+            var now = work.NowUtc();
+            await work.AppendLinesAsync(st => st.Entry(id, "download") != null ? null : [QLine.Add(id, "download", dl.Job ?? new JobDescriptor { Stage = "download", JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = now }, now, dl.Priority, now)], ct);
+            var h = await work.TryClaimForAsync(id, node, (_, sub) => sub.ClaimBy == null && sub.Entries.GetValueOrDefault("download") is { } e && e.Runnable(now) ? ["download"] : null, ct);
+            return h == null ? new Sampled(null, "its download was taken by another node") : new Sampled(new Claimed(id, "download", h.Epoch, h.Lease, work.Paths.Active(id)), "new");
+        }
+        finally { deciding.Release(); }
     }
 
     /// <summary>
@@ -168,19 +206,24 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         await full.PollAsync(ct);
         var todo = full.Read(st => st.Subjects.Values.Where(s => s.Entries.GetValueOrDefault("sample") is { State: "done" } && !s.Entries.ContainsKey("check") && !s.Entries.ContainsKey("download")).Select(s => (s.Id, S: s.Entries["sample"], s.Pub)).OrderBy(x => x.Id, StringComparer.Ordinal).ToList());
         int n = 0;
-        foreach (var (id, sm, pub) in todo)
+        foreach (var (id, sm, pub) in todo) if (await CheckOneAsync(id, sm, pub, ct)) n++;
+        return n;
+    }
+
+    /// <summary>The check of one finished sample and its lines (see <see cref="CheckSamplesAsync"/>). False: the check did not answer (said in the log); nothing was written.</summary>
+    async Task<bool> CheckOneAsync(string id, QEntry sm, string? pub, CancellationToken ct)
+    {
         {
-            JsonObject? rec; try { rec = await check(id, ct); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: check of {id} failed ({e.Message}); it is asked again on the next pass"); continue; }
-            if (rec == null) continue;
+            JsonObject? rec; try { rec = await check(id, ct); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: check of {id} failed ({e.Message}); it is asked again on the next pass"); return false; }
+            if (rec == null) return false;
             var decision = (string?)rec["decision"] ?? "new"; var at = full.NowUtc(); bool skip = PreCheckDecision.IsSkip(decision); bool ai = AiHold.Flagged(rec);
             var url = sm.Job?.Url ?? "https://www.youtube.com/watch?v=" + id; var top = (rec["top"] as JsonArray)?.OfType<JsonObject>().FirstOrDefault();
             var lines = new List<QLine> { QLine.Add(id, "check", new JobDescriptor { Stage = "check", JobId = id, Url = url, Priority = sm.Priority, AddedAt = at, Pub = pub, DuplicateOf = skip ? (string?)rec["matchUpload"] ?? (string?)top?["upload"] : null }, at, sm.Priority, at, skip ? "duplicate" : "done") };
             if (!skip) lines.Add(new QLine { T = "add", S = id, Stage = "download", Job = new JobDescriptor { Stage = "download", JobId = id, Url = url, MaxHeight = sm.Job?.MaxHeight, Format = sm.Job?.Format, Priority = sm.Priority, AddedAt = at, Pub = pub }, Pri = sm.Priority, Due = at, At = at, Hold = ai ? "ai" : null, AiScore = ai ? (double?)(rec["ai"] as JsonObject)?["score"] : null });
             await full.AppendLinesAsync(lines, ct);   // the check line goes first: a crash after it leaves a decided upload, and a settled one is entered below
             if (skip) await Handoff.EnterAsync(processing, new Handoff.Facts(id, "precheck", Title: (string?)rec["title"], Pub: pub, Priority: sm.Priority, Check: rec, State: "duplicate", Hold: null, AiScore: (double?)(rec["ai"] as JsonObject)?["score"], DuplicateOf: (string?)rec["matchUpload"] ?? (string?)top?["upload"], DuplicateShare: (double?)top?["share"], Url: url), ct);
-            n++;
+            return true;
         }
-        return n;
     }
 
     /// <summary>"done download" is in the full log (fold-back ran first); now each such upload enters processing (create-only; the repair covers a crash between the two appends).</summary>

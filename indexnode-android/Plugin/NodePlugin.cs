@@ -74,6 +74,7 @@ public sealed class NodePlugin : IPlugin
             Stages = stages, Workers = 1, Lanes = 1, Threads = 1, Once = once, MaxJobs = maxJobs, Limits = limits,
             Conditions = host.GetSetting("conditions"),
             FetchNext = DownloaderNode.FetchNext(http, settings, host.NodeId),
+            FetchSampled = DownloaderNode.FetchSampled(http, settings, host.NodeId),
             StorageHost = Uri.TryCreate(host.StoreUrl, UriKind.Absolute, out var su) ? su.Host : null, PollInterval = TimeSpan.FromSeconds(30),
             PlacementProbe = _ => Task.FromResult(new Placement { Provider = "phone", Reason = "phone", CheckedAt = Protocol.NowUtc() }),
             NetworkFetch = async (url, c) => { var r = await host.HttpAsync("GET", url, null, null, 65536, c); return r.Status == 200 ? r.Text : null; },

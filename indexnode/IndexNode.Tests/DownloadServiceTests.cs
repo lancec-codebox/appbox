@@ -95,6 +95,48 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task A_node_that_sampled_an_upload_is_handed_its_download_at_once_and_is_told_why_when_there_is_none()
+    {
+        // 0.13.49 (owner, 2026-11-24): "Sampling a sample should immediately proceed with its download ... batched onto a node, like processing"
+        var r = await Rig.Make(10, Add("n1", "sample", "2026-11-01T00:00:00Z", 200), Add("d1", "sample", "2026-11-02T00:00:00Z", 200), Add("a1", "sample", "2026-11-03T00:00:00Z", 200), Add("other", "sample", "2026-11-04T00:00:00Z", 200));
+        r.Decisions["d1"] = new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "orig1", ["top"] = new JsonArray(new JsonObject { ["upload"] = "orig1", ["share"] = 0.93 }) };
+        r.Decisions["a1"] = new JsonObject { ["decision"] = "new", ["ai"] = new JsonObject { ["flag"] = true, ["score"] = 0.6 } };
+        await r.Svc.TopUpAsync(default);
+        var dl = new JobQueue(r.S, P.DownloadWork, "node-a", () => T0, downloader: true); await dl.LoadAsync(default);
+        async Task Sample(string id) { var h = await dl.TryClaimAsync(id, s => ["sample"], default); await h!.AppendAsync([new QLine { T = "done", Stage = "sample", State = "done" }], true, default); await h.FinishAsync(); }
+
+        Assert.Equal("its sample is not recorded as done", (await r.Svc.SampledAsync("node-a", "n1", default)).Outcome);   // asked too early: nothing is checked or handed over
+        Assert.Equal(0, r.Checks);
+
+        await Sample("n1");
+        var got = await r.Svc.SampledAsync("node-a", "n1", default);
+        Assert.Equal("new", got.Outcome); Assert.Equal(("n1", "download"), (got.Claim!.Subject, got.Claim.Stage)); Assert.Equal(1, r.Checks);
+        Assert.Equal("done", r.Full.Read(f => f.Entry("n1", "check"))!.State); Assert.Equal(200, r.Full.Read(f => f.Entry("n1", "download"))!.Priority);
+        await dl.PollAsync(default);
+        Assert.Equal("node-a", dl.Read(w => w.Get("n1"))!.ClaimBy);                      // claimed for the node that asked
+        var adopted = dl.AdoptClaim(got.Claim.Subject, got.Claim.Epoch, got.Claim.Lease);
+        await adopted.AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default); await adopted.FinishAsync();   // the node runs it and reports
+        await r.Svc.RunOnceAsync(default);
+        Assert.Equal("done", r.Full.Read(f => f.Entry("n1", "download"))!.State); Assert.Equal("full", r.Proc.Read(p => p.Get("n1"))!.Data);   // and it enters processing like any download
+        Assert.Equal(1, r.Checks);                                                       // the pass does not check it a second time
+
+        await Sample("d1");
+        var dup = await r.Svc.SampledAsync("node-a", "d1", default);
+        Assert.Null(dup.Claim); Assert.Equal("duplicate of orig1: nothing to download", dup.Outcome);
+        Assert.Equal("duplicate", r.Proc.Read(p => p.Get("d1"))!.Entries["check"].State);  // settled exactly as the pass settles it
+
+        await Sample("a1");
+        var ai = await r.Svc.SampledAsync("node-a", "a1", default);
+        Assert.Null(ai.Claim); Assert.Equal("its download is held (ai)", ai.Outcome); Assert.Equal("ai", r.Full.Read(f => f.Entry("a1", "download"))!.Hold);
+
+        // an upload the pass already checked (the node asked a moment later): no second check, the download is still handed over, and to one node only
+        await Sample("other"); await r.Svc.FoldBackAsync(default); Assert.Equal(1, await r.Svc.CheckSamplesAsync(default)); int before = r.Checks;
+        var late = await r.Svc.SampledAsync("node-b", "other", default);
+        Assert.Equal(before, r.Checks); Assert.Equal("other", late.Claim!.Subject);
+        Assert.Equal("its download was taken by another node", (await r.Svc.SampledAsync("node-c", "other", default)).Outcome);
+    }
+
+    [Fact]
     public async Task A_downloaded_item_enters_processing_with_data_full_and_a_crash_before_enter_is_repaired()
     {
         var r = await Rig.Make(10, Add("n1", "download", "2026-11-01T00:00:00Z"));
