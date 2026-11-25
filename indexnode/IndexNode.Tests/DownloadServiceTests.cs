@@ -137,6 +137,30 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task A_nodes_call_does_not_wait_for_the_passes_other_checks_and_one_sample_is_checked_once_when_both_want_it()
+    {
+        // 0.13.50: 0.13.49 made the pass and a node's call take turns on one lock: the call waited behind the pass's whole batch (90 s live) and the node's timeout fired
+        var r = await Rig.Make(10, Add("slow", "sample", "2026-11-01T00:00:00Z", 200), Add("mine", "sample", "2026-11-02T00:00:00Z", 200));
+        var gate = new TaskCompletionSource(); int checks = 0; var started = new TaskCompletionSource();
+        r.Svc = new DownloadService(r.Full, r.Work, r.Proc, async (id, ct) => { Interlocked.Increment(ref checks); if (id == "slow") { started.TrySetResult(); await gate.Task; } return new JsonObject { ["decision"] = "new" }; }, 10);
+        await r.Svc.TopUpAsync(default);
+        var dl = new JobQueue(r.S, P.DownloadWork, "node-a", () => T0, downloader: true); await dl.LoadAsync(default);
+        async Task Sample(string id) { var h = await dl.TryClaimAsync(id, s => ["sample"], default); await h!.AppendAsync([new QLine { T = "done", Stage = "sample", State = "done" }], true, default); await h.FinishAsync(); }
+        await Sample("slow"); await r.Svc.FoldBackAsync(default);
+        var pass = r.Svc.CheckSamplesAsync(default);                                   // the pass is busy with a slow check
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await Sample("mine");
+        var got = await r.Svc.SampledAsync("node-a", "mine", default).WaitAsync(TimeSpan.FromSeconds(10));   // the node's call is answered while the pass is still inside its check
+        Assert.Equal("mine", got.Claim!.Subject); Assert.False(pass.IsCompleted);
+        var both = r.Svc.SampledAsync("node-b", "slow", default);                       // a node asks for the very sample the pass is checking: it waits for that one check, no second one
+        await Task.Delay(100); Assert.False(both.IsCompleted);
+        gate.SetResult();
+        Assert.Equal("slow", (await both.WaitAsync(TimeSpan.FromSeconds(10))).Claim!.Subject); await pass.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(2, checks);                                                       // "slow" once, "mine" once
+        Assert.Equal(1, r.Full.Read(f => f.Get("slow")!.Entries.Count(e => e.Key == "check")));
+    }
+
+    [Fact]
     public async Task A_downloaded_item_enters_processing_with_data_full_and_a_crash_before_enter_is_repaired()
     {
         var r = await Rig.Make(10, Add("n1", "download", "2026-11-01T00:00:00Z"));

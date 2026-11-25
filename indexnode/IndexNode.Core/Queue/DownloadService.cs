@@ -18,17 +18,23 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
 
     static bool Ready(QEntry e, string now) => e.State == "pending" && e.Hold == null && string.CompareOrdinal(e.Due, now) <= 0;
 
-    /// <summary>0.13.49: one at a time for the things that decide an upload (the pass, and a node's "I sampled this" call): two of them checking the same sample would write its check twice.</summary>
-    readonly SemaphoreSlim deciding = new(1, 1);
+    /// <summary>0.13.50: the checks in flight, by upload. The pass and a node's "I sampled this" call may both want the check of one sample: the second waits for the first's result, and it is written once.
+    /// (0.13.49 made the two take turns on one lock: a node's call waited behind the pass's whole batch of checks, 90 s and more.)</summary>
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<Task<bool>>> checking = new(StringComparer.Ordinal);
+
+    async Task<bool> CheckSharedAsync(string id, QEntry sm, string? pub, CancellationToken ct)
+    {
+        var mine = new Lazy<Task<bool>>(() => CheckOneAsync(id, sm, pub, CancellationToken.None));   // not the caller's token: the other waiter still wants the answer
+        var lazy = checking.GetOrAdd(id, mine);
+        try { return await lazy.Value.WaitAsync(ct); }
+        finally { if (lazy.Value.IsCompleted) checking.TryRemove(new KeyValuePair<string, Lazy<Task<bool>>>(id, lazy)); }
+    }
 
     public async Task<Pass> RunOnceAsync(CancellationToken ct)
     {
         await full.PollAsync(ct); await work.PollAsync(ct); await processing.PollAsync(ct);
         await ResolveRequestsAsync(ct);
-        int folded, checks;
-        await deciding.WaitAsync(ct);
-        try { folded = await FoldRunsAsync(ct) + await FoldBackAsync(ct); checks = await CheckSamplesAsync(ct); }
-        finally { deciding.Release(); }
+        int folded = await FoldRunsAsync(ct) + await FoldBackAsync(ct), checks = await CheckSamplesAsync(ct);
         int entered = await EnterDownloadsAsync(ct);
         int top = await TopUpAsync(ct), cleared = await ClearOutAsync(ct);
         return new Pass(folded, checks, entered, top, cleared);
@@ -45,14 +51,12 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     /// </summary>
     public async Task<Sampled> SampledAsync(string node, string id, CancellationToken ct)
     {
-        await deciding.WaitAsync(ct);
-        try
         {
             await work.PollAsync(ct); await full.PollAsync(ct); await processing.PollAsync(ct);
             await FoldBackAsync(ct);
             var (sm, pub) = full.Read(st => (st.Entry(id, "sample"), st.Get(id)?.Pub));
             if (sm is not { State: "done" }) return new Sampled(null, "its sample is not recorded as done");
-            if (full.Read(st => st.Entry(id, "check") == null && st.Entry(id, "download") == null) && !await CheckOneAsync(id, sm, pub, ct)) return new Sampled(null, "the check could not run; the service asks again on its next pass");
+            if (full.Read(st => st.Entry(id, "check") == null && st.Entry(id, "download") == null) && !await CheckSharedAsync(id, sm, pub, ct)) return new Sampled(null, "the check could not run; the service asks again on its next pass");
             var (chk, dl) = full.Read(st => (st.Entry(id, "check"), st.Entry(id, "download")));
             if (chk?.State == "duplicate") return new Sampled(null, "duplicate of " + (chk.Job?.DuplicateOf ?? "an indexed upload") + ": nothing to download");
             if (dl == null) return new Sampled(null, "the check added no download");
@@ -63,7 +67,6 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
             var h = await work.TryClaimForAsync(id, node, (_, sub) => sub.ClaimBy == null && sub.Entries.GetValueOrDefault("download") is { } e && e.Runnable(now) ? ["download"] : null, ct);
             return h == null ? new Sampled(null, "its download was taken by another node") : new Sampled(new Claimed(id, "download", h.Epoch, h.Lease, work.Paths.Active(id)), "new");
         }
-        finally { deciding.Release(); }
     }
 
     /// <summary>
@@ -206,7 +209,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         await full.PollAsync(ct);
         var todo = full.Read(st => st.Subjects.Values.Where(s => s.Entries.GetValueOrDefault("sample") is { State: "done" } && !s.Entries.ContainsKey("check") && !s.Entries.ContainsKey("download")).Select(s => (s.Id, S: s.Entries["sample"], s.Pub)).OrderBy(x => x.Id, StringComparer.Ordinal).ToList());
         int n = 0;
-        foreach (var (id, sm, pub) in todo) if (await CheckOneAsync(id, sm, pub, ct)) n++;
+        foreach (var (id, sm, pub) in todo) if (await CheckSharedAsync(id, sm, pub, ct)) n++;
         return n;
     }
 
@@ -214,6 +217,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     async Task<bool> CheckOneAsync(string id, QEntry sm, string? pub, CancellationToken ct)
     {
         {
+            if (full.Read(st => st.Entry(id, "check") != null || st.Entry(id, "download") != null)) return true;   // 0.13.50: decided since the caller looked (a node's call and the pass can both list the same sample)
             JsonObject? rec; try { rec = await check(id, ct); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: check of {id} failed ({e.Message}); it is asked again on the next pass"); return false; }
             if (rec == null) return false;
             var decision = (string?)rec["decision"] ?? "new"; var at = full.NowUtc(); bool skip = PreCheckDecision.IsSkip(decision); bool ai = AiHold.Flagged(rec);

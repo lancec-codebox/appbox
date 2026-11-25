@@ -74,4 +74,26 @@ public class HandOverLimitsTests
         Assert.Equal(["v1", "v2", "v3"], asked.ToArray());
         Assert.Equal(0, limits.Remaining);
     }
+
+    [Fact]
+    public async Task A_timed_out_call_to_the_service_does_not_stop_the_node()
+    {
+        // 0.13.50: the client's timeout is an OperationCanceledException; 0.13.49 rethrew it as if the node were being stopped, and the node exited with "node stopped" and no reason
+        var s = new FakeStore(); var ran = new List<string>();
+        var seed = new JobQueue(s, P, "seed"); await seed.LoadAsync(default);
+        QLine Add(string id) => QLine.Add(id, "sample", new JobDescriptor { Stage = "sample", JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = "2026-11-24T08:00:00Z" }, "2026-11-24T08:00:00Z", 0, "2026-11-24T08:00:00Z");
+        await seed.AppendLinesAsync([Add("v1"), Add("v2")], default);
+        int calls = 0, fetches = 0;
+        var o = new EngineOptions
+        {
+            NodeId = "test-node", Name = "test", Stages = ["sample", "download"], Workers = 1, Threads = 2, Once = true,
+            PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
+            BotBackoff = TimeSpan.FromHours(1), TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter(),
+            FetchSampled = (id, ct) => { Interlocked.Increment(ref calls); throw new TaskCanceledException("the call timed out"); },
+            FetchNext = (stages, ct) => { Interlocked.Increment(ref fetches); throw new TaskCanceledException("the call timed out"); },
+        };
+        await Run(new NodeEngine(s, P, o, new Dictionary<string, IStageHandler> { ["sample"] = new Rec(ran, "sample"), ["download"] = new Rec(ran, "download") }));
+        Assert.Equal(["sample:v1", "sample:v2"], ran.ToArray());                         // the second sample ran: the first call's timeout did not end the node
+        Assert.Equal(2, calls); Assert.True(fetches >= 1);                               // and the empty-queue hand-over's timeout did not either
+    }
 }

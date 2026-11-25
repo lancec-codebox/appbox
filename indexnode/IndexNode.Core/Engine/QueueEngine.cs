@@ -191,8 +191,8 @@ public sealed partial class NodeEngine
         {
             NextClaim? got;
             try { got = await o.FetchNext(asked.ToArray(), ct); }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception e) { Log.Info($"download: the service did not answer ({e.Message}); working from the work queue only"); got = null; nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }   // 0.13.50: only the node's own stop; the call's timeout is also an OperationCanceledException and is an unanswered call, below
+            catch (Exception e) { Log.Info($"download: the service did not answer ({(e is OperationCanceledException ? "timed out" : e.Message)}); working from the work queue only"); got = null; nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); }
             if (got == null) { nextFetch = DateTimeOffset.UtcNow.AddMinutes(1); Interlocked.Decrement(ref reserved); GiveBack(null); return false; }   // 0.13.42: nothing was handed over, so no job started (the slot leaked before: it counted against --max-jobs and a phone's daily cap)
             stage = got.Stage;
             await queue.PollAsync(ct);
@@ -231,12 +231,12 @@ public sealed partial class NodeEngine
                 await queue.PollAsync(ct);
                 h = queue.AdoptClaim(got.Subject, got.Epoch, got.Lease);
             }
-            catch (OperationCanceledException) { Interlocked.Decrement(ref reserved); throw; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { Interlocked.Decrement(ref reserved); throw; }
             catch (Exception e)
-            {
+            {   // 0.13.50: the call's own timeout is an OperationCanceledException too. 0.13.49 rethrew it and the whole node stopped, with no reason in its log (2026-11-25, 90 s behind the service's batch of checks)
                 Interlocked.Decrement(ref reserved);
                 if (e is HttpRequestException { StatusCode: System.Net.HttpStatusCode.NotFound }) { chainOff = true; Log.Info("sample: the download service is older than 0.13.49 (no /v1/download/sampled): samples and downloads stay separate jobs on this node"); }
-                else Log.Info($"sample {id}: the service did not answer for its download ({e.Message}); it stays queued");
+                else Log.Info($"sample {id}: the service did not answer for its download ({(e is OperationCanceledException ? "timed out" : e.Message)}); it stays queued");
                 return;
             }
             Interlocked.Increment(ref busyClaims);
