@@ -194,6 +194,9 @@ public sealed class LimitState
         return false;
     }
 
+    /// <summary>0.13.55 (owner, 2026-11-25: sampling is part of the download): set on a node that runs both stages. A sample-only node (sampling ahead, a directed tool) leaves it off and has only its sample budget.</summary>
+    public bool SampleNeedsDownloadRoom { get; set; }
+
     /// <summary>True when a new job of this stage may be claimed now; counts it as in flight (give it back with <see cref="Release"/>).</summary>
     public bool TryAcquire(string stage)
     {
@@ -202,6 +205,8 @@ public sealed class LimitState
             if (!InWindow(out _)) return false;
             if (stage == "sample")
             {   // 0.13.16: a sample counts only against the sample budget (default unlimited), never the full-download budget
+                // 0.13.55: on a node that also downloads, a sample is the first half of a download: none is taken when the full-download budget has no room for what follows
+                if (SampleNeedsDownloadRoom && budget != null && remaining - inflight <= 0) return false;
                 if (sBudget == null) return true;
                 if (sRemaining - sInflight <= 0) return false;
                 sInflight++; return true;

@@ -64,11 +64,15 @@ public sealed partial class NodeEngine
     {
         try
         {
+            if (o.Limits != null) o.Limits.SampleNeedsDownloadRoom = o.Stages.Contains("sample") && o.Stages.Contains("download");   // 0.13.55: a sample is the first half of a download on a node that does both
             while (!ct.IsCancellationRequested)
             {
                 if (o.MaxJobs != null && Volatile.Read(ref reserved) >= o.MaxJobs) return;
                 if (diskFull is { } full) { if (Interlocked.Exchange(ref diskLogged, 1) == 0) Log.Info($"node stopped: {full}"); runStop?.Cancel(); return; }
                 bool worked = false; IdleEnd();
+                // 0.13.55: a download node asks the service first. It hands out by priority over samples and downloads together, and a download only after its check against the index as it is now;
+                // the work queue (below) is what the node falls back on when the service has nothing for it or does not answer (samples only: downloads are not kept there).
+                if (o.FetchNext != null && o.DownloaderOnly && await TryFetchFromServiceAsync(lane, ct)) continue;
                 if (QueueStages().Any(StageEnabled))
                 {
                     QueueLook? look = null;

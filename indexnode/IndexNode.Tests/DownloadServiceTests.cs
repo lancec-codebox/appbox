@@ -60,6 +60,104 @@ public class DownloadServiceTests
         Assert.Equal("done", r.Full.Read(f => f.Entry("busy", "download"))!.State); Assert.Null(r.Full.Read(f => f.Entry("busy", "sample")));
     }
 
+    static QLine[] Checked(string id, int pri = 0, string pub = "2026-11-01T00:00:00Z") => [Sampled(id), Add(id, "check", pub, pri, "done"), Add(id, "download", pub, pri)];
+
+    [Fact]
+    public async Task A_download_sampled_before_the_index_was_built_is_checked_again_on_its_stored_clips_before_it_is_handed_out()
+    {
+        // 0.13.55 (owner, 2026-11-25: sampling is part of the download): stillnew and nowdup were sampled and checked at T0; the published index was built an hour later
+        var r = await Rig.Make(10, [.. Checked("stillnew", 5), .. Checked("nowdup", 9)]);
+        r.Svc.IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1));
+        r.Decisions["nowdup"] = new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "orig7", ["top"] = new JsonArray(new JsonObject { ["upload"] = "orig7", ["share"] = 0.91 }) };
+        var got = await r.Svc.NextAsync("dl1", ["sample", "download"], default);
+        Assert.Equal(("stillnew", "download"), (got!.Subject, got.Stage)); Assert.Equal(2, r.Checks);   // nowdup had the higher priority: checked first, found to be a copy, not handed out; then stillnew, checked and handed out
+        Assert.Equal("duplicate", r.Full.Read(f => f.Entry("nowdup", "check"))!.State); Assert.Equal("orig7", r.Full.Read(f => f.Entry("nowdup", "check"))!.Job!.DuplicateOf);
+        Assert.Equal("duplicate", r.Full.Read(f => f.Entry("nowdup", "download"))!.State); Assert.Null(r.Work.Read(w => w.Get("nowdup")));   // nothing was put on the work queue for it
+        var d = r.Proc.Read(p => p.Get("nowdup"))!; Assert.Equal("precheck", d.Data); Assert.Equal("duplicate", d.Entries["check"].State);  // it enters the catalog as a duplicate, like one found at its first check
+        Assert.Equal("done", r.Full.Read(f => f.Entry("stillnew", "check"))!.State); Assert.Equal("dl1", r.Work.Read(w => w.Get("stillnew"))!.ClaimBy);
+        Assert.Equal(0, (await r.Svc.RunOnceAsync(default)).Entered);   // a duplicate found this way is never entered as a download
+        Assert.Null(await r.Svc.NextAsync("dl2", ["sample", "download"], default)); Assert.Equal(2, r.Checks);   // nothing left, and nothing checked twice
+
+        // an index built BEFORE the check, or no index time at all: the verdict is current, no check runs
+        foreach (var built in new DateTimeOffset?[] { T0.AddHours(-1), null })
+        {
+            var f = await Rig.Make(10, Checked("fresh"));
+            if (built != null) f.Svc.IndexBuiltAt = _ => Task.FromResult(built);
+            var g = await f.Svc.NextAsync("dl1", ["download"], default); Assert.Equal("fresh", g!.Subject); Assert.Equal(0, f.Checks);
+        }
+    }
+
+    [Fact]
+    public async Task A_check_that_cannot_run_keeps_its_download_back_and_is_not_tried_again_for_half_an_hour()
+    {
+        var r = await Rig.Make(10, [.. Checked("broken"), Add("s1", "sample", "2026-11-02T00:00:00Z")]);
+        var now = T0; r.Svc.Clock = () => now; r.Svc.IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1));
+        int calls = 0; r.Svc = new DownloadService(r.Full, r.Work, r.Proc, (id, ct) => { calls++; throw new InvalidOperationException("the sample has no frames"); }, 10) { Clock = () => now, IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1)) };
+        var got = await r.Svc.NextAsync("dl1", ["sample", "download"], default);
+        Assert.Equal(("s1", "sample"), (got!.Subject, got.Stage)); Assert.Equal(1, calls);   // the download is not handed out on a verdict that could not be renewed; the node gets the sample instead
+        Assert.Equal("pending", r.Full.Read(f => f.Entry("broken", "download"))!.State);
+        Assert.Null(await r.Svc.NextAsync("dl2", ["sample", "download"], default)); Assert.Equal(1, calls);   // asked again a moment later: no second attempt
+        now = T0.AddMinutes(31);
+        Assert.Null(await r.Svc.NextAsync("dl2", ["sample", "download"], default)); Assert.Equal(2, calls);   // half an hour on it is tried once more
+    }
+
+    [Fact]
+    public async Task One_call_checks_at_most_four_stale_downloads_then_hands_out_a_sample_and_a_tie_goes_to_the_download()
+    {
+        var lines = new List<QLine>(); for (int i = 0; i < 6; i++) lines.AddRange(Checked("dup" + i, 3, $"2026-11-0{9 - i}T00:00:00Z"));
+        lines.Add(Add("s1", "sample", "2026-11-20T00:00:00Z", 3)); lines.AddRange(Checked("tie", 0)); lines.Add(Add("s0", "sample", "2026-11-21T00:00:00Z", 0));
+        var r = await Rig.Make(10, lines.ToArray());
+        r.Svc.IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1));
+        for (int i = 0; i < 6; i++) r.Decisions["dup" + i] = new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "orig" };
+        var a = await r.Svc.NextAsync("dl1", ["sample", "download"], default);
+        Assert.Equal(("s1", "sample"), (a!.Subject, a.Stage)); Assert.Equal(DownloadService.MaxChecksPerCall, r.Checks);   // four copies settled, then the caller is not kept waiting: the sample of the same priority
+        var b = await r.Svc.NextAsync("dl2", ["sample", "download"], default);
+        Assert.Equal(("tie", "download"), (b!.Subject, b.Stage)); Assert.Equal(7, r.Checks);   // the other two copies, then priority 0: the download before the sample of the same priority (and it was checked: 7)
+        var c = await r.Svc.NextAsync("dl3", ["sample", "download"], default); Assert.Equal(("s0", "sample"), (c!.Subject, c.Stage));
+        Assert.All(Enumerable.Range(0, 6), i => Assert.Equal("duplicate", r.Full.Read(f => f.Entry("dup" + i, "download"))!.State));
+    }
+
+    [Fact]
+    public async Task A_call_does_not_wait_behind_another_callers_check_and_stops_checking_after_one_that_cannot_run_or_after_its_time()
+    {
+        // found by the shadow dry run of 2026-11-25: a check takes about 12 s, and every node asked for the same first download
+        var r = await Rig.Make(10, [.. Checked("slow", 9), .. Checked("other", 5)]);
+        var gate = new TaskCompletionSource(); var entered = new TaskCompletionSource(); var seen = new List<string>();
+        var svc = new DownloadService(r.Full, r.Work, r.Proc, async (id, ct) => { lock (seen) seen.Add(id); if (id == "slow") { entered.TrySetResult(); await gate.Task; } return new JsonObject { ["decision"] = "new" }; }, 10) { IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1)) };
+        var first = svc.NextAsync("dl1", ["sample", "download"], default); await entered.Task;
+        var second = await svc.NextAsync("dl2", ["sample", "download"], default);
+        Assert.Equal(("other", "download"), (second!.Subject, second.Stage)); Assert.False(first.IsCompleted);   // dl2 did not wait for the check dl1 is in: it took the next download
+        gate.SetResult(); var got = await first; Assert.Equal(("slow", "download"), (got!.Subject, got.Stage));
+        Assert.Equal(["slow", "other"], seen);   // each checked once
+
+        // a check that cannot run (a store limit, the index): the same call tries no other download, so one bad minute does not send every ready download into its half hour
+        var b = await Rig.Make(10, [.. Checked("b1", 9), .. Checked("b2", 5), Add("s1", "sample", "2026-11-02T00:00:00Z")]);
+        int calls = 0; var bs = new DownloadService(b.Full, b.Work, b.Proc, (id, ct) => { calls++; throw new InvalidOperationException("storage: a step made 25 store ops"); }, 10) { IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1)) };
+        var bg = await bs.NextAsync("dl1", ["sample", "download"], default);
+        Assert.Equal(("s1", "sample"), (bg!.Subject, bg.Stage)); Assert.Equal(1, calls);
+
+        // the time limit: after 25 s of checking, the call starts no further check and the node gets a sample
+        var t = await Rig.Make(10, [.. Checked("d1", 9), .. Checked("d2", 8), .. Checked("d3", 7), Add("s1", "sample", "2026-11-02T00:00:00Z")]);
+        var now = T0; int n = 0;
+        var ts = new DownloadService(t.Full, t.Work, t.Proc, (id, ct) => { n++; now = now.AddSeconds(30); return Task.FromResult<JsonObject?>(new JsonObject { ["decision"] = "duplicate", ["matchUpload"] = "orig" }); }, 10) { Clock = () => now, IndexBuiltAt = _ => Task.FromResult<DateTimeOffset?>(T0.AddHours(1)) };
+        var tg = await ts.NextAsync("dl1", ["sample", "download"], default);
+        Assert.Equal(("s1", "sample"), (tg!.Subject, tg.Stage)); Assert.Equal(1, n);
+    }
+
+    [Fact]
+    public async Task A_download_nobody_holds_does_not_stay_on_the_work_queue()
+    {
+        var r = await Rig.Make(10, Checked("v1"));
+        var dl = new JobQueue(r.S, P.DownloadWork, "dl1", () => T0, downloader: true); await dl.LoadAsync(default);
+        var got = await r.Svc.NextAsync("dl1", ["download"], default); await dl.PollAsync(default);
+        var h = dl.AdoptClaim(got!.Subject, got.Epoch, got.Lease);
+        await h!.AppendAsync([new QLine { T = "failed", Stage = "download", State = "pending", Attempt = 1, Error = "HTTP 403", Due = At }], true, default); await h.FinishAsync();   // the node's download failed: it will be tried again
+        await r.Svc.RunOnceAsync(default);
+        Assert.Null(r.Work.Read(w => w.Entry("v1", "download")));                                       // its attempt is folded back, and it is not left where a node could claim it by itself
+        Assert.Equal(1, r.Full.Read(f => f.Entry("v1", "download"))!.Attempts); Assert.Equal("pending", r.Full.Read(f => f.Entry("v1", "download"))!.State);
+        var again = await r.Svc.NextAsync("dl2", ["download"], default); Assert.Equal("v1", again!.Subject);   // handed out again from the full queue
+    }
+
     [Fact]
     public async Task A_prioritised_item_joins_a_full_work_queue_at_once_and_is_the_next_one_handed_out()
     {
@@ -67,12 +165,12 @@ public class DownloadServiceTests
         var r = await Rig.Make(10, lines.ToArray());
         Assert.Equal(10, await r.Svc.TopUpAsync(default));   // the work queue is full (10 of 10), its highest priority is 9
         await r.Full.AppendLinesAsync([Sampled("asked"), Add("asked", "download", "2020-01-01T00:00:00Z", 1000), Add("same9", "sample", "2026-11-30T00:00:00Z", 9), Add("low", "sample", "2026-11-30T00:00:00Z", 1)], default);
-        Assert.Equal(1, await r.Svc.TopUpAsync(default));    // only the item above every live priority jumps; an equal or lower one waits for the ordinary top-up
+        Assert.Equal(0, await r.Svc.TopUpAsync(default));    // 0.13.55: a download is never put on the work queue ahead of time; an equal or lower sample waits for the ordinary top-up
         var ids = r.Work.Read(w => w.Subjects.Values.Select(s => s.Id).ToList());
-        Assert.Contains("asked", ids); Assert.DoesNotContain("same9", ids); Assert.DoesNotContain("low", ids); Assert.Equal(11, ids.Count);
-        Assert.Equal(0, await r.Svc.TopUpAsync(default));    // idempotent: it is in the work queue now
+        Assert.DoesNotContain("asked", ids); Assert.DoesNotContain("same9", ids); Assert.DoesNotContain("low", ids); Assert.Equal(10, ids.Count);
         var next = await r.Svc.NextAsync("laptop", ["download", "sample"], default);
-        Assert.Equal("asked", next!.Subject); Assert.Equal("download", next.Stage);   // and it is what a downloader gets next
+        Assert.Equal("asked", next!.Subject); Assert.Equal("download", next.Stage);   // and it is what a downloader gets next: its priority is above every sample's
+        Assert.Equal("laptop", r.Work.Read(w => w.Get("asked"))!.ClaimBy);            // on the work queue only now, claimed for the node that asked
         var many = Enumerable.Range(0, 80).Select(i => Add("hi" + i.ToString("00"), "sample", "2026-11-30T00:00:00Z", 5000)).ToArray();
         await r.Full.AppendLinesAsync(many, default);
         Assert.Equal(DownloadService.JumpMax, await r.Svc.TopUpAsync(default));   // bounded per pass
@@ -126,8 +224,10 @@ public class DownloadServiceTests
         Assert.Equal("done", r.Full.Read(f => f.Entry("n1", "check"))!.State); Assert.Equal("pending", r.Full.Read(f => f.Entry("n1", "download"))!.State);
         Assert.Equal("duplicate", r.Full.Read(f => f.Entry("d1", "check"))!.State); Assert.Null(r.Full.Read(f => f.Entry("d1", "download")));
         Assert.Equal("ai", r.Full.Read(f => f.Entry("a1", "download"))!.Hold);   // the AI hold stays in the full queue
-        await r.Svc.TopUpAsync(default);   // the new download item is topped up into work; the held one is not
-        Assert.NotNull(r.Work.Read(w => w.Entry("n1", "download"))); Assert.Null(r.Work.Read(w => w.Entry("a1", "download")));
+        await r.Svc.TopUpAsync(default);   // 0.13.55: neither download is topped up; the new one is handed out when a node asks, the held one never
+        Assert.Null(r.Work.Read(w => w.Entry("n1", "download"))); Assert.Null(r.Work.Read(w => w.Entry("a1", "download")));
+        var handed = await r.Svc.NextAsync("dl1", ["download"], default); Assert.Equal(("n1", "download"), (handed!.Subject, handed.Stage));
+        Assert.NotNull(r.Work.Read(w => w.Entry("n1", "download"))); Assert.Null(await r.Svc.NextAsync("dl2", ["download"], default));   // a1 stays held, n1 is taken
         var d1 = r.Proc.Read(p => p.Get("d1"))!; Assert.Equal("precheck", d1.Data); Assert.Equal("duplicate", d1.Entries["check"].State); Assert.Null(r.Proc.Read(p => p.Get("n1")));
         Assert.Equal(0, await r.Svc.CheckSamplesAsync(default));   // checked once
     }
@@ -202,9 +302,9 @@ public class DownloadServiceTests
     public async Task A_downloaded_item_enters_processing_with_data_full_and_a_crash_before_enter_is_repaired()
     {
         var r = await Rig.Make(10, Sampled("n1"), Add("n1", "download", "2026-11-01T00:00:00Z"));
-        await r.Svc.TopUpAsync(default);
         var dl = new JobQueue(r.S, P.DownloadWork, "dl1", () => T0, downloader: true); await dl.LoadAsync(default);
-        var h = await dl.TryClaimAsync("n1", s => ["download"], default); await h!.AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default); await h.FinishAsync();
+        var got1 = await r.Svc.NextAsync("dl1", ["download"], default); await dl.PollAsync(default);
+        var h = dl.AdoptClaim(got1!.Subject, got1.Epoch, got1.Lease); await h!.AppendAsync([new QLine { T = "done", Stage = "download", State = "done" }], true, default); await h.FinishAsync();
         Assert.Null(r.Proc.Read(p => p.Get("n1")));
         var pass = await r.Svc.RunOnceAsync(default); Assert.Equal(1, pass.Entered);
         Assert.Equal("full", r.Proc.Read(p => p.Get("n1"))!.Data); Assert.Equal("done", r.Full.Read(f => f.Entry("n1", "download"))!.State);

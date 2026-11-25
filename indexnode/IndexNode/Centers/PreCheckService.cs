@@ -21,6 +21,8 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     readonly SemaphoreSlim slots = new(Math.Max(1, concurrency));
     readonly DateTimeOffset started = DateTimeOffset.UtcNow;
     int indexVersion = -1; long requests, failures, searches;
+    /// <summary>0.13.55: when the published search index this serve looks things up in was built (its own cache: head.yaml is looked at every few minutes).</summary>
+    public async Task<DateTimeOffset?> IndexBuiltAtAsync(CancellationToken ct) => (await index.GetAsync(store, paths, ct))?.BuiltAt;
 
     /// <summary>The index through the 5-minute conditional re-check; the block cache is dropped the moment a new version shows up.</summary>
     public async Task<SearchData?> IndexAsync(CancellationToken ct)
@@ -324,7 +326,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     }
 }
 
-/// <summary>`indexnode serve [--port 8080] [--bind 0.0.0.0] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local dir]`.</summary>
+/// <summary>`indexnode serve [--port 8080] [--bind 0.0.0.0] [--threads N] [--block-cache-mb 512] [--concurrency 2] [--input-local dir] [--shadow --out-local dir]`. 0.13.55: --shadow reads the real store and writes only under the folder (a dry run of the download service on the live queue).</summary>
 public static class ServeCommand
 {
     public static async Task<int> RunAsync(Args a)
@@ -332,7 +334,18 @@ public static class ServeCommand
         var cfg = NodeConfig.Load(); var http = Commands.NewHttp(); var paths = new Paths(a.Get("prefix") ?? "index/");
         string? inL = a.Get("input-local") ?? a.Get("local");
         IStore store = inL != null ? new LocalStore(Path.GetFullPath(inL)) : !string.IsNullOrEmpty(cfg.Sas) ? new RestStore(http, cfg.Sas) : throw new InvalidOperationException("no SAS: set INDEXNODE_SAS_URL (a read-only container SAS) or use --input-local <dir>");
-        store = StageZipStore.Wrap(store, null);
+        // 0.13.55: `serve --shadow --out-local <dir>` reads the real store and writes nothing to it (the queue lines, the leases and every record go under <dir>), as `run --shadow` does.
+        // Before it the option was ignored here, and a serve started "in shadow" wrote to the real queue.
+        string? zips = null;
+        if (a.Has("shadow"))
+        {
+            if (inL != null) throw new ArgumentException("--shadow reads the real store: it does not go with --input-local");
+            var od = a.Get("out-local") ?? throw new ArgumentException("--shadow needs --out-local <dir>: the serve reads the real store and writes only there");
+            store = Commands.Shadow = new ShadowStore(store, od); zips = Path.Combine(od, "zips");
+            Console.WriteLine($"serve: SHADOW: reads the real store, writes nothing to it; every write goes under {od}");
+        }
+        else if (a.Get("out-local") != null) throw new ArgumentException("--out-local goes with --shadow (serve writes to the store it reads unless it runs in shadow)");
+        store = StageZipStore.Wrap(store, zips);
         if (inL != null) store = new MeteredStore(store);   // a RestStore meters itself; a local folder is counted here, so /v1/check reports its ops either way
         int threads = Math.Max(1, a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads); int port = a.Get("port") is { } p ? int.Parse(p) : 8080;
         var st = cfg.PreCheck ?? new();

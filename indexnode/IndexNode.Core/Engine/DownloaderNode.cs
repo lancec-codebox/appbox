@@ -37,7 +37,7 @@ public static class DownloaderNode
 
     /// <summary>EngineOptions.FetchNext: the download service's hand-over (POST /v1/download/next) for a node whose work queue has nothing ready; null when no check server is set.</summary>
     public static Func<string[], CancellationToken, Task<NextClaim?>>? FetchNext(HttpClient http, DownloaderSettings s, string nodeId) =>
-        s.HasCheck ? (stages, ct) => DownloadServiceClient.NextAsync(http, s.CheckUrl!.Trim(), s.CheckToken, nodeId, stages, ct) : null;
+        s.HasCheck ? (stages, ct) => DownloadServiceClient.NextAsync(http, s.CheckUrl!.Trim(), s.CheckToken, nodeId, stages, ct, TimeSpan.FromSeconds(Math.Max(30, s.CheckTimeoutSeconds ?? 90))) : null;
 
     /// <summary>EngineOptions.FetchSampled (0.13.49): after a sample, the same upload's download from the download service (POST /v1/download/sampled; the check runs inside the call, so it gets the check's timeout); null when no check server is set.</summary>
     public static Func<string, CancellationToken, Task<(NextClaim? Claim, string Outcome)>>? FetchSampled(HttpClient http, DownloaderSettings s, string nodeId) =>

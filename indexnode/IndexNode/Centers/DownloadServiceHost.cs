@@ -13,6 +13,7 @@ public static class DownloadServiceHost
         var root = await JobQueue.ResolveAsync(store, paths, ct); if (root.IsLegacyLayout) throw new QueueNotMigratedException("indexnode: --download-service needs the split queue (run: indexnode queue split)");
         var full = new JobQueue(store, paths.DownloadQueue, "service-" + node); var work = new JobQueue(store, paths.DownloadWork, "service-" + node); var proc = new JobQueue(store, paths.ProcessQueue, "service-" + node);
         var svc = new DownloadService(full, work, proc, async (id, t) => (await server.CheckAsync(id, false, t))["record"] as System.Text.Json.Nodes.JsonObject, workMax, store);
+        svc.IndexBuiltAt = server.IndexBuiltAtAsync;   // 0.13.55: a download is checked again when the index was built after its check
         server.Downloads = svc;
         _ = Task.Run(async () =>
         {

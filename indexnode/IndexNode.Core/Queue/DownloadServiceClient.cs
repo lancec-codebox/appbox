@@ -7,11 +7,11 @@ namespace IndexNode;
 /// <summary>The downloader's only two calls to the download service: where the work queue is (bootstrap) and one claimed item when the work queue has nothing ready.</summary>
 public static class DownloadServiceClient
 {
-    public static async Task<NextClaim?> NextAsync(HttpClient http, string url, string? token, string node, string[] stages, CancellationToken ct)
+    public static async Task<NextClaim?> NextAsync(HttpClient http, string url, string? token, string node, string[] stages, CancellationToken ct, TimeSpan? timeout = null)
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, url.TrimEnd('/') + "/v1/download/next") { Content = new StringContent(new JsonObject { ["node"] = node, ["stages"] = new JsonArray(stages.Select(x => (JsonNode?)x).ToArray()) }.ToJsonString(), Encoding.UTF8, "application/json") };
         if (!string.IsNullOrEmpty(token)) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct); cts.CancelAfter(TimeSpan.FromSeconds(30));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct); cts.CancelAfter(timeout ?? TimeSpan.FromSeconds(90));   // 0.13.55: was 30 s; a download is checked again inside the call (about 12 s a check, the service stops starting them after 25 s)
         using var res = await http.SendAsync(req, cts.Token);
         if (!res.IsSuccessStatusCode) throw new HttpRequestException($"the download service answered {(int)res.StatusCode}");
         var j = JsonNode.Parse(await res.Content.ReadAsStringAsync(cts.Token)) as JsonObject;

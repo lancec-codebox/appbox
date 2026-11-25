@@ -35,6 +35,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         await full.PollAsync(ct); await work.PollAsync(ct); await processing.PollAsync(ct);
         await ResolveRequestsAsync(ct);
         int folded = await FoldRunsAsync(ct) + await FoldBackAsync(ct), checks = await CheckSamplesAsync(ct);
+        await DropIdleDownloadsAsync(ct);
         int entered = await EnterDownloadsAsync(ct);
         int top = await TopUpAsync(ct), cleared = await ClearOutAsync(ct);
         return new Pass(folded, checks, entered, top, cleared);
@@ -62,10 +63,8 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
             if (dl == null) return new Sampled(null, "the check added no download");
             if (dl.Hold != null) return new Sampled(null, $"its download is held ({dl.Hold})");
             if (dl.State != "pending") return new Sampled(null, "its download is already " + dl.State);
-            var now = work.NowUtc();
-            await work.AppendLinesAsync(st => st.Entry(id, "download") != null ? null : [QLine.Add(id, "download", dl.Job ?? new JobDescriptor { Stage = "download", JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = now }, now, dl.Priority, now)], ct);
-            var h = await work.TryClaimForAsync(id, node, (_, sub) => sub.ClaimBy == null && sub.Entries.GetValueOrDefault("download") is { } e && e.Runnable(now) ? ["download"] : null, ct);
-            return h == null ? new Sampled(null, "its download was taken by another node") : new Sampled(new Claimed(id, "download", h.Epoch, h.Lease, work.Paths.Active(id)), "new");
+            var claim = await HandOutDownloadAsync(node, id, work.NowUtc(), ct, verify: false);   // checked a moment ago, against the index as it is
+            return claim == null ? new Sampled(null, "its download was taken by another node") : new Sampled(claim, "new");
         }
     }
 
@@ -249,7 +248,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         if (live >= WorkMax / 2) return addedRuns + await JumpAsync(now, ct);
         int room = WorkMax - live;
         var pick = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Id != null && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-"))
-            .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" or "download" && Ready(e, now)).OrderByDescending(e => QueueState.Rank(e.Stage)).FirstOrDefault()))   // a download before a sample of the same subject
+            .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" && Ready(e, now)).FirstOrDefault()))   // 0.13.55: samples only; a download is put on the work queue when it is handed out (HandOutDownloadAsync), never ahead of time
             .Where(x => x.E != null).OrderByDescending(x => x.E!.Priority).ThenByDescending(x => x.S.Pub ?? x.E!.Job?.Pub ?? "", StringComparer.Ordinal).ThenBy(x => x.S.Id, StringComparer.Ordinal)
             .Select(x => (x.S.Id, E: x.E!, x.S.Pub)).ToList());
         var have = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Keys.Select(k => s.Id + "/" + k)).ToHashSet(StringComparer.Ordinal)); int added = 0;
@@ -294,7 +293,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         int top = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => !e.Final && !IsRun(e.Stage))).Select(e => e.Priority).DefaultIfEmpty(int.MinValue).Max());
         var have = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Keys.Select(k => s.Id + "/" + k)).ToHashSet(StringComparer.Ordinal));
         var jump = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Id != null && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-"))
-            .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" or "download" && Ready(e, now) && e.Priority > top).OrderByDescending(e => QueueState.Rank(e.Stage)).FirstOrDefault()))
+            .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" && Ready(e, now) && e.Priority > top).FirstOrDefault()))
             .Where(x => x.E != null && !have.Contains(x.S.Id + "/" + x.E!.Stage)).OrderByDescending(x => x.E!.Priority).ThenByDescending(x => x.S.Pub ?? x.E!.Job?.Pub ?? "", StringComparer.Ordinal).ThenBy(x => x.S.Id, StringComparer.Ordinal)
             .Take(JumpMax).Select(x => (x.S.Id, E: x.E!, x.S.Pub)).ToList());
         if (jump.Count == 0) return 0;
@@ -353,12 +352,136 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     {
         await work.PollAsync(ct); await full.PollAsync(ct); await TopUpAsync(ct);
         var now = work.NowUtc(); var ok = stages.Length == 0 ? (Func<string, bool>)(_ => true) : st => Array.IndexOf(stages, st) >= 0;
-        var look = await work.LookAsync(st => st is "sample" or "download" or "refresh" or "classify" && ok(st), null, ct);
-        foreach (var (s, runnable) in look.Candidates)
+        var look = await work.LookAsync(st => st is "sample" or "refresh" or "classify" && ok(st), null, ct);
+        var cands = look.Candidates; var downloads = ok("download") ? ReadyDownloads(now) : []; int ci = 0, di = 0, checkedNow = 0; var started = Clock();
+        while (ci < cands.Count || di < downloads.Count)
         {
-            var h = await work.TryClaimForAsync(s.Id, node, (_, sub) => sub.ClaimBy == null ? sub.Entries.Values.Where(e => e.Runnable(now) && ok(e.Stage)).Select(e => e.Stage).Take(1).ToArray() : null, ct);
+            // the higher priority goes first; on a tie the download (its upload is one step further)
+            bool download = di < downloads.Count && (ci >= cands.Count || downloads[di].Priority >= cands[ci].Runnable.Max(e => e.Priority));
+            if (download)
+            {
+                var (id, _) = downloads[di++];
+                if (!handing.TryAdd(id, 0)) continue;   // another caller is on it right now (its check, its hand-out): this caller takes the next one, so nodes that ask at the same moment do not queue behind one check
+                try
+                {
+                    bool stale = await IsStaleAsync(id, ct);
+                    // enough checks for one call (each takes about 12 s and the node waits): the rest of this call is samples
+                    if (stale && (checkedNow >= MaxChecksPerCall || Clock() - started > CheckTime)) { di = downloads.Count; continue; }
+                    if (stale) checkedNow++;
+                    if (await HandOutDownloadAsync(node, id, now, ct, verify: true) is { } c) return c;
+                    if (stale && verifyFailed.ContainsKey(id)) di = downloads.Count;   // the check cannot run right now (a store limit, the index): no more of them in this call, or each would wait out its 30 min
+                }
+                finally { handing.TryRemove(id, out _); }
+                continue;
+            }
+            var (s, runnable) = cands[ci++];
+            var h = await work.TryClaimForAsync(s.Id, node, (_, sub) => sub.ClaimBy == null ? sub.Entries.Values.Where(e => e.Runnable(now) && ok(e.Stage) && e.Stage != "download").Select(e => e.Stage).Take(1).ToArray() : null, ct);
             if (h != null) return new Claimed(s.Id, runnable[0].Stage, h.Epoch, h.Lease, work.Paths.Active(s.Id));
         }
         return null;
+    }
+
+    /// <summary>How many downloads one <see cref="NextAsync"/> call may check again before it falls back to samples (a check takes several seconds, the caller waits).</summary>
+    public const int MaxChecksPerCall = 4;
+    /// <summary>No further check starts once a call has spent this long checking: with one more check (about 12 s on the 2026-11-25 dry run) the answer still comes well inside the node's 90 s.</summary>
+    public static readonly TimeSpan CheckTime = TimeSpan.FromSeconds(25);
+    public const string Go = "go";
+
+    /// <summary>0.13.55: the time the published search index was built (the serve's own cache answers). Null, or not set: nothing is known to be newer than a check, so no check is run again.</summary>
+    public Func<CancellationToken, Task<DateTimeOffset?>>? IndexBuiltAt { get; set; }
+
+    /// <summary>The uploads being handed out right now (their download is on the work queue for the moment between its add and its claim): <see cref="DropIdleDownloadsAsync"/> leaves them alone.</summary>
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> handing = new(StringComparer.Ordinal);
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<Task<string>>> verifying = new(StringComparer.Ordinal);
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> verifyFailed = new(StringComparer.Ordinal);
+    /// <summary>The clock for "a check that could not run is not tried again for a while" (tests set it).</summary>
+    public Func<DateTimeOffset> Clock { get; set; } = () => DateTimeOffset.UtcNow;
+    public static readonly TimeSpan VerifyRetry = TimeSpan.FromMinutes(30);
+
+    /// <summary>The downloads that may be handed out: pending, not held, due, of an upload that was sampled or checked, and not on the work queue already (there = handed out and running, or finished and not folded back yet). Priority first, then newest.</summary>
+    List<(string Id, int Priority)> ReadyDownloads(string now)
+    {
+        var busy = work.Read(w => w.Subjects.Values.Where(s => s.Entries.ContainsKey("download")).Select(s => s.Id).ToHashSet(StringComparer.Ordinal));
+        return full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Entries.GetValueOrDefault("download") is { } e && Ready(e, now) && (s.Entries.ContainsKey("sample") || s.Entries.ContainsKey("check")) && !busy.Contains(s.Id))
+            .Select(s => (S: s, E: s.Entries["download"])).OrderByDescending(x => x.E.Priority).ThenByDescending(x => x.S.Pub ?? x.E.Job?.Pub ?? "", StringComparer.Ordinal).ThenBy(x => x.S.Id, StringComparer.Ordinal)
+            .Take(64).Select(x => (x.S.Id, x.E.Priority)).ToList());
+    }
+
+    /// <summary>Was the upload's check made before the published index was built? Then its verdict says nothing about the dramas indexed since.</summary>
+    async Task<bool> IsStaleAsync(string id, CancellationToken ct)
+    {
+        var (sm, chk) = full.Read(st => (st.Entry(id, "sample"), st.Entry(id, "check")));
+        if (sm is not { State: "done" } || chk == null || IndexBuiltAt == null) return false;   // no stored clips, or never checked the new way: nothing to run again
+        if (verifyFailed.TryGetValue(id, out var until) && Clock() < until) return false;       // VerifyAsync answers "could not run" without trying
+        return await IndexBuiltAt(ct) is { } built && string.CompareOrdinal(chk.FinishedAt ?? chk.Added, Protocol.Utc(built)) < 0;
+    }
+
+    /// <summary>
+    /// 0.13.55 (owner, 2026-11-25: "roll the whole sampling into the download stage"; "As a part of the download we'll have it always do sampling"): no download starts on a verdict older than the index.
+    /// When an upload was sampled earlier and the published index has been built since its check, the check runs again on the STORED clips (no YouTube request), against the index as it is now.
+    /// "go": the download may be handed out (the check's time moves up). A duplicate now: the check and the download end as duplicate, the upload enters the catalog as one, nothing is downloaded.
+    /// Only duplicates are decided here: the AI hold is left as the first check, the owner or the threshold set it (the same clips give the same score).
+    /// Of 1,000 downloads on 2026-11-25, 824 had been sampled three days before; 65 of the first 558 processed were copies of dramas indexed in between.
+    /// </summary>
+    public async Task<string> VerifyAsync(string id, CancellationToken ct)
+    {
+        var mine = new Lazy<Task<string>>(() => VerifyOneAsync(id, CancellationToken.None));   // not the caller's token: another waiter still wants the answer
+        var lazy = verifying.GetOrAdd(id, mine);
+        try { return await lazy.Value.WaitAsync(ct); }
+        finally { if (lazy.Value.IsCompleted) verifying.TryRemove(new KeyValuePair<string, Lazy<Task<string>>>(id, lazy)); }
+    }
+
+    async Task<string> VerifyOneAsync(string id, CancellationToken ct)
+    {
+        var (chk, dl, pub) = full.Read(st => (st.Entry(id, "check"), st.Entry(id, "download"), st.Get(id)?.Pub));
+        if (dl is not { State: "pending" }) return "its download is " + (dl?.State ?? "gone");
+        if (dl.Hold != null) return $"its download is held ({dl.Hold})";
+        if (verifyFailed.TryGetValue(id, out var until) && Clock() < until) return "its check could not run; it is tried again later";
+        if (!await IsStaleAsync(id, ct)) return Go;
+        JsonObject? rec; try { rec = await check(id, ct); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: the check of {id} before its download failed ({e.Message}); not handed out, tried again in {VerifyRetry.TotalMinutes:0} min"); rec = null; }
+        if (rec == null) { verifyFailed[id] = Clock() + VerifyRetry; return "its check could not run; it is tried again later"; }
+        verifyFailed.TryRemove(id, out _);
+        var decision = (string?)rec["decision"] ?? "new"; var at = full.NowUtc(); bool skip = PreCheckDecision.IsSkip(decision);
+        var url = dl.Job?.Url ?? chk!.Job?.Url ?? "https://www.youtube.com/watch?v=" + id; var top = (rec["top"] as JsonArray)?.OfType<JsonObject>().FirstOrDefault();
+        var dupOf = skip ? (string?)rec["matchUpload"] ?? (string?)top?["upload"] : null;
+        var lines = new List<QLine> { new QLine { T = "done", S = id, Stage = "check", State = skip ? "duplicate" : "done", At = at, Job = new JobDescriptor { Stage = "check", JobId = id, Url = url, Priority = dl.Priority, AddedAt = chk!.Added, Pub = pub, DuplicateOf = dupOf } } };
+        if (skip) lines.Add(new QLine { T = "done", S = id, Stage = "download", State = "duplicate", At = at });
+        if (skip) await work.AppendLinesAsync(w => w.Get(id) is { ClaimBy: null } s && s.Entries.GetValueOrDefault("download") is { Final: false } ? [new QLine { T = "drop", S = id, Stage = "download" }] : null, ct);
+        await full.AppendLinesAsync(lines, ct);   // the check line first, as in the first check
+        if (!skip) return Go;
+        await Handoff.EnterAsync(processing, new Handoff.Facts(id, "precheck", Title: (string?)rec["title"], Pub: pub, Priority: dl.Priority, Check: rec, State: "duplicate", Hold: null, AiScore: (double?)(rec["ai"] as JsonObject)?["score"], DuplicateOf: dupOf, DuplicateShare: (double?)top?["share"], Url: url), ct);
+        Log.Info($"download service: {id} is a duplicate of {dupOf ?? "an indexed upload"} by the check before its download (first checked {chk.FinishedAt ?? chk.Added}): nothing is downloaded");
+        return "duplicate of " + (dupOf ?? "an indexed upload") + ": nothing to download";
+    }
+
+    /// <summary>Puts one download on the work queue and claims it for <paramref name="node"/>, after <see cref="VerifyAsync"/> when asked. Null: not handed out (said in the log when the check stopped it), or another node has it.</summary>
+    async Task<Claimed?> HandOutDownloadAsync(string node, string id, string now, CancellationToken ct, bool verify)
+    {
+        handing[id] = 0;
+        try
+        {
+            if (verify && await VerifyAsync(id, ct) is var v && v != Go) return null;
+            var dl = full.Read(st => st.Entry(id, "download")); if (dl is not { State: "pending", Hold: null }) return null;
+            await work.AppendLinesAsync(st => st.Entry(id, "download") != null ? null : [QLine.Add(id, "download", dl.Job ?? new JobDescriptor { Stage = "download", JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = now }, now, dl.Priority, now)], ct);
+            var h = await work.TryClaimForAsync(id, node, (_, sub) => sub.ClaimBy == null && sub.Entries.GetValueOrDefault("download") is { } e && e.Runnable(now) ? ["download"] : null, ct);
+            return h == null ? null : new Claimed(id, "download", h.Epoch, h.Lease, work.Paths.Active(id));
+        }
+        finally { handing.TryRemove(id, out _); }
+    }
+
+    /// <summary>
+    /// A download nobody holds does not stay on the work queue: one that was handed out and failed (its attempt is folded back first), one an older service topped up ahead of time.
+    /// It is handed out again from the full queue, checked again if the index has moved. So a node never finds a download to claim by itself, whatever its version.
+    /// </summary>
+    public async Task<int> DropIdleDownloadsAsync(CancellationToken ct)
+    {
+        bool IdleNow(QSubject? s) => s is { ClaimBy: null } && !handing.ContainsKey(s.Id) && s.Entries.GetValueOrDefault("download") is { Final: false };
+        var idle = work.Read(w => w.Subjects.Values.Where(IdleNow).Select(s => s.Id).ToList());
+        if (idle.Count == 0) return 0;
+        int n = 0;
+        foreach (var chunk in JobQueue.Chunks(idle, _ => 120))
+            await work.AppendLinesAsync(w => { var l = chunk.Where(id => IdleNow(w.Get(id))).Select(id => new QLine { T = "drop", S = id, Stage = "download" }).ToList(); n += l.Count; return l.Count == 0 ? null : l; }, ct);
+        if (n > 0) Log.Info($"download service: {n} download(s) nobody held left the work queue; they are handed out from the full queue");
+        return n;
     }
 }
