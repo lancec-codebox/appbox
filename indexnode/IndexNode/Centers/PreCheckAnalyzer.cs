@@ -43,6 +43,12 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
     public Func<DateTimeOffset?, IReadOnlyList<string>>? FreshUploads { get; set; }
     public int Excluded { get; private set; }
 
+    public async Task<DateTimeOffset?> IndexBuiltAtAsync(CancellationToken ct)
+    {
+        try { return (await cache.GetAsync(store, paths, ct))?.BuiltAt; }
+        catch (Exception e) when (e is not OperationCanceledException and not StorageBudgetExceeded) { return null; }   // an unreadable index: nothing is known to be newer than a verdict
+    }
+
     public async Task<string?> UnavailableAsync(PreCheckSettings s, CancellationToken ct)
     {
         SearchData? idx;

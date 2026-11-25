@@ -842,6 +842,36 @@ public class PreCheckTests : IDisposable
         Assert.Empty(rig.Calls);   // no yt-dlp: the window came from the stored video
     }
 
+    [Fact]
+    public async Task A_stored_verdict_older_than_the_published_index_is_checked_again_at_the_start_of_processing()
+    {
+        // 0.13.56 (owner, 2026-11-25: "at least we should have a check"): sampled days ago and judged new then; the drama it copies (b2) has been indexed since
+        if (await RealFfmpegAsync() is null) return;
+        var v = await BuildIndexAsync();
+        JsonObject Old(string at) => new() { ["decision"] = "new", ["at"] = at, ["ai"] = new JsonObject { ["score"] = 0.2, ["flag"] = false } };
+        var (rig, stage, id) = await SetupAsync("againdup0001", n => Take(v["b2"], 40, n));
+        await VideoJson.UpdateAsync(rig.Fs, P, id, r => { r["precheck"] = Old("2020-01-01T00:00:00Z"); }, default);
+        var job = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id, 480, null); job.JobId = id;
+        DuplicateFound? ex = null; try { await stage.RunAsync(Ctx(rig.Fs, job)); } catch (DuplicateFound d) { ex = d; }
+        Assert.NotNull(ex); Assert.Equal("b2", ex!.Upload);
+        var rec = Json(rig.Fs, P.Video(id, "precheck.json")); Assert.True(PreCheckDecision.IsSkip(rec.GetProperty("decision").GetString())); Assert.NotEqual("2020-01-01T00:00:00Z", rec.GetProperty("at").GetString());   // the record is the new check's
+
+        // a verdict made after the index was built is read as it is: no analysis, nothing written
+        var (rig2, stage2, id2) = await SetupAsync("againdup0002", n => Take(v["b2"], 40, n));
+        await VideoJson.UpdateAsync(rig2.Fs, P, id2, r => { r["precheck"] = Old("2999-01-01T00:00:00Z"); }, default);
+        var job2 = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id2, 480, null); job2.JobId = id2;
+        var before = rig2.Fs.Blobs.ToDictionary(kv => kv.Key, kv => kv.Value.Data.ToArray());
+        await stage2.RunAsync(Ctx(rig2.Fs, job2));
+        foreach (var kv in before) Assert.Equal(kv.Value, rig2.Fs[kv.Key].Data); Assert.Equal(before.Count, rig2.Fs.Blobs.Count);
+
+        // switched off (precheck AgainAtProcessing false): the old verdict is used, as before 0.13.56
+        var (rig3, _, id3) = await SetupAsync("againdup0003", n => Take(v["b2"], 40, n));
+        await VideoJson.UpdateAsync(rig3.Fs, P, id3, r => { r["precheck"] = Old("2020-01-01T00:00:00Z"); }, default);
+        var job3 = JobDescriptor.NewDownload("https://www.youtube.com/watch?v=" + id3, 480, null); job3.JobId = id3;
+        await new PreCheckStage(rig3.Tools, rig3.An, new PreCheckSettings { OrderToleranceSeconds = 100000, AgainAtProcessing = false }, "t").RunAsync(Ctx(rig3.Fs, job3));
+        Assert.Equal("new", Json(rig3.Fs, P.Video(id3, "precheck.json")).GetProperty("decision").GetString());
+    }
+
     // ------------------------------------------------------------------ 0.13.1: "to ('-1') must be a non-negative value" in the pre-check lookup
     [Fact]
     public async Task A_zero_byte_centers_zip_fails_as_a_bad_zip_never_as_a_negative_range()

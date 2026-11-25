@@ -524,8 +524,8 @@ public sealed partial class NodeEngine
         // 0.13.43: no sequence number here any more. A drama is numbered when its group step starts (see the group case), so a drama that is started and then set aside holds up nobody.
         // 0.13.2: decided from the store only (no processing zip besides download/comments), never from the done set; the stage itself returns at once for a video.json that already has the record
         bool noProcessing = !HasProcessing(have);
-        var vjPre = handlers.ContainsKey("precheck") && noProcessing ? (await VideoJson.RequireAsync(store, paths, id, token)).Root["precheck"] as System.Text.Json.Nodes.JsonObject : null;
-        if (handlers.TryGetValue("precheck", out var pre) && noProcessing && (vjPre == null || PreCheckDecision.IsSkip((string?)vjPre["decision"])))
+        // 0.13.56: the step runs for every drama with no processing done, also one that carries a verdict already: the stage returns at once when that verdict is as new as the published index, and checks again when it is older
+        if (handlers.TryGetValue("precheck", out var pre) && noProcessing)
         {
             ranPre = true;
             w.Run.Info.Stage = "precheck"; w.Run.Info.Step = null; RegistryChanged();
@@ -537,7 +537,10 @@ public sealed partial class NodeEngine
         string? pcDecision = null; System.Text.Json.Nodes.JsonObject? pcRec = null, pcRoot = null;
         if (handlers.ContainsKey("precheck")) { pcRoot = (await VideoJson.RequireAsync(store, paths, id, token)).Root; pcRec = pcRoot["precheck"] as System.Text.Json.Nodes.JsonObject; pcDecision = (string?)pcRec?["decision"]; }   // 0.13.2: video.json holds the record; unreadable or missing fails the claim (retried), never a quiet null
         // 0.13.45: the owner's verdict (video.json ai.verdict, `ai set`) wins over the pre-check's own flag here too. 0.13.44 read the flag alone at this point and held an upload again the moment its claim started.
-        bool pcAi = AiHold.Flagged(pcRec, pcRoot); double pcScore = (double?)pcRec?["ai"]?["score"] ?? 0;
+        // 0.13.56: decided from video.json's own ai section when it has one (the pre-check wrote it; `ai release-below` and `ai set` change it), not from the copy of the flag inside the pre-check record.
+        // On 2026-11-25, 100 uploads released under the 0.62 threshold (their ai.flag set false) were downloaded and then held again here, because the record inside still said flag true at 0.479.
+        bool pcAi = pcRoot?["ai"] is System.Text.Json.Nodes.JsonObject ? AiHold.Flagged(pcRoot) : AiHold.Flagged(pcRec, pcRoot);
+        double pcScore = (double?)pcRoot?["ai"]?["score"] ?? (double?)pcRec?["ai"]?["score"] ?? 0;
         // 0.13.1: an AI-flagged drama that is not a duplicate (that was decided first) is held, not skipped: the pre-check's done step goes on the log and the claim is released; with aiDramas on it just goes on
         if (noProcessing && pcAi && !PreCheckDecision.IsSkip(pcDecision) && !Control.Current.AiDramasOn)
         {

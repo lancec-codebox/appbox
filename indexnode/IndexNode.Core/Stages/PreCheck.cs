@@ -8,6 +8,8 @@ namespace IndexNode;
 public sealed class PreCheckSettings
 {
     public bool Enabled { get; set; } = true;
+    /// <summary>0.13.56 (owner, 2026-11-25: "at least we should have a check"): at the start of processing, an upload whose stored verdict is older than the published index is checked again on its stored video. Off: the stored verdict is used as it is (before 0.13.56).</summary>
+    public bool AgainAtProcessing { get; set; } = true;
     /// <summary>A sample frame counts as a match of an upload when its best cosine there is at least this.</summary>
     public double Tau { get; set; } = 0.70;
     /// <summary>Top share at or above this (and the duration rule) skips the download.</summary>
@@ -134,6 +136,8 @@ public interface IPreCheckAnalyzer
 {
     /// <summary>Null when the pre-check can run here; else why not (no search index, no SSCD model). Checked before anything is downloaded.</summary>
     Task<string?> UnavailableAsync(PreCheckSettings s, CancellationToken ct);
+    /// <summary>0.13.56: when the published search index this analyzer answers from was built. Null: not known (no index, or an analyzer that has none), and then no verdict counts as older than it.</summary>
+    Task<DateTimeOffset?> IndexBuiltAtAsync(CancellationToken ct) => Task.FromResult<DateTimeOffset?>(null);
     Task<PreCheckAnalysis> AnalyzeAsync(string samplePath, PreCheckSettings s, int threads, Action<string> progress, CancellationToken ct);
     /// <summary>0.13.15: the two-segment analysis (frames of every segment in one SSCD batch, one lookup, per-segment shares, every member of the candidate groups measured); the language ID is NOT run (see <see cref="PreCheck.SpeechNeeded"/>).</summary>
     Task<PreCheckAnalysis> AnalyzeSegmentsAsync(IReadOnlyList<SampleSegment> segments, PreCheckSettings s, int threads, Action<string> progress, CancellationToken ct);

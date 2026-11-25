@@ -20,8 +20,19 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
         var videoBlob = paths.Video(id, "video.mp4");
         var vj = await VideoJson.RequireAsync(store, paths, id, ct);   // 0.13.2: the record lives in video.json (precheck.json is not written any more); a missing descriptor fails the claim, loudly
         if (vj.Root["precheck"] is JsonObject pr)
-        {   // a repeat (the claim was interrupted after the record): a duplicate is finished again, anything else just goes on
-            if (PreCheckDecision.IsSkip((string?)pr["decision"])) { await FinishDuplicateAsync(ctx, pr, null, ct); }
+        {   // a repeat (the claim was interrupted after the record): a duplicate is finished again
+            if (PreCheckDecision.IsSkip((string?)pr["decision"])) { await FinishDuplicateAsync(ctx, pr, null, ct); return; }
+            // 0.13.56 (owner, 2026-11-25: "we also have the check that happens at the beginning of processing, right? Or at least we should have a check"): a sampled upload arrives with the verdict of its sample check,
+            // and until now that verdict was simply read here. Of 1,000 downloads on 2026-11-25, 66 were found to be copies only at the group step, after full processing; 65 of the dramas they joined were already in the
+            // published index when their processing started (they had waited a median of 8.3 h). So: a verdict older than the published index is checked again, on the stored video, before any processing.
+            // Only a duplicate is acted on. Anything else leaves the record as it is: the AI score and hold stay those of the first check (the owner or the threshold set them).
+            if (!s.AgainAtProcessing || (string?)pr["at"] is not { Length: > 0 } at || await analyzer.IndexBuiltAtAsync(ct) is not { } built || string.CompareOrdinal(at, Protocol.Utc(built)) >= 0) return;
+            var again = await AnalyzeAsync(ctx, null, ct);   // not strict: a check that cannot run here (no index, no model, a failed analysis) does not stop the processing, the upload goes on with the verdict it has
+            if (again == null) { Log.Info($"process {id}: the check at the start of processing could not run (first checked {at}); processing on that verdict"); return; }
+            if (!PreCheckDecision.IsSkip(again.Decision.Decision)) { Log.Info($"process {id}: checked again at the start of processing (first checked {at}, index built {Protocol.Utc(built)}): still {again.Decision.Decision}"); return; }
+            Log.Info($"process {id}: a duplicate by the check at the start of processing (first checked {at}, new then): not processed");
+            await RecordAsync(store, paths, id, again.Record, ct);
+            await FinishDuplicateAsync(ctx, again.Record, again.Summary, ct);
             return;
         }
 

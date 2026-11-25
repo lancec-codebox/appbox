@@ -303,7 +303,7 @@ public class QueueEngineTests
         foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
         foreach (var st in Protocol.StepStages) h[st] = new Fn(async ctx => { order.Add(ctx.Stage); if (st is not ("describe" or "translate" or "sync") && await ctx.Store.HeadAsync(P.Video(ctx.Job.JobId, st + ".zip"), default) == null) await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, st + ".zip"), [1], null, null, false, default); });
         h["process"] = h["frames"];
-        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await PreCheckStage.RecordAsync(ctx.Store, P, ctx.Job.JobId, System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"new\"}")!.AsObject(), default); });
+        h["precheck"] = new Fn(async ctx => { if ((await VideoJson.RequireAsync(ctx.Store, P, ctx.Job.JobId, default)).Root["precheck"] is System.Text.Json.Nodes.JsonObject have && !PreCheckDecision.IsSkip((string?)have["decision"])) return;   /* 0.13.56: the step is entered for every drama with no processing done; like the stage, this returns at once on a verdict that is not a skip */ order.Add("precheck"); await PreCheckStage.RecordAsync(ctx.Store, P, ctx.Job.JobId, System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"new\"}")!.AsObject(), default); });
         await Run(new NodeEngine(s, P, Opts(["process"]), h));
         Assert.Equal("precheck", order[0]);
         Assert.Contains("\"pc\":\"new\"", s.AppendText("index-test/jobs/queue.log"));
@@ -316,7 +316,7 @@ public class QueueEngineTests
         foreach (var st in new[] { "download", "refresh", "classify", "availability" }) h[st] = new Fn(_ => Task.CompletedTask);
         foreach (var st in Protocol.StepStages) h[st] = new Fn(async ctx => { order.Add(ctx.Stage); if (st is not ("describe" or "translate" or "sync") && await ctx.Store.HeadAsync(P.Video(ctx.Job.JobId, st + ".zip"), default) == null) await ctx.Store.PutAsync(P.Video(ctx.Job.JobId, st + ".zip"), [1], null, null, false, default); });
         h["process"] = h["frames"];
-        h["precheck"] = new Fn(async ctx => { order.Add("precheck"); await PreCheckStage.RecordAsync(ctx.Store, P, ctx.Job.JobId, System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"" + decision + "\",\"ai\":{\"flag\":true,\"score\":0.61,\"threshold\":0.479},\"share\":0.12}")!.AsObject(), default); });
+        h["precheck"] = new Fn(async ctx => { if ((await VideoJson.RequireAsync(ctx.Store, P, ctx.Job.JobId, default)).Root["precheck"] is System.Text.Json.Nodes.JsonObject have && !PreCheckDecision.IsSkip((string?)have["decision"])) return;   /* 0.13.56: the step is entered for every drama with no processing done; like the stage, this returns at once on a verdict that is not a skip */ order.Add("precheck"); await PreCheckStage.RecordAsync(ctx.Store, P, ctx.Job.JobId, System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"" + decision + "\",\"ai\":{\"flag\":true,\"score\":0.61,\"threshold\":0.479},\"share\":0.12}")!.AsObject(), default); });
         return h;
     }
     static Task SetAi(FakeStore s, string v) => s.PutAsync(P.Control, new ControlFile { AiDramas = v }.ToBytes(), null, null, false, default);
@@ -369,6 +369,18 @@ public class QueueEngineTests
         Assert.DoesNotContain("precheck", order); Assert.Equal("frames", order[0]);
         var e = Q(s).Entry("ai2", "process")!;
         Assert.Equal("done", e.State); Assert.Null(e.Hold);
+    }
+
+    [Fact]
+    public async Task An_upload_released_under_a_raised_threshold_is_not_held_again_when_its_processing_starts()
+    {
+        // 0.13.56: the sample check flagged it at the old threshold (the record keeps flag true); `ai release-below` then set video.json's ai.flag false and released its hold
+        var s = new FakeStore(); await s.AddJob(P, "process", "rel1", T(0)); await Downloaded(s, "rel1");
+        await PreCheckStage.RecordAsync(s, P, "rel1", System.Text.Json.Nodes.JsonNode.Parse("{\"decision\":\"new\",\"ai\":{\"flag\":true,\"score\":0.53,\"threshold\":0.479}}")!.AsObject(), default);
+        await VideoJson.UpdateAsync(s, P, "rel1", root => { root["ai"]!["flag"] = false; }, default);
+        var order = new List<string>();
+        await Run(new NodeEngine(s, P, Opts(["process"]), AiHandlers(order, "new")));
+        var e = Q(s).Entry("rel1", "process")!; Assert.Equal("done", e.State); Assert.Null(e.Hold); Assert.Equal("frames", order[0]);
     }
 
     [Fact]

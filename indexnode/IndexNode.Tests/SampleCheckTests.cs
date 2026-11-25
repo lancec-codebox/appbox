@@ -104,7 +104,7 @@ public class SampleCheckTests
         var q = r.Q;
         Assert.Equal("done", q.Entry("newv", "check")!.State); Assert.Equal("done", q.Entry("newv", "download")!.State); Assert.Equal(9, q.Entry("newv", "download")!.Priority);
         Assert.Equal("done", q.Entry("newv", "process")!.State);
-        Assert.Equal(0, r.PreChecks);   // process did not run the pre-check: the check record is in video.json
+        Assert.Equal(1, r.PreChecks);   // 0.13.56: the step is entered and returns at once (the record in video.json is as new as the index); no second analysis, see the next line
         Assert.Single(r.An.Seen);       // and the analyzer ran once, on the sample
     }
 
@@ -129,7 +129,7 @@ public class SampleCheckTests
         finally { try { Directory.Delete(dir, true); } catch { } }
         var segs = Assert.Single(r.An.Seen); Assert.Equal(2, segs.Count); Assert.Equal(PreCheck.Windows(700, 300, S.WindowPositions).Select(x => x.Start), segs.Select(x => x.Start));
         Assert.Equal("stored-video", (string?)(await VideoJson.RequireAsync(r.Store, P, id, default)).Root["precheck"]!["source"]);
-        Assert.Equal("done", r.Q.Entry(id, "check")!.State); Assert.Equal("done", r.Q.Entry(id, "process")!.State); Assert.Equal(0, r.PreChecks);
+        Assert.Equal("done", r.Q.Entry(id, "check")!.State); Assert.Equal("done", r.Q.Entry(id, "process")!.State); Assert.Equal(1, r.PreChecks);   // 0.13.56: entered, returned at once (the analyzer ran once, above)
     }
 
     [Fact]
