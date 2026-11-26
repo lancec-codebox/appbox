@@ -40,6 +40,20 @@
  .savebar{position:sticky;bottom:-16px;background:var(--card);border-top:1px solid var(--line);margin:0 -10px -16px;padding:8px 10px;display:flex;gap:10px;align-items:center}
  .msg:empty{display:none}
  details>summary{padding:8px 12px;color:var(--accent);cursor:pointer}
+ /* search */
+ .picrow{display:flex;gap:12px;align-items:flex-start} .picrow img{flex:0 0 84px;width:84px;max-height:150px;object-fit:contain;border-radius:6px;background:var(--chip)} .picrow .grow{flex:1;min-width:0;color:var(--mute)}
+ label.b{display:inline-flex;align-items:center;font-weight:600;padding:9px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);min-height:40px}
+ .res>.head{display:flex;gap:8px;align-items:baseline;padding:9px 12px 2px} .res>.head .t{flex:1;min-width:0;font-weight:600;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden} .res .sub{padding:0 12px 6px;color:var(--mute);font-size:12px;overflow-wrap:anywhere}
+ .res .sub a,.res .links a{color:var(--accent);text-decoration:none;font-weight:600} .res .links{padding:2px 12px 10px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+ .res .links button{font:inherit;font-weight:600;border:0;background:none;color:var(--accent);padding:6px 0;min-height:32px}
+ .strip{display:flex;gap:6px;overflow-x:auto;padding:4px 12px 10px} .strip:empty{display:none}
+ .fr{flex:0 0 auto;margin:0;width:118px} .fr .bx{position:relative;border-radius:6px;overflow:hidden;border:2px solid transparent;background:var(--chip)} .fr.hit .bx{border-color:var(--accent)}
+ .fr img{display:block;width:100%;height:auto} .fr i{position:absolute;border:2px solid #ffd400;border-radius:3px;box-sizing:border-box} .fr figcaption{font-size:11px;color:var(--mute);text-align:center;padding-top:2px}
+ .fr a{color:inherit;text-decoration:none}
+ .face{display:flex;gap:10px;padding:8px 12px;border-top:1px solid var(--line)} .card>h2+.face{border-top:0} .face>img{flex:0 0 64px;width:64px;height:64px;border-radius:8px;object-fit:cover;background:var(--chip)} .face .cands{flex:1;min-width:0}
+ .cand{display:flex;gap:8px;align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);background:none;border:0;border-top:1px solid var(--line);padding:8px 0;min-height:40px} .cand:first-child{border-top:0}
+ .cand .nm{flex:1;min-width:0} .cand small{display:block;color:var(--mute)} .cand .go{color:var(--accent);font-weight:700}
+ .empty{padding:10px 12px;color:var(--mute)}
 </style></head><body>
 <header><b>IndexNode</b><span class="v" id="ver"></span><span class="sp"></span><span class="chip" id="chip">…</span><button id="reload" aria-label="Reload the page" title="Reload the page">↻</button></header>
 <main>
@@ -57,6 +71,17 @@
  <div class="card"><h2>Ready to run</h2><div id="checks"></div></div>
  <div class="card"><h2>Last run</h2><div id="last"></div></div>
  <div class="card"><h2>This phone</h2><div id="phone"></div></div>
+</div>
+<!-- ============ Search (0.1.6) ============ -->
+<div class="tab" id="t-search">
+ <div class="card"><h2>Picture</h2><div class="pad">
+  <div class="picrow"><img id="pic" alt="" style="display:none"><div class="grow"><div id="picinfo">Choose a screenshot of a drama, or share one to IndexNode from another app.</div>
+   <div class="btns" style="margin-top:8px"><label class="b" for="file">Choose a picture</label><input type="file" id="file" accept="image/*" hidden></div></div></div>
+  <div class="btns"><button class="b p" id="findscene" disabled>Find the scene</button><button class="b" id="findactors" disabled>Find the actors</button></div>
+  <div class="msg" id="searchmsg"></div></div></div>
+ <div id="results"></div>
+ <div class="card"><h2>Search service</h2><div id="svc"></div>
+  <div class="pad" style="color:var(--mute)">The same service the downloads use. It sleeps when idle; the first search wakes it, which can take a minute.</div></div>
 </div>
 <!-- ============ Activity ============ -->
 <div class="tab" id="t-activity">
@@ -111,7 +136,7 @@
 </div>
 </main>
 <nav>
- <button data-t="status" class="on">Status</button><button data-t="activity">Activity</button><button data-t="setup">Setup<span class="dot" id="setupdot" style="display:none"></span></button><button data-t="settings">Settings<span class="dot" id="setdot" style="display:none"></span></button>
+ <button data-t="status" class="on">Status</button><button data-t="search">Search</button><button data-t="activity">Activity</button><button data-t="setup">Setup<span class="dot" id="setupdot" style="display:none"></span></button><button data-t="settings">Settings<span class="dot" id="setdot" style="display:none"></span></button>
 </nav>
 <script>
 const $=id=>document.getElementById(id); let n=0; const pend={};
@@ -127,7 +152,7 @@ const mb=b=>b>0?(b/1048576).toFixed(0)+' MB':'';
 let tab='status';
 function show(t){tab=t;for(const b of document.querySelectorAll('nav button'))b.classList.toggle('on',b.dataset.t===t);for(const d of document.querySelectorAll('.tab'))d.classList.toggle('on',d.id==='t-'+t);if(location.hash!=='#'+t)location.hash=t;if(t==='activity')log();if(t==='settings')diag();}
 for(const b of document.querySelectorAll('nav button'))b.onclick=()=>show(b.dataset.t);
-window.onhashchange=()=>{const t=location.hash.slice(1);if(['status','activity','setup','settings'].includes(t)&&t!==tab)show(t);};
+window.onhashchange=()=>{const t=location.hash.slice(1);if(['status','search','activity','setup','settings'].includes(t)&&t!==tab)show(t);};
 
 // ---- state ----
 let S=null, loaded=false, dirty=false;
@@ -165,6 +190,10 @@ function paint(s){
  $('app').innerHTML=row('Version',s.hostVersion)+row('Update',u.state==='available'||u.state==='needs-permission'||u.state==='confirm'?'Version '+(u.offer?u.offer.version:'')+' is available':u.state==='current'?'Up to date':u.state==='checking'?'Checking…':u.state==='downloading'?'Downloading…':u.state==='installing'?'Installing…':u.state==='done'?'Updated':u.state==='failed'?'Check failed':'Not checked yet',u.checkedAt?'Checked '+u.checkedAt:'');
  $('plugin').innerHTML=row('Version',s.pluginVersion||'Not loaded',s.pluginSource||'')+(s.pluginError?'<div class="row"><span class="k">Error</span><span class="val bad">'+esc(s.pluginError)+'</span></div>':'');
  update(u);
+ // search: the service line, the wait message of a call in flight, and a picture another app shared
+ const q=s.search||{}; $('svc').innerHTML=check(c.checkUrl?true:null,'Address',c.checkUrl||'From the store, when it names one',c.checkUrl?(c.checkToken?'Token set':'No token: searches will be refused'):'The setup carried no check server');
+ if(busy&&q.waiting)$('searchmsg').textContent=q.waiting;
+ if(q.shared&&!taking)takeShared();
  if(!loaded||!dirty&&tab!=='settings'){loaded=true;for(const k of BOOLS)$(k).checked=!!c[k];for(const k of NUMS)$(k).value=c[k]==null?'':c[k];$('uiUrl').value=c.uiUrl||'';$('pluginUrl').value=c.pluginUrl||'';}
 }
 function update(u){
@@ -189,6 +218,47 @@ const go=async()=>{const u=await call('installAppUpdate');return u.message||u.st
 // the reload button: the host loads the page again from its source (the app, or the UI URL) without the cache; a page opened outside the app just reloads
 $('reload').onclick=async()=>{try{await call('reloadUi');}catch(e){location.reload();}};
 
+// ---- search (0.1.6) ----
+// The picture goes to the service through the app (call 'service'); every answer is the service's own JSON. Pictures in answers are JPEGs in base64.
+let pic=null, busy=false, taking=false, run=0;
+const svc=a=>call('service',a);
+const clock=t=>{t=Math.max(0,Math.round(t));return Math.floor(t/3600)+':'+String(Math.floor(t/60)%60).padStart(2,'0')+':'+String(t%60).padStart(2,'0');};
+const yt=(id,t)=>'https://www.youtube.com/watch?v='+encodeURIComponent(id)+(t>0?'&t='+Math.floor(t)+'s':'');
+const sceneWord=x=>x>=0.52?['Match','ok']:x>=0.46?['Possible','warn']:['Weak',''];
+const actorWord=x=>x>=0.62?['Likely the same person','ok']:x>=0.5?['Possible','warn']:['Unlikely',''];
+// at most 1600 px on the long side, as a JPEG: a phone screenshot is several MB as it is, and the service reduces it much further anyway
+async function shrink(blob){const bmp=await createImageBitmap(blob);const k=Math.min(1,1600/Math.max(bmp.width,bmp.height));const cv=document.createElement('canvas');cv.width=Math.round(bmp.width*k);cv.height=Math.round(bmp.height*k);cv.getContext('2d').drawImage(bmp,0,0,cv.width,cv.height);const url=cv.toDataURL('image/jpeg',0.9);return {b64:url.slice(url.indexOf(',')+1),url,w:bmp.width,h:bmp.height};}
+async function setPic(blob,name){try{pic=await shrink(blob);pic.name=name||'picture';$('pic').src=pic.url;$('pic').style.display='';$('picinfo').textContent=pic.name+' · '+pic.w+'×'+pic.h;$('findscene').disabled=$('findactors').disabled=false;$('searchmsg').textContent='';$('results').innerHTML='';}catch(e){$('searchmsg').textContent='That file is not a picture this phone can read.';}}
+$('file').onchange=()=>{const f=$('file').files[0];if(f)setPic(f,f.name);$('file').value='';};
+async function takeShared(){taking=true;try{const r=await call('takeShared');if(r&&r.image){const bin=atob(r.image),u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);show('search');await setPic(new Blob([u]),r.name);}}catch(e){}taking=false;}
+const fig=(f,id,cls)=>'<figure class="fr'+(cls?' '+cls:'')+'"><a href="'+yt(id,f.t)+'"><div class="bx"><img alt="" src="data:image/jpeg;base64,'+f.jpeg+'">'+(f.box?'<i style="left:'+f.box[0]*100+'%;top:'+f.box[1]*100+'%;width:'+f.box[2]*100+'%;height:'+f.box[3]*100+'%"></i>':'')+'</div><figcaption>'+esc(f.timestamp||clock(f.t))+'</figcaption></a></figure>';
+async function work(btn,what,f){if(busy||!pic)return;busy=true;const mine=++run;$('findscene').disabled=$('findactors').disabled=true;$('searchmsg').className='msg';$('searchmsg').textContent=what;
+ try{await f(()=>mine===run);if(mine===run)$('searchmsg').textContent='';}catch(e){$('searchmsg').className='msg bad';$('searchmsg').textContent=e.message.replace(/^[A-Za-z]+Exception: /,'');}
+ busy=false;$('findscene').disabled=$('findactors').disabled=!pic;}
+// scene: the hits grouped by upload (best first); the frames around each of the first three are fetched at once, the rest on a tap
+$('findscene').onclick=()=>work('findscene','Searching…',async live=>{
+ const r=await svc({op:'search',image:pic.b64,top:40}); if(!live())return; const seen=new Set(), ups=[];
+ for(const h of r.hits||[]){if(seen.has(h.upload))continue;seen.add(h.upload);ups.push(h);if(ups.length===6)break;}
+ if(!ups.length){$('results').innerHTML='<div class="card"><div class="empty">Nothing in the index looks like this picture.</div></div>';return;}
+ $('results').innerHTML=ups.map((h,i)=>{const [w,c]=sceneWord(h.score);return '<div class="card res" id="sc'+i+'"><div class="head"><span class="chip '+c+'">'+w+'</span><span class="t" id="sct'+i+'">'+esc(h.upload)+'</span></div><div class="sub" id="scs'+i+'">at '+clock(h.time)+' · score '+h.score.toFixed(2)+'</div><div class="strip" id="scf'+i+'"></div><div class="links"><a href="'+yt(h.upload,h.time)+'">Open at '+clock(h.time)+'</a><button data-i="'+i+'" class="fbtn"'+(i<3?' style="display:none"':'')+'>Show frames</button><button data-i="'+i+'" class="abtn">Who is in my picture?</button></div><div id="sca'+i+'"></div></div>';}).join('');
+ const frames=async i=>{const h=ups[i];try{const f=await svc({op:'frames',upload:h.upload,at:h.time,around:2,step:3,width:240});const n=f.info||{};$('sct'+i).textContent=n.title||h.upload;$('scs'+i).textContent=(n.channel?n.channel+' · ':'')+'at '+clock(h.time)+(n.duration?' of '+clock(n.duration):'')+' · score '+h.score.toFixed(2);$('scf'+i).innerHTML=(f.frames||[]).map(x=>fig(x,h.upload,x.hit?'hit':'')).join('');const el=$('scf'+i),hit=el.querySelector('.hit');if(hit)el.scrollLeft=hit.offsetLeft-el.offsetLeft-(el.clientWidth-hit.clientWidth)/2;}catch(e){$('scs'+i).textContent+=' · frames: '+e.message;}};
+ for(const b of document.querySelectorAll('.fbtn'))b.onclick=()=>{b.style.display='none';frames(+b.dataset.i);};
+ for(const b of document.querySelectorAll('.abtn'))b.onclick=async()=>{const i=+b.dataset.i;b.disabled=true;$('sca'+i).innerHTML='<div class="empty">Looking at the faces…</div>';try{const a=await svc({op:'actors',image:pic.b64,upload:ups[i].upload});$('sca'+i).innerHTML=faces(a,'f'+i+'_');wire($('sca'+i));}catch(e){$('sca'+i).innerHTML='<div class="empty bad">'+esc(e.message)+'</div>';}b.disabled=false;};
+ for(let i=0;i<Math.min(3,ups.length);i++){if(!live())return;await frames(i);}
+});
+// actors: one block per face of the picture; a tap on an actor shows the dramas they are in, and shots from each
+function faces(a,p){const fs=a.faces||[];if(!fs.length)return '<div class="empty">No face was found in the picture.</div>';
+ return fs.map((f,k)=>{const own=(f.inUpload||[]).filter(x=>x.actor&&x.cosine>=0.5).slice(0,1), list=own.map(x=>({actor:x.actor,cosine:x.cosine,here:true})).concat((f.actors||[]).filter(x=>!own.some(o=>o.actor===x.actor)));
+  return '<div class="face"><img alt="" src="data:image/jpeg;base64,'+f.jpeg+'"><div class="cands">'+(list.length?list.map(x=>{const [w]=actorWord(x.cosine);return '<button class="cand" data-actor="'+esc(x.actor)+'" data-box="'+p+k+'"><span class="nm">'+esc(x.actor)+'<small>'+w+' ('+x.cosine.toFixed(2)+')'+(x.here?' · in this drama':'')+(x.dramas?' · '+x.dramas+' drama'+(x.dramas===1?'':'s'):'')+'</small></span><span class="go">›</span></button>';}).join(''):'<div class="empty" style="padding:6px 0">Nobody in the index looks like this face.</div>')+'</div></div><div id="'+p+k+'"></div>';}).join('');}
+function wire(root){for(const b of root.querySelectorAll('.cand'))b.onclick=()=>actor(b.dataset.actor,$(b.dataset.box));}
+async function actor(id,box){box.innerHTML='<div class="empty">Loading '+esc(id)+'…</div>';
+ try{const a=await svc({op:'actor',actor:id});const ds=a.dramas||[];let n=0;
+  box.innerHTML='<div class="empty" style="padding-bottom:4px">'+esc(id)+' appears in '+ds.length+' drama'+(ds.length===1?'':'s')+'</div>'+ds.map(d=>d.uploads.map(u=>{const k=n++;return '<div class="res" style="border-top:1px solid var(--line)"><div class="head"><span class="t">'+esc(u.title||d.title||u.upload)+'</span></div><div class="sub">'+(u.channel?esc(u.channel)+' · ':'')+u.faces+' faces'+(u.duration?' · '+clock(u.duration):'')+'</div><div class="strip" id="'+box.id+'s'+k+'"></div><div class="links"><a href="'+yt(u.upload,0)+'">Open</a><button class="sbtn" data-k="'+k+'" data-upload="'+esc(u.upload)+'" data-unit="'+esc(u.unit)+'"'+(k<2?' style="display:none"':'')+'>Show shots</button></div></div>';}).join('')).join('');
+  const shots=async b=>{const el=$(box.id+'s'+b.dataset.k);try{const s=await svc({op:'shots',upload:b.dataset.upload,unit:b.dataset.unit,count:6,width:240});el.innerHTML=(s.shots||[]).map(x=>fig(x,b.dataset.upload)).join('')||'<span class="empty" style="padding:0">No shots stored.</span>';}catch(e){el.innerHTML='<span class="empty bad" style="padding:0">'+esc(e.message)+'</span>';}};
+  const bs=[...box.querySelectorAll('.sbtn')];for(const b of bs)b.onclick=()=>{b.style.display='none';shots(b);};for(const b of bs.slice(0,2))await shots(b);
+ }catch(e){box.innerHTML='<div class="empty bad">'+esc(e.message)+'</div>';}}
+$('findactors').onclick=()=>work('findactors','Looking at the faces…',async live=>{const a=await svc({op:'actors',image:pic.b64});if(!live())return;$('results').innerHTML='<div class="card"><h2>Faces in the picture</h2>'+faces(a,'fa')+'</div>';wire($('results'));});
+
 // ---- activity ----
 let lines=[];
 function drawLog(){const q=$('logq').value.trim().toLowerCase();const l=q?lines.filter(x=>x.toLowerCase().includes(q)):lines;const p=$('log'),end=p.scrollTop+p.clientHeight>=p.scrollHeight-20;p.textContent=l.slice(-400).join('\n')||(q?'Nothing matches.':'The log is empty.');if(end)p.scrollTop=p.scrollHeight;}
@@ -205,6 +275,6 @@ async function copyText(t){try{await navigator.clipboard.writeText(t);return tru
 act('copyd',async()=>{await diag();return (await copyText(lastReport))?'Copied ('+lastReport.length+' characters; no storage key or token in it)':'Copy failed: use Share on the Activity tab';},'diagmsg');
 act('cleard',async()=>{await call('clearDiagnostics');await diag();return 'Cleared';},'diagmsg');
 
-const first=location.hash.slice(1); if(['activity','setup','settings'].includes(first))show(first);
+const first=location.hash.slice(1); if(['search','activity','setup','settings'].includes(first))show(first);
 refresh(); setInterval(()=>{refresh();if(tab==='activity')log();},3000); setInterval(()=>{if(tab==='settings')diag();},6000);
 </script></body></html>

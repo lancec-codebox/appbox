@@ -21,6 +21,10 @@ public sealed class NodeRuntime
     public PluginManager Plugins { get; }
     /// <summary>0.1.5: the app's own update (find, download, verify, install).</summary>
     public AppUpdater Updater { get; }
+    /// <summary>0.1.6: the Search tab's calls to the service (screenshot search, frames, actors).</summary>
+    public ServiceCalls Service { get; }
+    /// <summary>0.1.6: a picture another app shared to this one (a screenshot), kept until the Search tab takes it.</summary>
+    public (string Name, byte[] Data)? SharedImage { get; set; }
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(60) };
     private readonly object gate = new();
     private CancellationTokenSource? runCts;
@@ -41,6 +45,15 @@ public sealed class NodeRuntime
         Directory.CreateDirectory(Host.FilesDir);
         Plugins = new PluginManager(Path.Combine(ctx.FilesDir!.AbsolutePath, "plugins"), LoadBundled, HostVersion);
         Updater = new AppUpdater(ctx, () => HostVersion, m => Host.Log(m), () => Running);
+        Service = new ServiceCalls(Host.HttpAsync, () => (Prefs.Get("checkUrl"), Prefs.CheckToken), ReadServiceFileAsync, m => Host.Log(m));
+    }
+
+    /// <summary>index/service.json of the store (where the service is, when the setup does not say or its address no longer answers); null when the node is not set up or the store has no such file.</summary>
+    private async Task<string?> ReadServiceFileAsync(CancellationToken ct)
+    {
+        if (Prefs.Sas == null) return null;
+        var r = await Host.StoreAsync("GET", ServiceCalls.StoreFile, null, null, 64 * 1024, ct);
+        return r.Status == 200 ? r.Text : null;
     }
 
     private (Manifest, byte[])? LoadBundled()
@@ -179,6 +192,7 @@ public sealed class NodeRuntime
                 ["pluginUrl"] = Prefs.Get("pluginUrl") ?? PluginManager.RollingManifestUrl, ["periodic"] = Prefs.Bool("periodic", true), ["periodMinutes"] = Prefs.Int("periodMinutes", 60),
             },
             ["medusaMode"] = MedusaMode(),
+            ["search"] = new JsonObject { ["waiting"] = Service.Waiting, ["shared"] = SharedImage != null },
             ["appUpdate"] = Updater.Json(),
         };
     }

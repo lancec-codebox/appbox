@@ -12,6 +12,7 @@ public sealed class Bridge(Func<string, string, Task<JsonNode?>> handler, Func<s
     public static readonly string[] Methods =
     [
         "getState", "getLog", "runNow", "stopRun", "saveSettings", "importSetup", "pairMedusa", "pairStatus", "checkPluginUpdate", "setUiUrl", "clearLog", "shareLog", "getDiagnostics", "clearDiagnostics", "checkAppUpdate", "installAppUpdate", "reloadUi",
+        "service", "takeShared",   // 0.1.6: the Search tab (see ServiceCalls) and a picture another app shared to this one
     ];
 
     /// <summary>The reply text to post back, or null when the message was refused.</summary>

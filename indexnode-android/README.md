@@ -12,7 +12,7 @@ A phone node of the drama index. A small .NET 11 (CoreCLR, untrimmed) Android ho
 
 ## Build and test
 ```
-dotnet test indexnode-android/Tests -c Release            # 43 tests
+dotnet test indexnode-android/Tests -c Release            # 61 tests
 dotnet workload install android                            # once; SDK 11
 dotnet build indexnode-android/Plugin -c Release           # -> Plugin/bin/Release/net11.0/IndexNode.Plugin.dll
 dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release/net11.0-android/*-Signed.apk
@@ -20,6 +20,17 @@ dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release
 Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug"`, then `-p:AndroidKeyStore=true -p:AndroidSigningKeyStore=debug.keystore -p:AndroidSigningStorePass=android -p:AndroidSigningKeyAlias=androiddebugkey -p:AndroidSigningKeyPass=android`.
 
 ## Release notes
+
+### 0.1.6 (host 0.1.6, versionCode 7, plugin 0.1.2; needs IndexNode 0.13.62 on the service)
+- **A Search tab** (owner, 2026-11-25). Choose a picture, or share a screenshot to IndexNode from another app (the app is a share target for pictures), then:
+  - **Find the scene:** the dramas the picture looks like, best first, each with the matched frame and the frames around it (tap a frame to open the video at that moment), and "Who is in my picture?" to compare the faces with that drama's own cast.
+  - **Find the actors:** each face of the picture with the actors it looks like; tap an actor for the dramas they appear in and shots of them in each, the face marked.
+- **How it talks to the service.** The page calls one bridge method, `service`, with `{op: status|search|actors|frames|actor|shots, ...}`; `Loader/ServiceCalls.cs` turns each into one fixed route of `indexnode serve` (`/v1/search`, `/v1/frames`, `/v1/actors/...`) with the check server's token, so the page cannot make the app call anything else. The service is the check server of the setup. When the setup has none, or its address never answers, the app reads `index/service.json` in the store (`{"url": "https://...", "token": "..."}`), once per app start. The service sleeps when idle: a call waits up to 150 s while it wakes ("Waking the service…").
+- **Links leave the app.** A link to a video opens in the phone's YouTube app or browser, not inside the page.
+- **Fix: the top of the page was hidden.** 0.1.5 drew Android's own title bar over the page's header. The activity has no title bar now and the page is padded by the system bars and the keyboard.
+- Picture limits: the page reduces a picture to 1600 px on its long side before sending; a shared picture may be up to 24 MB.
+- Not verified on a phone (compiled by CI only): the picture chooser, the share target, the window padding. The page itself was rendered at phone width against real answers of the service. Tests: `Tests/ServiceCallsTests.cs`.
+- The "Download a video" card and the HD copy planned for 0.1.6 move to the next build.
 
 ### 0.1.5 (host 0.1.5, versionCode 6, plugin 0.1.2)
 - **The app updates itself, like Medusa.** On start, and from Settings, App, "Check for update", it reads `host.json` on the rolling release (`indexnode-android-plugin`), which CI writes for each new host version: the version, the APK's URL in this repository's releases, its SHA-256 and size. A newer version shows as a banner on the Status tab with an **Update** button. The app downloads the APK, checks the size and hash, and hands it to a PackageInstaller session; Android shows its own confirmation. The first time, Android asks to allow IndexNode to install apps: allow it, come back, tap Update again. An update is refused while a run is in progress. Rules in `Loader/HostUpdate.cs` (tested); the Android part is `Host/AppUpdater.cs`.
