@@ -69,6 +69,8 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     public string? SearchToken { get; init; }
     /// <summary>0.13.62: frames around a moment and the actor lookup (GET /v1/frames, POST /v1/actors/search, GET /v1/actors/...), for a person's search page. They need the serve token or the search token; with neither set they answer 401.</summary>
     public LookServer? Look { get; init; }
+    /// <summary>0.13.69: the local copy of the frame codes log and the view of the loaded version (route=frames).</summary>
+    public FrameCodesCache Codes { get; init; } = new(Path.Combine(NodeConfig.ConfigDir(), "frame-codes"));
     bool SearchTokenOk(HttpContext c) => !string.IsNullOrEmpty(SearchToken) && c.Request.Headers.Authorization.ToString() is { } auth && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
         && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(System.Text.Encoding.UTF8.GetBytes(auth[7..].Trim()), System.Text.Encoding.UTF8.GetBytes(SearchToken));
     public Tools? Tools { get; init; }
@@ -197,7 +199,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     }
 
     /// <summary>The screenshot query: an image (SSCD with the CLI's preprocessing, optional bar trim) or a ready vector, then the CLI's lookup (CenterSearch.QueryAsync). Writes nothing.</summary>
-    public async Task<JsonObject> SearchAsync(byte[]? image, string imageName, byte[]? vector, bool trim, int topCenters, int top, CancellationToken ct, int maxUploads = -1, bool? ranged = null)
+    public async Task<JsonObject> SearchAsync(byte[]? image, string imageName, byte[]? vector, bool trim, int topCenters, int top, CancellationToken ct, int maxUploads = -1, bool? ranged = null, string? route = null)
     {
         var sw = Stopwatch.StartNew(); double embedMs = 0; BarCrop crop = BarCrop.None; float[] q; string kind;
         if (vector is { Length: > 0 }) { q = CentersCommands.ReadVector(vector); kind = "vector"; }
@@ -222,12 +224,24 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         List<Hit> hits; QueryTimings tm; long ops;
         if (maxUploads < 0) maxUploads = settings.SearchUploads;
         if (topCenters <= 0) topCenters = Math.Clamp((int)Math.Round(idx.Bits.Length / SearchData.CodeBytes * settings.SearchCentersShare), 300, 5000);   // 0.13.62: grows with the index
-        using (var scope = meter.BeginStep(meter.Limits.StepLimitFor("search"), null)) { (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct, maxUploads, ranged ?? settings.SearchRanged); ops = meter.StepOps; }
+        route = (route is { Length: > 0 } ? route : settings.SearchRoute).ToLowerInvariant();
+        if (route is not ("centers" or "frames")) throw new ArgumentException("route: centers or frames");
+        int codesMissing = -1; long codesFrames = 0;
+        using (var scope = meter.BeginStep(meter.Limits.StepLimitFor("search"), null))
+        {
+            if (route == "frames")
+            {   // 0.13.69: a code of every frame, the best SearchFrames read exactly (the first search of a version brings the local codes up to date)
+                var view = await Codes.ViewAsync(store, paths, idx, ct); codesMissing = view.Missing; codesFrames = view.Frames;
+                (hits, tm) = await FrameCodeSearch.QueryAsync(store, paths, view, q, settings.SearchFrames, top, threads, ct, ranged ?? settings.SearchRanged);
+            }
+            else (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct, maxUploads, ranged ?? settings.SearchRanged);
+            ops = meter.StepOps;
+        }
         Interlocked.Increment(ref searches);
         return new JsonObject
         {
             ["indexVersion"] = idx.Version,
-            ["query"] = new JsonObject { ["kind"] = kind, ["trim"] = trim, ["crop"] = trim && kind == "image" ? new JsonObject { ["top"] = crop.Top, ["bottom"] = crop.Bottom, ["left"] = crop.Left, ["right"] = crop.Right } : null, ["topCenters"] = topCenters, ["top"] = top, ["maxUploads"] = maxUploads, ["ranged"] = ranged ?? settings.SearchRanged },
+            ["query"] = new JsonObject { ["kind"] = kind, ["trim"] = trim, ["crop"] = trim && kind == "image" ? new JsonObject { ["top"] = crop.Top, ["bottom"] = crop.Bottom, ["left"] = crop.Left, ["right"] = crop.Right } : null, ["route"] = route, ["topCenters"] = route == "centers" ? topCenters : null, ["frames"] = route == "frames" ? settings.SearchFrames : null, ["top"] = top, ["maxUploads"] = maxUploads, ["ranged"] = ranged ?? settings.SearchRanged, ["codesFrames"] = route == "frames" ? codesFrames : null, ["codesMissing"] = route == "frames" ? codesMissing : null },
             ["hits"] = new JsonArray(hits.Select(h => (JsonNode?)new JsonObject { ["upload"] = h.Upload, ["time"] = Math.Round(h.Time, 2), ["timestamp"] = Clip.Stamp(h.Time), ["score"] = Math.Round(h.Score, 4), ["row"] = h.Row, ["center"] = h.Center, ["voteRank"] = h.Vote, ["voteCenters"] = h.VoteCenters }).ToArray()),
             ["timings"] = new JsonObject { ["embedMs"] = Math.Round(embedMs, 1), ["scanMs"] = Math.Round(tm.ScanMs, 1), ["readMs"] = Math.Round(tm.ReadMs, 1), ["scoreMs"] = Math.Round(tm.ScoreMs, 1), ["uploads"] = tm.Uploads, ["uploadsOpened"] = tm.Opened, ["storeOps"] = ops, ["requests"] = tm.Requests, ["bytes"] = tm.Bytes, ["totalMs"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1) },
         };
@@ -338,7 +352,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
                 string Field(string n) => form.TryGetValue(n, out var v) && v.ToString().Length > 0 ? v.ToString() : c.Request.Query[n].ToString();
                 int Int(string n, int d, int max) => Field(n) is { Length: > 0 } s ? Math.Clamp(int.Parse(s, System.Globalization.CultureInfo.InvariantCulture), 1, max) : d;
                 bool trim = Field("trim") is var tv && (tv.Equals("true", StringComparison.OrdinalIgnoreCase) || tv == "1");
-                var res = await SearchAsync(await Part("image"), form.Files.GetFile("image")?.FileName ?? "", await Part("vector"), trim, Field("topCenters").Length > 0 ? Int("topCenters", 300, 5000) : 0, Int("top", 20, 200), c.RequestAborted, Field("maxUploads") is { Length: > 0 } mu ? Math.Clamp(int.Parse(mu, System.Globalization.CultureInfo.InvariantCulture), 0, 5000) : -1, Field("ranged") is { Length: > 0 } rg ? rg.Equals("true", StringComparison.OrdinalIgnoreCase) || rg == "1" : null);
+                var res = await SearchAsync(await Part("image"), form.Files.GetFile("image")?.FileName ?? "", await Part("vector"), trim, Field("topCenters").Length > 0 ? Int("topCenters", 300, 5000) : 0, Int("top", 20, 200), c.RequestAborted, Field("maxUploads") is { Length: > 0 } mu ? Math.Clamp(int.Parse(mu, System.Globalization.CultureInfo.InvariantCulture), 0, 5000) : -1, Field("ranged") is { Length: > 0 } rg ? rg.Equals("true", StringComparison.OrdinalIgnoreCase) || rg == "1" : null, Field("route") is { Length: > 0 } rt ? rt : null);
                 return Results.Text(res.ToJsonString(), "application/json");
             }
             catch (Exception e) when (e is ArgumentException or FormatException or OverflowException or InvalidDataException or BadHttpRequestException) { Interlocked.Increment(ref failures); return Results.BadRequest(new { error = e.Message }); }

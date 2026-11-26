@@ -32,6 +32,12 @@ public sealed class PreCheckSettings
     /// <summary>0.13.62: how many centers a screenshot search looks into when the caller names no number: this share of all centers in the index (at least 300, at most 5000). A fixed 300 found the test screenshots
     /// at 1,400 uploads and lost them at 2,457 (2026-11-25: the right center was about the 450th nearest of 619,000 by bit code; a phone screenshot is far from its frame, about 0.55). 0.002 is about 1,240 today.</summary>
     public double SearchCentersShare { get; set; } = 0.002;
+    /// <summary>0.13.69: how many uploads without frame codes a search-index build adds to the codes log (2 store ops each: one read of the frames file, one append).</summary>
+    public int CodesPerBuild { get; set; } = 60;
+    /// <summary>0.13.69: the route of /v1/search: "centers" (bits.bin of the centers, as before) or "frames" (a code of every frame, the best SearchFrames re-ranked exactly). A request's route= wins.</summary>
+    public string SearchRoute { get; set; } = "centers";
+    /// <summary>0.13.69: how many nearest frames (by code) the frames route reads exactly (owner, 2026-11-26: 100).</summary>
+    public int SearchFrames { get; set; } = 100;
     /// <summary>0.13.21 (config precheck.vote-uploads): vote-first lookup: after the bit scan the uploads are ranked by how many frames have them among their top rows, and only the top this-many are read and scored exactly. 0 = read every upload with a top row (the old behaviour). Applies to the pre-check, the check and the group step.</summary>
     public int VoteUploads { get; set; } = 20;
     /// <summary>0.13.58: the screenshot search (/v1/search, `indexnode search`) opens the frames of at most this many uploads, the ones whose centers stand best; a request may ask for another number (maxUploads). 0 = every upload behind the top centers.</summary>

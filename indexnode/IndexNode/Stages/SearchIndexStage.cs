@@ -20,6 +20,8 @@ public sealed class SearchIndexStage(IStore store, int keepVersions = 3, PreChec
         if (head == null) next = await SearchIndexBuild.BuildAsync(store, paths, ups, null, null, 1, 1, threads, m => Log.Info("search-index: " + m), ct);
         else next = await SearchIndexBuild.BuildAsync(store, paths, ups, head.Mean, head, head.Version + 1, head.MeanVersion, threads, m => Log.Info("search-index: " + m), ct);
         next.BuiltAt = started;   // centers that finish after this are not in it: the pre-check looks at them by brute force
+        ctx.Report("search-index", "frame codes");
+        await FrameCodes.FillAsync(store, paths, next, (settings ?? new PreCheckSettings()).CodesPerBuild, 0, m => Log.Info("search-index: " + m), ct);   // 0.13.69: the codes of uploads that have none yet
         ctx.Report("search-index", "groups");
         var groups = await GroupBuild.ApplyAsync(store, paths, head, next, ct, m => Log.Info("search-index: " + m), threads, settings, requireGroups: true, foldOnly: true, speechFresh: true, write: false);
         // 0.13.23: nothing changed since the head (same uploads with the same centers, retained files, group records and video.json ETags, same groups): no new version, nothing written

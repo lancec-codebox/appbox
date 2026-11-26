@@ -11,7 +11,8 @@ namespace IndexNode;
 /// <summary>0.13.23: the grouping record (compact JSON) of a video.json that is no indexed upload, with the ETag it was read at.</summary>
 public sealed record OtherRec(string Etag, string Rec);
 
-public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null, string? Group = null, string? File = null, long TableOff = 0, string? VideoEtag = null, string? GroupRec = null);
+/// <param name="Codes">0.13.69: where this upload's entry is in the frame codes log ("segment:offset[,offset]", FrameCodes); null: none yet.</param>
+public sealed record SearchUpload(string Id, string Sha, string ETag, long ZipSize, long DataStart, long DataLength, int Frames, int K, int RowStart, string? SpeechLanguage = null, bool? Dubbed = null, string? Group = null, string? File = null, long TableOff = 0, string? VideoEtag = null, string? GroupRec = null, string? Codes = null);
 
 /// <summary>The global search table, as published under index/search/vN/: mean.f32 (512 f32), bits.bin (64-byte sign codes of center - mean), refs.bin (per row: u32 upload index, u32 center index), uploads.yaml.</summary>
 public sealed class SearchData
@@ -32,6 +33,8 @@ public sealed class SearchData
     public Catalog? Catalog { get; set; }
     /// <summary>0.13.23: records of the non-indexed video.json files (uploads.yaml others:), by upload id.</summary>
     public Dictionary<string, OtherRec> Others { get; set; } = new(StringComparer.Ordinal);
+    /// <summary>0.13.69: how many of the uploads have no frame codes yet (uploads.yaml codesMissing); -1 when the version predates them.</summary>
+    public int CodesMissing { get; set; } = -1;
 
     /// <summary>Bit d of a code (byte d/8, bit d%8, least significant first) is 1 when center[d] - mean[d] &gt; 0.</summary>
     public static void Code(ReadOnlySpan<float> center, ReadOnlySpan<float> mean, Span<byte> code)
@@ -48,7 +51,7 @@ public sealed class SearchData
         int kept = 0; for (int r = 0; r < Count; r++) if (map[RefUpload[r]] >= 0) kept++;
         var nb = new byte[(long)kept * CodeBytes]; var ru = new int[kept]; var rc = new int[kept]; int w = 0;
         for (int r = 0; r < Count; r++) { int u = map[RefUpload[r]]; if (u < 0) continue; Buffer.BlockCopy(Bits, r * CodeBytes, nb, w * CodeBytes, CodeBytes); ru[w] = u; rc[w] = RefCenter[r]; w++; }
-        return new SearchData { Version = Version, MeanVersion = MeanVersion, MeanFrames = MeanFrames, Mean = Mean, Bits = nb, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = BuiltAt };
+        return new SearchData { Version = Version, MeanVersion = MeanVersion, MeanFrames = MeanFrames, Mean = Mean, Bits = nb, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = BuiltAt, CodesMissing = CodesMissing };
     }
 
     // ---------------------------------------------------------------- scan
@@ -193,11 +196,11 @@ public sealed class SearchData
     {
         var sb = new StringBuilder();
         sb.Append("version: ").Append(Version).Append('\n').Append("meanVersion: ").Append(MeanVersion).Append('\n').Append("meanFrames: ").Append(MeanFrames).Append('\n')
-          .Append(BuiltAt == null ? "" : "builtAt: " + Protocol.Utc(BuiltAt.Value) + "\n").Append("dim: 512\ncodeBytes: 64\ncenters: ").Append(Count).Append("\nuploads:\n");
+          .Append(BuiltAt == null ? "" : "builtAt: " + Protocol.Utc(BuiltAt.Value) + "\n").Append("dim: 512\ncodeBytes: 64\ncenters: ").Append(Count).Append('\n').Append(CodesMissing >= 0 ? "codesMissing: " + CodesMissing + "\n" : "").Append("uploads:\n");
         foreach (var u in Uploads)
             sb.Append("  - id: ").Append(Q(u.Id)).Append("\n    sha: ").Append(Q(u.Sha)).Append("\n    etag: ").Append(Q(u.ETag)).Append("\n    zipSize: ").Append(u.ZipSize).Append("\n    dataStart: ").Append(u.DataStart)
               .Append("\n    dataLength: ").Append(u.DataLength).Append("\n    frames: ").Append(u.Frames).Append("\n    k: ").Append(u.K).Append("\n    rowStart: ").Append(u.RowStart).Append('\n')
-              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n").Append(u.Group == null ? "" : "    group: " + Q(u.Group) + "\n").Append(u.File == null ? "" : "    file: " + Q(u.File) + "\n    tableOff: " + u.TableOff + "\n").Append(u.VideoEtag == null ? "" : "    videoEtag: " + Q(u.VideoEtag) + "\n").Append(u.GroupRec == null ? "" : "    groupRec: " + Q(u.GroupRec) + "\n");
+              .Append(u.SpeechLanguage == null ? "" : "    speechLanguage: " + Q(u.SpeechLanguage) + "\n").Append(u.Dubbed == null ? "" : "    dubbed: " + (u.Dubbed.Value ? "true" : "false") + "\n").Append(u.Group == null ? "" : "    group: " + Q(u.Group) + "\n").Append(u.File == null ? "" : "    file: " + Q(u.File) + "\n    tableOff: " + u.TableOff + "\n").Append(u.VideoEtag == null ? "" : "    videoEtag: " + Q(u.VideoEtag) + "\n").Append(u.GroupRec == null ? "" : "    groupRec: " + Q(u.GroupRec) + "\n").Append(u.Codes == null ? "" : "    codes: " + Q(u.Codes) + "\n");
         if (Others.Count > 0) { sb.Append("others:\n"); foreach (var (id, o) in Others.OrderBy(k => k.Key, StringComparer.Ordinal)) sb.Append("  - id: ").Append(Q(id)).Append("\n    etag: ").Append(Q(o.Etag)).Append("\n    rec: ").Append(Q(o.Rec)).Append('\n'); }
         return sb.ToString();
     }
@@ -221,7 +224,7 @@ public sealed class SearchData
     public static bool Unchanged(SearchData head, SearchData next, GroupSet groups, GroupSet? prior)
     {
         if (head.Catalog == null || head.MeanVersion != next.MeanVersion || !head.Mean.AsSpan().SequenceEqual(next.Mean)) return false;
-        if (head.Uploads.Count != next.Uploads.Count || head.Count != next.Count) return false;
+        if (head.Uploads.Count != next.Uploads.Count || head.Count != next.Count || head.CodesMissing != next.CodesMissing) return false;
         if (next.Uploads.Any(u => u.VideoEtag == null || u.GroupRec == null)) return false;   // nothing to prove it by: publish as before
         for (int i = 0; i < head.Uploads.Count; i++) if (head.Uploads[i] with { VideoEtag = null } != next.Uploads[i] with { VideoEtag = null }) return false;
         if (!head.Bits.AsSpan().SequenceEqual(next.Bits)) return false;
@@ -229,6 +232,8 @@ public sealed class SearchData
         static string J(GroupSet? g) { if (g == null) return ""; var o = g.ToJson(); o["indexVersion"] = 0; o["builtAt"] = null; return o.ToJsonString(); }
         return prior != null && J(prior) == J(groups);
     }
+
+    public static int ParseCodesMissing(string yaml) { foreach (var l in yaml.Split('\n')) { if (l.StartsWith("uploads:")) break; if (l.StartsWith("codesMissing:") && int.TryParse(l[13..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)) return n; } return -1; }
 
     public static DateTimeOffset? ParseBuiltAt(string yaml)
     {
@@ -240,7 +245,7 @@ public sealed class SearchData
     public static (int Version, int MeanVersion, long MeanFrames, List<SearchUpload> Uploads) ParseUploadsYaml(string yaml)
     {
         int version = 0, meanVersion = 0; long meanFrames = 0; var ups = new List<SearchUpload>(); Dictionary<string, string>? cur = null;
-        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null, cur.GetValueOrDefault("group") is { Length: > 0 } gr && gr != "null" ? gr : null, cur.GetValueOrDefault("file") is { Length: > 0 } ff && ff != "null" ? ff : null, cur.TryGetValue("tableOff", out var to) ? long.Parse(to) : 0, cur.GetValueOrDefault("videoEtag") is { Length: > 0 } ve && ve != "null" ? ve : null, cur.GetValueOrDefault("groupRec") is { Length: > 0 } grr && grr != "null" ? grr : null)); cur = null; }
+        void Flush() { if (cur == null) return; ups.Add(new SearchUpload(cur["id"], cur["sha"], cur["etag"], long.Parse(cur["zipSize"]), long.Parse(cur["dataStart"]), long.Parse(cur["dataLength"]), int.Parse(cur["frames"]), int.Parse(cur["k"]), int.Parse(cur["rowStart"]), cur.GetValueOrDefault("speechLanguage") is { Length: > 0 } sl && sl != "null" ? sl : null, cur.TryGetValue("dubbed", out var db) && db is "true" or "false" ? db == "true" : null, cur.GetValueOrDefault("group") is { Length: > 0 } gr && gr != "null" ? gr : null, cur.GetValueOrDefault("file") is { Length: > 0 } ff && ff != "null" ? ff : null, cur.TryGetValue("tableOff", out var to) ? long.Parse(to) : 0, cur.GetValueOrDefault("videoEtag") is { Length: > 0 } ve && ve != "null" ? ve : null, cur.GetValueOrDefault("groupRec") is { Length: > 0 } grr && grr != "null" ? grr : null, cur.GetValueOrDefault("codes") is { Length: > 0 } cd && cd != "null" ? cd : null)); cur = null; }
         foreach (var raw in yaml.Split('\n'))
         {
             var line = raw.TrimEnd('\r'); if (line.Length == 0 || line.StartsWith('#')) continue;
@@ -310,7 +315,7 @@ public sealed class SearchData
         int n = refs.Length / 8; if (bits.Length != n * CodeBytes) throw new InvalidDataException($"bits.bin has {bits.Length / CodeBytes} codes, refs.bin {n}");
         var ru = new int[n]; var rc = new int[n]; for (int i = 0; i < n; i++) { ru[i] = BinaryPrimitives.ReadInt32LittleEndian(refs.AsSpan(i * 8)); rc[i] = BinaryPrimitives.ReadInt32LittleEndian(refs.AsSpan(i * 8 + 4)); }
         Catalog? cat = null; try { cat = await IndexNode.Catalog.ReadAsync(store, paths, version.Value, ct); } catch (InvalidDataException) { }   // an unreadable catalog counts as none
-        return new SearchData { Version = version.Value, MeanVersion = mv, MeanFrames = mf, Mean = mean, Bits = bits, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = builtAt, Catalog = cat, Others = ParseOthersYaml(yaml) };
+        return new SearchData { Version = version.Value, MeanVersion = mv, MeanFrames = mf, Mean = mean, Bits = bits, RefUpload = ru, RefCenter = rc, Uploads = ups, BuiltAt = builtAt, Catalog = cat, Others = ParseOthersYaml(yaml), CodesMissing = ParseCodesMissing(yaml) };
     }
 
     /// <summary>Writes vN (files created only if new: a second builder of the same version loses), then moves head.yaml (If-Match on a rewrite, If-None-Match on the first).</summary>
@@ -445,7 +450,7 @@ public static class SearchIndexBuild
             }
         }
         var all = new byte[(long)row * SearchData.CodeBytes]; long o = 0; foreach (var b in bits) { b.CopyTo(all, o); o += b.Length; }
-        return new SearchData { Version = version, MeanVersion = meanVersion, MeanFrames = keep != null && total == 0 ? keep.MeanFrames : (long)total, Mean = mean, Bits = all, RefUpload = [.. ru], RefCenter = [.. rc], Uploads = ups };
+        return new SearchData { Version = version, MeanVersion = meanVersion, MeanFrames = keep != null && total == 0 ? keep.MeanFrames : (long)total, Mean = mean, Bits = all, RefUpload = [.. ru], RefCenter = [.. rc], Uploads = ups, CodesMissing = ups.Count(u => u.Codes == null) };
     }
 }
 

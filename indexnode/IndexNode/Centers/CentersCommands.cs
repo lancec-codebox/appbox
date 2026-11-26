@@ -143,7 +143,7 @@ public static class CentersCommands
     public static async Task<int> SearchIndexAsync(Args a, IStore? remote = null)
     {
         var sub = a.Positional.FirstOrDefault();
-        if (sub is not ("build" or "update")) throw new ArgumentException("search-index build [--new-mean] | update   [--threads N]");
+        if (sub is not ("build" or "update")) throw new ArgumentException("search-index build [--new-mean] | update   [--threads N] [--codes-max N] [--codes-pace per-minute]");
         var (cfg, store, paths, _) = OpenStore(a, remote);
         int threads = a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads;
         using var cts = new CancellationTokenSource(); Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -165,6 +165,8 @@ public static class CentersCommands
             if (!newMean) next.MeanFrames = head!.MeanFrames;
         }
         next.BuiltAt = startedAt;
+        // 0.13.69: frame codes of the uploads that have none yet (--codes-max, default the stage's CodesPerBuild; --codes-pace: uploads a minute, for a large first fill)
+        await FrameCodes.FillAsync(store, paths, next, a.Get("codes-max") is { } cm ? int.Parse(cm) : (cfg.PreCheck ?? new()).CodesPerBuild, a.Get("codes-pace") is { } cp ? double.Parse(cp, CultureInfo.InvariantCulture) : 0, Console.WriteLine, cts.Token);
         var groups = await GroupBuild.ApplyAsync(store, paths, head, next, cts.Token, Console.WriteLine, threads, cfg.PreCheck, speechFresh: true, write: false);
         // 0.13.23: nothing changed since the head: no new version, nothing written
         if (sub == "update" && head != null && SearchData.Unchanged(head, next, groups, await GroupStore.LoadAsync(store, paths, head.Version, cts.Token)))
@@ -194,13 +196,21 @@ public static class CentersCommands
         float[] q;
         if (a.Get("vector") is { } vf) q = ReadVector(File.ReadAllBytes(vf));
         else if (a.Get("image") is { } img) q = await EmbedImageAsync(new Tools(http, cfg), cfg, http, img, cts.Token, a.Has("trim"));
-        else throw new ArgumentException("search --vector <f32 or f16 file of 512 values> | --image <file> [--top-centers 300] [--top 20]");
+        else throw new ArgumentException("search --vector <f32 or f16 file of 512 values> | --image <file> [--top-centers 300] [--top 20] [--route centers|frames] [--frames 100]");
         if (a.Get("save-vector") is { } sv) { var qb = new byte[q.Length * 4]; Buffer.BlockCopy(q, 0, qb, 0, qb.Length); File.WriteAllBytes(sv, qb); }   // 0.13.48: the query's vector as f32, for experiments on other rankings
         var sw = Stopwatch.StartNew();
         var idx = await SearchData.LoadAsync(store, paths, a.Get("version") is { } v ? int.Parse(v) : null, cts.Token) ?? throw new InvalidOperationException("no search index: run search-index build");
         Console.WriteLine($"index v{idx.Version}: {idx.Uploads.Count} uploads, {idx.Count} centers (loaded in {sw.Elapsed.TotalSeconds:F1}s)");
         int maxUp = a.Get("max-uploads") is { } mu ? int.Parse(mu) : (cfg.PreCheck ?? new()).SearchUploads;   // 0.13.58: the uploads opened (0: all)
-        var (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topC, top, threads, cts.Token, maxUp, a.Has("ranged") || (cfg.PreCheck ?? new()).SearchRanged);
+        List<Hit> hits; QueryTimings tm;
+        if ((a.Get("route") ?? (cfg.PreCheck ?? new()).SearchRoute) == "frames")
+        {   // 0.13.69: a code of every frame (the local copy of the codes log under the config dir), the best --frames (default SearchFrames) read exactly
+            var cache = new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes")); var vsw = Stopwatch.StartNew();
+            var view = await cache.ViewAsync(store, paths, idx, cts.Token);
+            Console.WriteLine($"frame codes: {view.Frames:N0} frames of {idx.Uploads.Count - view.Missing} uploads ({view.Missing} without codes), {cache.Reads} log reads ({cache.BytesRead / 1048576.0:F0} MB), {vsw.Elapsed.TotalSeconds:F1}s");
+            (hits, tm) = await FrameCodeSearch.QueryAsync(store, paths, view, q, a.Get("frames") is { } fk ? int.Parse(fk) : (cfg.PreCheck ?? new()).SearchFrames, top, threads, cts.Token, ranged: true);
+        }
+        else (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topC, top, threads, cts.Token, maxUp, a.Has("ranged") || (cfg.PreCheck ?? new()).SearchRanged);
         foreach (var h in hits) Console.WriteLine($"{h.Upload}  {Clip.Stamp(h.Time)}  {h.Time:F1}s  {h.Score:F4}  (row {h.Row}, center {h.Center}, vote {h.Vote})");
         Console.WriteLine($"timings: scan {tm.ScanMs:F1} ms, reads {tm.ReadMs:F1} ms ({tm.Requests} requests, {tm.Bytes / 1048576.0:F1} MB, {tm.Opened} of {tm.Uploads} uploads opened), scoring {tm.ScoreMs:F1} ms");
         return 0;
