@@ -21,6 +21,11 @@ Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android 
 
 ## Release notes
 
+### 0.1.9 (host 0.1.9, versionCode 10, plugin 0.1.2, page 0.1.8.0)
+- **Fix: the page was drawn under the status bar and the navigation buttons** (seen on a Pixel 7 with 0.1.8). 0.1.6 padded the WebView by the window insets, but a WebView ignores its own padding for its content. Now the WebView sits in a frame and the frame is padded (system bars, display cutout, keyboard). The strips behind the bars take the colour of the page's header and tab bar, with dark or light system icons to match.
+- A native change, so an APK: the page did not change.
+- Not verified on a phone (compiled by CI only).
+
 ### 0.1.8 (host 0.1.8, versionCode 9, plugin 0.1.2, page 0.1.8.0)
 - **The page updates without a new APK** (owner, 2026-11-25: "We seem to be changing the outer app a lot"). The page (`Host/Assets/web/index.html`) has its own version, the meta tag `ui-version`; CI publishes it as `ui.html` with `ui.json` (`{version, sha256, page, minHost}`) on the rolling release whenever that version is new. The app looks on start and from Settings, App, "Check for a newer page": a page newer than the one it shows, whose hash matches, whose own tags agree with the manifest and whose `ui-min-host` is not above the app's version, is kept in the app's files and loaded at once. The page before it stays on disk. Rules in `Loader/UiManager.cs` (tested).
 - **A downloaded page that does not come alive is dropped.** After loading one, the app waits 15 s for its first call; without one it marks that version bad, never loads it again, and shows the page before it or the one in the APK. The page in the APK is always the last resort, and a newer APK's page wins over an older downloaded one.

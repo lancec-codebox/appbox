@@ -47,7 +47,8 @@ public class MainActivity : Activity
         cb?.OnReceiveValue(WebChromeClient.FileChooserParams.ParseResult((int)resultCode, data));
     }
 
-    // 0.1.6: the page keeps clear of the status bar, the navigation bar and the keyboard (0.1.5 also drew Android's own title bar over the top of the page: the theme has none now)
+    // The page keeps clear of the status bar, the navigation buttons, a display cutout and the keyboard. 0.1.9: the FRAME around the WebView gets the padding.
+    // 0.1.6 padded the WebView itself, and a WebView ignores its own padding for its content: on a Pixel 7 (2026-11-25) the page was still drawn under both bars.
     sealed class Insets : Java.Lang.Object, AndroidX.Core.View.IOnApplyWindowInsetsListener
     {
         public AndroidX.Core.View.WindowInsetsCompat? OnApplyWindowInsets(View? v, AndroidX.Core.View.WindowInsetsCompat? insets)
@@ -73,8 +74,16 @@ public class MainActivity : Activity
         _web.Settings.AllowContentAccess = false;
         _web.SetWebViewClient(new Client(this));
         _web.SetWebChromeClient(new Chrome(this));
-        SetContentView(_web);
-        AndroidX.Core.View.ViewCompat.SetOnApplyWindowInsetsListener(_web, new Insets());
+        var frame = new Android.Widget.FrameLayout(this);
+        frame.AddView(_web, new Android.Widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, ViewGroup.LayoutParams.MatchParent));
+        // the strips behind the status bar and the navigation buttons take the colour of the page's header and tab bar, and the system icons on them stay readable, in light and dark
+        bool dark = (Resources!.Configuration!.UiMode & Android.Content.Res.UiMode.NightMask) == Android.Content.Res.UiMode.NightYes;
+        frame.SetBackgroundColor(dark ? Android.Graphics.Color.ParseColor("#191d24") : Android.Graphics.Color.White);
+        SetContentView(frame);
+        AndroidX.Core.View.ViewCompat.SetOnApplyWindowInsetsListener(frame, new Insets());
+        var bars = AndroidX.Core.View.WindowCompat.GetInsetsController(Window!, frame);
+        bars.AppearanceLightStatusBars = !dark; bars.AppearanceLightNavigationBars = !dark;
+        AndroidX.Core.View.ViewCompat.RequestApplyInsets(frame);
         if (Build.VERSION.SdkInt >= BuildVersionCodes.Tiramisu) RequestPermissions(new[] { Android.Manifest.Permission.PostNotifications }, 1);
         RunWorker.Schedule(this);
         LoadUi();
