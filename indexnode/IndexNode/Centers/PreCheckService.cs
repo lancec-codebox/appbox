@@ -346,7 +346,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             catch (StorageBudgetExceeded e) { Interlocked.Increment(ref failures); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
             catch (Exception e) { Interlocked.Increment(ref failures); Log.Info("serve: search failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
         });
-        Look?.Map(app, c => { Interlocked.Increment(ref requests); return TokenOk(c) || SearchTokenOk(c); });
+        Look?.Map(app, c => { Interlocked.Increment(ref requests); return TokenOk(c) || SearchTokenOk(c); }, TokenOk);   // 0.13.63: the verdict route writes: the serve token only, never the search token
         return app;
     }
 }

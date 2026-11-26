@@ -13,6 +13,10 @@ namespace IndexNode;
 ///   POST /v1/actors/search (multipart "image", optional "upload") the faces of a picture, each with the actors it looks like (exact cosine against the actor index's unit centres); with "upload", also against that upload's own units
 ///   GET  /v1/actors/{actor}                                       the dramas and uploads an actor appears in
 ///   GET  /v1/actors/shots?upload=&amp;unit=&amp;count=6&amp;width=240     frames of one upload in which that actor's unit was seen, each with the face's box
+/// 0.13.63, the owner's review of AI holds (the last one WRITES, and takes the serve token only):
+///   GET  /v1/ai/holds                                             every upload held as AI in the two queues: score, verdict if any, title, channel, length
+///   GET  /v1/ai/frames?upload=&amp;count=6&amp;width=240                 pictures of a held upload, from its sample (or its stored frames)
+///   POST /v1/ai/verdict {"upload","verdict":"real"|"ai","reason","by"}   the owner's verdict, exactly what `indexnode ai set` does (AiHold.SetVerdictAsync): video.json gets ai.verdict, "real" releases the holds
 /// Reads only. A ghosted frames.zip or cast.zip is made readable the usual way (the read commits its blocks); the actor index and the units files are never ghosted.
 /// </summary>
 public sealed class LookServer(IStore store, Paths paths, Tools tools, HttpClient http, SearchIndexCache index, int threads)
@@ -241,14 +245,93 @@ public sealed class LookServer(IStore store, Paths paths, Tools tools, HttpClien
         return new JsonObject { ["info"] = await InfoAsync(upload, ct), ["unit"] = unitKey, ["actor"] = actors is { } ai ? ActorOf(ai, upload, unitKey) ?? unit.Actor : unit.Actor, ["faces"] = unit.N, ["first"] = Math.Round(unit.First, 2), ["last"] = Math.Round(unit.Last, 2), ["shots"] = shots };
     }
 
+    // ---- AI holds (0.13.63)
+
+    readonly SemaphoreSlim queueGate = new(1, 1);
+    JobQueue? procQ, dlQ;
+    /// <summary>The processing queue and the full download queue, opened on the first call as the CLI opens them (`ai set`); tests hand in their own.</summary>
+    public Func<CancellationToken, Task<(JobQueue Processing, JobQueue Download)>>? Queues { get; set; }
+    async Task<(JobQueue Processing, JobQueue Download)> QueuesAsync(CancellationToken ct)
+    {
+        if (Queues != null) return await Queues(ct);
+        await queueGate.WaitAsync(ct);
+        try
+        {
+            if (procQ == null || dlQ == null)
+            {
+                await JobQueue.RequireSnapshotAsync(store, paths, ct);
+                procQ = await JobQueue.OpenAsync(store, paths, "serve-look", false, ct); dlQ = await JobQueue.OpenAsync(store, paths, "serve-look", true, ct);
+            }
+            return (procQ, dlQ);
+        }
+        finally { queueGate.Release(); }
+    }
+
+    /// <summary>Every upload with an unfinished entry held as AI, from the queues as they are now (one poll each) and the uploads' records (one bulk read). Not yet judged first, then the lowest score first (the likeliest to be real).</summary>
+    public async Task<JsonObject> HoldsAsync(CancellationToken ct)
+    {
+        var (proc, dl) = await QueuesAsync(ct);
+        var held = new List<(string Id, string Where, double? Score, string Added)>();
+        foreach (var (q, name) in new[] { (proc, "processing"), (dl, "download") })
+        {
+            await q.PollAsync(ct);
+            held.AddRange(q.Read(st => st.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => !e.Final && e.Hold == "ai").Select(e => (s.Id, name + "/" + e.Stage, e.HoldAiScore, e.Added))).ToList()));
+        }
+        var ids = held.Select(h => h.Id).Distinct(StringComparer.Ordinal).ToList();
+        var docs = ids.Count == 0 ? new Dictionary<string, VideoJson.Doc?>() : await VideoJson.ReadManyAsync(store, paths, ids, ct);
+        var items = new List<(JsonObject O, bool Judged, double Score)>();
+        foreach (var g in held.GroupBy(h => h.Id, StringComparer.Ordinal))
+        {
+            var r = docs.GetValueOrDefault(g.Key)?.Root; var ai = r?["ai"] as JsonObject; var yt = r?["youtube"] as JsonObject;
+            double? score = Num(ai?["score"]) ?? g.Select(x => x.Score).FirstOrDefault(x => x != null); string? verdict = AiHold.Verdict(r);
+            items.Add((new JsonObject
+            {
+                ["upload"] = g.Key, ["score"] = score == null ? null : Math.Round(score.Value, 3), ["verdict"] = verdict, ["verdictAt"] = Text(ai?["verdictAt"]), ["verdictBy"] = Text(ai?["verdictBy"]),
+                ["title"] = Text(yt?["title"]), ["channel"] = Text(yt?["channel"]), ["duration"] = r == null ? null : VideoJson.Duration(r), ["heldAt"] = g.Select(x => x.Added).Where(x => x.Length > 0).DefaultIfEmpty("").Min(),
+                ["held"] = new JsonArray(g.Select(x => (JsonNode?)JsonValue.Create(x.Where)).ToArray()), ["url"] = "https://www.youtube.com/watch?v=" + g.Key,
+            }, verdict != null, score ?? 2));
+        }
+        return new JsonObject { ["count"] = items.Count, ["toReview"] = items.Count(x => !x.Judged), ["holds"] = new JsonArray(items.OrderBy(x => x.Judged).ThenBy(x => x.Score).Select(x => (JsonNode?)x.O).ToArray()) };
+    }
+    static double? Num(JsonNode? n) => n is JsonValue v && v.TryGetValue<double>(out var d) ? d : null;
+    static string? Text(JsonNode? n) => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
+    /// <summary>Pictures of a held upload for a person to judge: its sample (the two segments the check looked at; ffmpeg cuts the frames), or its stored frames when it was processed. Never the whole video.</summary>
+    public async Task<JsonObject> HoldFramesAsync(string upload, int count, int width, CancellationToken ct)
+    {
+        CheckId(upload); count = Math.Clamp(count, 2, MaxShots); width = Math.Clamp(width, 64, MaxWidth);
+        SheetCommand.ISource src = await SheetCommand.SampleSource.OpenAsync(store, paths, upload, tools, ct) is { } ss ? ss
+            : await SheetCommand.FramesSource.OpenAsync(store, paths, upload, tools, ct) is { } fs ? fs : throw new FileNotFoundException($"{upload} has neither a sample nor stored frames");
+        await using var _ = src;
+        var times = src is SheetCommand.SampleSource sm ? sm.Segments.SelectMany(s => SheetCommand.Spread(s.Start, s.End, Math.Max(1, count / sm.Segments.Count))).ToList()
+            : SheetCommand.Spread(((SheetCommand.FramesSource)src).Duration * 0.03, ((SheetCommand.FramesSource)src).Duration * 0.97, count);
+        var frames = new JsonArray(); var seen = new HashSet<double>();
+        foreach (var t in times)
+            if (await src.AtAsync(t, ct) is { } s && seen.Add(s.T)) frames.Add(new JsonObject { ["t"] = Math.Round(s.T, 2), ["timestamp"] = SheetCommand.Clock(s.T), ["jpeg"] = Convert.ToBase64String(Jpeg(s.Im, width)) });
+        return new JsonObject { ["upload"] = upload, ["from"] = src.Kind, ["frames"] = frames };
+    }
+
+    /// <summary>The owner's verdict on one upload. The same call the CLI makes; nothing here decides anything.</summary>
+    public async Task<JsonObject> VerdictAsync(string upload, string verdict, string? reason, string? by, CancellationToken ct)
+    {
+        CheckId(upload);
+        if (verdict is not ("real" or "ai")) throw new ArgumentException("the verdict is real or ai");
+        var who = "app" + (string.IsNullOrWhiteSpace(by) ? "" : ":" + new string(by.Trim().Where(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.').Take(40).ToArray()));
+        var (proc, dl) = await QueuesAsync(ct);
+        var r = await AiHold.SetVerdictAsync(proc, dl, store, paths, upload, verdict, string.IsNullOrWhiteSpace(reason) ? null : reason.Trim()[..Math.Min(200, reason.Trim().Length)], who, false, ct);
+        Log.Info($"serve: verdict {upload} {verdict} by {who}: released [{string.Join(", ", r.Released)}], held [{string.Join(", ", r.Held)}]{(r.Known ? "" : " (no video.json: nothing recorded)")}");
+        return new JsonObject { ["upload"] = upload, ["verdict"] = verdict, ["recorded"] = r.Known, ["released"] = new JsonArray(r.Released.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()), ["held"] = new JsonArray(r.Held.Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()) };
+    }
+
     // ---- routes
 
     /// <summary>Adds the four routes. Each is one step of the storage budget (the search step's limit) and answers like /v1/search: 400 for a bad request, 404 for something the index does not have, 503 when the store budget is spent.</summary>
-    public void Map(WebApplication app, Func<HttpContext, bool> authorized)
+    public void Map(WebApplication app, Func<HttpContext, bool> authorized, Func<HttpContext, bool>? owner = null)
     {
-        async Task<IResult> Run(HttpContext c, string what, Func<Task<JsonObject>> f)
+        owner ??= authorized;
+        async Task<IResult> Run(HttpContext c, string what, Func<Task<JsonObject>> f, bool writes = false)
         {
-            if (!authorized(c)) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
+            if (!(writes ? owner(c) : authorized(c))) return Results.Json(new { error = "unauthorized" }, statusCode: 401);
             var meter = StoreMeter.Current;
             try
             {
@@ -278,6 +361,13 @@ public sealed class LookServer(IStore store, Paths paths, Tools tools, HttpClien
             return await ActorsSearchAsync(ms.ToArray(), I(c, "top", 5), c.RequestAborted, form.TryGetValue("upload", out var up) && up.ToString().Length > 0 ? up.ToString() : Q(c, "upload"));
         }); });
         app.MapGet("/v1/actors/shots", async (HttpContext c) => { return await Run(c, "actor shots", () => ShotsAsync(Q(c, "upload"), Q(c, "unit"), I(c, "count", 6), I(c, "width", 240), c.RequestAborted)); });
+        app.MapGet("/v1/ai/holds", async (HttpContext c) => { return await Run(c, "ai holds", () => HoldsAsync(c.RequestAborted)); });
+        app.MapGet("/v1/ai/frames", async (HttpContext c) => { return await Run(c, "ai frames", () => HoldFramesAsync(Q(c, "upload"), I(c, "count", 6), I(c, "width", 240), c.RequestAborted)); });
+        app.MapPost("/v1/ai/verdict", async (HttpContext c) => { return await Run(c, "ai verdict", async () =>
+        {
+            var o = await System.Text.Json.JsonSerializer.DeserializeAsync<JsonObject>(c.Request.Body, cancellationToken: c.RequestAborted) ?? throw new ArgumentException("a JSON object is expected");
+            return await VerdictAsync(Text(o["upload"]) ?? throw new ArgumentException("no upload"), Text(o["verdict"]) ?? "", Text(o["reason"]), Text(o["by"]), c.RequestAborted);
+        }, writes: true); });
         app.MapGet("/v1/actors/{actor}", async (HttpContext c, string actor) => { return await Run(c, "actor", () => ActorAsync(actor, c.RequestAborted)); });
     }
 }
