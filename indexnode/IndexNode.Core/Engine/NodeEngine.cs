@@ -436,8 +436,8 @@ public sealed partial class NodeEngine
             while (true)
             {
                 await Task.Delay(o.IdleCheck, token);
-                if (!running.IsEmpty || Volatile.Read(ref busyClaims) > 0) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); continue; }
-                if (SearchIndexPullable()) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); continue; }
+                if (!running.IsEmpty || Volatile.Read(ref busyClaims) > 0) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); HeldLog("running " + running.Count + " (" + string.Join(", ", running.Keys.Select(r => r.Info.JobId + "/" + r.Info.Stage).Take(5)) + "), claims in progress " + Volatile.Read(ref busyClaims)); continue; }
+                if (SearchIndexPullable()) { Interlocked.Exchange(ref lastBusyTicks, DateTime.UtcNow.Ticks); HeldLog("a search index build this node could pull is pending"); continue; }
                 if (DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastBusyTicks), DateTimeKind.Utc) >= window)
                 {
                     Log.Info($"idle for {window.TotalMinutes:F1} min: exiting (--exit-when-idle)");
@@ -448,6 +448,9 @@ public sealed partial class NodeEngine
         catch (OperationCanceledException) { }
     }
     private int busyClaims;
+    long heldLogTicks;
+    /// <summary>0.13.67: what keeps --exit-when-idle from firing, at most once every 10 minutes (2026-11-26: a 3-lane actors node stayed up 55 min after its last job and the log did not say why).</summary>
+    void HeldLog(string why) { var now = DateTime.UtcNow.Ticks; if (now - Interlocked.Read(ref heldLogTicks) < TimeSpan.FromMinutes(10).Ticks) return; Interlocked.Exchange(ref heldLogTicks, now); Log.Info("idle exit held: " + why); }
 
     private bool TryReserve()
     {

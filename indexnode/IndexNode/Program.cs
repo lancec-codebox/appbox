@@ -186,7 +186,7 @@ public static class Program
                 "sheet" => await SheetCommand.RunAsync(a),
                 "videos" => await VideosBackfill.RunAsync(a),
                 "scripts" => await ScriptsCommand.RunAsync(a),
-                "search" => a.Has("vector") || a.Has("image") ? await CentersCommands.SearchAsync(a) : await Commands.SearchAsync(a),
+                "search" => a.Positional.FirstOrDefault() == "recall" ? await RecallBench.RunAsync(a) : a.Has("vector") || a.Has("image") ? await CentersCommands.SearchAsync(a) : await Commands.SearchAsync(a),   // 0.13.68: search recall (a measurement)
                 "centers" => await CentersCommands.CentersAsync(a),
                 "search-index" => await CentersCommands.SearchIndexAsync(a),
                 "groups" => await GroupsCommand.RunAsync(a),
