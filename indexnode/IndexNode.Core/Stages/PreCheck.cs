@@ -39,6 +39,11 @@ public sealed class PreCheckSettings
     public string SearchRoute { get; set; } = "auto";
     /// <summary>The route "auto" resolves to for a version: frames once every upload has codes.</summary>
     public static string ResolveRoute(string? route, int codesMissing) => (route is { Length: > 0 } r ? r.ToLowerInvariant() : "auto") is "auto" ? (codesMissing == 0 ? "frames" : "centers") : route!.ToLowerInvariant();
+    /// <summary>0.13.72: the route of the duplicate check, the group step and the index build's group checks: "auto" (frames once the version has codes for every upload), "frames" or "centers".
+    /// Measured 2026-11-26 (`precheck whatif --route frames`, 536 stored dramas): no new skip among 120 without copies; among 416 with copies 3 more duplicates found, none lost.</summary>
+    public string CheckRoute { get; set; } = "auto";
+    /// <summary>0.13.72: how many nearest frames by code each query frame of a check reads exactly.</summary>
+    public int CheckFrames { get; set; } = 10;
     /// <summary>0.13.69: how many nearest frames (by code) the frames route reads exactly (owner, 2026-11-26: 100).</summary>
     public int SearchFrames { get; set; } = 100;
     /// <summary>0.13.21 (config precheck.vote-uploads): vote-first lookup: after the bit scan the uploads are ranked by how many frames have them among their top rows, and only the top this-many are read and scored exactly. 0 = read every upload with a top row (the old behaviour). Applies to the pre-check, the check and the group step.</summary>

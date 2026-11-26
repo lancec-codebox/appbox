@@ -140,7 +140,7 @@ public sealed class PreCheckAnalyzer(Tools tools, NodeConfig cfg, HttpClient htt
         int ex = excludeId == null ? -1 : idx.Uploads.FindIndex(u => u.Id == excludeId);
         int excluded = ex < 0 ? 0 : idx.RefUpload.Count(u => u == ex);
         var fc0 = FramesCache.Current is { } fcA ? (fcA.Hits, fcA.Downloads, 0) : (0, 0, 0);
-        var (best, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, idx, rows, s.TopCenters, threads, ct, ex, Blocks, s.VoteUploads);
+        var (best, st) = await PreCheckSearch.LookupAsync(store, paths, idx, rows, s, threads, ct, ex, Blocks);   // 0.13.72: frame codes once every upload has them
         secs["votedUploads"] = st.VotedUploads; secs["readUploads"] = st.ReadUploads; secs["blocksRead"] = st.Blocks; secs["winnerVoteRank"] = st.WinnerVoteRank;   // 0.13.21: so a miss of the vote can be seen in the record
         var fresh = new List<string>();
         if (FreshUploads != null)

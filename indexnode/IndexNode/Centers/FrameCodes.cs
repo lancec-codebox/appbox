@@ -299,6 +299,9 @@ public sealed record FrameCodesUpload(ulong[] Codes, uint[] Offsets, float[] Tim
 /// </summary>
 public sealed class FrameCodesCache(string root)
 {
+    static FrameCodesCache? shared;
+    /// <summary>0.13.72: the process's one cache under the config dir (the check, the group step and the search share it).</summary>
+    public static FrameCodesCache Shared => shared ??= new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes"));
     readonly SemaphoreSlim gate = new(1, 1);
     FrameCodesView? view;
     readonly Dictionary<(int Mv, int Seg, long Off), FrameCodes.Part> parts = new();
@@ -321,13 +324,28 @@ public sealed class FrameCodesCache(string root)
             var need = new Dictionary<int, long>();
             foreach (var p in ptrs) if (p is { } pp) need[pp.Segment] = Math.Max(need.GetValueOrDefault(pp.Segment, -1), pp.Offsets.Max());
             foreach (var (seg, last) in need) await SyncAsync(store, paths, mv, seg, last, ct);
-            var ups = new FrameCodesUpload?[idx.Uploads.Count]; long frames = 0; var keep = new HashSet<(int, int, long)>();
+            var ups = new FrameCodesUpload?[idx.Uploads.Count]; long frames = 0; bool dropped = false; var keep = new HashSet<(int, int, long)>();
             for (int i = 0; i < ups.Length; i++)
             {
                 if (ptrs[i] is not { } p) continue;
                 var got = new List<FrameCodes.Part>();
-                foreach (var off in p.Offsets) { var key = (mv, p.Segment, off); if (!parts.TryGetValue(key, out var part)) parts[key] = part = ReadPart(mv, p.Segment, off); got.Add(part); keep.Add(key); }
-                var u = idx.Uploads[i];
+                var u = idx.Uploads[i]; bool bad = false; if (dropped) continue;
+                foreach (var off in p.Offsets)
+                {
+                    var key = (mv, p.Segment, off);
+                    if (!parts.TryGetValue(key, out var part))
+                    {
+                        try { part = ReadPart(mv, p.Segment, off); }
+                        catch (InvalidDataException e)
+                        {   // the local copy is not this store's log (another store, a log written again): it goes, the next view fetches the log anew; this upload counts as missing now
+                            Log.Info($"frame codes: {u.Id}: {e.Message}; the local copy of log {p.Segment} is dropped"); try { File.Delete(LocalFile(mv, p.Segment)); } catch (IOException) { }
+                            parts.Clear(); bad = dropped = true; break;
+                        }
+                        parts[key] = part;
+                    }
+                    got.Add(part); keep.Add(key);
+                }
+                if (bad) continue;
                 if (got.Any(x => x.Id != u.Id || x.Sha != u.Sha)) { Log.Info($"frame codes: {u.Id}: the entry at {u.Codes} is for {got[0].Id} ({got[0].Sha[..Math.Min(8, got[0].Sha.Length)]}), not this upload: treated as missing"); continue; }
                 got.Sort((a, b) => a.First.CompareTo(b.First));
                 ups[i] = got.Count == 1 ? new FrameCodesUpload(got[0].Codes, got[0].Offsets, got[0].Times) : new FrameCodesUpload([.. got.SelectMany(x => x.Codes)], [.. got.SelectMany(x => x.Offsets)], [.. got.SelectMany(x => x.Times)]);
@@ -335,7 +353,8 @@ public sealed class FrameCodesCache(string root)
             }
             foreach (var k in parts.Keys.Where(k => !keep.Contains(k)).ToList()) parts.Remove(k);
             var nv = new FrameCodesView { Index = idx, Uploads = ups, Frames = frames };
-            Volatile.Write(ref view, nv); return nv;
+            if (!dropped) Volatile.Write(ref view, nv);   // a view made while the local copy was dropped is not kept: the next call fetches the log again
+            return nv;
         }
         finally { gate.Release(); }
     }

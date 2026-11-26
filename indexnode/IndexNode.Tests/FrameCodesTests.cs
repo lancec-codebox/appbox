@@ -150,6 +150,27 @@ public class FrameCodesTests
     }
 
     [Fact]
+    public async Task The_check_lookup_goes_to_the_codes_only_when_every_upload_has_them()
+    {
+        var (f, idx, xs) = await Seed(2);
+        var q = new List<float[]> { xs["u1"].AsSpan(5 * D, D).ToArray() };
+        var s = new PreCheckSettings(); Assert.Equal("auto", s.CheckRoute); var dir = Tmp(); var cache = new FrameCodesCache(dir);
+        var (b0, st0) = await PreCheckSearch.LookupAsync(f, P, idx, q, s, 2, default, codes: cache);   // no codes yet: the centers (they vote)
+        Assert.Equal("u1", idx.Uploads[b0[0]!.Upload].Id); Assert.True(st0.VotedUploads >= 1);
+        await FrameCodes.FillAsync(f, P, idx, 60, 0, _ => { }, default); Assert.Equal(0, idx.CodesMissing);
+        var (b1, st1) = await PreCheckSearch.LookupAsync(f, P, idx, q, s, 2, default, codes: cache);   // now the codes: one vector per nearest frame, no votes
+        Assert.Equal("u1", idx.Uploads[b1[0]!.Upload].Id); Assert.Equal(10.0, b1[0]!.Time, 3); Assert.Equal(0, st1.WinnerVoteRank);
+        var (b2, _) = await PreCheckSearch.LookupAsync(f, P, idx, q, new PreCheckSettings { CheckRoute = "centers" }, 2, default, codes: cache);
+        Assert.Equal("u1", idx.Uploads[b2[0]!.Upload].Id);
+        // a local copy that is not this store's log: the upload counts as missing once, the copy goes, the next view is whole again
+        var path = Path.Combine(dir, "m1", "log-0000.bin"); var junk = File.ReadAllBytes(path); Array.Fill(junk, (byte)7, 0, 64); File.WriteAllBytes(path, junk);
+        var other = new FrameCodesCache(dir); var v1 = await other.ViewAsync(f, P, idx, default); Assert.True(v1.Missing >= 1); Assert.False(File.Exists(path));
+        idx.Uploads[0] = idx.Uploads[0] with { }; var idx2 = new SearchData { Version = idx.Version, MeanVersion = idx.MeanVersion, Mean = idx.Mean, Bits = idx.Bits, RefUpload = idx.RefUpload, RefCenter = idx.RefCenter, Uploads = idx.Uploads, CodesMissing = 0 };
+        var v2 = await other.ViewAsync(f, P, idx2, default); Assert.Equal(0, v2.Missing);
+        try { Directory.Delete(dir, true); } catch { }
+    }
+
+    [Fact]
     public async Task Small_parallel_ranges_that_cut_parts_still_give_the_whole_log()
     {
         var (f, idx, _) = await Seed(5);

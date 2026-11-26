@@ -106,7 +106,7 @@ public static class GroupBuild
         for (int at = 0; at < frames.Count; at += ChunkFrames)
         {
             var part = frames.Skip(at).Take(ChunkFrames).Select(f => f.V).ToList();
-            var (b, st) = await PreCheckSearch.BestPerFrameAsync(store, paths, next, part, s.TopCenters, threads, ct, ex, cache, s.VoteUploads);
+            var (b, st) = await PreCheckSearch.LookupAsync(store, paths, next, part, s, threads, ct, ex, cache);   // 0.13.72: frame codes once every upload has them
             stats?.Add(st.ScanMs, st.ReadMs, st.ScoreMs, st.Requests, st.Bytes); stats?.Peak(CentersBlob.InFlight);
             Array.Copy(b, 0, best, at, b.Length);
         }

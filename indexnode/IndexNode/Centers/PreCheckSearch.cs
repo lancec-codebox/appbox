@@ -126,6 +126,14 @@ public static class PreCheckSearch
     /// 0.13.71: the same answer as <see cref="BestPerFrameAsync"/> from the frame codes instead of the centers: each query's <paramref name="k"/> nearest frames by code (every frame of every upload
     /// but <paramref name="excludeUpload"/>), their stored vectors read exactly (each frame once, merged ranges per frames file), the best cosine per query.
     /// </summary>
+    /// <summary>0.13.72: the per-frame lookup by the configured route (<see cref="PreCheckSettings.CheckRoute"/>): frame codes once every upload of <paramref name="idx"/> has them, else the centers.</summary>
+    public static async Task<(FrameBest?[] Best, Stats Stats)> LookupAsync(IStore raw, Paths paths, SearchData idx, IReadOnlyList<float[]> queries, PreCheckSettings s, int threads, CancellationToken ct, int excludeUpload = -1, BlockCache? shared = null, FrameCodesCache? codes = null)
+    {
+        if (PreCheckSettings.ResolveRoute(s.CheckRoute, idx.CodesMissing) == "frames" && idx.Uploads.Count > 0)
+            return await BestPerFrameCodesAsync(raw, paths, await (codes ?? FrameCodesCache.Shared).ViewAsync(raw, paths, idx, ct), queries, s.CheckFrames, threads, ct, excludeUpload);
+        return await BestPerFrameAsync(raw, paths, idx, queries, s.TopCenters, threads, ct, excludeUpload, shared, s.VoteUploads);
+    }
+
     public static async Task<(FrameBest?[] Best, Stats Stats)> BestPerFrameCodesAsync(IStore raw, Paths paths, FrameCodesView view, IReadOnlyList<float[]> queries, int k, int threads, CancellationToken ct, int excludeUpload = -1)
     {
         var idx = view.Index; int n = queries.Count; var q = new float[n][];
