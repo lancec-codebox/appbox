@@ -320,7 +320,7 @@ public static class Commands
             var actorsStage = ActorsCommand.NewStage(store, http, a, false, null, childProbe); handlers["actors"] = actorsStage;
             // 0.13.32: this node can make the repaired cast state (it has the r50 model and the child probe): the cast step's repair mode, and the actors job that reads it
             ((ProcessStage)handlers["process"]).CastRepair = async (c, t) => await ActorsCommand.CastRepairAsync(actorsStage, c, t);
-            StepVersions.SetCode("cast", StepVersions.CastRepaired); StepVersions.SetCode("actors", StepVersions.ActorsRepaired);
+            StepVersions.SetCode("cast", StepVersions.CastRepaired); StepVersions.SetCode("actors", StepVersions.ActorsLinked);
         }   // no probe: no handler, so the node never claims actors
         foreach (var st in Protocol.StepStages) handlers[st] = handlers["process"]; // a step job is a process job with one step
         var limits = BuildLimits(a, cfg, nodeId);

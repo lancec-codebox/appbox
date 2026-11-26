@@ -438,8 +438,11 @@ public class OpsPerJobTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task Over_32_MB_vec_f16_is_not_read_whole_and_a_shortlist_takes_at_most_8_ranges_of_4_MB()
+    public async Task Over_the_whole_file_cap_vec_f16_is_not_read_whole_and_a_shortlist_takes_at_most_8_ranges_of_4_MB()
     {
+        // 0.13.65: the cap is 1 GB; this test lowers it to keep the old path covered
+        var cap = ActorsIndex.MaxWholeVec; ActorsIndex.MaxWholeVec = 32L << 20;
+        try {
         ActorsIndex.ForgetCache(); var (fs, idx) = await BigIndex(40, 1000);   // 40000 rows x 1 KB = 41 MB
         var io = new ActorsIO(fs, P); Assert.True((long)idx.Count * idx.Dim * 2 > ActorsIndex.MaxWholeVec);
         var cached = await ActorsIndex.ForAnnouncedAsync(io, 0, default); Assert.Null(cached!.Vec); Assert.DoesNotContain(fs.Gets, n => n.EndsWith("vec.f16") && !n.Contains("range"));
@@ -448,6 +451,27 @@ public class OpsPerJobTests(ITestOutputHelper output)
         Assert.InRange(cached.RowReads, 1, ActorsIndex.MaxRangeReads); Assert.True(fs.Gets.Count <= ActorsIndex.MaxRangeReads);
         await cached.PrefetchAsync(io, rows.Select(r => r + 1), default, ActorsIndex.MaxRangeReads - cached.RowReads); Assert.True(cached.RowReads <= ActorsIndex.MaxRangeReads);
         ActorsIndex.ForgetCache();
+        } finally { ActorsIndex.MaxWholeVec = cap; }
+    }
+
+    [Fact]
+    public async Task A_41_MB_index_is_read_whole_and_every_unit_is_compared_with_every_actor()
+    {
+        // 0.13.65: what went wrong on 2026-11-26: the candidates of every unit after an upload's first were dropped once vec.f16 passed 32 MB
+        ActorsIndex.ForgetCache(); var (fs, idx) = await BigIndex(40, 1000);
+        var io = new ActorsIO(fs, P); fs.Gets.Clear();
+        var cached = await ActorsIndex.ForAnnouncedAsync(io, 0, default); Assert.NotNull(cached!.Vec); Assert.Equal(1, fs.Gets.Count(n => n.EndsWith("vec.f16")));
+        fs.Gets.Clear();
+        for (int t = 0; t < 30; t++)
+        {   // thirty different units' own centres: each finds itself (cosine 1) among every unit of the index, with no store read
+            int ui = t % cached.Uploads.Count, uk = t % cached.Uploads[ui].Units.Count; int row = cached.Uploads[ui].Units[uk].Row;
+            var v = new float[cached.Dim]; for (int d = 0; d < cached.Dim; d++) v[d] = (float)BitConverter.ToHalf(cached.Vec!, (row * cached.Dim + d) * 2);
+            var n = Math.Sqrt(v.Sum(x => (double)x * x)); for (int d = 0; d < v.Length; d++) v[d] = (float)(v[d] / n);
+            var hits = cached.Exact(v, 0.99, _ => true)!;
+            Assert.Contains(hits, h => h.Upload == ui && h.Unit == uk);
+            Assert.Empty(cached.Exact(v, 0.99, up => up != cached.Uploads[ui].Id)!.Where(h => h.Upload == ui));   // the allow filter
+        }
+        Assert.Empty(fs.Gets); ActorsIndex.ForgetCache();
     }
 
     [Fact]

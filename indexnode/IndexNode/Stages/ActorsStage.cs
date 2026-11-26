@@ -169,7 +169,12 @@ public sealed class ActorsStage(IStore store, ActorsBuild.Probe? probe = null, d
         {
             var list = new List<Cand>();
             foreach (var (up, pprod, punits) in pend) foreach (var pu in punits) { if (pprod == prod || pu.Vec.Length == 0) continue; double c = CastLogic.Cosine(u.Vec[0], pu.Vec[0]); if (c >= ActorsBuild.BandLow) list.Add(new Cand(up, pu.Key, "", pprod, c, pu)); }
-            if (idx != null && idx.Count > 0)
+            // 0.13.65: with the index's vectors in memory (read whole once per version) every actor is compared exactly; the AI rule is checked only for the uploads that are close enough
+            if (idx?.Exact(u.Vec[0], ActorsBuild.BandLow, up => up != id && !aiIdx.Contains(up), iu => iu.Prod != prod) is { } exact)
+            {
+                foreach (var (iu, ik, cos) in exact) { var upId = idx.Uploads[iu].Id; if (aiIdx.Contains(upId)) continue; if (await Ai(upId)) { aiIdx.Add(upId); continue; } var x = idx.Uploads[iu].Units[ik]; list.Add(new Cand(upId, x.Key, "", x.Prod, cos, null, iu, ik)); routed++; }
+            }
+            else if (idx != null && idx.Count > 0)
             {
                 var rt2 = idx.Route(u.Vec[0], Top, up => up != id && !aiIdx.Contains(up), iu => iu.Prod != prod);
                 var survive = new List<(int Upload, int Unit, int Dist)>(); foreach (var rr in rt2) { var upId = idx.Uploads[rr.Upload].Id; if (aiIdx.Contains(upId)) continue; if (await Ai(upId)) { aiIdx.Add(upId); continue; } survive.Add(rr); }   // only the routed survivors are checked, never the whole index

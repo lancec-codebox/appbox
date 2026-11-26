@@ -17,4 +17,7 @@ public static class StepVersions
     public static void Reset() => code.Clear();
     /// <summary>The version the cast step makes at once the repaired cast state exists (units + r50 files under index/actors/); actors v2 reads only that.</summary>
     public const int CastRepaired = 2, ActorsRepaired = 2;
+    /// <summary>0.13.65: actors v3 = every unit compared with every actor of the index (v2 dropped the candidates of every unit after an upload's first once the index passed 32 MB).
+    /// Raising the required version to 3 in control re-runs the step for every upload in its repair mode (its own units and r50 files are reused; only the links are made again).</summary>
+    public const int ActorsLinked = 3;
 }

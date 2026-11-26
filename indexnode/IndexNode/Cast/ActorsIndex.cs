@@ -31,8 +31,32 @@ public sealed class ActorsIndex
     public HashSet<string> Ids => Uploads.Select(u => u.Id).ToHashSet(StringComparer.Ordinal);
     public int RowReads;
     readonly Dictionary<int, byte[]> rows = new();
-    /// <summary>0.13.28: files over this size (vec.f16 of a 60k-actor index) are not read whole: a shortlist from codes.bin (in memory), then coalesced range reads.</summary>
-    public static long MaxWholeVec = 32L << 20; public static long MaxRangeBytes = 4L << 20; public const int MaxRangeReads = 8;
+    /// <summary>Files up to this size are read whole, once per version per process. 0.13.65: 1 GB (was 32 MB). Over 32 MB the stage fell back to a shortlist re-checked by at most 8 ranged reads
+    /// PER UPLOAD, shared by all its units: the first unit used them up and the candidates of every later unit were dropped without a word. On 2026-11-26 (index v189, vec.f16 114 MB) an upload's
+    /// first unit was linked to another upload 80% of the time and its later units 16%; 20,910 of 22,705 actors were in one upload only. Over this size the old path still runs.</summary>
+    public static long MaxWholeVec = 1L << 30; public static long MaxRangeBytes = 4L << 20; public const int MaxRangeReads = 8;
+    float[]? centres; (int Upload, int Unit)[]? centreOf;
+    /// <summary>0.13.65: every unit's centre (its first row in vec.f16) against <paramref name="v"/>, exactly, best first, at or above <paramref name="min"/>; after the allow filters.
+    /// Only when vec.f16 is in memory (null otherwise). 27,000 units x 512: a few milliseconds per unit, so nothing depends on a bit-code shortlist.</summary>
+    public List<(int Upload, int Unit, double Cos)>? Exact(float[] v, double min, Func<string, bool> allow, Func<IUnit, bool>? unitOk = null)
+    {
+        if (Vec == null) return null;
+        if (centres == null || centreOf == null)
+        {
+            var of = Uploads.SelectMany((u, i) => u.Units.Select((_, k) => (i, k))).ToArray(); var cs = new float[(long)of.Length * Dim];
+            for (int r = 0; r < of.Length; r++) { int row = Uploads[of[r].i].Units[of[r].k].Row; for (int d = 0; d < Dim; d++) cs[(long)r * Dim + d] = (float)BitConverter.ToHalf(Vec, (row * Dim + d) * 2); }
+            centres = cs; centreOf = of;
+        }
+        int n = Math.Min(v.Length, Dim); var hit = new List<(int, int, double)>(); var okUp = new Dictionary<int, bool>();
+        for (int r = 0; r < centreOf.Length; r++)
+        {
+            double s = 0; long o = (long)r * Dim; for (int d = 0; d < n; d++) s += centres[o + d] * v[d];
+            if (s < min) continue;
+            var (ui, uk) = centreOf[r]; if (!okUp.TryGetValue(ui, out var ok)) okUp[ui] = ok = allow(Uploads[ui].Id);
+            if (ok && (unitOk == null || unitOk(Uploads[ui].Units[uk]))) hit.Add((ui, uk, s));
+        }
+        return hit.OrderByDescending(x => x.Item3).ToList();
+    }
     /// <summary>The linked unit-key pairs of every upload's units file (links.json of the version): what the next build folds into actors without re-reading carried-forward files.</summary>
     public Dictionary<string, List<(string Unit, string Other)>> Links = new(StringComparer.Ordinal);
     /// <summary>The 64-byte sign code of v - mean (bit d set when v[d] &gt; mean[d]); vectors shorter than 512 dims leave the rest 0.</summary>
