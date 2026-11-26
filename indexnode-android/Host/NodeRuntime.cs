@@ -57,7 +57,8 @@ public sealed class NodeRuntime
     private async Task<string?> ReadServiceFileAsync(CancellationToken ct)
     {
         if (Prefs.Sas == null) return null;
-        var r = await Host.StoreAsync("GET", ServiceCalls.StoreFile, null, null, 64 * 1024, ct);
+        // 0.1.10: the host's store path is relative to the ACCOUNT ("/media/index/..."), as the plugin's are; 0.1.8 sent "/index/service.json" and the gate refused it ("the request is outside the store container")
+        var r = await Host.StoreAsync("GET", new Uri(Host.StoreUrl).AbsolutePath.TrimEnd('/') + ServiceCalls.StoreFile, null, null, 64 * 1024, ct);
         return r.Status == 200 ? r.Text : null;
     }
 

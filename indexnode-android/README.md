@@ -21,6 +21,10 @@ Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android 
 
 ## Release notes
 
+### 0.1.10 (host 0.1.10, versionCode 11, plugin 0.1.2, page 0.1.8.0)
+- **Fix: Search and Review failed with "the request is outside the store container"** on a phone whose setup names no check server (seen on a Pixel 7). Finding the service through the store's `index/service.json` sent the path without the container's name, and the store gate refused it. Now the container path comes first, as in the plugin's requests; a refused read is logged and the page says no service is set up instead of failing.
+- A phone set up with a QR that carries the check server never takes this path.
+
 ### 0.1.9 (host 0.1.9, versionCode 10, plugin 0.1.2, page 0.1.8.0)
 - **Fix: the page was drawn under the status bar and the navigation buttons** (seen on a Pixel 7 with 0.1.8). 0.1.6 padded the WebView by the window insets, but a WebView ignores its own padding for its content. Now the WebView sits in a frame and the frame is padded (system bars, display cutout, keyboard). The strips behind the bars take the colour of the page's header and tab bar, with dark or light system icons to match.
 - A native change, so an APK: the page did not change.

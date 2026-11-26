@@ -18,6 +18,7 @@ public delegate Task<HostResponse> HostHttp(string method, string url, IReadOnly
 public sealed class ServiceCalls(HostHttp http, Func<(string? Url, string? Token)> saved, Func<CancellationToken, Task<string?>> storeFile, Action<string> log)
 {
     public static readonly string[] Ops = ["status", "search", "actors", "frames", "actor", "shots", "holds", "holdframes", "verdict"];
+    /// <summary>The file's path inside the store container; the host prefixes the container's own path.</summary>
     public const string StoreFile = "/index/service.json";
     public const int MaxImageBytes = 8 * 1024 * 1024, MaxAnswerBytes = 16 * 1024 * 1024;
     public TimeSpan WakeFor { get; set; } = TimeSpan.FromSeconds(150);
@@ -36,7 +37,7 @@ public sealed class ServiceCalls(HostHttp http, Func<(string? Url, string? Token
         {
             if (await storeFile(ct) is { Length: > 0 } text && JsonNode.Parse(text) is JsonObject o && Str(o, "url") is { } u && OkUrl(u)) got = (u.TrimEnd('/'), Str(o, "token"));
         }
-        catch (Exception e) when (e is JsonException or HttpRequestException or InvalidOperationException) { log("service: the store's service.json could not be read: " + e.Message); }
+        catch (Exception e) when (e is JsonException or HttpRequestException or InvalidOperationException or UnauthorizedAccessException) { log("service: the store's service.json could not be read: " + e.Message); }
         fromStore = got; return got;
     }
 
