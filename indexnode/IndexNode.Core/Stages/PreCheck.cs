@@ -16,6 +16,9 @@ public sealed class PreCheckSettings
     public double SkipShare { get; set; } = 0.80;
     /// <summary>Top share in [PartialShare, SkipShare) is another cut of the same drama.</summary>
     public double PartialShare { get; set; } = 0.60;
+    /// <summary>0.13.61 (owner, 2026-11-25: "Yes, same length only"): an upload that no member passes at SkipShare is still stopped as a copy when one member matches BOTH segments at PartialShare or more,
+    /// in order, and the upload is about that member's length (the duplicate band). A clearly shorter or longer one stays an overlap and is processed: a compilation must not absorb the full drama, nor the drama a part of it. False: as before 0.13.61.</summary>
+    public bool OverlapSameLengthStops { get; set; } = true;
     /// <summary>The duration rule: |duration - matched duration| &lt;= max(DurationPercent of the matched duration, DurationMinSeconds).</summary>
     public double DurationPercent { get; set; } = 0.15;
     public double DurationMinSeconds { get; set; } = 600;
@@ -314,6 +317,7 @@ public static class PreCheck
     /// 0.13.15, the two-segment rule. Candidates: every group (or ungrouped upload) either segment matched; the one with the highest combined share first. Inside a group EVERY member is tried in turn (ordered by the sum of its segment shares) until one passes:
     /// each segment's share against the member >= SkipShare, and the timing is consistent in the member (segment 1 before segment 2, the gap there >= the gap in the new video minus OrderToleranceSeconds). The first member that passes is authoritative:
     /// N within [M - durationPercent*M, M + max(slackPercent*M, slackSeconds)] = duplicate; N shorter = subset (a part of M); N longer = longer (processed). No member passes: the best group share >= PartialShare = overlap, else new.
+    /// 0.13.61: before "overlap", the first member that matches both segments at PartialShare or more, in order, and has the new upload's length (the duplicate band) makes it a duplicate (<see cref="PreCheckSettings.OverlapSameLengthStops"/>).
     /// Duplicate and subset keep the canonical-language exception. The shares of every member come with the analysis (a member the lookup did not list is measured directly from its frames file by the analyzer).
     /// </summary>
     public static PreCheckDecision Decide(PreCheckAnalysis a, double duration, Func<string, double?> matchedDuration, PreCheckSettings s, bool legacy = false)
@@ -335,6 +339,7 @@ public static class PreCheck
         var order = groups.OrderByDescending(kv => GroupCombined(kv.Value)).ThenBy(kv => kv.Key, StringComparer.Ordinal).ToList();
         var checks = new List<MemberCheck>();
         double bestGroupShare = 0; string? bestUpload = null;
+        Func<PreCheckDecision>? sameLength = null;   // 0.13.61: the first same-length overlap, used only when no member passes
         foreach (var (gk, ms0) in order)
         {
             string? gid = gk.StartsWith("u:", StringComparison.Ordinal) ? null : gk;
@@ -345,33 +350,45 @@ public static class PreCheck
                 double? md = copies.FirstOrDefault(c => c.Upload == m)?.Duration ?? a.Top.FirstOrDefault(t => t.Upload == m)?.Duration ?? matchedDuration(m);
                 var shares = segs.Select(sg => Sh(sg, m)).ToList();
                 var times = segs.Select(sg => sg.Shares.TryGetValue(m, out var x) && x.Frames > 0 ? (double?)x.MedianTime : null).ToList();
-                string reason; bool ok = false;
-                if (shares.Any(x => x < s.SkipShare)) reason = "share " + string.Join("/", shares.Select(x => x.ToString("0.00", CultureInfo.InvariantCulture))) + $" below {s.SkipShare:0.00} in a segment";
-                else if (md == null) reason = "duration unknown";
-                else if (segs.Count >= 2 && times[0] is not { } t1 || segs.Count >= 2 && times[1] is not { }) reason = "no matched time";
-                else if (segs.Count >= 2 && !(times[0]!.Value < times[1]!.Value)) reason = $"segments out of order in {m} ({times[0]:0}s then {times[1]:0}s)";
-                else if (segs.Count >= 2 && times[1]!.Value - times[0]!.Value < (segs[1].Mid - segs[0].Mid) - s.OrderToleranceSeconds) reason = $"gap in {m} {times[1]!.Value - times[0]!.Value:0}s is shorter than the gap in the new video {segs[1].Mid - segs[0].Mid:0}s by more than {s.OrderToleranceSeconds:0}s";
-                else { ok = true; reason = "both segments match in order"; }
-                checks.Add(new MemberCheck(m, gid, md, shares, times, ok, reason));
-                if (!ok) continue;
-                double M = md!.Value, lo = M - s.DurationPercent * M, hi = M + Math.Max(s.DurationSlackPercent * M, s.DurationSlackSeconds);
-                var asTop = a.Top.FirstOrDefault(t => t.Upload == m);
-                var mt = new PreCheckMatch(m, shares.Average(), asTop?.BestCosine ?? 0, times[0] ?? 0, segs.Sum(x => x.Shares.TryGetValue(m, out var q) ? q.Frames : 0), asTop?.SpeechLanguage ?? copies.FirstOrDefault(c => c.Upload == m)?.SpeechLanguage, asTop?.Dubbed ?? copies.FirstOrDefault(c => c.Upload == m)?.Dubbed, M);
-                var longest = Longest(a, mt, M);
-                string basis = $"member {m} matches both segments (shares {string.Join("/", shares.Select(x => x.ToString("0.00", CultureInfo.InvariantCulture)))}, times {string.Join("/", times.Select(x => x?.ToString("0") ?? "?"))} s, in order)";
-                var extra = new JsonObject { ["memberDuration"] = Math.Round(M, 2), ["duration"] = Math.Round(duration, 2), ["timesInMember"] = new JsonArray(times.Select(x => (JsonNode?)(x == null ? null : Math.Round(x.Value, 1))).ToArray()) };
-                PreCheckDecision R(string d, string why) => new(d, [basis, why], mt) { MatchedMember = m, MatchedLongest = longest, Checked = checks.ToList(), Extra = extra };
-                if (duration > hi) return R(PreCheckDecision.Longer, $"longer than {m}: {duration:0} s vs {M:0} s + max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s): processed");
-                string kind = duration < lo ? PreCheckDecision.Subset : PreCheckDecision.Duplicate;
-                string why2 = kind == PreCheckDecision.Subset ? $"{duration:0} s is shorter than {M:0} s by more than {s.DurationPercent:0%}: a part of {m}" : $"duration {duration:0} s within [-{s.DurationPercent:0%}, +max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s)] of {m} ({M:0} s)";
-                if (kind == PreCheckDecision.Subset) extra["subsetOf"] = m;
-                // canonical = Chinese audio only: a zh-audio upload whose group copies are all dubs is processed fully and becomes the canonical copy
-                var mine = a.Speech is { Unavailable: null } sp ? NormLang(sp.Language) ?? "zh" : null;
-                var cs = (copies.Count > 0 ? copies.Select(c => (Up: c.Upload, Lang: NormLang(c.SpeechLanguage) ?? "zh")) : [(m, NormLang(mt.SpeechLanguage) ?? "zh")]).ToList();
-                if (mine == "zh" && cs.All(c => c.Lang != "zh")) return R(PreCheckDecision.Canonical, $"{why2}; the new upload is original-language (zh) and all {cs.Count} known copies are dubs ({string.Join(", ", cs.Select(c => c.Up + ":" + c.Lang))}): processed as the canonical copy");
-                return R(kind, why2);
+                string sh = string.Join("/", shares.Select(x => x.ToString("0.00", CultureInfo.InvariantCulture)));
+                // what stops this member being the match when each segment needs the share `min`; null = it matches both segments in order
+                string? Fault(double min) =>
+                    shares.Any(x => x < min) ? $"share {sh} below {min.ToString("0.00", CultureInfo.InvariantCulture)} in a segment"
+                    : md == null ? "duration unknown"
+                    : segs.Count >= 2 && (times[0] == null || times[1] == null) ? "no matched time"
+                    : segs.Count >= 2 && !(times[0]!.Value < times[1]!.Value) ? $"segments out of order in {m} ({times[0]:0}s then {times[1]:0}s)"
+                    : segs.Count >= 2 && times[1]!.Value - times[0]!.Value < (segs[1].Mid - segs[0].Mid) - s.OrderToleranceSeconds ? $"gap in {m} {times[1]!.Value - times[0]!.Value:0}s is shorter than the gap in the new video {segs[1].Mid - segs[0].Mid:0}s by more than {s.OrderToleranceSeconds:0}s"
+                    : null;
+                var fault = Fault(s.SkipShare); bool ok = fault == null;
+                double M = md ?? 0, lo = M - s.DurationPercent * M, hi = M + Math.Max(s.DurationSlackPercent * M, s.DurationSlackSeconds);
+                // 0.13.61: the share alone is short of SkipShare, yet both segments match this member in order at PartialShare and the lengths are alike
+                bool same = !ok && s.OverlapSameLengthStops && segs.Count >= 2 && Fault(s.PartialShare) == null && duration >= lo && duration <= hi;
+                checks.Add(new MemberCheck(m, gid, md, shares, times, ok, ok ? "both segments match in order" : same ? $"{fault}; both are {s.PartialShare.ToString("0.00", CultureInfo.InvariantCulture)} or more, in order, and the length is the same" : fault!));
+                PreCheckDecision Verdict(bool overlap)
+                {
+                    var asTop = a.Top.FirstOrDefault(t => t.Upload == m);
+                    var mt = new PreCheckMatch(m, shares.Average(), asTop?.BestCosine ?? 0, times[0] ?? 0, segs.Sum(x => x.Shares.TryGetValue(m, out var q) ? q.Frames : 0), asTop?.SpeechLanguage ?? copies.FirstOrDefault(c => c.Upload == m)?.SpeechLanguage, asTop?.Dubbed ?? copies.FirstOrDefault(c => c.Upload == m)?.Dubbed, M);
+                    var longest = Longest(a, mt, M);
+                    string tm = string.Join("/", times.Select(x => x?.ToString("0") ?? "?"));
+                    string basis = overlap ? $"member {m} matches both segments in order at {s.PartialShare.ToString("0.00", CultureInfo.InvariantCulture)} or more, not at {s.SkipShare.ToString("0.00", CultureInfo.InvariantCulture)} (shares {sh}, times {tm} s)" : $"member {m} matches both segments (shares {sh}, times {tm} s, in order)";
+                    var extra = new JsonObject { ["memberDuration"] = Math.Round(M, 2), ["duration"] = Math.Round(duration, 2), ["timesInMember"] = new JsonArray(times.Select(x => (JsonNode?)(x == null ? null : Math.Round(x.Value, 1))).ToArray()) };
+                    if (overlap) extra["sameLengthOverlap"] = true;
+                    PreCheckDecision R(string d, string why) => new(d, [basis, why], mt) { MatchedMember = m, MatchedLongest = longest, Checked = checks.ToList(), Extra = extra };
+                    if (duration > hi) return R(PreCheckDecision.Longer, $"longer than {m}: {duration:0} s vs {M:0} s + max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s): processed");
+                    string kind = duration < lo ? PreCheckDecision.Subset : PreCheckDecision.Duplicate;
+                    string why2 = kind == PreCheckDecision.Subset ? $"{duration:0} s is shorter than {M:0} s by more than {s.DurationPercent:0%}: a part of {m}" : $"duration {duration:0} s within [-{s.DurationPercent:0%}, +max({s.DurationSlackPercent:0%}, {s.DurationSlackSeconds:0} s)] of {m} ({M:0} s)" + (overlap ? ": an overlap of the same length, stopped as a copy" : "");
+                    if (kind == PreCheckDecision.Subset) extra["subsetOf"] = m;
+                    // canonical = Chinese audio only: a zh-audio upload whose group copies are all dubs is processed fully and becomes the canonical copy
+                    var mine = a.Speech is { Unavailable: null } sp ? NormLang(sp.Language) ?? "zh" : null;
+                    var cs = (copies.Count > 0 ? copies.Select(c => (Up: c.Upload, Lang: NormLang(c.SpeechLanguage) ?? "zh")) : [(m, NormLang(mt.SpeechLanguage) ?? "zh")]).ToList();
+                    if (mine == "zh" && cs.All(c => c.Lang != "zh")) return R(PreCheckDecision.Canonical, $"{why2}; the new upload is original-language (zh) and all {cs.Count} known copies are dubs ({string.Join(", ", cs.Select(c => c.Up + ":" + c.Lang))}): processed as the canonical copy");
+                    return R(kind, why2);
+                }
+                if (ok) return Verdict(false);
+                if (same) sameLength ??= () => Verdict(true);
             }
         }
+        if (sameLength != null) return sameLength();
         var topM = bestUpload == null ? null : new PreCheckMatch(bestUpload, bestGroupShare, a.Top.FirstOrDefault(t => t.Upload == bestUpload)?.BestCosine ?? 0, 0, 0);
         var note = $"{checks.Count} member(s) checked in {order.Count} candidate group(s), none passed both segments in order";
         if (bestGroupShare >= s.PartialShare) return new(PreCheckDecision.Overlap, [$"best segment share {bestGroupShare:0.00} >= {s.PartialShare:0.00} ({bestUpload}); {note}"], topM) { Checked = checks };

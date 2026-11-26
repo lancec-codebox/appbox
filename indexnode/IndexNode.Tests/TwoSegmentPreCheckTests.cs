@@ -51,6 +51,30 @@ public class TwoSegmentPreCheckTests
     }
 
     [Fact]
+    public void An_overlap_of_the_same_length_stops_and_one_of_another_length_is_processed()
+    {
+        // 0.13.61 (owner, 2026-11-25: "Yes, same length only"): both segments match m1 in order at 0.60+, not at 0.80
+        static (double, double, double, double) Weak(double t1, double t2) => (0.73, t1, 0.70, t2);
+        var d = PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(6050)), 6000, _ => null, S);
+        Assert.Equal("duplicate", d.Decision); Assert.Equal("m1", d.MatchedMember); Assert.True((bool)d.Extra!["sameLengthOverlap"]!);
+        Assert.False(d.Checked[0].Passed); Assert.Contains("length is the same", d.Checked[0].Reason); Assert.Contains("overlap of the same length", d.Reasons[1]);
+        // the member is a compilation (far longer than the new upload), or a shorter cut: an overlap, processed
+        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(9000)), 6000, _ => null, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(5000)), 6000, _ => null, S).Decision);
+        // same length, but only one segment reaches 0.60, or the two are out of order: an overlap
+        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = (0.73, 1800, 0.40, 4200) }, durations: D(6000)), 6000, _ => null, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(4200, 1800) }, durations: D(6000)), 6000, _ => null, S).Decision);
+        // switched off: as before 0.13.61
+        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(6050)), 6000, _ => null, new PreCheckSettings { OverlapSameLengthStops = false }).Decision);
+        // a member that passes at 0.80 decides, wherever it stands: here m2 passes and the upload is longer than it, so it is processed
+        var both = PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200), ["m2"] = Ok(1500, 3900) }, durations: D(6000, 5000)), 6000, _ => null, S);
+        Assert.Equal("longer", both.Decision); Assert.Equal("m2", both.MatchedMember);
+        // the canonical exception holds for it too: zh audio and the only known copy is a dub
+        var zh = An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(6000), langs: new() { ["m1"] = "en" }, speech: new SpeechResult("zh", false, 3, 40, 60, null));
+        Assert.Equal("canonical", PreCheck.Decide(zh, 6000, _ => null, S).Decision);
+    }
+
+    [Fact]
     public void A_gap_shrink_within_the_tolerance_is_fine_and_a_gap_that_grows_too_much_is_not()
     {
         // the gap in N is 2400 s; in M 2400-120 = 2280 s passes (tolerance 120), 2279 s does not; a LONGER gap in M is fine
@@ -78,16 +102,20 @@ public class TwoSegmentPreCheckTests
         Assert.Equal("duplicate", d.Decision); Assert.Equal("m3", d.MatchedMember);
         Assert.Equal(["m2", "m1", "m3"], d.Checked.Select(c => c.Member).ToArray());
         Assert.Equal([false, false, true], d.Checked.Select(c => c.Passed).ToArray());
-        // the same group with no member passing: overlap, every member recorded
-        var none = PreCheck.Decide(An(6000, new() { ["m1"] = (1.0, 1800, 0.75, 4200), ["m2"] = (0.78, 1800, 1.0, 4200), ["m3"] = (0.70, 1800, 0.85, 4200) }, durations: D(6000, 6000, 6000)), 6000, _ => null, S);
+        // the same group with no member passing, the members far longer than the upload: overlap, every member recorded
+        var weak = new Dictionary<string, (double, double, double, double)> { ["m1"] = (1.0, 1800, 0.75, 4200), ["m2"] = (0.78, 1800, 1.0, 4200), ["m3"] = (0.70, 1800, 0.85, 4200) };
+        var none = PreCheck.Decide(An(6000, weak, durations: D(9000, 9000, 9000)), 6000, _ => null, S);
         Assert.Equal("overlap", none.Decision); Assert.Equal(3, none.Checked.Count);
+        // 0.13.61: the members have the upload's length: the first one tried that matches both segments at 0.60 makes it a copy, and every member is still recorded
+        var same = PreCheck.Decide(An(6000, weak, durations: D(6000, 6000, 6000)), 6000, _ => null, S);
+        Assert.Equal("duplicate", same.Decision); Assert.Equal("m2", same.MatchedMember); Assert.Equal(3, same.Checked.Count); Assert.All(same.Checked, c => Assert.False(c.Passed));
     }
 
     [Fact]
     public void Low_shares_are_new_and_the_canonical_exception_still_applies()
     {
         Assert.Equal("new", PreCheck.Decide(An(6000, new() { ["m1"] = (0.5, 1800, 0.4, 4200) }, durations: D(6000)), 6000, _ => null, S).Decision);
-        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = (0.7, 1800, 0.65, 4200) }, durations: D(6000)), 6000, _ => null, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = (0.7, 1800, 0.65, 4200) }, durations: D(9000)), 6000, _ => null, S).Decision);   // 0.13.61: against a member of the same length this is a copy
         var dubs = new Dictionary<string, string?> { ["m1"] = "en", ["m2"] = "ja" };
         var zh = new SpeechResult("zh", false, 3, 40, 60, null);
         var a = An(6000, new() { ["m1"] = Ok(1800, 4200), ["m2"] = Ok(1800, 4200) }, durations: D(6000, 6000), langs: dubs, speech: zh);
