@@ -1,5 +1,8 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- The page has its own version: CI publishes it on the rolling release when this number is new, and the app loads the newest page that is newer than the one inside it.
+     Raise ui-version with every change to this file; ui-min-host is the oldest app whose bridge this page needs. -->
+<meta name="ui-version" content="0.1.8.0"><meta name="ui-min-host" content="0.1.8">
 <title>IndexNode</title>
 <style>
  :root{--bg:#f4f5f7;--card:#fff;--ink:#16181d;--mute:#5d6470;--line:#dfe2e8;--accent:#1f5fbf;--accent-ink:#fff;--ok:#1a7f43;--bad:#b3261e;--warn:#9a5b00;--chip:#e7eaf0;--log-bg:#11141a;--log-ink:#d5d9e0}
@@ -121,7 +124,7 @@
 <!-- ============ Settings ============ -->
 <div class="tab" id="t-settings">
  <div class="card"><h2>App</h2><div id="app"></div>
-  <div class="pad"><div class="btns" style="margin-top:0"><button class="b" id="upcheck">Check for update</button><button class="b p" id="upgo2" style="display:none">Update</button></div><div class="msg" id="upmsg2"></div></div></div>
+  <div class="pad"><div class="btns" style="margin-top:0"><button class="b" id="upcheck">Check for update</button><button class="b p" id="upgo2" style="display:none">Update</button><button class="b" id="uicheck">Check for a newer page</button></div><div class="msg" id="upmsg2"></div><div class="msg" id="uimsg"></div></div></div>
  <div class="card"><h2>When to run</h2>
   <label class="f"><span>Wi-Fi only</span><input type="checkbox" id="wifiOnly"></label>
   <label class="f"><span>Only while charging</span><input type="checkbox" id="chargingOnly"></label>
@@ -202,7 +205,7 @@ function paint(s){
  $('s-check').innerHTML=check(c.checkUrl?true:null,'Server',c.checkUrl||'None')+row('Token',c.checkUrl?(c.checkToken?'Set':'None'):'');
  $('setupdot').style.display=(!s.configured||!medOk)?'':'none';
  // settings
- $('app').innerHTML=row('Version',s.hostVersion)+row('Update',u.state==='available'||u.state==='needs-permission'||u.state==='confirm'?'Version '+(u.offer?u.offer.version:'')+' is available':u.state==='current'?'Up to date':u.state==='checking'?'Checking…':u.state==='downloading'?'Downloading…':u.state==='installing'?'Installing…':u.state==='done'?'Updated':u.state==='failed'?'Check failed':'Not checked yet',u.checkedAt?'Checked '+u.checkedAt:'');
+ $('app').innerHTML=row('Version',s.hostVersion)+row('Update',u.state==='available'||u.state==='needs-permission'||u.state==='confirm'?'Version '+(u.offer?u.offer.version:'')+' is available':u.state==='current'?'Up to date':u.state==='checking'?'Checking…':u.state==='downloading'?'Downloading…':u.state==='installing'?'Installing…':u.state==='done'?'Updated':u.state==='failed'?'Check failed':'Not checked yet',u.checkedAt?'Checked '+u.checkedAt:'')+(s.ui?row('Page',s.ui.version+(s.ui.source==='downloaded'?' (updated; the app carries '+s.ui.bundled+')':' (the one in the app)'),s.ui.error?'Last check: '+s.ui.error:''):'');
  $('plugin').innerHTML=row('Version',s.pluginVersion||'Not loaded',s.pluginSource||'')+(s.pluginError?'<div class="row"><span class="k">Error</span><span class="val bad">'+esc(s.pluginError)+'</span></div>':'');
  update(u);
  // search: the service line, the wait message of a call in flight, and a picture another app shared
@@ -228,6 +231,7 @@ act('save',async()=>{const o={};for(const k of BOOLS)o[k]=$(k).checked;for(const
  await call('saveSettings',o);if(($('uiUrl').value||'')!==((S&&S.settings.uiUrl)||''))await call('setUiUrl',$('uiUrl').value);dirty=false;loaded=false;return 'Saved';},'savemsg');
 act('upd',async()=>{const r=await call('checkPluginUpdate');return (r.outcome==='current'?'The plugin is up to date':r.outcome==='updated'?'Plugin updated':r.outcome)+(r.version?' ('+r.version+')':'')+(r.detail?': '+r.detail:'');},'updmsg');
 act('upcheck',async()=>{const u=await call('checkAppUpdate');return u.message||u.state;},'upmsg2');
+act('uicheck',async()=>{const r=await call('checkUiUpdate');return r.outcome==='updated'?'Page '+r.version+' loaded':r.outcome==='current'?'The page is up to date ('+r.version+')':r.outcome==='needs-newer-host'?r.detail:'Page check failed: '+(r.detail||'');},'uimsg');
 const go=async()=>{const u=await call('installAppUpdate');return u.message||u.state;}; act('upgo',go,'upmsg'); act('upgo2',go,'upmsg2');
 
 // the reload button: the host loads the page again from its source (the app, or the UI URL) without the cache; a page opened outside the app just reloads
@@ -237,6 +241,8 @@ $('reload').onclick=async()=>{try{await call('reloadUi');}catch(e){location.relo
 // The picture goes to the service through the app (call 'service'); every answer is the service's own JSON. Pictures in answers are JPEGs in base64.
 let pic=null, busy=false, taking=false, run=0;
 const svc=a=>call('service',a);
+// 0.1.8: any route of the service under /v1/: api('GET','/v1/x?y=1'), api('POST','/v1/x',{json:{...}}), api('POST','/v1/x',{image:b64,fields:{...}}). New screens use this, so they need no new app.
+const api=(method,path,extra)=>call('service',Object.assign({method,path},extra||{}));
 const clock=t=>{t=Math.max(0,Math.round(t));return Math.floor(t/3600)+':'+String(Math.floor(t/60)%60).padStart(2,'0')+':'+String(t%60).padStart(2,'0');};
 const yt=(id,t)=>'https://www.youtube.com/watch?v='+encodeURIComponent(id)+(t>0?'&t='+Math.floor(t)+'s':'');
 const sceneWord=x=>x>=0.52?['Match','ok']:x>=0.46?['Possible','warn']:['Weak',''];

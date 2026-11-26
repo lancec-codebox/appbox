@@ -32,6 +32,7 @@ jobs:
     outputs:
       host: ${{ steps.v.outputs.host }}
       plugin: ${{ steps.v.outputs.plugin }}
+      ui: ${{ steps.v.outputs.ui }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -47,7 +48,19 @@ jobs:
           set -euo pipefail
           H="$(sed -nE 's/.*<ApplicationDisplayVersion>([^<]+)<.*/\1/p' indexnode-android/Host/Host.csproj | head -1)"
           P="$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' indexnode-android/Plugin/Plugin.csproj | head -1)"
-          echo "host=$H" >> "$GITHUB_OUTPUT"; echo "plugin=$P" >> "$GITHUB_OUTPUT"
+          # the page's own version and the oldest app it runs on (meta tags of the page; the app's UiManager reads the same tags)
+          U="$(sed -nE 's/.*<meta name="ui-version" content="([^"]+)".*/\1/p' indexnode-android/Host/Assets/web/index.html | head -1)"
+          UM="$(sed -nE 's/.*<meta name="ui-min-host" content="([^"]+)".*/\1/p' indexnode-android/Host/Assets/web/index.html | head -1)"
+          [ -n "$U" ] && [ -n "$UM" ] || { echo "::error::index.html has no ui-version / ui-min-host meta tag"; exit 1; }
+          echo "host=$H" >> "$GITHUB_OUTPUT"; echo "plugin=$P" >> "$GITHUB_OUTPUT"; echo "ui=$U" >> "$GITHUB_OUTPUT"; echo "uimin=$UM" >> "$GITHUB_OUTPUT"
+      - name: Page (the WebView UI, published beside the plugin so the app can update it without a new APK)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp indexnode-android/Host/Assets/web/index.html out/ui.html
+          SHA="$(sha256sum out/ui.html | cut -d' ' -f1)"
+          printf '{"version":"%s","sha256":"%s","page":"ui.html","minHost":"%s"}\n' "${{ steps.v.outputs.ui }}" "$SHA" "${{ steps.v.outputs.uimin }}" > out/ui.json
+          cat out/ui.json
       - name: Plugin
         run: |
           dotnet build indexnode-android/Plugin -c Release
@@ -96,7 +109,8 @@ jobs:
           path: out/*
 
   release:
-    # main only. A new host version publishes the APK as release indexnode-android-v<version>; a new plugin version replaces the assets of the rolling release indexnode-android-plugin.
+    # main only. A new host version publishes the APK as release indexnode-android-v<version>; a new plugin version replaces the assets of the rolling release indexnode-android-plugin;
+    # a new page version (the ui-version meta tag of index.html) replaces ui.html and ui.json there.
     needs: build
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
@@ -131,6 +145,14 @@ jobs:
           else
             gh release create "$TAG" out/IndexNode.Plugin.dll out/manifest.json --latest=false --title "IndexNode Android plugin (rolling)" --notes "The newest plugin DLL and its manifest. The app checks manifest.json before each run."
           fi
+      - name: Page on the rolling release (new version only)
+        run: |
+          set -euo pipefail
+          TAG="indexnode-android-plugin"
+          NEW="${{ needs.build.outputs.ui }}"
+          CUR="$(gh release download "$TAG" --pattern ui.json -O - 2>/dev/null | sed -nE 's/.*"version":"([^"]+)".*/\1/p')" || CUR=""
+          # the page first, then the manifest that names it: an app that reads the manifest in between still finds the page its hash describes or refuses it
+          if [ "$CUR" = "$NEW" ]; then echo "page $NEW is already on $TAG"; else gh release upload "$TAG" out/ui.html --clobber; gh release upload "$TAG" out/ui.json --clobber; fi
       - name: host.json on the rolling release (when the published APK is this build's version and its hash differs from what is there)
         run: |
           set -euo pipefail

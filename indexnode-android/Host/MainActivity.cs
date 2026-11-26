@@ -64,7 +64,9 @@ public class MainActivity : Activity
         base.OnCreate(savedInstanceState);
         _rt = NodeRuntime.Get(this);
         _bridge = new Bridge(Handle, () => _origin, _rt.Host.Log);
-        _assets = new WebViewAssetLoader.Builder().AddPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this)!)!.Build()!;
+        // /assets/ is the APK's own files; /ui/ (0.1.8) is the folder of downloaded pages, same origin, so the bridge treats both alike
+        _assets = new WebViewAssetLoader.Builder().AddPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this)!)!
+            .AddPathHandler("/ui/", new WebViewAssetLoader.InternalStoragePathHandler(this, new Java.IO.File(_rt.Ui.WwwDir)))!.Build()!;
         _web = new WebView(this);
         _web.Settings.JavaScriptEnabled = true;
         _web.Settings.AllowFileAccess = false;
@@ -111,15 +113,30 @@ public class MainActivity : Activity
     async Task StartupUpdateAsync()
     {
         try { var r = await _rt.CheckPluginAsync(); _rt.Host.Log($"plugin on start: {r.Outcome} {r.Version} {r.Detail}"); } catch (Exception e) { _rt.Host.Log("plugin check failed: " + e.Message); }
+        try { if ((await _rt.CheckUiAsync()).Switched) RunOnUiThread(() => LoadUi()); } catch (Exception e) { _rt.Host.Log("page check failed: " + e.Message); }   // 0.1.8: a newer page is shown at once
         await _rt.Updater.CheckAsync(default);   // 0.1.5: the app's own update; a failure is a state the page shows, never an exception
     }
 
     string? SavedUiUrl => _rt.Prefs.Get("uiUrl");
 
+    string? _uiVersion; volatile bool _uiAlive;   // 0.1.8: the downloaded page being shown, and whether it has called the app yet
+
+    // A downloaded page must call the app soon after it loads. One that does not is broken on this phone: it is never loaded again, and the page before it (or the one in the app) is shown.
+    void WatchPage(string version) => _ = Task.Run(async () =>
+    {
+        await Task.Delay(TimeSpan.FromSeconds(15));
+        if (_uiVersion != version || _uiAlive) return;
+        _rt.Host.Log($"page {version} did not come alive in 15 s: it will not be used again");
+        _rt.Ui.MarkBad(version); RunOnUiThread(() => LoadUi());
+    });
+
+    // Which page: a UI URL from Settings (a developer's override), else the newest downloaded page that is newer than the one in the app, else the page in the app.
     void LoadUi(bool bundledOnly = false)
     {
         var url = bundledOnly ? null : SavedUiUrl;
         var origin = string.IsNullOrWhiteSpace(url) ? null : Bridge.OriginOf(url!);
+        _uiVersion = null;
+        if (origin == null && !bundledOnly && _rt.Ui.PageToLoad() is { } page) { url = AssetOrigin + "/ui/" + page.File; origin = AssetOrigin; _uiVersion = page.Version; _uiAlive = false; WatchPage(page.Version); }
         if (origin == null) { url = BundledUrl; origin = AssetOrigin; }
         if (!WebViewFeature.IsFeatureSupported(WebViewFeature.WebMessageListener)) _rt.Host.Log("WebMessageListener NOT supported by this WebView");
         else
@@ -134,8 +151,10 @@ public class MainActivity : Activity
 
     async Task<JsonNode?> Handle(string m, string arg)
     {
+        _uiAlive = true;
         switch (m)
         {
+            case "checkUiUpdate": { var r = await _rt.CheckUiAsync(); if (r.Switched) RunOnUiThread(() => LoadUi()); return new JsonObject { ["outcome"] = r.Outcome, ["version"] = r.Version, ["detail"] = r.Detail }; }
             case "getState": { var s = _rt.StateJson(); s["medusa"] = await _rt.MedusaStatusAsync(); return s; }
             case "getLog": return new JsonArray(_rt.Host.LogLines().Select(l => (JsonNode?)JsonValue.Create(l)).ToArray());
             case "clearLog": _rt.Host.ClearLog(); return true;

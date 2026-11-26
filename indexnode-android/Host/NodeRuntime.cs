@@ -21,6 +21,8 @@ public sealed class NodeRuntime
     public PluginManager Plugins { get; }
     /// <summary>0.1.5: the app's own update (find, download, verify, install).</summary>
     public AppUpdater Updater { get; }
+    /// <summary>0.1.8: the page's own updates (the page of the rolling release, kept beside the one in the app).</summary>
+    public UiManager Ui { get; }
     /// <summary>0.1.6: the Search tab's calls to the service (screenshot search, frames, actors).</summary>
     public ServiceCalls Service { get; }
     /// <summary>0.1.6: a picture another app shared to this one (a screenshot), kept until the Search tab takes it.</summary>
@@ -45,6 +47,9 @@ public sealed class NodeRuntime
         Directory.CreateDirectory(Host.FilesDir);
         Plugins = new PluginManager(Path.Combine(ctx.FilesDir!.AbsolutePath, "plugins"), LoadBundled, HostVersion);
         Updater = new AppUpdater(ctx, () => HostVersion, m => Host.Log(m), () => Running);
+        string? bundledUi = null;
+        try { using var pg = ctx.Assets!.Open("web/index.html"); using var sr = new StreamReader(pg); bundledUi = UiManager.Meta(sr.ReadToEnd(), "ui-version"); } catch (Exception e) { Host.Log("the page in the app could not be read: " + e.Message); }
+        Ui = new UiManager(Path.Combine(ctx.FilesDir!.AbsolutePath, "ui"), bundledUi, HostVersion);
         Service = new ServiceCalls(Host.HttpAsync, () => (Prefs.Get("checkUrl"), Prefs.CheckToken), ReadServiceFileAsync, m => Host.Log(m));
     }
 
@@ -54,6 +59,14 @@ public sealed class NodeRuntime
         if (Prefs.Sas == null) return null;
         var r = await Host.StoreAsync("GET", ServiceCalls.StoreFile, null, null, 64 * 1024, ct);
         return r.Status == 200 ? r.Text : null;
+    }
+
+    /// <summary>0.1.8: looks for a newer page on the rolling release; "updated" means the caller loads it now.</summary>
+    public async Task<UpdateResult> CheckUiAsync()
+    {
+        var r = await Ui.CheckAsync((u, ct) => http.GetByteArrayAsync(u, ct), Prefs.Get("uiManifestUrl") ?? UiManager.RollingManifestUrl);
+        Host.Log($"page check: {r.Outcome} {r.Version} {r.Detail}");
+        return r;
     }
 
     private (Manifest, byte[])? LoadBundled()
@@ -193,6 +206,7 @@ public sealed class NodeRuntime
             },
             ["medusaMode"] = MedusaMode(),
             ["search"] = new JsonObject { ["waiting"] = Service.Waiting, ["shared"] = SharedImage != null },
+            ["ui"] = new JsonObject { ["version"] = Ui.Active.Version, ["source"] = Ui.Active.Source, ["bundled"] = Ui.Bundled, ["error"] = Ui.LastError },
             ["appUpdate"] = Updater.Json(),
         };
     }

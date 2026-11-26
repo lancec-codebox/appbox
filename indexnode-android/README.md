@@ -4,7 +4,7 @@ A phone node of the drama index. A small .NET 11 (CoreCLR, untrimmed) Android ho
 
 ## Layout
 - `Contract/` (netstandard2.1, `IndexNode.Contract`): `IHost`, `IPlugin`, `ITools`, `IToolWorkspace`. The only thing host and plugin share.
-- `Loader/` (net10.0, plain): hash-verified plugin loading in a collectible context, `PluginManager` (update, smoke test, last good, bundled fallback), `Bridge` (WebView message router), `HostPolicy` (run conditions, setup parsing, node id, redaction), `StoreGate` (the SAS is added here only).
+- `Loader/` (net10.0, plain): `UiManager` (0.1.8: the page's own updates), `ServiceCalls` (the page's calls to `indexnode serve`), hash-verified plugin loading in a collectible context, `PluginManager` (update, smoke test, last good, bundled fallback), `Bridge` (WebView message router), `HostPolicy` (run conditions, setup parsing, node id, redaction), `StoreGate` (the SAS is added here only).
 - `Medusa/` (net10.0): `MedusaClient` + `MedusaV2Tools` (pairing, runs, workspaces, Range reads), `MedusaV1Tools` (plain-video fallback).
 - `Plugin/` (net11.0): `NodePlugin`: the node loop on `IndexNode.Core`, using only `IHost` and `ITools`. One DLL: Core is embedded as a resource.
 - `Host/` (net11.0-android): activity, WebView page (`Assets/web/index.html`), WorkManager worker, `AndroidHost`, settings. No node logic.
@@ -12,7 +12,7 @@ A phone node of the drama index. A small .NET 11 (CoreCLR, untrimmed) Android ho
 
 ## Build and test
 ```
-dotnet test indexnode-android/Tests -c Release            # 62 tests
+dotnet test indexnode-android/Tests -c Release            # 67 tests
 dotnet workload install android                            # once; SDK 11
 dotnet build indexnode-android/Plugin -c Release           # -> Plugin/bin/Release/net11.0/IndexNode.Plugin.dll
 dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release/net11.0-android/*-Signed.apk
@@ -20,6 +20,14 @@ dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release
 Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug"`, then `-p:AndroidKeyStore=true -p:AndroidSigningKeyStore=debug.keystore -p:AndroidSigningStorePass=android -p:AndroidSigningKeyAlias=androiddebugkey -p:AndroidSigningKeyPass=android`.
 
 ## Release notes
+
+### 0.1.8 (host 0.1.8, versionCode 9, plugin 0.1.2, page 0.1.8.0)
+- **The page updates without a new APK** (owner, 2026-11-25: "We seem to be changing the outer app a lot"). The page (`Host/Assets/web/index.html`) has its own version, the meta tag `ui-version`; CI publishes it as `ui.html` with `ui.json` (`{version, sha256, page, minHost}`) on the rolling release whenever that version is new. The app looks on start and from Settings, App, "Check for a newer page": a page newer than the one it shows, whose hash matches, whose own tags agree with the manifest and whose `ui-min-host` is not above the app's version, is kept in the app's files and loaded at once. The page before it stays on disk. Rules in `Loader/UiManager.cs` (tested).
+- **A downloaded page that does not come alive is dropped.** After loading one, the app waits 15 s for its first call; without one it marks that version bad, never loads it again, and shows the page before it or the one in the APK. The page in the APK is always the last resort, and a newer APK's page wins over an older downloaded one.
+- **The page's service call is general.** `service` also takes `{method: GET|POST, path: "/v1/...", json | image [+ fields]}`: any route of the configured service under `/v1/`, the address and token added by the app; nothing outside `/v1/`, no other host. The page helper is `api(method, path, extra)`. The named operations of 0.1.6 and 0.1.7 still work. A new route of the service plus a new page is now a release without an APK.
+- **To change the page from now on:** edit `index.html`, raise `ui-version` (and `ui-min-host` only when the page needs a newer bridge), merge to main. The APK is rebuilt only when `ApplicationDisplayVersion` changes; it then carries that page too.
+- The outer app now changes only for what needs Android itself (permissions, share targets, notifications) or a new bridge method.
+- Not verified on a phone: loading a page from the app's files folder (`WebViewAssetLoader.InternalStoragePathHandler`, served under `/ui/`).
 
 ### 0.1.7 (host 0.1.7, versionCode 8, plugin 0.1.2; needs IndexNode 0.13.63 on the service)
 - **A Review tab: the uploads held as AI** (owner, 2026-11-25). The list comes from the service (the two queues as they are now): the AI score, title, channel, length, when it was held and at which step, lowest score first (or newest first), with a filter by title or channel. Each card shows six pictures from the upload's sample, a link to the video on YouTube, and two buttons, **Real** and **AI**.

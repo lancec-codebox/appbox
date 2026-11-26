@@ -12,6 +12,7 @@ public sealed class Bridge(Func<string, string, Task<JsonNode?>> handler, Func<s
     public static readonly string[] Methods =
     [
         "getState", "getLog", "runNow", "stopRun", "saveSettings", "importSetup", "pairMedusa", "pairStatus", "checkPluginUpdate", "setUiUrl", "clearLog", "shareLog", "getDiagnostics", "clearDiagnostics", "checkAppUpdate", "installAppUpdate", "reloadUi",
+        "checkUiUpdate",           // 0.1.8: the page itself updates from the rolling release (see UiManager)
         "service", "takeShared",   // 0.1.6: the Search tab (see ServiceCalls) and a picture another app shared to this one
     ];
 

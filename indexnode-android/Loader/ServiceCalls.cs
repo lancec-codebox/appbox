@@ -47,6 +47,25 @@ public sealed class ServiceCalls(HostHttp http, Func<(string? Url, string? Token
     /// <summary>The request an operation becomes: method, path with query, and the multipart body when it carries a picture.</summary>
     public static (string Method, string Path, byte[]? Body, string? ContentType) Build(JsonObject a)
     {
+        // 0.1.8, the general form: {"method": "GET"|"POST", "path": "/v1/...", "json": {...} | "image": base64 [, "fields": {...}]}. Any route of the service under /v1/, and nothing else:
+        // the host and the token are the app's, the page only names the path. A new route of the service needs no new app.
+        if (a["op"] == null && Str(a, "path") is { } p)
+        {
+            string method = (Str(a, "method") ?? "GET").ToUpperInvariant();
+            if (method is not ("GET" or "POST")) throw new ArgumentException("method: GET or POST");
+            if (!p.StartsWith("/v1/", StringComparison.Ordinal) || p.Length > 2000 || p.Contains("..") || p.Contains("//") || p.Any(c => c <= ' ' || c > '~' || c is '\\' or '#' or '@')) throw new ArgumentException("path: a route under /v1/ is expected");
+            if (a["image"] != null)
+            {
+                if (method != "POST") throw new ArgumentException("a picture goes with POST");
+                byte[] img; try { img = Convert.FromBase64String(Str(a, "image") ?? ""); } catch (FormatException) { throw new ArgumentException("the picture is not base64"); }
+                if (img.Length == 0 || img.Length > MaxImageBytes) throw new ArgumentException($"the picture is empty or over {MaxImageBytes / (1024 * 1024)} MB");
+                var fs = (a["fields"] as JsonObject)?.Where(kv => kv.Value is JsonValue && System.Text.RegularExpressions.Regex.IsMatch(kv.Key, "^[A-Za-z0-9_]{1,40}$")).Select(kv => (kv.Key, kv.Value!.ToString().Replace("\r", " ").Replace("\n", " "))).ToList() ?? [];
+                var (mb, mt) = Multipart(img, fs);
+                return (method, p, mb, mt);
+            }
+            if (a["json"] is JsonNode j) return method == "POST" ? (method, p, Encoding.UTF8.GetBytes(j.ToJsonString()), "application/json") : throw new ArgumentException("a body goes with POST");
+            return (method, p, null, null);
+        }
         string op = Str(a, "op") ?? throw new ArgumentException("no op");
         string Id(string k) { var v = Str(a, k) ?? throw new ArgumentException($"{op}: no {k}"); if (v.Length > 64 || v.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '#'))) throw new ArgumentException($"{op}: {k} is not an id"); return v; }
         string Num(string k, double d, double min, double max) { double v = a[k] is JsonValue jv && jv.TryGetValue<double>(out var x) ? x : d; return Math.Clamp(v, min, max).ToString("0.###", CultureInfo.InvariantCulture); }
@@ -100,7 +119,7 @@ public sealed class ServiceCalls(HostHttp http, Func<(string? Url, string? Token
         var first = saved(); if (!OkUrl(first.Url)) first = (null, null);
         var where = first.Url != null ? first : await FromStoreAsync(ct);
         if (where.Url == null) throw new InvalidOperationException("No service is set up: scan a setup QR that carries the check server (Setup, step 3).");
-        bool status = (string?)a["op"] == "status";
+        bool status = Str(a, "op") == "status" || Str(a, "path") == "/v1/health";
         try { return await SendAsync(where, method, path, body, contentType, status, ct); }
         catch (HttpRequestException) when (first.Url != null && !status)
         {   // the saved address did not answer in all that time: the store may name a newer one (the service was moved)
