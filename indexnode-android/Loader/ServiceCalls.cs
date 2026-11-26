@@ -17,7 +17,7 @@ public delegate Task<HostResponse> HostHttp(string method, string url, IReadOnly
 /// </summary>
 public sealed class ServiceCalls(HostHttp http, Func<(string? Url, string? Token)> saved, Func<CancellationToken, Task<string?>> storeFile, Action<string> log)
 {
-    public static readonly string[] Ops = ["status", "search", "actors", "frames", "actor", "shots"];
+    public static readonly string[] Ops = ["status", "search", "actors", "frames", "actor", "shots", "holds", "holdframes", "verdict"];
     public const string StoreFile = "/index/service.json";
     public const int MaxImageBytes = 8 * 1024 * 1024, MaxAnswerBytes = 16 * 1024 * 1024;
     public TimeSpan WakeFor { get; set; } = TimeSpan.FromSeconds(150);
@@ -56,6 +56,15 @@ public sealed class ServiceCalls(HostHttp http, Func<(string? Url, string? Token
             case "frames": return ("GET", $"/v1/frames?upload={Uri.EscapeDataString(Id("upload"))}&at={Num("at", 0, 0, 1e6)}&around={Num("around", 2, 0, 6)}&step={Num("step", 3, 1, 600)}&width={Num("width", 320, 64, 720)}", null, null);
             case "actor": return ("GET", "/v1/actors/" + Uri.EscapeDataString(Id("actor")), null, null);
             case "shots": return ("GET", $"/v1/actors/shots?upload={Uri.EscapeDataString(Id("upload"))}&unit={Uri.EscapeDataString(Id("unit"))}&count={Num("count", 6, 1, 12)}&width={Num("width", 240, 64, 720)}", null, null);
+            // 0.1.7: the owner's review of AI holds. "verdict" is the one operation that changes the store (through the service: the same as `indexnode ai set`)
+            case "holds": return ("GET", "/v1/ai/holds", null, null);
+            case "holdframes": return ("GET", $"/v1/ai/frames?upload={Uri.EscapeDataString(Id("upload"))}&count={Num("count", 6, 2, 12)}&width={Num("width", 240, 64, 720)}", null, null);
+            case "verdict":
+            {
+                string v = Str(a, "verdict") is "real" or "ai" ? Str(a, "verdict")! : throw new ArgumentException("verdict: real or ai");
+                var o = new JsonObject { ["upload"] = Id("upload"), ["verdict"] = v, ["reason"] = Str(a, "reason") is { } r ? r[..Math.Min(200, r.Length)] : null, ["by"] = Str(a, "by") is { } b ? b[..Math.Min(60, b.Length)] : null };
+                return ("POST", "/v1/ai/verdict", Encoding.UTF8.GetBytes(o.ToJsonString()), "application/json");
+            }
             case "search":
             case "actors":
             {

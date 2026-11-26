@@ -47,6 +47,23 @@ public class ServiceCallsTests
     }
 
     [Fact]
+    public async Task The_review_of_ai_holds_lists_shows_and_sends_a_verdict()
+    {
+        var f = new Fake(); var s = f.Make();
+        await s.CallAsync(Arg(new { op = "holds" }), default);
+        await s.CallAsync(Arg(new { op = "holdframes", upload = "2ew-ffbGang" }), default);
+        await s.CallAsync(Arg(new { op = "verdict", upload = "2ew-ffbGang", verdict = "real", by = "s20-fe", reason = "looked" }), default);
+        Assert.Equal(["GET https://svc.example/v1/ai/holds", "GET https://svc.example/v1/ai/frames?upload=2ew-ffbGang&count=6&width=240", "POST https://svc.example/v1/ai/verdict"], f.Calls.Select(c => c.Method + " " + c.Url).ToArray());
+        Assert.Equal("application/json", f.Calls[2].Type); Assert.Equal("Bearer tok", f.Calls[2].Auth);
+        var sent = JsonNode.Parse(Encoding.UTF8.GetString(f.Calls[2].Body!))!;
+        Assert.Equal(("2ew-ffbGang", "real", "s20-fe", "looked"), ((string)sent["upload"]!, (string)sent["verdict"]!, (string)sent["by"]!, (string)sent["reason"]!));
+        // only real or ai, and only for a plain id
+        await Assert.ThrowsAsync<ArgumentException>(() => s.CallAsync(Arg(new { op = "verdict", upload = "2ew-ffbGang", verdict = "delete" }), default));
+        await Assert.ThrowsAsync<ArgumentException>(() => s.CallAsync(Arg(new { op = "verdict", upload = "a/b", verdict = "ai" }), default));
+        Assert.Equal(3, f.Calls.Count);
+    }
+
+    [Fact]
     public async Task Nothing_but_the_known_operations_and_plain_ids_gets_through()
     {
         var s = new Fake().Make();

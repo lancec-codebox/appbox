@@ -54,6 +54,10 @@
  .cand{display:flex;gap:8px;align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);background:none;border:0;border-top:1px solid var(--line);padding:8px 0;min-height:40px} .cand:first-child{border-top:0}
  .cand .nm{flex:1;min-width:0} .cand small{display:block;color:var(--mute)} .cand .go{color:var(--accent);font-weight:700}
  .empty{padding:10px 12px;color:var(--mute)}
+ /* review */
+ .seg{display:flex;gap:6px;flex-wrap:wrap} .seg button.b{min-height:36px;padding:6px 12px;font-weight:600} .seg button.b.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+ .rvb{display:flex;gap:8px;align-items:center;padding:0 12px 10px} .rvb button.b{flex:1;min-height:44px} .rvb button.real{border-color:var(--ok);color:var(--ok)} .rvb button.ai{border-color:var(--bad);color:var(--bad)}
+ .rvb .chip{flex:0 0 auto} .rvc .msg{padding:0 12px 8px;margin:0}
 </style></head><body>
 <header><b>IndexNode</b><span class="v" id="ver"></span><span class="sp"></span><span class="chip" id="chip">…</span><button id="reload" aria-label="Reload the page" title="Reload the page">↻</button></header>
 <main>
@@ -82,6 +86,17 @@
  <div id="results"></div>
  <div class="card"><h2>Search service</h2><div id="svc"></div>
   <div class="pad" style="color:var(--mute)">The same service the downloads use. It sleeps when idle; the first search wakes it, which can take a minute.</div></div>
+</div>
+<!-- ============ Review (0.1.7): uploads held as AI ============ -->
+<div class="tab" id="t-review">
+ <div class="card"><h2>Held as AI</h2><div class="pad">
+  <div id="rvsum" style="color:var(--mute)">Open this tab to load the list.</div>
+  <div class="seg" style="margin-top:8px"><button class="b on" id="rvtodo">To review</button><button class="b" id="rvai">Marked AI</button><button class="b" id="rvsort">Lowest score first</button><button class="b" id="rvload">Refresh</button></div>
+  <input type="search" id="rvq" placeholder="Filter by title or channel" style="margin-top:8px">
+  <div class="msg" id="rvmsg"></div></div></div>
+ <div id="rvlist"></div>
+ <button class="b" id="rvmore" style="display:none;width:100%;margin-bottom:10px">Show more</button>
+ <div class="card"><div class="pad" style="color:var(--mute)">Real: the hold is released and the verdict is written to the upload's record; a held download is fetched the next time downloads are on. AI: it stays held. Either can be changed later.</div></div>
 </div>
 <!-- ============ Activity ============ -->
 <div class="tab" id="t-activity">
@@ -136,7 +151,7 @@
 </div>
 </main>
 <nav>
- <button data-t="status" class="on">Status</button><button data-t="search">Search</button><button data-t="activity">Activity</button><button data-t="setup">Setup<span class="dot" id="setupdot" style="display:none"></span></button><button data-t="settings">Settings<span class="dot" id="setdot" style="display:none"></span></button>
+ <button data-t="status" class="on">Status</button><button data-t="search">Search</button><button data-t="review">Review</button><button data-t="activity">Activity</button><button data-t="setup">Setup<span class="dot" id="setupdot" style="display:none"></span></button><button data-t="settings">Settings<span class="dot" id="setdot" style="display:none"></span></button>
 </nav>
 <script>
 const $=id=>document.getElementById(id); let n=0; const pend={};
@@ -150,9 +165,9 @@ const mb=b=>b>0?(b/1048576).toFixed(0)+' MB':'';
 
 // ---- tabs ----
 let tab='status';
-function show(t){tab=t;for(const b of document.querySelectorAll('nav button'))b.classList.toggle('on',b.dataset.t===t);for(const d of document.querySelectorAll('.tab'))d.classList.toggle('on',d.id==='t-'+t);if(location.hash!=='#'+t)location.hash=t;if(t==='activity')log();if(t==='settings')diag();}
+function show(t){tab=t;for(const b of document.querySelectorAll('nav button'))b.classList.toggle('on',b.dataset.t===t);for(const d of document.querySelectorAll('.tab'))d.classList.toggle('on',d.id==='t-'+t);if(location.hash!=='#'+t)location.hash=t;if(t==='activity')log();if(t==='settings')diag();if(t==='review')rvOpen();}
 for(const b of document.querySelectorAll('nav button'))b.onclick=()=>show(b.dataset.t);
-window.onhashchange=()=>{const t=location.hash.slice(1);if(['status','search','activity','setup','settings'].includes(t)&&t!==tab)show(t);};
+window.onhashchange=()=>{const t=location.hash.slice(1);if(['status','search','review','activity','setup','settings'].includes(t)&&t!==tab)show(t);};
 
 // ---- state ----
 let S=null, loaded=false, dirty=false;
@@ -259,6 +274,39 @@ async function actor(id,box){box.innerHTML='<div class="empty">Loading '+esc(id)
  }catch(e){box.innerHTML='<div class="empty bad">'+esc(e.message)+'</div>';}}
 $('findactors').onclick=()=>work('findactors','Looking at the faces…',async live=>{const a=await svc({op:'actors',image:pic.b64});if(!live())return;$('results').innerHTML='<div class="card"><h2>Faces in the picture</h2>'+faces(a,'fa')+'</div>';wire($('results'));});
 
+// ---- review (0.1.7): the uploads held as AI ----
+// The list comes from the service (the queues as they are now); a verdict goes back through it and is written to the store there, as `indexnode ai set` does.
+let RV=null, rvMode='todo', rvSort='score', rvShown=0, rvLoading=false, rvPump=false; const RVPAGE=20, rvPics={}, rvWant=[];
+const rvList=()=>{const q=$('rvq').value.trim().toLowerCase();let l=(RV||[]).filter(h=>rvMode==='ai'?h.verdict==='ai':(!h.verdict||h.now));
+ if(q)l=l.filter(h=>((h.title||'')+' '+(h.channel||'')+' '+h.upload).toLowerCase().includes(q));if(rvSort==='new')l=l.slice().sort((a,b)=>(b.heldAt||'').localeCompare(a.heldAt||''));return l;};
+const rvButtons=h=>h.verdict?'<span class="chip '+(h.verdict==='real'?'ok':'bad')+'">Marked '+(h.verdict==='real'?'real':'AI')+'</span><button class="b" data-v="'+(h.verdict==='real'?'ai':'real')+'">Change to '+(h.verdict==='real'?'AI':'real')+'</button>':'<button class="b real" data-v="real">Real</button><button class="b ai" data-v="ai">AI</button>';
+const rvCard=h=>'<div class="card res rvc" id="rv_'+h.upload+'" data-id="'+h.upload+'"><div class="head"><span class="chip '+(h.score>=0.8?'bad':'warn')+'">AI '+(h.score==null?'?':h.score.toFixed(2))+'</span><span class="t">'+esc(h.title||h.upload)+'</span></div><div class="sub">'+esc([h.channel,h.duration?clock(h.duration):'',h.heldAt?'held '+h.heldAt.slice(5,10):'',(h.held||[]).map(x=>x.split('/')[1]).join(', ')].filter(Boolean).join(' · '))+'</div><div class="strip">'+(rvPics[h.upload]||'')+'</div><div class="links"><a href="'+yt(h.upload,0)+'">Open on YouTube</a></div><div class="rvb">'+rvButtons(h)+'</div><div class="msg"></div></div>';
+function rvSum(){if(!RV)return;$('rvsum').textContent=RV.length+' held as AI · '+RV.filter(h=>!h.verdict).length+' to review · '+RV.filter(h=>h.verdict==='ai').length+' marked AI'+(RV.some(h=>h.now&&h.verdict==='real')?' · '+RV.filter(h=>h.now&&h.verdict==='real').length+' marked real just now':'');}
+// pictures: only for the cards that come into view, one upload at a time (each is a few seconds: the service cuts them from the sample)
+const rvSee=new IntersectionObserver(es=>{for(const e of es)if(e.isIntersecting){const id=e.target.dataset.id;if(!rvPics[id]&&!rvWant.includes(id)){rvWant.push(id);rvPull();}}},{root:document.querySelector('main'),rootMargin:'250px'});
+async function rvPull(){if(rvPump)return;rvPump=true;while(rvWant.length){const id=rvWant.pop();if(tab!=='review'||!$('rv_'+id))continue;
+ try{const f=await svc({op:'holdframes',upload:id,count:6,width:240});rvPics[id]=(f.frames||[]).map(x=>fig(x,id)).join('')||'<span class="empty" style="padding:0">No pictures stored.</span>';}catch(e){rvPics[id]='<span class="empty bad" style="padding:0">Pictures: '+esc(e.message)+'</span>';}
+ const c=$('rv_'+id);if(c)c.querySelector('.strip').innerHTML=rvPics[id];}rvPump=false;}
+function rvDraw(more){const l=rvList();if(!more){rvShown=0;$('rvlist').innerHTML='';rvSee.disconnect();}
+ const next=l.slice(rvShown,rvShown+RVPAGE);rvShown+=next.length;$('rvlist').insertAdjacentHTML('beforeend',next.map(rvCard).join(''));
+ if(!l.length)$('rvlist').innerHTML='<div class="card"><div class="empty">'+(RV&&RV.length?'Nothing matches.':'Nothing is held as AI.')+'</div></div>';
+ for(const id of next.map(h=>h.upload))rvSee.observe($('rv_'+id));
+ // the first three of a fresh list are fetched at once (not left to the observer), the first card first
+ if(!more){for(const h of next.slice(0,3).reverse())if(!rvPics[h.upload]&&!rvWant.includes(h.upload))rvWant.push(h.upload);rvPull();}
+ $('rvmore').style.display=l.length>rvShown?'':'none';$('rvmore').textContent='Show more ('+(l.length-rvShown)+' left)';rvSum();}
+async function rvLoad(){if(rvLoading)return;rvLoading=true;$('rvmsg').className='msg';$('rvmsg').textContent='Loading the list…';
+ try{const r=await svc({op:'holds'});RV=r.holds||[];$('rvmsg').textContent='';rvDraw();}catch(e){$('rvmsg').className='msg bad';$('rvmsg').textContent=e.message.replace(/^[A-Za-z]+Exception: /,'');}rvLoading=false;}
+function rvOpen(){if(!RV)rvLoad();else rvDraw();}
+$('rvload').onclick=rvLoad; $('rvmore').onclick=()=>rvDraw(true); $('rvq').oninput=()=>rvDraw();
+$('rvtodo').onclick=()=>{rvMode='todo';$('rvtodo').classList.add('on');$('rvai').classList.remove('on');rvDraw();}; $('rvai').onclick=()=>{rvMode='ai';$('rvai').classList.add('on');$('rvtodo').classList.remove('on');rvDraw();};
+$('rvsort').onclick=()=>{rvSort=rvSort==='score'?'new':'score';$('rvsort').textContent=rvSort==='score'?'Lowest score first':'Newest first';rvDraw();};
+$('rvlist').onclick=async e=>{const b=e.target.closest('button[data-v]');if(!b)return;const c=b.closest('.rvc'),id=c.dataset.id,h=RV.find(x=>x.upload===id),m=c.querySelector('.msg');
+ for(const x of c.querySelectorAll('button[data-v]'))x.disabled=true;m.className='msg';m.textContent='Saving…';
+ try{const r=await svc({op:'verdict',upload:id,verdict:b.dataset.v,by:(S&&S.nodeName)||''});h.verdict=r.verdict;h.now=true;
+  m.textContent=(r.verdict==='real'?((r.released||[]).length?'Released: '+r.released.map(x=>x.split('/')[1]).join(', ')+'.':'Recorded as real.'):((r.held||[]).length?'Held again: '+r.held.map(x=>x.split('/')[1]).join(', ')+'.':'Stays held.'))+(r.recorded?'':' The store has no record of this upload, so no verdict was written.');}
+ catch(err){m.className='msg bad';m.textContent=err.message.replace(/^[A-Za-z]+Exception: /,'');}
+ c.querySelector('.rvb').innerHTML=rvButtons(h);rvSum();};
+
 // ---- activity ----
 let lines=[];
 function drawLog(){const q=$('logq').value.trim().toLowerCase();const l=q?lines.filter(x=>x.toLowerCase().includes(q)):lines;const p=$('log'),end=p.scrollTop+p.clientHeight>=p.scrollHeight-20;p.textContent=l.slice(-400).join('\n')||(q?'Nothing matches.':'The log is empty.');if(end)p.scrollTop=p.scrollHeight;}
@@ -275,6 +323,6 @@ async function copyText(t){try{await navigator.clipboard.writeText(t);return tru
 act('copyd',async()=>{await diag();return (await copyText(lastReport))?'Copied ('+lastReport.length+' characters; no storage key or token in it)':'Copy failed: use Share on the Activity tab';},'diagmsg');
 act('cleard',async()=>{await call('clearDiagnostics');await diag();return 'Cleared';},'diagmsg');
 
-const first=location.hash.slice(1); if(['search','activity','setup','settings'].includes(first))show(first);
+const first=location.hash.slice(1); if(['search','review','activity','setup','settings'].includes(first))show(first);
 refresh(); setInterval(()=>{refresh();if(tab==='activity')log();},3000); setInterval(()=>{if(tab==='settings')diag();},6000);
 </script></body></html>

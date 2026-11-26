@@ -12,7 +12,7 @@ A phone node of the drama index. A small .NET 11 (CoreCLR, untrimmed) Android ho
 
 ## Build and test
 ```
-dotnet test indexnode-android/Tests -c Release            # 61 tests
+dotnet test indexnode-android/Tests -c Release            # 62 tests
 dotnet workload install android                            # once; SDK 11
 dotnet build indexnode-android/Plugin -c Release           # -> Plugin/bin/Release/net11.0/IndexNode.Plugin.dll
 dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release/net11.0-android/*-Signed.apk
@@ -20,6 +20,13 @@ dotnet build indexnode-android/Host -c Release <signing>   # -> Host/bin/Release
 Debug signing: `keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug"`, then `-p:AndroidKeyStore=true -p:AndroidSigningKeyStore=debug.keystore -p:AndroidSigningStorePass=android -p:AndroidSigningKeyAlias=androiddebugkey -p:AndroidSigningKeyPass=android`.
 
 ## Release notes
+
+### 0.1.7 (host 0.1.7, versionCode 8, plugin 0.1.2; needs IndexNode 0.13.63 on the service)
+- **A Review tab: the uploads held as AI** (owner, 2026-11-25). The list comes from the service (the two queues as they are now): the AI score, title, channel, length, when it was held and at which step, lowest score first (or newest first), with a filter by title or channel. Each card shows six pictures from the upload's sample, a link to the video on YouTube, and two buttons, **Real** and **AI**.
+- **A verdict is written to the store by the service**, with the same call as `indexnode ai set`: the upload's record gets `ai.verdict` (and who gave it: `app:<node name>`); Real releases the holds, AI keeps or sets them. A verdict can be changed afterwards. A held download that is released is fetched the next time downloads are on.
+- Three more operations of the page's `service` method (`holds`, `holdframes`, `verdict`), each one fixed route (`GET /v1/ai/holds`, `GET /v1/ai/frames`, `POST /v1/ai/verdict`); the verdict route takes the check server's token only.
+- Pictures are fetched for the first three cards at once and for the others as they come into view, one upload at a time (a few seconds each).
+- Not verified on a phone. The page was rendered at phone width against the real list (670 holds on 2026-11-25).
 
 ### 0.1.6 (host 0.1.6, versionCode 7, plugin 0.1.2; needs IndexNode 0.13.62 on the service)
 - **A Search tab** (owner, 2026-11-25). Choose a picture, or share a screenshot to IndexNode from another app (the app is a share target for pictures), then:
