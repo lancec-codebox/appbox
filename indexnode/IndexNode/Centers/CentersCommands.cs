@@ -209,6 +209,8 @@ public static class CentersCommands
             var view = await cache.ViewAsync(store, paths, idx, cts.Token);
             Console.WriteLine($"frame codes: {view.Frames:N0} frames of {idx.Uploads.Count - view.Missing} uploads ({view.Missing} without codes), {cache.Reads} log reads ({cache.BytesRead / 1048576.0:F0} MB), {vsw.Elapsed.TotalSeconds:F1}s");
             (hits, tm) = await FrameCodeSearch.QueryAsync(store, paths, view, q, a.Get("frames") is { } fk ? int.Parse(fk) : (cfg.PreCheck ?? new()).SearchFrames, top, threads, cts.Token, ranged: true);
+            for (int rep = 1; rep < (a.Get("repeat") is { } rp ? int.Parse(rp) : 1); rep++)   // 0.13.73: the same query again in this process (the first scan also faults the mapped pages in)
+                Console.WriteLine($"  again: scan {(await FrameCodeSearch.QueryAsync(store, paths, view, q, 100, top, threads, cts.Token, ranged: true)).Timings.ScanMs:F1} ms");
         }
         else (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topC, top, threads, cts.Token, maxUp, a.Has("ranged") || (cfg.PreCheck ?? new()).SearchRanged);
         foreach (var h in hits) Console.WriteLine($"{h.Upload}  {Clip.Stamp(h.Time)}  {h.Time:F1}s  {h.Score:F4}  (row {h.Row}, center {h.Center}, vote {h.Vote})");

@@ -163,11 +163,35 @@ public class FrameCodesTests
         var (b2, _) = await PreCheckSearch.LookupAsync(f, P, idx, q, new PreCheckSettings { CheckRoute = "centers" }, 2, default, codes: cache);
         Assert.Equal("u1", idx.Uploads[b2[0]!.Upload].Id);
         // a local copy that is not this store's log: the upload counts as missing once, the copy goes, the next view is whole again
-        var path = Path.Combine(dir, "m1", "log-0000.bin"); var junk = File.ReadAllBytes(path); Array.Fill(junk, (byte)7, 0, 64); File.WriteAllBytes(path, junk);
-        var other = new FrameCodesCache(dir); var v1 = await other.ViewAsync(f, P, idx, default); Assert.True(v1.Missing >= 1); Assert.False(File.Exists(path));
+        var path = Path.Combine(dir, "m1", "log-0000.bin"); using (var jf = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) jf.Write(Enumerable.Repeat((byte)7, 64).ToArray());   // in place: the file is mapped
+        var other = new FrameCodesCache(dir); var v1 = await other.ViewAsync(f, P, idx, default); Assert.Equal(idx.Uploads.Count, v1.Missing);   // the next generation's file is used (a mapped file cannot always be deleted on Windows)
         idx.Uploads[0] = idx.Uploads[0] with { }; var idx2 = new SearchData { Version = idx.Version, MeanVersion = idx.MeanVersion, Mean = idx.Mean, Bits = idx.Bits, RefUpload = idx.RefUpload, RefCenter = idx.RefCenter, Uploads = idx.Uploads, CodesMissing = 0 };
-        var v2 = await other.ViewAsync(f, P, idx2, default); Assert.Equal(0, v2.Missing);
+        var v2 = await other.ViewAsync(f, P, idx2, default); Assert.Equal(0, v2.Missing); Assert.Equal(120, v2.Frames);
+        Assert.True(File.Exists(Path.Combine(dir, "m1", "log-0000.g1.bin")));
+        // a new cache on the same folder takes the newest generation and needs no read
+        var third = new FrameCodesCache(dir); var v3 = await third.ViewAsync(f, P, idx2, default); Assert.Equal(0, v3.Missing); Assert.Equal(0, third.Reads);
         try { Directory.Delete(dir, true); } catch { }
+    }
+
+    [Fact]
+    public async Task A_new_version_appends_to_the_mapped_local_copy_and_the_old_view_still_reads()
+    {
+        var (f, idx, xs) = await Seed(2);
+        await FrameCodes.FillAsync(f, P, idx, 1, 0, _ => { }, default);
+        var dir = Tmp();
+        try
+        {
+            var cache = new FrameCodesCache(dir);
+            var v1 = await cache.ViewAsync(f, P, idx, default); Assert.Equal(1, v1.Missing);
+            var idx2 = new SearchData { Version = 2, MeanVersion = idx.MeanVersion, Mean = idx.Mean, Bits = idx.Bits, RefUpload = idx.RefUpload, RefCenter = idx.RefCenter, Uploads = idx.Uploads.ToList() };
+            await FrameCodes.FillAsync(f, P, idx2, 60, 0, _ => { }, default);   // the second upload's entry: appended to the store, then to the mapped copy
+            var v2 = await cache.ViewAsync(f, P, idx2, default); Assert.Equal(0, v2.Missing); Assert.Equal(120, v2.Frames);
+            // the old view's map still reads (its upload, its time)
+            var u0 = v1.Uploads.First(u => u != null)!; Assert.Equal(60, u0.Count); Assert.Equal(0f, Enumerable.Range(0, 60).Select(r => u0.Time(r)).Min());
+            var q = xs["u1"].AsSpan(9 * D, D).ToArray(); var near = v2.Nearest(FrameCodes.Code(q, idx.Mean), 3, 2);
+            Assert.Equal("u1", idx2.Uploads[near[0].Upload].Id); Assert.Equal(0, near[0].Dist); Assert.Equal(18f, v2.Uploads[near[0].Upload]!.Time(near[0].Row));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     [Fact]

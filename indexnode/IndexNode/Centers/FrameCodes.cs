@@ -103,6 +103,20 @@ public static class FrameCodes
         return checked((int)BinaryPrimitives.ReadUInt32LittleEndian(b[4..]));
     }
 
+    public sealed record PartHead(string Id, string Blob, string Sha, int MeanVersion, int First, int Count, int Total, int Length, int DataOff);
+
+    /// <summary>0.13.73: the header of the part at the start of <paramref name="b"/> (checked: magic, format, length, closing newline); the columns follow at DataOff: codes, offsets, times.</summary>
+    public static PartHead Head(ReadOnlySpan<byte> b)
+    {
+        int len = LengthAt(b); if (len == 0 || b.Length < len) throw new InvalidDataException("a frame codes part is cut short");
+        if (BinaryPrimitives.ReadUInt32LittleEndian(b[8..]) != Format) throw new InvalidDataException("unknown frame codes format");
+        int mv = (int)BinaryPrimitives.ReadUInt32LittleEndian(b[12..]), first = (int)BinaryPrimitives.ReadUInt32LittleEndian(b[16..]), n = (int)BinaryPrimitives.ReadUInt32LittleEndian(b[20..]), total = (int)BinaryPrimitives.ReadUInt32LittleEndian(b[24..]);
+        int il = BinaryPrimitives.ReadUInt16LittleEndian(b[28..]), bl = BinaryPrimitives.ReadUInt16LittleEndian(b[30..]), sl = BinaryPrimitives.ReadUInt16LittleEndian(b[32..]);
+        int o = (Fixed + il + bl + sl + 7) & ~7;
+        if (o + n * (CodeBytes + 8) + 1 != len || b[len - 1] != (byte)'\n') throw new InvalidDataException($"a frame codes part of length {len} does not match {n} frames");
+        return new PartHead(Encoding.UTF8.GetString(b.Slice(Fixed, il)), Encoding.UTF8.GetString(b.Slice(Fixed + il, bl)), Encoding.UTF8.GetString(b.Slice(Fixed + il + bl, sl)), mv, first, n, total, len, o);
+    }
+
     public static Part Decode(ReadOnlySpan<byte> b)
     {
         int len = LengthAt(b); if (len == 0 || b.Length < len) throw new InvalidDataException("a frame codes part is cut short");
@@ -208,8 +222,8 @@ public static class FrameCodes
     }
 }
 
-/// <summary>0.13.69: the codes of one index version, in memory: one entry per upload that has them (parts joined), each with its codes, vector offsets and times.</summary>
-public sealed class FrameCodesView
+/// <summary>0.13.69: the codes of one index version: one entry per upload that has them. 0.13.73: the codes, offsets and times are read where they lie in the memory-mapped local copy of the log (nothing copied).</summary>
+public sealed unsafe class FrameCodesView
 {
     public required SearchData Index { get; init; }
     /// <summary>Per upload of the version (same index as Index.Uploads): its frames, or null when it has no codes.</summary>
@@ -233,24 +247,24 @@ public sealed class FrameCodesView
             var hist = new int[FrameCodes.CodeBytes * 8 + 1];
             for (int li = p; li < live.Length; li += threads)
             {
-                int ui = live[li]; var c = Uploads[ui]!.Codes; int n = c.Length / FrameCodes.Words;
-                for (int qi = 0; qi < Q; qi++)
-                {
-                    var q = qs[qi]; ulong q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3], q4 = q[4], q5 = q[5], q6 = q[6], q7 = q[7]; int t = thr[qi]; var m = mine[qi];
-                    for (int r = 0, o = 0; r < n; r++, o += 8)
+                int ui = live[li];
+                foreach (var ch in Uploads[ui]!.Chunks)
+                    for (int qi = 0; qi < Q; qi++)
                     {
-                        int d = BitOperations.PopCount(c[o] ^ q0) + BitOperations.PopCount(c[o + 1] ^ q1) + BitOperations.PopCount(c[o + 2] ^ q2) + BitOperations.PopCount(c[o + 3] ^ q3)
-                              + BitOperations.PopCount(c[o + 4] ^ q4) + BitOperations.PopCount(c[o + 5] ^ q5) + BitOperations.PopCount(c[o + 6] ^ q6) + BitOperations.PopCount(c[o + 7] ^ q7);
-                        if (d > t) continue;
-                        m.Add(new Near(ui, r, d));
-                        if (m.Count > 4 * k)
+                        var q = qs[qi]; ulong q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3], q4 = q[4], q5 = q[5], q6 = q[6], q7 = q[7]; int t = thr[qi]; var m = mine[qi]; byte* c = ch.Codes;
+                        for (int r = 0; r < ch.Count; r++, c += FrameCodes.CodeBytes)
                         {
-                            Array.Clear(hist); foreach (var h in m) hist[h.Dist]++;
-                            int tt = 0, cum = 0; while (tt < hist.Length - 1 && cum + hist[tt] < k) { cum += hist[tt]; tt++; }
-                            m.RemoveAll(h => h.Dist > tt); t = thr[qi] = tt;
+                            int d = FrameCodesUpload.Dist(c, q0, q1, q2, q3, q4, q5, q6, q7);
+                            if (d > t) continue;
+                            m.Add(new Near(ui, ch.First + r, d));
+                            if (m.Count > 4 * k)
+                            {
+                                Array.Clear(hist); foreach (var h in m) hist[h.Dist]++;
+                                int tt = 0, cum = 0; while (tt < hist.Length - 1 && cum + hist[tt] < k) { cum += hist[tt]; tt++; }
+                                m.RemoveAll(h => h.Dist > tt); t = thr[qi] = tt;
+                            }
                         }
                     }
-                }
             }
             parts[p] = mine;
         });
@@ -270,18 +284,21 @@ public sealed class FrameCodesView
             ulong q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3], q4 = q[4], q5 = q[5], q6 = q[6], q7 = q[7];
             for (int li = p; li < live.Length; li += threads)
             {
-                int ui = live[li]; var c = Uploads[ui]!.Codes; int n = c.Length / FrameCodes.Words;
-                for (int r = 0, o = 0; r < n; r++, o += 8)
+                int ui = live[li];
+                foreach (var ch in Uploads[ui]!.Chunks)
                 {
-                    int d = BitOperations.PopCount(c[o] ^ q0) + BitOperations.PopCount(c[o + 1] ^ q1) + BitOperations.PopCount(c[o + 2] ^ q2) + BitOperations.PopCount(c[o + 3] ^ q3)
-                          + BitOperations.PopCount(c[o + 4] ^ q4) + BitOperations.PopCount(c[o + 5] ^ q5) + BitOperations.PopCount(c[o + 6] ^ q6) + BitOperations.PopCount(c[o + 7] ^ q7);
-                    if (d > thr) continue;
-                    mine.Add(new Near(ui, r, d));
-                    if (mine.Count > 4 * k)
+                    byte* c = ch.Codes;
+                    for (int r = 0; r < ch.Count; r++, c += FrameCodes.CodeBytes)
                     {
-                        Array.Clear(hist); foreach (var h in mine) hist[h.Dist]++;
-                        int t = 0, cum = 0; while (t < hist.Length - 1 && cum + hist[t] < k) { cum += hist[t]; t++; }
-                        mine.RemoveAll(h => h.Dist > t); thr = t;
+                        int d = FrameCodesUpload.Dist(c, q0, q1, q2, q3, q4, q5, q6, q7);
+                        if (d > thr) continue;
+                        mine.Add(new Near(ui, ch.First + r, d));
+                        if (mine.Count > 4 * k)
+                        {
+                            Array.Clear(hist); foreach (var h in mine) hist[h.Dist]++;
+                            int t = 0, cum = 0; while (t < hist.Length - 1 && cum + hist[t] < k) { cum += hist[t]; t++; }
+                            mine.RemoveAll(h => h.Dist > t); thr = t;
+                        }
                     }
                 }
             }
@@ -291,11 +308,57 @@ public sealed class FrameCodesView
     }
 }
 
-public sealed record FrameCodesUpload(ulong[] Codes, uint[] Offsets, float[] Times) { public int Count => Times.Length; }
+/// <summary>0.13.73: a read-only memory map of one local log file. The view keeps it alive; nothing is copied out of it. Mapped with FileShare.ReadWrite | Delete so the next sync can append to the
+/// file (a later map covers the new length; this one stays for the views made from it).</summary>
+public sealed unsafe class MappedLog
+{
+    readonly System.IO.MemoryMappedFiles.MemoryMappedFile? mmf; readonly System.IO.MemoryMappedFiles.MemoryMappedViewAccessor? acc;
+    public byte* Ptr { get; } public long Length { get; }
+    public MappedLog(string path)
+    {
+        var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        Length = fs.Length; if (Length == 0) { fs.Dispose(); return; }
+        mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateFromFile(fs, null, 0, System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read, HandleInheritability.None, false);
+        acc = mmf.CreateViewAccessor(0, Length, System.IO.MemoryMappedFiles.MemoryMappedFileAccess.Read);
+        Ptr = (byte*)acc.SafeMemoryMappedViewHandle.DangerousGetHandle() + acc.PointerOffset;   // valid while acc is reachable: this object holds it, the uploads hold this object
+        // the first scan of a new map would fault every page in (~0.5 s for 1 GB, measured): touch them in the background now
+        Warm = Task.Run(() => { long sum = 0; for (long o = 0; o < Length; o += 4096) sum += Ptr[o]; return sum; });
+    }
+    /// <summary>The background touch of every page (done when the map is warm).</summary>
+    public Task<long> Warm { get; } = Task.FromResult(0L);
+}
+
+/// <summary>One upload's frames in a version: one chunk per part of its entry (one part below 50,000 frames), each pointing into the mapped log.</summary>
+public sealed unsafe class FrameCodesUpload
+{
+    public readonly struct Chunk(byte* codes, byte* offsets, byte* times, int first, int count)
+    {
+        public byte* Codes { get; } = codes; public byte* Offsets { get; } = offsets; public byte* Times { get; } = times;
+        public int First { get; } = first; public int Count { get; } = count;
+    }
+    readonly MappedLog map;   // kept alive while this upload is
+    public Chunk[] Chunks { get; }
+    public int Count { get; }
+    internal FrameCodesUpload(MappedLog map, Chunk[] chunks) { this.map = map; Chunks = chunks; Count = chunks.Sum(c => c.Count); }
+
+    Chunk At(int row) { foreach (var c in Chunks) if (row >= c.First && row < c.First + c.Count) return c; throw new ArgumentOutOfRangeException(nameof(row)); }
+    /// <summary>Where the frame's vector is in the upload's frames file.</summary>
+    public uint Offset(int row) { var c = At(row); return System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(c.Offsets + 4L * (row - c.First)); }
+    public float Time(int row) { var c = At(row); return System.Runtime.CompilerServices.Unsafe.ReadUnaligned<float>(c.Times + 4L * (row - c.First)); }
+    /// <summary>The popcount distance of the 64-byte code at <paramref name="c"/> (any alignment) to <paramref name="q"/>.</summary>
+    public static int Dist(byte* c, ulong[] q) => Dist(c, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Dist(byte* c, ulong q0, ulong q1, ulong q2, ulong q3, ulong q4, ulong q5, ulong q6, ulong q7)
+    {
+        static ulong W(byte* p) => System.Runtime.CompilerServices.Unsafe.ReadUnaligned<ulong>(p);
+        return BitOperations.PopCount(W(c) ^ q0) + BitOperations.PopCount(W(c + 8) ^ q1) + BitOperations.PopCount(W(c + 16) ^ q2) + BitOperations.PopCount(W(c + 24) ^ q3)
+             + BitOperations.PopCount(W(c + 32) ^ q4) + BitOperations.PopCount(W(c + 40) ^ q5) + BitOperations.PopCount(W(c + 48) ^ q6) + BitOperations.PopCount(W(c + 56) ^ q7);
+    }
+}
 
 /// <summary>
-/// 0.13.69: a reader's local copy of the codes log (`&lt;root&gt;/m&lt;meanVersion&gt;/log-NNNN.bin`, complete parts only) and the view of the loaded version. A new version costs one ranged read per
-/// segment with new bytes (whole new parts, up to 64 MB a read); nothing already here is read again.
+/// 0.13.69: a reader's local copy of the codes log (`&lt;root&gt;/m&lt;meanVersion&gt;/log-NNNN.bin`, complete parts only) and the view of the loaded version. A new version costs reads of the new bytes
+/// only. 0.13.73: the view points into a memory map of the local copy: building it reads the part headers, nothing else.
 /// </summary>
 public sealed class FrameCodesCache(string root)
 {
@@ -304,13 +367,39 @@ public sealed class FrameCodesCache(string root)
     public static FrameCodesCache Shared => shared ??= new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes"));
     readonly SemaphoreSlim gate = new(1, 1);
     FrameCodesView? view;
-    readonly Dictionary<(int Mv, int Seg, long Off), FrameCodes.Part> parts = new();
+    readonly Dictionary<(int Mv, int Seg), MappedLog> maps = new();
+    readonly Dictionary<(int Mv, int Seg), int> gens = new();
     public int Reads { get; private set; }
     public long BytesRead { get; private set; }
 
-    string LocalFile(int mv, int seg) => Path.Combine(root, $"m{mv}", $"log-{seg:D4}.bin");
+    /// <summary>The local file of a segment. A copy found to be another store's log is left behind under its name (a mapped file cannot always be deleted) and the next generation's file is used.</summary>
+    string LocalFile(int mv, int seg)
+    {
+        if (!gens.TryGetValue((mv, seg), out var g))
+        {
+            var dir = Path.Combine(root, $"m{mv}"); g = 0;
+            if (Directory.Exists(dir))
+                foreach (var f in Directory.GetFiles(dir, $"log-{seg:D4}*.bin"))
+                {
+                    var n = Path.GetFileNameWithoutExtension(f); int i = n.IndexOf(".g", StringComparison.Ordinal);
+                    if (i > 0 && int.TryParse(n[(i + 2)..], out var gi) && gi > g) g = gi;
+                }
+            gens[(mv, seg)] = g;
+            for (int old = 0; old < g; old++) TryDelete(Name(mv, seg, old));   // generations left behind by an earlier process
+        }
+        return Name(mv, seg, g);
+    }
+    string Name(int mv, int seg, int g) => Path.Combine(root, $"m{mv}", g == 0 ? $"log-{seg:D4}.bin" : $"log-{seg:D4}.g{g}.bin");
+    static void TryDelete(string f) { try { if (File.Exists(f)) File.Delete(f); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
 
-    /// <summary>The view of <paramref name="idx"/>: from memory when it is the one already built, else the log is brought up to date and the view built (parts already decoded are kept).</summary>
+    MappedLog Map(int mv, int seg)
+    {
+        var path = LocalFile(mv, seg); long len = File.Exists(path) ? new FileInfo(path).Length : 0;
+        if (maps.TryGetValue((mv, seg), out var m) && m.Length == len) return m;
+        return maps[(mv, seg)] = new MappedLog(path);
+    }
+
+    /// <summary>The view of <paramref name="idx"/>: from memory when it is the one already built, else the log is brought up to date and the view built over the mapped local copy.</summary>
     public async Task<FrameCodesView> ViewAsync(IStore store, Paths paths, SearchData idx, CancellationToken ct)
     {
         var v = Volatile.Read(ref view); if (v != null && ReferenceEquals(v.Index, idx)) return v;
@@ -320,52 +409,48 @@ public sealed class FrameCodesCache(string root)
             if (view != null && ReferenceEquals(view.Index, idx)) return view;
             int mv = idx.MeanVersion;
             var ptrs = idx.Uploads.Select(u => FrameCodes.ParsePointer(u.Codes)).ToArray();
-            // how far each segment must be here: past the last part a pointer names (its length is read from the local copy as we go)
+            // how far each segment must be here: past the last part a pointer names
             var need = new Dictionary<int, long>();
             foreach (var p in ptrs) if (p is { } pp) need[pp.Segment] = Math.Max(need.GetValueOrDefault(pp.Segment, -1), pp.Offsets.Max());
             foreach (var (seg, last) in need) await SyncAsync(store, paths, mv, seg, last, ct);
-            var ups = new FrameCodesUpload?[idx.Uploads.Count]; long frames = 0; bool dropped = false; var keep = new HashSet<(int, int, long)>();
-            for (int i = 0; i < ups.Length; i++)
-            {
-                if (ptrs[i] is not { } p) continue;
-                var got = new List<FrameCodes.Part>();
-                var u = idx.Uploads[i]; bool bad = false; if (dropped) continue;
-                foreach (var off in p.Offsets)
-                {
-                    var key = (mv, p.Segment, off);
-                    if (!parts.TryGetValue(key, out var part))
-                    {
-                        try { part = ReadPart(mv, p.Segment, off); }
-                        catch (InvalidDataException e)
-                        {   // the local copy is not this store's log (another store, a log written again): it goes, the next view fetches the log anew; this upload counts as missing now
-                            Log.Info($"frame codes: {u.Id}: {e.Message}; the local copy of log {p.Segment} is dropped"); try { File.Delete(LocalFile(mv, p.Segment)); } catch (IOException) { }
-                            parts.Clear(); bad = dropped = true; break;
-                        }
-                        parts[key] = part;
-                    }
-                    got.Add(part); keep.Add(key);
-                }
-                if (bad) continue;
-                if (got.Any(x => x.Id != u.Id || x.Sha != u.Sha)) { Log.Info($"frame codes: {u.Id}: the entry at {u.Codes} is for {got[0].Id} ({got[0].Sha[..Math.Min(8, got[0].Sha.Length)]}), not this upload: treated as missing"); continue; }
-                got.Sort((a, b) => a.First.CompareTo(b.First));
-                ups[i] = got.Count == 1 ? new FrameCodesUpload(got[0].Codes, got[0].Offsets, got[0].Times) : new FrameCodesUpload([.. got.SelectMany(x => x.Codes)], [.. got.SelectMany(x => x.Offsets)], [.. got.SelectMany(x => x.Times)]);
-                frames += ups[i]!.Count;
-            }
-            foreach (var k in parts.Keys.Where(k => !keep.Contains(k)).ToList()) parts.Remove(k);
-            var nv = new FrameCodesView { Index = idx, Uploads = ups, Frames = frames };
+            var (nv, dropped) = Build(idx, ptrs, mv);
             if (!dropped) Volatile.Write(ref view, nv);   // a view made while the local copy was dropped is not kept: the next call fetches the log again
             return nv;
         }
         finally { gate.Release(); }
     }
 
-    FrameCodes.Part ReadPart(int mv, int seg, long off)
+    /// <summary>The view over the mapped local copies: the part headers are read, the columns are pointed at.</summary>
+    unsafe (FrameCodesView View, bool Dropped) Build(SearchData idx, (int Segment, long[] Offsets)?[] ptrs, int mv)
     {
-        using var fh = File.OpenHandle(LocalFile(mv, seg));
-        var head = new byte[FrameCodes.Fixed]; if (RandomAccess.Read(fh, head, off) != head.Length) throw new InvalidDataException($"frame codes log {seg}: nothing at {off}");
-        var len = FrameCodes.LengthAt(head); var b = new byte[len];
-        if (RandomAccess.Read(fh, b, off) != len) throw new InvalidDataException($"frame codes log {seg}: the part at {off} is cut short");
-        return FrameCodes.Decode(b);
+            var ups = new FrameCodesUpload?[idx.Uploads.Count]; long frames = 0; bool dropped = false;
+            for (int i = 0; i < ups.Length && !dropped; i++)
+            {
+                if (ptrs[i] is not { } p) continue;
+                var u = idx.Uploads[i]; var map = Map(mv, p.Segment); var chunks = new List<FrameCodesUpload.Chunk>(); string? wrong = null;
+                try
+                {
+                    foreach (var off in p.Offsets)
+                    {
+                        if (off < 0 || off + FrameCodes.Fixed > map.Length) throw new InvalidDataException($"frame codes log {p.Segment}: nothing at {off} (the copy has {map.Length})");
+                        var h = FrameCodes.Head(new ReadOnlySpan<byte>(map.Ptr + off, (int)Math.Min(map.Length - off, int.MaxValue)));
+                        if (h.Id != u.Id || h.Sha != u.Sha) { wrong = $"{h.Id} ({h.Sha[..Math.Min(8, h.Sha.Length)]})"; break; }
+                        byte* d = map.Ptr + off + h.DataOff;
+                        chunks.Add(new FrameCodesUpload.Chunk(d, d + (long)h.Count * FrameCodes.CodeBytes, d + (long)h.Count * (FrameCodes.CodeBytes + 4), h.First, h.Count));
+                    }
+                }
+                catch (InvalidDataException e)
+                {   // the local copy is not this store's log (another store, a log written again): the next generation's file is used and the next view fetches the log anew
+                    Log.Info($"frame codes: {u.Id}: {e.Message}; the local copy of log {p.Segment} is dropped");
+                    var old = LocalFile(mv, p.Segment); gens[(mv, p.Segment)] = gens[(mv, p.Segment)] + 1; maps.Remove((mv, p.Segment)); TryDelete(old);
+                    dropped = true; break;
+                }
+                if (wrong != null) { Log.Info($"frame codes: {u.Id}: the entry at {u.Codes} is for {wrong}, not this upload: treated as missing"); continue; }
+                chunks.Sort((a, b) => a.First.CompareTo(b.First));
+                ups[i] = new FrameCodesUpload(map, [.. chunks]); frames += ups[i]!.Count;
+            }
+            if (dropped) Array.Clear(ups);
+            return (new FrameCodesView { Index = idx, Uploads = ups, Frames = dropped ? 0 : frames }, dropped);
     }
 
     /// <summary>0.13.71: ranges of this size are read <see cref="Streams"/> at a time. Measured 2026-11-26 on the hexad host (West US 2): one stream ~21 MB/s (the 961 MB log in 54 s), 16 parallel 16 MB ranges ~250 MB/s (curl); with 32 streams the cold load of the log is 6.4 s, from the local copy 1.3 s.</summary>
@@ -424,7 +509,7 @@ public static class FrameCodeSearch
                 try
                 {
                     var z = await FramesReader.ForAsync(raw, paths, up, attempt, t, whole: !ranged);
-                    var want = rows.Select(r => (Row: r, Off: (long)fu.Offsets[r])).OrderBy(x => x.Off).ToList();
+                    var want = rows.Select(r => (Row: r, Off: (long)fu.Offset(r))).OrderBy(x => x.Off).ToList();
                     var res = new List<Hit>(); var vec = new float[CentersFile.Dim];
                     for (int i = 0; i < want.Count;)
                     {
@@ -434,7 +519,7 @@ public static class FrameCodeSearch
                         for (int m = i; m <= j; m++)
                         {
                             Vec.FromHalf(buf.AsSpan((int)(want[m].Off - start), FrameCodes.VectorBytes), vec);
-                            res.Add(new Hit(up.Id, fu.Times[want[m].Row], want[m].Row, Vec.Dot(q, vec), -1, rank, rows.Count));
+                            res.Add(new Hit(up.Id, fu.Time(want[m].Row), want[m].Row, Vec.Dot(q, vec), -1, rank, rows.Count));
                         }
                         i = j + 1;
                     }

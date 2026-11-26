@@ -141,7 +141,7 @@ public static class PreCheckSearch
         var sw = Stopwatch.StartNew();
         var near = view.NearestMany(q.Select(x => FrameCodes.Code(x, idx.Mean)).ToList(), k, threads, excludeUpload);
         double scanMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
-        var need = near.SelectMany(l => l).GroupBy(h => h.Upload).ToDictionary(g => g.Key, g => g.Select(h => h.Row).Distinct().OrderBy(r => view.Uploads[g.Key]!.Offsets[r]).ToList());
+        var need = near.SelectMany(l => l).GroupBy(h => h.Upload).ToDictionary(g => g.Key, g => g.Select(h => h.Row).Distinct().OrderBy(r => view.Uploads[g.Key]!.Offset(r)).ToList());
         var vecs = new ConcurrentDictionary<(int Up, int Row), float[]>(); long bytes = 0; int requests = 0;
         await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>
         {
@@ -153,10 +153,10 @@ public static class PreCheckSearch
                     var z = await FramesReader.ForAsync(raw, paths, up, attempt, t);
                     for (int i = 0; i < rows.Count;)
                     {
-                        int j = i; long start = fu.Offsets[rows[i]], end = start + FrameCodes.VectorBytes;
-                        while (j + 1 < rows.Count && fu.Offsets[rows[j + 1]] - end <= CenterSearch.MergeGap && fu.Offsets[rows[j + 1]] + FrameCodes.VectorBytes - start <= CenterSearch.MaxMerged) { j++; end = fu.Offsets[rows[j]] + FrameCodes.VectorBytes; }
+                        int j = i; long start = fu.Offset(rows[i]), end = start + FrameCodes.VectorBytes;
+                        while (j + 1 < rows.Count && fu.Offset(rows[j + 1]) - end <= CenterSearch.MergeGap && fu.Offset(rows[j + 1]) + FrameCodes.VectorBytes - start <= CenterSearch.MaxMerged) { j++; end = fu.Offset(rows[j]) + FrameCodes.VectorBytes; }
                         var buf = await z.ReadAsync(start, (int)(end - start), t);
-                        for (int m = i; m <= j; m++) { var v = new float[CentersFile.Dim]; Vec.FromHalf(buf.AsSpan((int)(fu.Offsets[rows[m]] - start), FrameCodes.VectorBytes), v); vecs[(kv.Key, rows[m])] = v; }
+                        for (int m = i; m <= j; m++) { var v = new float[CentersFile.Dim]; Vec.FromHalf(buf.AsSpan((int)(fu.Offset(rows[m]) - start), FrameCodes.VectorBytes), v); vecs[(kv.Key, rows[m])] = v; }
                         i = j + 1;
                     }
                     Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests); return;
@@ -173,7 +173,7 @@ public static class PreCheckSearch
             {
                 if (!vecs.TryGetValue((h.Upload, h.Row), out var v)) continue;
                 float c = Vec.Dot(q[i], v);
-                if (b == null || c > b.Cosine) b = new FrameBest(h.Upload, view.Uploads[h.Upload]!.Times[h.Row], c);
+                if (b == null || c > b.Cosine) b = new FrameBest(h.Upload, view.Uploads[h.Upload]!.Time(h.Row), c);
             }
             best[i] = b;
         });
