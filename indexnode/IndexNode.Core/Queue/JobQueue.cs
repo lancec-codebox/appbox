@@ -419,17 +419,22 @@ public sealed class JobQueue
     }
 
     /// <summary>Deletes active files whose subject has nothing left to run (a node that crashed between its final done and the delete). Returns how many.</summary>
+    /// <summary>0.13.66: subjects whose stale marker was found to still have pending work, and until when they are left alone. On 2026-11-26 two such markers (left when a job ended while the breaker was open)
+    /// had their lease taken and given back on every look for work, about 150 times a minute: a quarter of the box's store budget. A claim of the subject takes the lapsed marker over anyway.</summary>
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> stalePending = new(StringComparer.Ordinal);
+    public static TimeSpan StalePendingPause = TimeSpan.FromMinutes(10);
+
     public async Task<int> CleanStaleAsync(IEnumerable<string> subjects, CancellationToken ct)
     {
-        int n = 0;
-        foreach (var subject in subjects.Take(5))
+        int n = 0; var now = clock();
+        foreach (var subject in subjects.Where(x => !(stalePending.TryGetValue(x, out var until) && until > now)).Take(5))
         {
             var name = paths.Active(subject);
             string? lease;
             try { lease = await store.AcquireLeaseAsync(name, Protocol.LeaseSeconds, ct); } catch (StorageException e) when (e.Status == 404) { continue; }
             if (lease == null) continue;
             bool pending = Read(s => s.Get(subject) is { } sub && sub.Active);
-            if (pending) { try { await store.ReleaseLeaseAsync(name, lease, ct); } catch { } continue; }
+            if (pending) { stalePending[subject] = now + StalePendingPause; try { await store.ReleaseLeaseAsync(name, lease, ct); } catch { } continue; }
             try { await store.DeleteAsync(name, lease, ct); n++; } catch (Exception e) { Log.Info($"queue: could not delete the stale {name} ({e.Message})"); }
         }
         return n;

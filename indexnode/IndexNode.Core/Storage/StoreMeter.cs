@@ -4,7 +4,22 @@ using System.Runtime.CompilerServices;
 namespace IndexNode;
 
 /// <summary>0.13.18: thrown by a store call when the storage budget is used up (the node's breaker is open, or the step's own budget is spent). The step fails as a normal failure and is retried later.</summary>
-public sealed class StorageBudgetExceeded(string message) : InvalidOperationException(message);
+public sealed class StorageBudgetExceeded(string message) : InvalidOperationException(message)
+{
+    /// <summary>0.13.66: the node-wide breaker was open (its per-minute window), not this step's own budget: the job did nothing wrong and is only paused.</summary>
+    public bool NodeWide { get; init; }
+    /// <summary>The node-wide trip inside <paramref name="e"/> (itself, or one wrapped by an AggregateException or as an inner exception), or null.</summary>
+    public static StorageBudgetExceeded? NodeWideIn(Exception? e)
+    {
+        for (int i = 0; e != null && i < 8; i++)
+        {
+            if (e is StorageBudgetExceeded { NodeWide: true } s) return s;
+            if (e is AggregateException a) { var f = a.Flatten().InnerExceptions.Select(NodeWideIn).FirstOrDefault(x => x != null); if (f != null) return f; }
+            e = e.InnerException;
+        }
+        return null;
+    }
+}
 
 /// <summary>0.13.18: one line of the per-site table.</summary>
 /// <summary>One line of the per-site table. <c>Failed</c> counts real failures (404, 409, 412 ...); <c>NotModified</c> counts 304s of conditional reads, which are successes (not in <c>Failed</c>, not in the breaker). <c>Blobs</c>: distinct blobs behind the row in the breaker's one-minute window (0 = not tracked, e.g. the all-time table).</summary>
@@ -120,7 +135,7 @@ public sealed class StoreMeter
             if (trippedAt is { } t)
             {
                 if (now() - t >= Limits.Cooldown) { trippedAt = null; window.Clear(); winOps = winFails = 0; Log.Info($"storage: the breaker closed after {Limits.Cooldown.TotalMinutes:0.#} min"); tripMessage = null; }
-                else throw new StorageBudgetExceeded(tripMessage ?? "storage breaker open");
+                else throw new StorageBudgetExceeded(tripMessage ?? "storage breaker open") { NodeWide = true };
             }
             if (CliMax > 0 && Total >= CliMax) throw new StorageBudgetExceeded($"storage: --storage-max {CliMax} reached. Top sites: {Top(Table(), 5)}");
             if (sc != null && sc.Tripped != null) throw new StorageBudgetExceeded(sc.Tripped);

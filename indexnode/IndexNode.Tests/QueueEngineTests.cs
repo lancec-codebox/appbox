@@ -133,6 +133,30 @@ public class QueueEngineTests
     }
 
     [Fact]
+    public async Task A_node_wide_breaker_trip_pauses_the_job_without_counting_an_attempt_or_growing_its_back_off()
+    {
+        // 0.13.66: on 2026-11-26 the actor index build kept meeting the box's open breaker during a relink; each trip counted as a failed attempt, the back-off doubled, and no index was built for three hours
+        var s = new FakeStore(); await s.AddJob(P, "download", "paused", T(0));
+        var calls = new ConcurrentDictionary<string, int>(); var times = new List<DateTimeOffset>();
+        var meter = new StoreMeter(); meter.Limits.Cooldown = TimeSpan.FromMilliseconds(120);
+        var b = Opts(["download"], backoff: n => TimeSpan.FromHours(Math.Pow(2, n)), once: false);
+        var o = new EngineOptions { NodeId = b.NodeId, Name = b.Name, Stages = b.Stages, Workers = b.Workers, Threads = b.Threads, Once = false, PollInterval = b.PollInterval, RenewInterval = b.RenewInterval, RegistryInterval = b.RegistryInterval, ControlInterval = b.ControlInterval, BotBackoff = b.BotBackoff, TransientBackoff = b.TransientBackoff, Ops = b.Ops, Meter = meter };   // a Transient back-off would be hours: the test would never see a second try
+        var e = Engine(s, o, stage: ctx =>
+        {
+            int n = calls.AddOrUpdate(ctx.Job.JobId, 1, (_, k) => k + 1); lock (times) times.Add(DateTimeOffset.UtcNow);
+            if (n <= 3) throw new StorageBudgetExceeded("storage breaker OPEN: 600 store ops in the last minute (max-per-min 600)") { NodeWide = true };
+            if (n == 4) throw new AggregateException(new StorageBudgetExceeded("storage breaker OPEN (wrapped, as the index build throws it)") { NodeWide = true });
+            return Task.CompletedTask;
+        });
+        using var cts = new CancellationTokenSource(); var run = e.RunAsync(cts.Token);
+        await Within(() => Q(s).Entry("paused", "download")?.State == "done", 8000);
+        cts.Cancel(); await run;
+        Assert.Equal(5, calls["paused"]);                                                            // four pauses, then it ran: never parked as failed
+        var en = Q(s).Entry("paused", "download")!; Assert.Equal("done", en.State); Assert.Equal(0, en.Attempts);   // no attempt was counted
+        lock (times) for (int i = 1; i < times.Count; i++) Assert.True(times[i] - times[i - 1] >= TimeSpan.FromMilliseconds(100), "each retry waits for the breaker's cooldown");
+    }
+
+    [Fact]
     public async Task Transient_failures_count_attempts_and_the_third_is_final_permanent_is_at_once_a_bot_block_counts_none()
     {
         var s = new FakeStore(); await s.AddJob(P, "download", "flaky", T(0)); await s.AddJob(P, "download", "dead", T(1));

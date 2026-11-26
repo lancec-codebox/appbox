@@ -134,6 +134,26 @@ public class QueueLogTests
     }
 
     [Fact]
+    public async Task A_stale_marker_of_a_subject_with_pending_work_is_left_alone_for_a_while()
+    {
+        // 0.13.66: 2026-11-26, such markers had their lease taken and given back on every look for work (about 150 times a minute)
+        var (s, c) = NewStore();
+        var a = await Node(s, c, "a");
+        await a.AppendLinesAsync([AddProcess("v1", "2026-11-20T08:00:00Z")], default);
+        var h = (await a.TryClaimAsync("v1", Pick, default))!;   // claimed, never finished, the lease lapses: the subject still has pending work
+        c.Add(TimeSpan.FromMinutes(5));
+        var look = await a.LookAsync(_ => false, null, default);   // this node runs no stage of it (otherwise it would be a candidate, not stale)
+        Assert.Equal(["v1"], look.Stale);
+        s.Ops.Clear(); int Total() => s.Ops.Values.Sum();
+        Assert.Equal(0, await a.CleanStaleAsync(look.Stale, default)); Assert.True(s.Exists("index/jobs/active/v1.json"));   // pending: kept
+        int first = Total(); Assert.True(first > 0);
+        for (int i = 0; i < 20; i++) await a.CleanStaleAsync(look.Stale, default);
+        Assert.Equal(first, Total());                                             // the next looks touch nothing
+        c.Add(JobQueue.StalePendingPause + TimeSpan.FromSeconds(1));
+        await a.CleanStaleAsync(look.Stale, default); Assert.True(Total() > first);   // looked at again after the pause
+    }
+
+    [Fact]
     public async Task Claim_of_work_that_is_already_done_releases_and_deletes_the_file()
     {
         var (s, c) = NewStore();

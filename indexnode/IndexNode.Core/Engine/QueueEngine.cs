@@ -323,7 +323,10 @@ public sealed partial class NodeEngine
 
     // ---------------------------------------------------------------- one claim
 
-    private enum Outcome { Done, Permanent, Bot, Transient, Released, LeaseLost, Skipped, Duplicate }
+    /// <summary>Paused (0.13.66): the node-wide storage breaker opened during the job. Not the job's failure: no attempt is counted and the retry waits only for the breaker to close.
+    /// Before, it was Transient: on 2026-11-26 the actor index build tripped the breaker again and again during a relink, its back-off doubled each time (2^attempts minutes),
+    /// and no index was built for three hours; the last uploads of the relink waited the same way.</summary>
+    private enum Outcome { Done, Permanent, Bot, Transient, Released, LeaseLost, Skipped, Duplicate, Paused }
 
     private sealed class ClaimWork(ClaimHandle h, string id, Running run, CancellationTokenSource cts)
     {
@@ -470,7 +473,8 @@ public sealed partial class NodeEngine
         catch (BotBlocked e) { return (Outcome.Bot, e.Message, false, ctx); }
         catch (LeaseLostException e) { return (Outcome.LeaseLost, e.Message, false, ctx); }
         catch (OperationCanceledException) { return (h.Lost ? Outcome.LeaseLost : Outcome.Released, null, false, ctx); }
-        catch (StorageBudgetExceeded e) { Log.Info($"[{stage}#{lane}] {id}: {e.Message}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Transient, e.Message, false, ctx); }
+        catch (StorageBudgetExceeded e) { Log.Info($"[{stage}#{lane}] {id}: {e.Message}"); return (h.Lost ? Outcome.LeaseLost : e.NodeWide ? Outcome.Paused : Outcome.Transient, e.Message, false, ctx); }
+        catch (Exception e) when (StorageBudgetExceeded.NodeWideIn(e) is { } nw) { Log.Info($"[{stage}#{lane}] {id}: {nw.Message}"); return (h.Lost ? Outcome.LeaseLost : Outcome.Paused, nw.Message, false, ctx); }
         catch (Exception e) when (DiskGuard.IsDiskError(e))
         {   // 0.13.34: the local disk failed (full, or a write error): this claim fails as Transient, the node goes on; it stops only if the disk is still too full for the next download
             var dir = (StageZipStore.Find(store) as StageZipStore)?.CacheDir ?? Path.GetTempPath(); var free = o.FreeSpace(dir);
@@ -641,6 +645,13 @@ public sealed partial class NodeEngine
                     }
                 case Outcome.Permanent:
                     { var l = L("failed"); l.Permanent = true; if (stage == "download") l.Job = job; await h.AppendAsync([l], true, none); break; }
+                case Outcome.Paused:
+                    {   // 0.13.66: the attempt count and the due time stay as they were; only this node waits for its breaker to close (the line may not get through while it is open: the entry then simply stays as it is)
+                        var l = L("pending"); l.Attempt = entry.Attempts; l.Due = Protocol.Utc(NowUtc + o.Meter.Limits.Cooldown); l.Job = stage is "download" or "refresh" or "classify" or "availability" ? job : null;
+                        try { await h.AppendAsync([l], true, none); } catch (StorageBudgetExceeded) { }
+                        ignoreSubject[id] = DateTimeOffset.UtcNow + o.Meter.Limits.Cooldown;
+                        break;
+                    }
                 case Outcome.Transient:
                     {
                         var l = L("pending"); l.Attempt = entry.Attempts + 1; l.Job = stage is "download" or "refresh" or "classify" or "availability" ? job : null; job.NodeId = o.NodeId;   // the body carries the network of the attempt
@@ -665,8 +676,8 @@ public sealed partial class NodeEngine
         catch (LeaseLostException) { Log.Info($"[claim#{lane}] {id}: lease lost before the outcome could be recorded; dropped"); return; }
         catch (Exception e) { Log.Info($"[claim#{lane}] could not record the outcome for {id}: {e.Message}"); }
         // 0.13.37: the stop mark (run_* only: a failed or released run leaves the stored v alone), after the queue line
-        if (outcome is Outcome.Permanent or Outcome.Transient or Outcome.Bot or Outcome.Released or Outcome.Duplicate)
-            await MarkStopAsync(w, stage == "process" && ctx?.Stage is { } ms ? ms : stage, outcome switch { Outcome.Transient or Outcome.Bot => "transient", Outcome.Released => "released", _ => "failed" });
+        if (outcome is Outcome.Permanent or Outcome.Transient or Outcome.Paused or Outcome.Bot or Outcome.Released or Outcome.Duplicate)
+            await MarkStopAsync(w, stage == "process" && ctx?.Stage is { } ms ? ms : stage, outcome switch { Outcome.Transient or Outcome.Paused or Outcome.Bot => "transient", Outcome.Released => "released", _ => "failed" });
         if (stage is "process" or "describe" or "translate" || true) StageZipStore.Stage(store)?.DiscardStaged(id, Protocol.IsStep(stage) || stage is "download" ? stage : null);
         Log.Info($"[claim#{lane}] {id}: {stage} {outcome}{(error != null ? " (" + Redact.Sas(error) + ")" : "")}");
     }
