@@ -183,6 +183,11 @@ public sealed partial class NodeEngine
     private async Task<bool> TryFetchFromServiceAsync(int lane, CancellationToken ct)
     {
         if (o.FetchNext == null || !o.DownloaderOnly || DateTimeOffset.UtcNow < nextFetch || StorageHalted()) return false;
+        // 0.13.60: read the work queue's tail and any announced control change BEFORE asking. Since 0.13.55 the node asks the service first and goes round again whenever it is handed work,
+        // so it never reached the look at the queue that refreshes control: on 2026-11-26 two nodes went on downloading for 14 minutes after download=stop (15 downloads nobody asked for).
+        try { await queue.PollAsync(ct); await Control.RefreshIfAnnouncedAsync(queue.Read(st => st.ControlETag), ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception e) { Log.Info($"download: the work queue could not be read before asking the service ({e.Message}); asking with the control state the node has"); }
         if (!TryReserve()) return false;
         // 0.13.48: the hand-over respects this node's limits. Only the stages the limit has room for are asked for, and the job that comes back counts like one the node claimed itself.
         // 0.13.47 asked for every enabled stage: a node whose full-download budget was used up logged "limit refuses download" and was handed a download each time it asked (2026-11-24: 110 downloads on a budget of 97).

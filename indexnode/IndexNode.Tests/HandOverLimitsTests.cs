@@ -99,6 +99,36 @@ public class HandOverLimitsTests
     }
 
     [Fact]
+    public async Task A_node_that_is_being_handed_work_still_sees_downloads_switched_off()
+    {
+        // 0.13.60: the service hands d1 over and, in the same moment, downloads are switched off (control file + the "ctl" line). The node runs d1 and must NOT ask again.
+        var s = new FakeStore(); var seen = new List<string>(); int calls = 0;
+        var seed = new JobQueue(s, P, "seed"); await seed.LoadAsync(default);
+        var svc = new JobQueue(s, P, "service"); await svc.LoadAsync(default);
+        QLine Add(string id) => QLine.Add(id, "download", new JobDescriptor { Stage = "download", JobId = id, Url = "https://www.youtube.com/watch?v=" + id, AddedAt = "2026-11-24T08:00:00Z" }, "2026-11-24T08:00:00Z", 0, "2026-11-24T08:00:00Z");
+        async Task<NextClaim?> Next(string[] stages, CancellationToken ct)
+        {
+            int k = Interlocked.Increment(ref calls); string id = "d" + k;
+            await svc.PollAsync(ct); await svc.AppendLinesAsync([Add(id)], ct);
+            var h = await svc.TryClaimForAsync(id, "test-node", (_, sub) => ["download"], ct);
+            if (k == 1)
+            {
+                await s.PutAsync(P.Control, new ControlFile { Stages = new() { ["download"] = "stop" } }.ToBytes(), null, null, false, ct);
+                await ControlWatcher.AnnounceAsync(s, P, "test", ct);
+            }
+            return new NextClaim(id, "download", h!.Epoch, h.Lease);
+        }
+        var o = new EngineOptions
+        {
+            NodeId = "test-node", Name = "test", Stages = ["sample", "download"], Workers = 1, Threads = 2, Once = true,
+            PollInterval = TimeSpan.FromMilliseconds(30), RenewInterval = TimeSpan.FromMilliseconds(40), RegistryInterval = TimeSpan.FromMilliseconds(100), ControlInterval = TimeSpan.FromMilliseconds(40),
+            BotBackoff = TimeSpan.FromHours(1), TransientBackoff = _ => TimeSpan.Zero, Ops = new OpCounter(), FetchNext = Next,
+        };
+        await Run(new NodeEngine(s, P, o, new Dictionary<string, IStageHandler> { ["sample"] = new Rec(seen, "sample"), ["download"] = new Rec(seen, "download") }));
+        Assert.Equal(1, calls); Assert.Equal(["download:d1"], seen.ToArray());
+    }
+
+    [Fact]
     public async Task A_timed_out_call_to_the_service_does_not_stop_the_node()
     {
         // 0.13.50: the client's timeout is an OperationCanceledException; 0.13.49 rethrew it as if the node were being stopped, and the node exited with "node stopped" and no reason

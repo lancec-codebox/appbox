@@ -63,6 +63,7 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
             if (dl == null) return new Sampled(null, "the check added no download");
             if (dl.Hold != null) return new Sampled(null, $"its download is held ({dl.Hold})");
             if (dl.State != "pending") return new Sampled(null, "its download is already " + dl.State);
+            if (!DownloadsOn) return new Sampled(null, "downloads are off in control; it stays queued");   // 0.13.60: the check is kept, the download waits for the switch
             var claim = await HandOutDownloadAsync(node, id, work.NowUtc(), ct, verify: false);   // checked a moment ago, against the index as it is
             return claim == null ? new Sampled(null, "its download was taken by another node") : new Sampled(claim, "new");
         }
@@ -348,8 +349,14 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     public sealed record Claimed(string Subject, string Stage, int Epoch, string Lease, string Active);
 
     /// <summary>POST /v1/download/next: tops the work queue up at once, then claims ONE ready item for <paramref name="node"/> with the claim line and the lease a node would make. Two concurrent callers never get the same item (the active file's lease decides). Null: nothing ready.</summary>
+    /// <summary>0.13.60: is this stage switched on in control ("download" covers samples too)? Not set: on. The service hands nothing out while downloads are off, whatever the node that asks believes:
+    /// the switch must hold against a node that has not seen it (an old version, a missed line).</summary>
+    public Func<string, bool>? StageOn { get; set; }
+    bool DownloadsOn => StageOn == null || StageOn("download");
+
     public async Task<Claimed?> NextAsync(string node, string[] stages, CancellationToken ct)
     {
+        if (!DownloadsOn) return null;
         await work.PollAsync(ct); await full.PollAsync(ct); await TopUpAsync(ct);
         var now = work.NowUtc(); var ok = stages.Length == 0 ? (Func<string, bool>)(_ => true) : st => Array.IndexOf(stages, st) >= 0;
         var look = await work.LookAsync(st => st is "sample" or "refresh" or "classify" && ok(st), null, ct);

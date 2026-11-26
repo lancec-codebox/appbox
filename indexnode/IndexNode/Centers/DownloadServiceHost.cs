@@ -13,7 +13,11 @@ public static class DownloadServiceHost
         var root = await JobQueue.ResolveAsync(store, paths, ct); if (root.IsLegacyLayout) throw new QueueNotMigratedException("indexnode: --download-service needs the split queue (run: indexnode queue split)");
         var full = new JobQueue(store, paths.DownloadQueue, "service-" + node); var work = new JobQueue(store, paths.DownloadWork, "service-" + node); var proc = new JobQueue(store, paths.ProcessQueue, "service-" + node);
         var svc = new DownloadService(full, work, proc, async (id, t) => (await server.CheckAsync(id, false, t))["record"] as System.Text.Json.Nodes.JsonObject, workMax, store);
-        svc.IndexBuiltAt = server.IndexBuiltAtAsync;   // 0.13.55: a download is checked again when the index was built after its check
+        svc.IndexBuiltAt = server.IndexBuiltAtAsync;
+        // 0.13.60: the service follows the control file itself (read at start, then only when a "ctl" line on the work queue announces a change)
+        var control = new ControlWatcher(store, paths);
+        try { await control.RefreshAsync(ct, force: true); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info("download service: control not read at start (" + Redact.Sas(e.Message) + "); handing out as if downloads were on"); }
+        svc.StageOn = st => control.Effective(st) == Level.Run;   // 0.13.55: a download is checked again when the index was built after its check
         server.Downloads = svc;
         _ = Task.Run(async () =>
         {
@@ -32,6 +36,7 @@ public static class DownloadServiceHost
                     else await store.RenewLeaseAsync(name, lease, ct);
                     if (!loaded) { await full.LoadAsync(ct); await work.LoadAsync(ct); await proc.LoadAsync(ct); loaded = true; }
                     var pass = await svc.RunOnceAsync(ct);
+                    await control.RefreshIfAnnouncedAsync(work.Read(st => st.ControlETag), ct);   // the pass polled the work queue: a control change announced there is read now
                     if (pass.Cleared > 0 && work.Blocks >= 200) await svc.RollOverWorkAsync(ct);   // the snapshot then holds only the live items
                     if (pass.FoldedBack + pass.Checked + pass.Entered + pass.ToppedUp + pass.Cleared > 0) Log.Info($"download service: folded back {pass.FoldedBack}, checked {pass.Checked}, entered {pass.Entered}, topped up {pass.ToppedUp}, cleared {pass.Cleared}");
                 }

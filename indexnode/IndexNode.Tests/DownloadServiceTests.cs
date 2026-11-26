@@ -145,6 +145,18 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task While_downloads_are_off_in_control_the_service_hands_nothing_out()
+    {
+        // 0.13.60: on 2026-11-26 two nodes that had not seen download=stop were handed 15 more downloads
+        var r = await Rig.Make(10, [.. Checked("ready"), Add("s1", "sample", "2026-11-02T00:00:00Z")]);
+        bool on = false; r.Svc.StageOn = st => on;
+        Assert.Null(await r.Svc.NextAsync("dl1", ["sample", "download"], default));                       // neither the download nor the sample
+        Assert.Null(r.Work.Read(w => w.Get("ready")?.ClaimBy)); Assert.Null(r.Work.Read(w => w.Get("s1")?.ClaimBy));
+        on = true;
+        var got = await r.Svc.NextAsync("dl1", ["sample", "download"], default); Assert.Equal(("ready", "download"), (got!.Subject, got.Stage));
+    }
+
+    [Fact]
     public async Task A_download_nobody_holds_does_not_stay_on_the_work_queue()
     {
         var r = await Rig.Make(10, Checked("v1"));
