@@ -203,7 +203,7 @@ public static class CentersCommands
         Console.WriteLine($"index v{idx.Version}: {idx.Uploads.Count} uploads, {idx.Count} centers (loaded in {sw.Elapsed.TotalSeconds:F1}s)");
         int maxUp = a.Get("max-uploads") is { } mu ? int.Parse(mu) : (cfg.PreCheck ?? new()).SearchUploads;   // 0.13.58: the uploads opened (0: all)
         List<Hit> hits; QueryTimings tm;
-        if ((a.Get("route") ?? (cfg.PreCheck ?? new()).SearchRoute) == "frames")
+        if (PreCheckSettings.ResolveRoute(a.Get("route") ?? (cfg.PreCheck ?? new()).SearchRoute, idx.CodesMissing) == "frames")
         {   // 0.13.69: a code of every frame (the local copy of the codes log under the config dir), the best --frames (default SearchFrames) read exactly
             var cache = new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes")); var vsw = Stopwatch.StartNew();
             var view = await cache.ViewAsync(store, paths, idx, cts.Token);

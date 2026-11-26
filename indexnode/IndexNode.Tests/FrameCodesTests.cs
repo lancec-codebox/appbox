@@ -25,6 +25,15 @@ public class FrameCodesTests
     }
 
     [Fact]
+    public void Auto_is_frames_only_when_every_upload_has_codes()
+    {
+        Assert.Equal("frames", PreCheckSettings.ResolveRoute("auto", 0)); Assert.Equal("centers", PreCheckSettings.ResolveRoute("auto", 3));
+        Assert.Equal("centers", PreCheckSettings.ResolveRoute("auto", -1));   // a version from before the codes
+        Assert.Equal("frames", PreCheckSettings.ResolveRoute(null, 0)); Assert.Equal("centers", PreCheckSettings.ResolveRoute("Centers", 0)); Assert.Equal("frames", PreCheckSettings.ResolveRoute("frames", 5));
+        Assert.Equal("auto", new PreCheckSettings().SearchRoute);
+    }
+
+    [Fact]
     public void A_part_round_trips_and_ends_with_a_newline()
     {
         var p = new FrameCodes.Part("abc", "index/search/frames/abc.bin", "beef", 1, 0, 3, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24], [2144, 3168, 4192], [0.5f, 1.5f, 2.5f]);

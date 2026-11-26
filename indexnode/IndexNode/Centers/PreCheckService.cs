@@ -224,7 +224,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         List<Hit> hits; QueryTimings tm; long ops;
         if (maxUploads < 0) maxUploads = settings.SearchUploads;
         if (topCenters <= 0) topCenters = Math.Clamp((int)Math.Round(idx.Bits.Length / SearchData.CodeBytes * settings.SearchCentersShare), 300, 5000);   // 0.13.62: grows with the index
-        route = (route is { Length: > 0 } ? route : settings.SearchRoute).ToLowerInvariant();
+        route = PreCheckSettings.ResolveRoute(route is { Length: > 0 } ? route : settings.SearchRoute, idx.CodesMissing);
         if (route is not ("centers" or "frames")) throw new ArgumentException("route: centers or frames");
         int codesMissing = -1; long codesFrames = 0;
         using (var scope = meter.BeginStep(meter.Limits.StepLimitFor("search"), null))

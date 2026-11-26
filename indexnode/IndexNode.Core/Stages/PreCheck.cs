@@ -34,8 +34,11 @@ public sealed class PreCheckSettings
     public double SearchCentersShare { get; set; } = 0.002;
     /// <summary>0.13.69: how many uploads without frame codes a search-index build adds to the codes log (2 store ops each: one read of the frames file, one append).</summary>
     public int CodesPerBuild { get; set; } = 60;
-    /// <summary>0.13.69: the route of /v1/search: "centers" (bits.bin of the centers, as before) or "frames" (a code of every frame, the best SearchFrames re-ranked exactly). A request's route= wins.</summary>
-    public string SearchRoute { get; set; } = "centers";
+    /// <summary>0.13.69: the route of /v1/search: "centers" (bits.bin of the centers, as before) or "frames" (a code of every frame, the best SearchFrames re-ranked exactly). A request's route= wins.
+    /// 0.13.70 default "auto": frames when the loaded version has codes for every upload, else centers (2026-11-26, 31 phone screenshots through the service on v182: frames 29 / 31 / 0, centers 27 / 28 / 3).</summary>
+    public string SearchRoute { get; set; } = "auto";
+    /// <summary>The route "auto" resolves to for a version: frames once every upload has codes.</summary>
+    public static string ResolveRoute(string? route, int codesMissing) => (route is { Length: > 0 } r ? r.ToLowerInvariant() : "auto") is "auto" ? (codesMissing == 0 ? "frames" : "centers") : route!.ToLowerInvariant();
     /// <summary>0.13.69: how many nearest frames (by code) the frames route reads exactly (owner, 2026-11-26: 100).</summary>
     public int SearchFrames { get; set; } = 100;
     /// <summary>0.13.21 (config precheck.vote-uploads): vote-first lookup: after the bit scan the uploads are ranked by how many frames have them among their top rows, and only the top this-many are read and scored exactly. 0 = read every upload with a top row (the old behaviour). Applies to the pre-check, the check and the group step.</summary>
