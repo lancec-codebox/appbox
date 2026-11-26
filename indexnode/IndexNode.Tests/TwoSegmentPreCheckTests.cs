@@ -61,6 +61,9 @@ public class TwoSegmentPreCheckTests
         // the member is a compilation (far longer than the new upload), or a shorter cut: an overlap, processed
         Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(9000)), 6000, _ => null, S).Decision);
         Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(1800, 4200) }, durations: D(5000)), 6000, _ => null, S).Decision);
+        // 0.13.64: up to 5% longer counts as the same length (6300 s against 6000 s); more does not
+        Assert.Equal("duplicate", PreCheck.Decide(An(6300, new() { ["m1"] = Weak(1890, 4410) }, durations: D(6000)), 6300, _ => null, S).Decision);
+        Assert.Equal("overlap", PreCheck.Decide(An(6400, new() { ["m1"] = Weak(1920, 4480) }, durations: D(6000)), 6400, _ => null, S).Decision);
         // same length, but only one segment reaches 0.60, or the two are out of order: an overlap
         Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = (0.73, 1800, 0.40, 4200) }, durations: D(6000)), 6000, _ => null, S).Decision);
         Assert.Equal("overlap", PreCheck.Decide(An(6000, new() { ["m1"] = Weak(4200, 1800) }, durations: D(6000)), 6000, _ => null, S).Decision);
@@ -87,9 +90,9 @@ public class TwoSegmentPreCheckTests
     [Fact]
     public void Longer_than_the_member_plus_the_slack_is_longer_and_processed()
     {
-        // slack = max(2% of 6000 = 120 s, 60 s) = 120 s
-        Assert.Equal("duplicate", PreCheck.Decide(An(6120, new() { ["m1"] = Ok(1800, 4200) }, durations: D(6000)), 6120, _ => null, S).Decision);
-        var d = PreCheck.Decide(An(6121, new() { ["m1"] = Ok(1800, 4200) }, durations: D(6000)), 6121, _ => null, S);
+        // slack = max(5% of 6000 = 300 s, 60 s) = 300 s (0.13.64; 2% before); the member times follow the longer upload, so the gap test passes and only the length decides
+        Assert.Equal("duplicate", PreCheck.Decide(An(6300, new() { ["m1"] = Ok(1890, 4410) }, durations: D(6000)), 6300, _ => null, S).Decision);
+        var d = PreCheck.Decide(An(6301, new() { ["m1"] = Ok(1890, 4410) }, durations: D(6000)), 6301, _ => null, S);
         Assert.Equal("longer", d.Decision); Assert.False(PreCheckDecision.IsSkip(d.Decision)); Assert.Equal("m1", d.MatchedMember);
     }
 

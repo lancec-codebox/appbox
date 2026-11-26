@@ -23,7 +23,8 @@ public sealed class PreCheckSettings
     public double DurationPercent { get; set; } = 0.15;
     public double DurationMinSeconds { get; set; } = 600;
     /// <summary>0.13.13, the asymmetric rule: a download is a duplicate only when L - DurationPercent*L &lt;= duration &lt;= L + max(DurationSlackPercent*L, DurationSlackSeconds), L = the duration of the LONGEST member of the matched upload's group (the matched upload itself without a group). Longer than that: processed.</summary>
-    public double DurationSlackPercent { get; set; } = 0.02;
+    /// <summary>0.13.64 (owner, 2026-11-26: "Up to 5% longer stops too"): an upload up to this much longer than its match (or 60 s, whichever is more) is a copy, not "longer". Was 0.02.</summary>
+    public double DurationSlackPercent { get; set; } = 0.05;
     public double DurationSlackSeconds { get; set; } = 60;
 
     /// <summary>Centers whose member blocks are read per frame.</summary>

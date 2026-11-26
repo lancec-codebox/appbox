@@ -237,8 +237,8 @@ public class PreCheckTests : IDisposable
         Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 * 0.95, _ => 1800, S).Decision);
         var shorter = PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 * 0.70, _ => 1800, S);
         Assert.Equal("overlap", shorter.Decision); Assert.Contains("shorter than the group's longest copy", shorter.Reasons[0]);
-        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 60, _ => 1800, S).Decision);       // the slack: max(2% = 36 s, 60 s)
-        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 61, _ => 1800, S).Decision);
+        Assert.Equal("duplicate", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 90, _ => 1800, S).Decision);       // the slack: max(5% = 90 s, 60 s) (0.13.64; 2% before)
+        Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800 + 91, _ => 1800, S).Decision);
         Assert.Equal("overlap", PreCheck.Decide(A(("up1", 0.97, 0.99)), 1800, _ => null, S).Decision);              // L unknown: processed
     }
 
@@ -253,7 +253,7 @@ public class PreCheckTests : IDisposable
         Assert.Equal("overlap", PreCheck.Decide(a, 2400 + 600, _ => null, S).Decision);                                  // longer than L + slack
         var rec = PreCheck.Record("new1", d, a, new System.Text.Json.Nodes.JsonObject(), null, (0, 300), 2400, S, "n", "v", false, 0, false);
         Assert.Equal("long1", (string)rec["matchedLongest"]!["id"]!); Assert.Equal(2400.0, (double)rec["matchedLongest"]!["duration"]!);
-        Assert.Equal(0.02, (double)rec["settings"]!["durationSlackPercent"]!); Assert.Equal(60.0, (double)rec["settings"]!["durationSlackSeconds"]!);
+        Assert.Equal(0.05, (double)rec["settings"]!["durationSlackPercent"]!); Assert.Equal(60.0, (double)rec["settings"]!["durationSlackSeconds"]!);
         // the legacy (symmetric) rule, for what-if comparisons: 2400 is far from the matched 1500 by more than 15% and 10 min
         Assert.Equal("partial", PreCheck.Decide(a, 2400, _ => null, S, legacy: true).Decision);
     }
