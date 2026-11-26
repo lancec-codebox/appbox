@@ -107,6 +107,30 @@ public class FrameCodesTests
     }
 
     [Fact]
+    public async Task The_per_frame_lookup_on_codes_finds_each_query_frame_in_its_own_upload_and_leaves_the_excluded_one_out()
+    {
+        var (f, idx, xs) = await Seed(3);
+        await FrameCodes.FillAsync(f, P, idx, 60, 0, _ => { }, default);
+        var dir = Tmp();
+        try
+        {
+            var view = await new FrameCodesCache(dir).ViewAsync(f, P, idx, default);
+            var qs = new[] { ("u0", 3), ("u2", 40), ("u1", 59) }.Select(x => xs[x.Item1].AsSpan(x.Item2 * D, D).ToArray()).ToList();
+            var (best, st) = await PreCheckSearch.BestPerFrameCodesAsync(f, P, view, qs, 5, 2, default);
+            Assert.Equal(["u0", "u2", "u1"], best.Select(b => idx.Uploads[b!.Upload].Id).ToArray());
+            Assert.Equal([6.0, 80.0, 118.0], best.Select(b => Math.Round(b!.Time, 3)).ToArray());
+            Assert.All(best, b => Assert.True(b!.Cosine > 0.999f));
+            int u2 = idx.Uploads.FindIndex(u => u.Id == "u2");
+            var (ex, _) = await PreCheckSearch.BestPerFrameCodesAsync(f, P, view, qs, 5, 2, default, u2);
+            Assert.NotEqual("u2", idx.Uploads[ex[1]!.Upload].Id); Assert.True(ex[1]!.Cosine < 0.9f);
+            // the batched scan is the single scan, query by query
+            var codes = qs.Select(q => FrameCodes.Code(q, idx.Mean)).ToList(); var many = view.NearestMany(codes, 7, 3);
+            for (int i = 0; i < qs.Count; i++) Assert.Equal(view.Nearest(codes[i], 7, 2), many[i]);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public async Task Another_writer_appending_in_between_moves_the_entry_but_never_tears_it()
     {
         var (f, idx, _) = await Seed(2);
@@ -121,6 +145,24 @@ public class FrameCodesTests
         {
             var view = await new FrameCodesCache(dir).ViewAsync(f, P, idx, default);
             Assert.Equal(0, view.Missing); Assert.Equal(120, view.Frames);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task Small_parallel_ranges_that_cut_parts_still_give_the_whole_log()
+    {
+        var (f, idx, _) = await Seed(5);
+        await FrameCodes.FillAsync(f, P, idx, 60, 0, _ => { }, default);
+        var dir = Tmp();
+        try
+        {
+            var small = new FrameCodesCache(dir) { RangeBytes = 1000, Streams = 3 };   // a part is ~4.6 KB: every part is cut across ranges and windows
+            var view = await small.ViewAsync(f, P, idx, default);
+            Assert.Equal(0, view.Missing); Assert.Equal(300, view.Frames);
+            Assert.True(small.Reads > 20);
+            var len = (await f.GetAppendInfoAsync(FrameCodes.Segment(P, idx.MeanVersion, 0), default))!.Length;
+            Assert.Equal(len, new FileInfo(Path.Combine(dir, "m1", "log-0000.bin")).Length);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

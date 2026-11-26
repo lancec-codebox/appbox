@@ -16,9 +16,21 @@ public static class PreCheckWhatIf
     /// <summary>0.13.15: Old = the 0.13.14 single-window rule on one window at 0.5; New = the two-segment rule (windows at 0.30/0.70, 30 frames each, the drama itself excluded). FalseSkips: every new duplicate/subset where the drama's own group step says new or mixed, or its covered share is under 0.5. AiChanges: dramas whose AI flag differs between the two samples.</summary>
     public sealed record Summary(int Dramas, Dictionary<string, int> Old, Dictionary<string, int> New, int OldSkipNewProcessed, int NewSkipOldProcessed, int NewButGroupJoin, int Failed, IReadOnlyList<string> FalseSkips, IReadOnlyList<string> AiChanges, double Seconds, IReadOnlyList<string>? Differs = null, int Pairs = 0, int PairsFull = 0, int PairsVote = 0, IReadOnlyList<string>? PairMisses = null, long BlocksFull = 0, long BlocksVote = 0, long RequestsFull = 0, long RequestsVote = 0, int VoteUploads = 0);
 
+    /// <summary>0.13.71 (`--route frames`): the frame codes of the head version. The run then compares the centers route (vote-first, as the check runs today: the "full read" fields) with the frames route (the "vote-first" fields).</summary>
+    public static FrameCodesView? Codes { get; set; }
+    /// <summary>0.13.71: how many nearest frames by code each query frame reads exactly on the frames route.</summary>
+    public static int CodesK { get; set; } = 10;
+
     public static async Task<int> RunAsync(Args a, IStore? remote = null)
     {
         var (cfg, store, paths, _) = CentersCommands.OpenStore(a, remote);
+        if (a.Get("route") is "frames")
+        {
+            var head0 = await SearchData.LoadAsync(store, paths, null, default) ?? throw new InvalidOperationException("no search index");
+            var cc = new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes")); Codes = await cc.ViewAsync(store, paths, head0, default);
+            if (a.Get("codes-k") is { } ck) CodesK = int.Parse(ck);
+            Console.Error.WriteLine($"precheck whatif: ROUTE COMPARISON on v{head0.Version}: 'full read' = centers (vote-first top {(cfg.PreCheck ?? new()).VoteUploads}, as today), 'vote-first' = frame codes (k {CodesK}); {Codes.Frames:N0} frames, {Codes.Missing} uploads without codes");
+        }
         int threads = Math.Max(1, a.Get("threads") is { } t ? int.Parse(t) : cfg.EffectiveThreads);
         int limit = a.Get("limit") is { } l ? int.Parse(l) : int.MaxValue;
         var ids = a.Get("ids") is { } f ? File.ReadAllLines(f).Select(x => x.Trim()).Where(x => x.Length > 0 && !x.StartsWith('#')).ToList() : null;
@@ -118,9 +130,9 @@ public static class PreCheckWhatIf
     /// <summary>0.13.21: both lookups per drama, each with its own empty cache so the block and request counts are cold and comparable: the full read (voteUploads 0) and vote-first (s.VoteUploads). The record is the vote-first one plus "fullRead" and "differs".</summary>
     static async Task<JsonObject?> OneAsync(IStore store, Paths paths, SearchData head, Dictionary<string, string> ofGroup, Dictionary<string, List<GroupMember>> groupMembers, Dictionary<string, int> indexOf, PreCheckSettings s, string id, int threads, BlockCache cache, CancellationToken ct)
     {
-        var full = await CoreAsync(store, paths, head, ofGroup, groupMembers, indexOf, s, id, threads, new BlockCache(0), 0, ct);
+        var full = await CoreAsync(store, paths, head, ofGroup, groupMembers, indexOf, s, id, threads, new BlockCache(0), Codes != null ? s.VoteUploads : 0, ct);
         if (full == null) return null;
-        var vf = await CoreAsync(store, paths, head, ofGroup, groupMembers, indexOf, s, id, threads, new BlockCache(0), s.VoteUploads, ct);
+        var vf = await CoreAsync(store, paths, head, ofGroup, groupMembers, indexOf, s, id, threads, new BlockCache(0), Codes != null ? -2 : s.VoteUploads, ct);   // -2: the frames route
         if (vf == null) return null;
         var lf = (JsonObject)full["lookup"]!; var lv = (JsonObject)vf["lookup"]!;
         vf["fullRead"] = lf.DeepClone();
@@ -154,8 +166,8 @@ public static class PreCheckWhatIf
         var (os, oe, _) = PreCheck.Window(duration, s.WindowSeconds, s.WindowPosition);
         var rowsOld = Pick(os, oe, s.Frames);
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var (bestN, stN) = await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsNew, s.TopCenters, threads, ct, ex, cache, vote);
-        var (bestO, stO) = await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsOld, s.TopCenters, threads, ct, ex, cache, vote);
+        var (bestN, stN) = vote == -2 ? await PreCheckSearch.BestPerFrameCodesAsync(store, paths, Codes!, rowsNew, CodesK, threads, ct, ex) : await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsNew, s.TopCenters, threads, ct, ex, cache, vote);
+        var (bestO, stO) = vote == -2 ? await PreCheckSearch.BestPerFrameCodesAsync(store, paths, Codes!, rowsOld, CodesK, threads, ct, ex) : await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsOld, s.TopCenters, threads, ct, ex, cache, vote);
         var upIds = head.Uploads.Select(u => u.Id).ToList();
         IReadOnlyList<GroupCopy> Copies(string g) => groupMembers[g].Where(m => m.Upload != id).Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration ?? DurationOf(m.Upload))).ToList();
         PreCheckAnalysis Build(FrameBest?[] best, int n, List<float[]> rows)

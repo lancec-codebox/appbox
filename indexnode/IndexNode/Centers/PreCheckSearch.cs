@@ -123,6 +123,56 @@ public static class PreCheckSearch
     }
 
     /// <summary>
+    /// 0.13.71: the same answer as <see cref="BestPerFrameAsync"/> from the frame codes instead of the centers: each query's <paramref name="k"/> nearest frames by code (every frame of every upload
+    /// but <paramref name="excludeUpload"/>), their stored vectors read exactly (each frame once, merged ranges per frames file), the best cosine per query.
+    /// </summary>
+    public static async Task<(FrameBest?[] Best, Stats Stats)> BestPerFrameCodesAsync(IStore raw, Paths paths, FrameCodesView view, IReadOnlyList<float[]> queries, int k, int threads, CancellationToken ct, int excludeUpload = -1)
+    {
+        var idx = view.Index; int n = queries.Count; var q = new float[n][];
+        for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
+        var sw = Stopwatch.StartNew();
+        var near = view.NearestMany(q.Select(x => FrameCodes.Code(x, idx.Mean)).ToList(), k, threads, excludeUpload);
+        double scanMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
+        var need = near.SelectMany(l => l).GroupBy(h => h.Upload).ToDictionary(g => g.Key, g => g.Select(h => h.Row).Distinct().OrderBy(r => view.Uploads[g.Key]!.Offsets[r]).ToList());
+        var vecs = new ConcurrentDictionary<(int Up, int Row), float[]>(); long bytes = 0; int requests = 0;
+        await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>
+        {
+            var up = idx.Uploads[kv.Key]; var fu = view.Uploads[kv.Key]!; var rows = kv.Value;
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    var z = await FramesReader.ForAsync(raw, paths, up, attempt, t);
+                    for (int i = 0; i < rows.Count;)
+                    {
+                        int j = i; long start = fu.Offsets[rows[i]], end = start + FrameCodes.VectorBytes;
+                        while (j + 1 < rows.Count && fu.Offsets[rows[j + 1]] - end <= CenterSearch.MergeGap && fu.Offsets[rows[j + 1]] + FrameCodes.VectorBytes - start <= CenterSearch.MaxMerged) { j++; end = fu.Offsets[rows[j]] + FrameCodes.VectorBytes; }
+                        var buf = await z.ReadAsync(start, (int)(end - start), t);
+                        for (int m = i; m <= j; m++) { var v = new float[CentersFile.Dim]; Vec.FromHalf(buf.AsSpan((int)(fu.Offsets[rows[m]] - start), FrameCodes.VectorBytes), v); vecs[(kv.Key, rows[m])] = v; }
+                        i = j + 1;
+                    }
+                    Interlocked.Add(ref bytes, z.BytesRead); Interlocked.Add(ref requests, z.Requests); return;
+                }
+                catch (StaleZipException) when (attempt == 0) { }
+            }
+        });
+        double readMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
+        var best = new FrameBest?[n];
+        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads), CancellationToken = ct }, i =>
+        {
+            FrameBest? b = null;
+            foreach (var h in near[i])
+            {
+                if (!vecs.TryGetValue((h.Upload, h.Row), out var v)) continue;
+                float c = Vec.Dot(q[i], v);
+                if (b == null || c > b.Cosine) b = new FrameBest(h.Upload, view.Uploads[h.Upload]!.Times[h.Row], c);
+            }
+            best[i] = b;
+        });
+        return (best, new Stats(scanMs, readMs, sw.Elapsed.TotalMilliseconds, vecs.Count, requests, bytes, need.Count, need.Count, 0));
+    }
+
+    /// <summary>
     /// 0.13.1: the uploads whose centers.zip is newer than the index, searched by brute force (every center's members, exact cosine): their upload index is <c>idx.Uploads.Count + position in <paramref name="fresh"/></c>.
     /// Merges into <paramref name="best"/> (the indexed result per frame) and returns the fresh uploads that could be read (a missing or unreadable one is skipped, not fatal: the index is a cache of these).
     /// </summary>

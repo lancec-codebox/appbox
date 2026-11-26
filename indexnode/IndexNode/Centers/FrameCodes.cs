@@ -112,9 +112,19 @@ public static class FrameCodes
         var id = Encoding.UTF8.GetString(b.Slice(Fixed, il)); var blob = Encoding.UTF8.GetString(b.Slice(Fixed + il, bl)); var sha = Encoding.UTF8.GetString(b.Slice(Fixed + il + bl, sl));
         int o = (Fixed + il + bl + sl + 7) & ~7;
         if (o + n * (CodeBytes + 8) + 1 != len || b[len - 1] != (byte)'\n') throw new InvalidDataException($"frame codes part of {id}: length {len} does not match {n} frames");
-        var codes = new ulong[(long)n * Words]; for (int i = 0; i < codes.Length; i++, o += 8) codes[i] = BinaryPrimitives.ReadUInt64LittleEndian(b[o..]);
-        var offs = new uint[n]; for (int i = 0; i < n; i++, o += 4) offs[i] = BinaryPrimitives.ReadUInt32LittleEndian(b[o..]);
-        var times = new float[n]; for (int i = 0; i < n; i++, o += 4) times[i] = BinaryPrimitives.ReadSingleLittleEndian(b[o..]);
+        ulong[] codes; uint[] offs; float[] times;
+        if (BitConverter.IsLittleEndian)
+        {   // 0.13.71: one block copy per column (the file is little-endian, as this machine)
+            codes = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(b.Slice(o, n * CodeBytes)).ToArray(); o += n * CodeBytes;
+            offs = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(b.Slice(o, n * 4)).ToArray(); o += n * 4;
+            times = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(b.Slice(o, n * 4)).ToArray(); o += n * 4;
+        }
+        else
+        {
+            codes = new ulong[(long)n * Words]; for (int i = 0; i < codes.Length; i++, o += 8) codes[i] = BinaryPrimitives.ReadUInt64LittleEndian(b[o..]);
+            offs = new uint[n]; for (int i = 0; i < n; i++, o += 4) offs[i] = BinaryPrimitives.ReadUInt32LittleEndian(b[o..]);
+            times = new float[n]; for (int i = 0; i < n; i++, o += 4) times[i] = BinaryPrimitives.ReadSingleLittleEndian(b[o..]);
+        }
         return new Part(id, blob, sha, mv, first, total, codes, offs, times);
     }
 
@@ -209,6 +219,45 @@ public sealed class FrameCodesView
 
     public sealed record Near(int Upload, int Row, int Dist);
 
+    /// <summary>0.13.71: the <paramref name="k"/> nearest frames of EACH query (the duplicate check's and the group step's many frames): the uploads are split among the threads, and each upload's codes
+    /// are scanned for every query while they are in cache (read from memory once per call, not once per query). <paramref name="exclude"/>: an upload index left out (the subject itself).</summary>
+    public List<Near>[] NearestMany(IReadOnlyList<ulong[]> qs, int k, int threads, int exclude = -1)
+    {
+        int Q = qs.Count; threads = Math.Max(1, threads); var live = Enumerable.Range(0, Uploads.Length).Where(i => Uploads[i] != null && i != exclude).ToArray();
+        var result = new List<Near>[Q]; for (int i = 0; i < Q; i++) result[i] = [];
+        if (k <= 0 || Q == 0 || live.Length == 0) return result;
+        var parts = new List<Near>[threads][];
+        Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads }, p =>
+        {
+            var mine = new List<Near>[Q]; var thr = new int[Q]; for (int i = 0; i < Q; i++) { mine[i] = new List<Near>(4 * k + 64); thr[i] = int.MaxValue; }
+            var hist = new int[FrameCodes.CodeBytes * 8 + 1];
+            for (int li = p; li < live.Length; li += threads)
+            {
+                int ui = live[li]; var c = Uploads[ui]!.Codes; int n = c.Length / FrameCodes.Words;
+                for (int qi = 0; qi < Q; qi++)
+                {
+                    var q = qs[qi]; ulong q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3], q4 = q[4], q5 = q[5], q6 = q[6], q7 = q[7]; int t = thr[qi]; var m = mine[qi];
+                    for (int r = 0, o = 0; r < n; r++, o += 8)
+                    {
+                        int d = BitOperations.PopCount(c[o] ^ q0) + BitOperations.PopCount(c[o + 1] ^ q1) + BitOperations.PopCount(c[o + 2] ^ q2) + BitOperations.PopCount(c[o + 3] ^ q3)
+                              + BitOperations.PopCount(c[o + 4] ^ q4) + BitOperations.PopCount(c[o + 5] ^ q5) + BitOperations.PopCount(c[o + 6] ^ q6) + BitOperations.PopCount(c[o + 7] ^ q7);
+                        if (d > t) continue;
+                        m.Add(new Near(ui, r, d));
+                        if (m.Count > 4 * k)
+                        {
+                            Array.Clear(hist); foreach (var h in m) hist[h.Dist]++;
+                            int tt = 0, cum = 0; while (tt < hist.Length - 1 && cum + hist[tt] < k) { cum += hist[tt]; tt++; }
+                            m.RemoveAll(h => h.Dist > tt); t = thr[qi] = tt;
+                        }
+                    }
+                }
+            }
+            parts[p] = mine;
+        });
+        for (int qi = 0; qi < Q; qi++) result[qi] = parts.SelectMany(x => x[qi]).OrderBy(h => h.Dist).ThenBy(h => h.Upload).ThenBy(h => h.Row).Take(k).ToList();
+        return result;
+    }
+
     /// <summary>The <paramref name="k"/> frames nearest the query code (popcount distance), best first (ties: upload order, then row). Each of <paramref name="threads"/> parts keeps its candidates under a threshold that tightens as it goes.</summary>
     public List<Near> Nearest(ulong[] q, int k, int threads)
     {
@@ -250,7 +299,6 @@ public sealed record FrameCodesUpload(ulong[] Codes, uint[] Offsets, float[] Tim
 /// </summary>
 public sealed class FrameCodesCache(string root)
 {
-    public const int ChunkBytes = 64 << 20;
     readonly SemaphoreSlim gate = new(1, 1);
     FrameCodesView? view;
     readonly Dictionary<(int Mv, int Seg, long Off), FrameCodes.Part> parts = new();
@@ -301,28 +349,39 @@ public sealed class FrameCodesCache(string root)
         return FrameCodes.Decode(b);
     }
 
-    /// <summary>Reads segment <paramref name="seg"/> from the end of the local copy until the part at <paramref name="lastOffset"/> is whole here. Keeps complete parts only (a part cut by a chunk is read again).</summary>
+    /// <summary>0.13.71: ranges of this size are read <see cref="Streams"/> at a time. Measured 2026-11-26 on the hexad host (West US 2): one stream ~21 MB/s (the 961 MB log in 54 s), 16 parallel 16 MB ranges ~250 MB/s (curl); with 32 streams the cold load of the log is 6.4 s, from the local copy 1.3 s.</summary>
+    public int RangeBytes { get; init; } = 16 << 20;
+    public int Streams { get; init; } = 32;
+
+    /// <summary>Reads segment <paramref name="seg"/> from the end of the local copy until the part at <paramref name="lastOffset"/> is whole here: one HEAD for the length, then windows of
+    /// <see cref="Streams"/> parallel ranged reads. Keeps complete parts only (a part cut at the end of a window waits for the next one).</summary>
     async Task SyncAsync(IStore store, Paths paths, int mv, int seg, long lastOffset, CancellationToken ct)
     {
-        var path = LocalFile(mv, seg); Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var name = FrameCodes.Segment(paths, mv, seg); var path = LocalFile(mv, seg); Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         long have = File.Exists(path) ? new FileInfo(path).Length : 0;
         bool Whole() { if (have <= lastOffset) return false; using var fh = File.OpenHandle(path); var h = new byte[FrameCodes.Fixed]; return RandomAccess.Read(fh, h, lastOffset) == h.Length && lastOffset + FrameCodes.LengthAt(h) <= have; }
-        while (!Whole())
+        if (Whole()) return;
+        var info = await store.GetAppendInfoAsync(name, ct) ?? throw new FileNotFoundException(name); Reads++;
+        if (info.Length <= lastOffset) throw new InvalidDataException($"frame codes log {seg}: the part at {lastOffset} is past the end ({info.Length})");
+        var carry = Array.Empty<byte>(); long at = have;
+        while (at < info.Length && !Whole())
         {
-            var r = await store.ReadAppendAsync(FrameCodes.Segment(paths, mv, seg), have, ChunkBytes, ct); Reads++; BytesRead += r.Data.Length;
-            if (r.NotFound) throw new FileNotFoundException(FrameCodes.Segment(paths, mv, seg));
-            // complete parts only
-            int used = 0; var d = r.Data;
-            while (true) { int len = FrameCodes.LengthAt(d.AsSpan(used)); if (len == 0 || used + len > d.Length) break; used += len; }
-            if (used == 0)
+            var ranges = new List<(long Off, int Len)>();
+            for (long o = at; o < info.Length && ranges.Count < Streams; o += RangeBytes) ranges.Add((o, (int)Math.Min(RangeBytes, info.Length - o)));
+            var bufs = new byte[ranges.Count][];
+            await Parallel.ForEachAsync(Enumerable.Range(0, ranges.Count), new ParallelOptions { MaxDegreeOfParallelism = Streams, CancellationToken = ct }, async (i, t) =>
             {
-                if (d.Length == 0 || have + d.Length >= r.Length) throw new InvalidDataException($"frame codes log {seg}: the part at {lastOffset} is past the end ({r.Length})");
-                // one part larger than the chunk cannot happen (a part is at most 3.6 MB)
-                throw new InvalidDataException($"frame codes log {seg}: no whole part in {d.Length} bytes at {have}");
-            }
-            using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read)) fs.Write(d, 0, used);
-            have += used;
+                var r = await store.GetRangeAsync(name, ranges[i].Off, ranges[i].Len, null, t);
+                bufs[i] = r.Data is { } d0 && d0.Length == ranges[i].Len ? d0 : throw new InvalidDataException($"{name}: asked for {ranges[i].Len} bytes at {ranges[i].Off}, got {r.Data?.Length.ToString() ?? "none"}");
+            });
+            long got = ranges.Sum(x => (long)x.Len); Reads += ranges.Count; BytesRead += got; at += got;
+            // whole parts go to the local copy; a part cut at the end of the window is carried into the next
+            var d = new byte[carry.Length + got]; carry.CopyTo(d, 0); long w = carry.Length; foreach (var b in bufs) { b.CopyTo(d, w); w += b.Length; }
+            int used = 0; while (true) { int len = FrameCodes.LengthAt(d.AsSpan(used)); if (len == 0 || used + len > d.Length) break; used += len; }
+            if (used > 0) { using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read); fs.Write(d, 0, used); have += used; }
+            carry = d[used..];
         }
+        if (!Whole()) throw new InvalidDataException($"frame codes log {seg}: the part at {lastOffset} is not whole at the end ({info.Length})");
     }
 }
 
