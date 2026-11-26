@@ -67,6 +67,10 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
     public string? Token { get; init; }
     /// <summary>0.13.58: when set (env INDEXNODE_SEARCH_TOKEN), POST /v1/search needs `Authorization: Bearer <it>`: the site's Worker is the only caller. Not set: /v1/search is open, as before.</summary>
     public string? SearchToken { get; init; }
+    /// <summary>0.13.62: frames around a moment and the actor lookup (GET /v1/frames, POST /v1/actors/search, GET /v1/actors/...), for a person's search page. They need the serve token or the search token; with neither set they answer 401.</summary>
+    public LookServer? Look { get; init; }
+    bool SearchTokenOk(HttpContext c) => !string.IsNullOrEmpty(SearchToken) && c.Request.Headers.Authorization.ToString() is { } auth && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+        && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(System.Text.Encoding.UTF8.GetBytes(auth[7..].Trim()), System.Text.Encoding.UTF8.GetBytes(SearchToken));
     public Tools? Tools { get; init; }
     /// <summary>The analyzer /v1/check runs (default: the server's own); tests put a fake one.</summary>
     public IPreCheckAnalyzer? CheckAnalyzer { get; init; }
@@ -217,6 +221,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
         if (meter.Tripped) throw new StorageBudgetExceeded(meter.TripMessage ?? "the storage breaker is open");
         List<Hit> hits; QueryTimings tm; long ops;
         if (maxUploads < 0) maxUploads = settings.SearchUploads;
+        if (topCenters <= 0) topCenters = Math.Clamp((int)Math.Round(idx.Bits.Length / SearchData.CodeBytes * settings.SearchCentersShare), 300, 5000);   // 0.13.62: grows with the index
         using (var scope = meter.BeginStep(meter.Limits.StepLimitFor("search"), null)) { (hits, tm) = await CenterSearch.QueryAsync(store, paths, idx, q, topCenters, top, threads, ct, maxUploads, ranged ?? settings.SearchRanged); ops = meter.StepOps; }
         Interlocked.Increment(ref searches);
         return new JsonObject
@@ -333,7 +338,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
                 string Field(string n) => form.TryGetValue(n, out var v) && v.ToString().Length > 0 ? v.ToString() : c.Request.Query[n].ToString();
                 int Int(string n, int d, int max) => Field(n) is { Length: > 0 } s ? Math.Clamp(int.Parse(s, System.Globalization.CultureInfo.InvariantCulture), 1, max) : d;
                 bool trim = Field("trim") is var tv && (tv.Equals("true", StringComparison.OrdinalIgnoreCase) || tv == "1");
-                var res = await SearchAsync(await Part("image"), form.Files.GetFile("image")?.FileName ?? "", await Part("vector"), trim, Int("topCenters", 300, 5000), Int("top", 20, 200), c.RequestAborted, Field("maxUploads") is { Length: > 0 } mu ? Math.Clamp(int.Parse(mu, System.Globalization.CultureInfo.InvariantCulture), 0, 5000) : -1, Field("ranged") is { Length: > 0 } rg ? rg.Equals("true", StringComparison.OrdinalIgnoreCase) || rg == "1" : null);
+                var res = await SearchAsync(await Part("image"), form.Files.GetFile("image")?.FileName ?? "", await Part("vector"), trim, Field("topCenters").Length > 0 ? Int("topCenters", 300, 5000) : 0, Int("top", 20, 200), c.RequestAborted, Field("maxUploads") is { Length: > 0 } mu ? Math.Clamp(int.Parse(mu, System.Globalization.CultureInfo.InvariantCulture), 0, 5000) : -1, Field("ranged") is { Length: > 0 } rg ? rg.Equals("true", StringComparison.OrdinalIgnoreCase) || rg == "1" : null);
                 return Results.Text(res.ToJsonString(), "application/json");
             }
             catch (Exception e) when (e is ArgumentException or FormatException or OverflowException or InvalidDataException or BadHttpRequestException) { Interlocked.Increment(ref failures); return Results.BadRequest(new { error = e.Message }); }
@@ -341,6 +346,7 @@ public sealed class PreCheckServer(PreCheckAnalyzer analyzer, SearchIndexCache i
             catch (StorageBudgetExceeded e) { Interlocked.Increment(ref failures); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 503); }
             catch (Exception e) { Interlocked.Increment(ref failures); Log.Info("serve: search failed: " + Redact.Sas(e.ToString())); return Results.Json(new { error = Redact.Sas(e.Message) }, statusCode: 500); }
         });
+        Look?.Map(app, c => { Interlocked.Increment(ref requests); return TokenOk(c) || SearchTokenOk(c); });
         return app;
     }
 }
@@ -372,7 +378,7 @@ public static class ServeCommand
         var cache = new SearchIndexCache(Path.Combine(NodeConfig.ConfigDir(), "search-cache"), TimeSpan.FromMinutes(5));
         var blocks = new BlockCache((a.Get("block-cache-mb") is { } m ? long.Parse(m) : 512) * 1024 * 1024);
         var analyzer = new PreCheckAnalyzer(tools, cfg, http, store, paths, cache) { Blocks = blocks, InProcess = true };
-        var server = new PreCheckServer(analyzer, cache, store, paths, blocks, st, threads, Commands.VersionString, a.Get("concurrency") is { } c ? int.Parse(c) : 2) { ImageConfig = cfg, ImageHttp = http, Tools = tools, SearchToken = Environment.GetEnvironmentVariable("INDEXNODE_SEARCH_TOKEN") is { Length: > 0 } stok ? stok.Trim() : null, Token = Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN") is { Length: > 0 } et ? et.Trim() : cfg.Serve?.Token };
+        var server = new PreCheckServer(analyzer, cache, store, paths, blocks, st, threads, Commands.VersionString, a.Get("concurrency") is { } c ? int.Parse(c) : 2) { ImageConfig = cfg, ImageHttp = http, Tools = tools, Look = new LookServer(store, paths, tools, http, cache, threads), SearchToken = Environment.GetEnvironmentVariable("INDEXNODE_SEARCH_TOKEN") is { Length: > 0 } stok ? stok.Trim() : null, Token = Environment.GetEnvironmentVariable("INDEXNODE_SERVE_TOKEN") is { Length: > 0 } et ? et.Trim() : cfg.Serve?.Token };
         if (string.IsNullOrEmpty(server.Token)) Console.WriteLine("serve: no serve.token / INDEXNODE_SERVE_TOKEN: POST /v1/check answers 401 to everyone");
         using var cts = new CancellationTokenSource();
         // 0.13.21: SIGINT and SIGTERM stop serve gracefully; if the stop has not finished in 8 s the process exits anyway (a hung shutdown must not keep the port or the old binary alive)
@@ -383,7 +389,7 @@ public static class ServeCommand
         var bind = a.Get("bind") ?? "0.0.0.0";
         var app = server.Build($"http://{bind}:{port}"); server.Ready = false;
         await app.StartAsync(cts.Token);
-        Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/health); answering 503 until the load is done");
+        Console.WriteLine($"serve: listening on {string.Join(", ", app.Urls)}  (POST /v1/check [bearer token], POST /v1/precheck, POST /v1/search, GET /v1/frames + /v1/actors [bearer token], GET /v1/health); answering 503 until the load is done");
         Console.WriteLine($"serve: loading models and the search index ({threads} threads)...");
         var sw = Stopwatch.StartNew();
         await analyzer.WarmAsync(threads, cts.Token);

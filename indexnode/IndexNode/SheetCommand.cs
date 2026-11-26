@@ -193,6 +193,11 @@ public static class SheetCommand
             }
             if (best is not { } b) return null;
             var f = b.Info.Frames[b.Row]; var ext = container == "mjpeg" ? "mjpeg" : "mp4";
+            if (container == "mjpeg" && f.Off >= 0 && f.Len > 0 && !datas.ContainsKey(b.Info.Chunk))
+            {   // 0.13.62: one frame is one ranged read of its own bytes, not the whole ten-minute chunk (tens of MB)
+                var rr = await store.GetRangeAsync(paths.Video(id, $"frames/{b.Info.Chunk}.mjpeg"), f.Off, f.Len, null, ct);
+                if (rr.Data is { } one && one.Length == f.Len && one.Length > 3 && one[0] == 0xFF && one[1] == 0xD8) return new Shot(t, f.T, Imaging.DecodeJpeg(one));
+            }
             var data = await DataAsync(b.Info.Chunk, ext, ct);
             if (container == "mjpeg")
             {
