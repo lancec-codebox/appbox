@@ -475,7 +475,8 @@ public static class Commands
                     return 0;
                 }
                 var sid = PriorityTool.SourceId(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException($"sources {sub} <id>|--all-due"));
-                Console.WriteLine(await Sources.TriggerAsync(queue, sid, sub, default) ? $"{sid}: {sub} due now (priority {Protocol.RefreshNowPriority}); the next free downloader runs it" : $"{sid}: a node is running it right now");
+                int? bfl = a.Get("backfill") is { } bfs ? int.Parse(bfs) : null;   // 0.13.74: how deep a channel lookup lists (its newest N uploads)
+                Console.WriteLine(await Sources.TriggerAsync(queue, sid, sub, default, backfill: bfl) ? $"{sid}: {sub} due now (priority {Protocol.RefreshNowPriority}){(bfl != null ? $", backfill {bfl}" : "")}; the next free downloader runs it" : $"{sid}: a node is running it right now");
                 return 0;
             }
             case "priority":

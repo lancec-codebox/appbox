@@ -24,8 +24,27 @@ public static class JobsCommand
             }
             case "list": case null:
                 return await ListAsync(a, await Load(store, paths));
+            case "states":
+            {   // 0.13.74 (read only): every entry of the given uploads in the processing and the download queue, one line per upload: id <tab> realm:stage=state[:hold] ...
+                var ids = File.ReadAllLines(a.Get("ids") ?? throw new ArgumentException("jobs states --ids=<file> [--out=<file>]")).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+                var pq = await Load(store, paths); var dq = await JobQueue.OpenAsync(store, paths, "cli", true, default);
+                string Of(JobQueue q, string realm, string id) => q.Read(st => st.Get(id) is { } s ? string.Join(" ", s.Entries.Values.Select(e => $"{realm}:{e.Stage}={e.State}{(e.Hold != null ? ":" + e.Hold : "")}{(e.State == "failed" && e.Job?.Reason is { } why ? "[" + why.Replace(" ", "_")[..Math.Min(60, why.Length)] + "]" : "")}")) : "");
+                var lines = ids.Select(id => id + "\t" + (Of(pq, "p", id) + " " + Of(dq, "d", id)).Trim()).ToList();
+                if (a.Get("out") is { } o) File.WriteAllLines(o, lines); else foreach (var l in lines) Console.WriteLine(l);
+                Console.Error.WriteLine($"{ids.Count} uploads; known to a queue: {lines.Count(l => l.Split('\t')[1].Length > 0)}");
+                return 0;
+            }
             case "priority":
             {
+                if (a.Get("ids") is { } idf)
+                {   // 0.13.74: one priority for every upload of a file, in the full download queue (the owner's picks); --dry-run counts only
+                    var list = File.ReadAllLines(idf).Select(x => x.Trim()).Where(x => x.Length > 0 && !x.StartsWith('#')).Distinct().ToList();
+                    int pp = PriorityTool.ParseOption(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("jobs priority --ids=<file> N"));
+                    var dq = await JobQueue.OpenAsync(store, paths, "cli", true, default);
+                    if (a.Has("dry-run")) { int live = list.Count(x => dq.Read(st => st.Get(x)) is { } s && s.Entries.Values.Any(e => !e.Final)); Console.WriteLine($"[dry run] {list.Count} id(s); with an open download-queue entry (would get priority {pp}): {live}"); return 0; }
+                    var rr = await PriorityTool.SetAsync(dq, pp, list, default);
+                    Console.WriteLine($"priority {pp}: {rr.Changed} upload(s) changed; skipped {string.Join(", ", rr.Skipped.Select(k => $"{k.Value} {k.Key}"))}"); return 0;
+                }
                 var id = a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("jobs priority <subject> N");
                 var q = await JobQueue.OpenForVideoAsync(store, paths, "cli", id, default);   // processing first, then download
                 int p = PriorityTool.ParseOption(a.Positional.ElementAtOrDefault(2) ?? throw new ArgumentException("jobs priority <subject> N"));

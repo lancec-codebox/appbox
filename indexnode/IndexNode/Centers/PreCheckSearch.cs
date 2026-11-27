@@ -130,18 +130,28 @@ public static class PreCheckSearch
     public static async Task<(FrameBest?[] Best, Stats Stats)> LookupAsync(IStore raw, Paths paths, SearchData idx, IReadOnlyList<float[]> queries, PreCheckSettings s, int threads, CancellationToken ct, int excludeUpload = -1, BlockCache? shared = null, FrameCodesCache? codes = null)
     {
         if (PreCheckSettings.ResolveRoute(s.CheckRoute, idx.CodesMissing) == "frames" && idx.Uploads.Count > 0)
-            return await BestPerFrameCodesAsync(raw, paths, await (codes ?? FrameCodesCache.Shared).ViewAsync(raw, paths, idx, ct), queries, s.CheckFrames, threads, ct, excludeUpload);
+            return await BestPerFrameCodesAsync(raw, paths, await (codes ?? FrameCodesCache.Shared).ViewAsync(raw, paths, idx, ct), queries, s.CheckFrames, threads, ct, excludeUpload, s.VoteUploads);
         return await BestPerFrameAsync(raw, paths, idx, queries, s.TopCenters, threads, ct, excludeUpload, shared, s.VoteUploads);
     }
 
-    public static async Task<(FrameBest?[] Best, Stats Stats)> BestPerFrameCodesAsync(IStore raw, Paths paths, FrameCodesView view, IReadOnlyList<float[]> queries, int k, int threads, CancellationToken ct, int excludeUpload = -1)
+    /// <param name="voteUploads">0.13.74: only the uploads with the most votes (query frames that have one of their frames among their k nearest; ties by the rank-weighted sum) are read, at most this many (0: all). 0.13.73 read every upload any nearest frame belonged to: ~340 per check on a box with no frames cache.</param>
+    public static async Task<(FrameBest?[] Best, Stats Stats)> BestPerFrameCodesAsync(IStore raw, Paths paths, FrameCodesView view, IReadOnlyList<float[]> queries, int k, int threads, CancellationToken ct, int excludeUpload = -1, int voteUploads = 0)
     {
         var idx = view.Index; int n = queries.Count; var q = new float[n][];
         for (int i = 0; i < n; i++) { q[i] = (float[])queries[i].Clone(); Vec.Normalize(q[i]); }
         var sw = Stopwatch.StartNew();
         var near = view.NearestMany(q.Select(x => FrameCodes.Code(x, idx.Mean)).ToList(), k, threads, excludeUpload);
         double scanMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
-        var need = near.SelectMany(l => l).GroupBy(h => h.Upload).ToDictionary(g => g.Key, g => g.Select(h => h.Row).Distinct().OrderBy(r => view.Uploads[g.Key]!.Offset(r)).ToList());
+        // the vote: per upload, how many query frames have it among their nearest (once per frame), then the rank-weighted sum, then the upload index
+        var frames = new Dictionary<int, int>(); var weight = new Dictionary<int, double>(); var seenU = new HashSet<int>();
+        foreach (var l in near)
+        {
+            seenU.Clear();
+            for (int r = 0; r < l.Count; r++) { var u = l[r].Upload; if (seenU.Add(u)) frames[u] = frames.GetValueOrDefault(u) + 1; weight[u] = weight.GetValueOrDefault(u) + 1.0 / (1 + r); }
+        }
+        var voted = frames.Keys.OrderByDescending(u => frames[u]).ThenByDescending(u => weight[u]).ThenBy(u => u).ToList();
+        var keep = (voteUploads > 0 ? voted.Take(voteUploads) : voted).ToHashSet();
+        var need = near.SelectMany(l => l).Where(h => keep.Contains(h.Upload)).GroupBy(h => h.Upload).ToDictionary(g => g.Key, g => g.Select(h => h.Row).Distinct().OrderBy(r => view.Uploads[g.Key]!.Offset(r)).ToList());
         var vecs = new ConcurrentDictionary<(int Up, int Row), float[]>(); long bytes = 0; int requests = 0;
         await Parallel.ForEachAsync(need, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(64, threads * 8)), CancellationToken = ct }, async (kv, t) =>
         {
@@ -177,7 +187,7 @@ public static class PreCheckSearch
             }
             best[i] = b;
         });
-        return (best, new Stats(scanMs, readMs, sw.Elapsed.TotalMilliseconds, vecs.Count, requests, bytes, need.Count, need.Count, 0));
+        return (best, new Stats(scanMs, readMs, sw.Elapsed.TotalMilliseconds, vecs.Count, requests, bytes, voted.Count, need.Count, 0));
     }
 
     /// <summary>

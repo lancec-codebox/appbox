@@ -19,6 +19,13 @@ public static class ClassifyCommand
             {
                 const string use = "classify set <videoId> drama|not [--reason R]   (an id starting with '-': --video=<id> drama, or: classify set drama -- <id>)";
                 var rest = a.Positional.Skip(1).ToList(); string? id, verdict;
+                if (a.Get("ids") is { } idf)
+                {   // 0.13.74: one verdict for every id of a file (the owner's picks); --dry-run counts only
+                    var list = File.ReadAllLines(idf).Select(x => x.Trim()).Where(x => x.Length > 0 && !x.StartsWith('#')).Distinct().ToList(); verdict = rest.FirstOrDefault() ?? throw new ArgumentException("classify set --ids=<file> drama|not");
+                    if (a.Has("dry-run")) { Console.WriteLine($"[dry run] {list.Count} id(s) would be set {verdict}; known to the download queue: {list.Count(x => queue.Read(st => st.Get(x)) != null)}"); return 0; }
+                    int n = 0; foreach (var x in list) { Console.WriteLine(await SetAsync(store, queue, paths, x, verdict, a.Get("reason"), DateTimeOffset.UtcNow, default)); n++; }
+                    Console.WriteLine($"{n} id(s) set {verdict}"); return 0;
+                }
                 if (a.Get("video") is { } vid) { id = vid; verdict = rest.FirstOrDefault(); }
                 else if (rest.Count > 0 && rest[0].ToLowerInvariant() is "drama" or "not" && rest.Count > 1) { verdict = rest[0]; id = rest[1]; }   // after "--" the id comes last
                 else { id = rest.ElementAtOrDefault(0); verdict = rest.ElementAtOrDefault(1); }

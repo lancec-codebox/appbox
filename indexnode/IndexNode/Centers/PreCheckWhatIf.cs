@@ -166,8 +166,8 @@ public static class PreCheckWhatIf
         var (os, oe, _) = PreCheck.Window(duration, s.WindowSeconds, s.WindowPosition);
         var rowsOld = Pick(os, oe, s.Frames);
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var (bestN, stN) = vote == -2 ? await PreCheckSearch.BestPerFrameCodesAsync(store, paths, Codes!, rowsNew, CodesK, threads, ct, ex) : await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsNew, s.TopCenters, threads, ct, ex, cache, vote);
-        var (bestO, stO) = vote == -2 ? await PreCheckSearch.BestPerFrameCodesAsync(store, paths, Codes!, rowsOld, CodesK, threads, ct, ex) : await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsOld, s.TopCenters, threads, ct, ex, cache, vote);
+        var (bestN, stN) = vote == -2 ? await PreCheckSearch.BestPerFrameCodesAsync(store, paths, Codes!, rowsNew, CodesK, threads, ct, ex, s.VoteUploads) : await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsNew, s.TopCenters, threads, ct, ex, cache, vote);
+        var (bestO, stO) = vote == -2 ? await PreCheckSearch.BestPerFrameCodesAsync(store, paths, Codes!, rowsOld, CodesK, threads, ct, ex, s.VoteUploads) : await PreCheckSearch.BestPerFrameAsync(store, paths, head, rowsOld, s.TopCenters, threads, ct, ex, cache, vote);
         var upIds = head.Uploads.Select(u => u.Id).ToList();
         IReadOnlyList<GroupCopy> Copies(string g) => groupMembers[g].Where(m => m.Upload != id).Select(m => new GroupCopy(m.Upload, m.SpeechLanguage, m.Dubbed, m.Duration ?? DurationOf(m.Upload))).ToList();
         PreCheckAnalysis Build(FrameBest?[] best, int n, List<float[]> rows)

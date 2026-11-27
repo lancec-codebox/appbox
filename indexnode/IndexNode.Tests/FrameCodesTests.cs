@@ -195,6 +195,27 @@ public class FrameCodesTests
     }
 
     [Fact]
+    public async Task The_codes_lookup_reads_only_the_uploads_with_the_most_votes()
+    {
+        var (f, idx, xs) = await Seed(3);
+        await FrameCodes.FillAsync(f, P, idx, 60, 0, _ => { }, default);
+        var dir = Tmp();
+        try
+        {
+            var view = await new FrameCodesCache(dir).ViewAsync(f, P, idx, default);
+            // four frames of u2, one of u0: with one upload read, u2 (four votes) is read and u0's frame finds no exact match in it
+            var qs = new[] { ("u2", 1), ("u2", 7), ("u2", 20), ("u2", 33), ("u0", 4) }.Select(x => xs[x.Item1].AsSpan(x.Item2 * D, D).ToArray()).ToList();
+            var (all, stAll) = await PreCheckSearch.BestPerFrameCodesAsync(f, P, view, qs, 5, 2, default);
+            Assert.Equal(3, stAll.ReadUploads); Assert.Equal("u0", idx.Uploads[all[4]!.Upload].Id);
+            var (one, stOne) = await PreCheckSearch.BestPerFrameCodesAsync(f, P, view, qs, 5, 2, default, voteUploads: 1);
+            Assert.Equal(1, stOne.ReadUploads); Assert.Equal(3, stOne.VotedUploads);
+            Assert.All(one.Take(4), b => Assert.Equal("u2", idx.Uploads[b!.Upload].Id));
+            Assert.True(one[4] == null || idx.Uploads[one[4]!.Upload].Id == "u2");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public async Task Small_parallel_ranges_that_cut_parts_still_give_the_whole_log()
     {
         var (f, idx, _) = await Seed(5);

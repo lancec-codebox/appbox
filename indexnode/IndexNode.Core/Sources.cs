@@ -130,7 +130,8 @@ public static partial class Sources
     internal static JobDescriptor Clone(JobDescriptor j) => JobDescriptor.Parse(j.ToBytes());
 
     /// <summary>Makes the source due now at <see cref="Protocol.RefreshNowPriority"/>: kind "lookup" (a full listing again) or "refresh" (incremental). A source a node is running right now is left alone (false).</summary>
-    public static async Task<bool> TriggerAsync(JobQueue queue, string sourceId, string kind, CancellationToken ct, Func<DateTimeOffset>? now = null)
+    /// <param name="backfill">0.13.74: a channel lookup lists this many of its newest uploads (kept on the source for later lookups); null leaves it as it is.</param>
+    public static async Task<bool> TriggerAsync(JobQueue queue, string sourceId, string kind, CancellationToken ct, Func<DateTimeOffset>? now = null, int? backfill = null)
     {
         if (kind is not ("lookup" or "refresh")) throw new ArgumentException("kind is lookup or refresh");
         bool ok = false;
@@ -142,7 +143,7 @@ public static partial class Sources
             if (st.Get(sourceId)?.ClaimBy != null) return null;
             var job = Clone(e.Job ?? new JobDescriptor { JobId = sourceId, Stage = "refresh" });
             var at = Protocol.Utc((now ?? (() => DateTimeOffset.UtcNow))());
-            job.Run = kind; job.Attempts = 0; job.LastError = null; job.Permanent = null;   // a manual refresh also revives an inactive source; the run decides again from the upload dates
+            job.Run = kind; job.Attempts = 0; job.LastError = null; job.Permanent = null; if (backfill != null) job.Backfill = backfill;   // a manual refresh also revives an inactive source; the run decides again from the upload dates
             ok = true;
             return [new QLine { T = "retry", S = sourceId, Stage = "refresh", Due = at, Job = job, At = at }, new QLine { T = "pri", S = sourceId, Pri = Protocol.RefreshNowPriority }];
         }, ct);
