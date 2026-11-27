@@ -33,7 +33,30 @@ public class ShadowStoreTests : IDisposable
         Assert.Equal(AppendOutcome.PositionMismatch, (await s.AppendBlockAsync("index/q/log-1", [1], info.Length, default)).Outcome);
         var rd = await s.ReadAppendAsync("index/q/log-1", 0, 4096, default); Assert.Equal("{\"a\":1}\n{\"b\":2}\n", System.Text.Encoding.UTF8.GetString(rd.Data));
         Assert.Equal(r1.Length, (await real.GetAppendInfoAsync("index/q/log-1", default))!.Length);   // the real log is untouched
-        s.Flush(); Assert.Single(Directory.GetFiles(Path.Combine(dir, "append")));
+        s.Flush(); var saved = Assert.Single(Directory.GetFiles(Path.Combine(dir, "append"), "*.log"));
+        Assert.Equal("{\"b\":2}\n", File.ReadAllText(saved));   // 0.13.81: the shadow's own appends; the .base file holds the real bytes before them
+        Assert.Equal(r1.Length.ToString(), File.ReadAllText(Path.ChangeExtension(saved, ".base")));
+    }
+
+    [Fact]
+    public async Task A_binary_append_blob_is_appended_in_the_shadow_without_copying_it_and_reads_back_whole()
+    {   // 0.13.81: the frame codes log is binary (no newlines) and large; the overlay used to copy it with the line-log reader and fail at the second 4 MiB chunk
+        var real = new FakeStore(); await real.CreateAppendBlobAsync("index/search/codes/m1/log-0000.bin", true, default);
+        var baseBytes = new byte[9 * 1024 * 1024]; new Random(7).NextBytes(baseBytes); for (int i = 0; i < baseBytes.Length; i++) if (baseBytes[i] == (byte)'\n') baseBytes[i] = 1;
+        Assert.Equal(AppendOutcome.Ok, (await real.AppendBlockAsync("index/search/codes/m1/log-0000.bin", baseBytes, 0, default)).Outcome);
+        var s = new ShadowStore(real, dir);
+        var r = await s.AppendBlockAsync("index/search/codes/m1/log-0000.bin", [5, 6, 7], baseBytes.Length, default);
+        Assert.Equal(AppendOutcome.Ok, r.Outcome); Assert.Equal(baseBytes.Length + 3, r.Length);
+        Assert.Equal(baseBytes.Length, (await real.GetAppendInfoAsync("index/search/codes/m1/log-0000.bin", default))!.Length);   // the real log is untouched
+        var across = await s.GetRangeAsync("index/search/codes/m1/log-0000.bin", baseBytes.Length - 2, 5, null, default);
+        Assert.Equal(new byte[] { baseBytes[^2], baseBytes[^1], 5, 6, 7 }, across.Data);
+        var mid = await s.GetRangeAsync("index/search/codes/m1/log-0000.bin", 4 * 1024 * 1024, 16, null, default);
+        Assert.Equal(baseBytes.AsSpan(4 * 1024 * 1024, 16).ToArray(), mid.Data);
+        Assert.Equal(baseBytes.Length + 3, (await s.GetAppendInfoAsync("index/search/codes/m1/log-0000.bin", default))!.Length);
+        s.Flush();
+        var saved = Directory.GetFiles(Path.Combine(dir, "append"), "*.log").Single();
+        Assert.Equal(new byte[] { 5, 6, 7 }, File.ReadAllBytes(saved));   // only the shadow's own appends are saved
+        Assert.Equal(baseBytes.Length.ToString(), File.ReadAllText(Path.ChangeExtension(saved, ".base")));
     }
 
     [Fact]

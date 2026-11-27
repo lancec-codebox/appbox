@@ -9,7 +9,9 @@ public sealed class ShadowStore : IStore
     readonly IStore real; readonly LocalStore local; readonly string dir;
     readonly ConcurrentDictionary<string, Log0> appends = new(); readonly ConcurrentDictionary<string, bool> deleted = new();
     public long BlockedWrites; public string Dir => dir; public IStore Real => real;
-    sealed class Log0 { public byte[] Data = []; public bool Sealed; public readonly object Gate = new(); }
+    /// <summary>0.13.81: an append blob in the overlay = the real blob's first <see cref="Base"/> bytes (frozen at the first touch, read from the real store on demand with plain ranges) + the shadow's own <see cref="Tail"/>.
+    /// A blob made in the shadow has Base 0. Never a copy of the real bytes: the frame codes log is binary and 1.5 GB.</summary>
+    sealed class Log0 { public long Base; public byte[] Tail = []; public bool Sealed; public readonly object Gate = new(); public long Length => Base + Tail.Length; }
     public ShadowStore(IStore real, string dir) { this.real = real; this.dir = dir; Directory.CreateDirectory(dir); local = new LocalStore(Path.Combine(dir, "blobs")); }
 
     /// <summary>The shadow under these wrappers, if any (the aggregate's commit loop waits to see its own block, which a shadow never stores: it asks first).</summary>
@@ -22,12 +24,29 @@ public sealed class ShadowStore : IStore
         if (appends.TryGetValue(name, out var l)) return l;
         if (Gone(name)) return null;
         var info = await real.GetAppendInfoAsync(name, ct); if (info == null) return null;
-        var data = new List<byte>(); long off = 0;
-        while (off < info.Length) { var r = await real.ReadAppendAsync(name, off, 4 * 1024 * 1024, ct); if (r.Data.Length == 0) break; data.AddRange(r.Data); off += r.Data.Length; }
-        return appends.GetOrAdd(name, _ => new Log0 { Data = data.ToArray(), Sealed = info.Sealed });
+        return appends.GetOrAdd(name, _ => new Log0 { Base = info.Length, Sealed = info.Sealed });
+    }
+
+    /// <summary>Bytes [off, off+len) of an overlay log: the base part from the real store (plain range: binary-safe), the rest from the shadow's tail.</summary>
+    async Task<byte[]> ReadLogAsync(string name, Log0 l, long off, int len, CancellationToken ct)
+    {
+        long total; long bas; byte[] tail; lock (l.Gate) { total = l.Length; bas = l.Base; tail = l.Tail; }
+        off = Math.Clamp(off, 0, total); len = (int)Math.Min(len, total - off); if (len <= 0) return [];
+        var outp = new byte[len]; int got = 0;
+        if (off < bas)
+        {
+            int n = (int)Math.Min(len, bas - off);
+            var r = await real.GetRangeAsync(name, off, n, null, ct);
+            var d = r.Data ?? throw new InvalidDataException($"{name}: the real log is shorter than the {bas} bytes the shadow saw");
+            if (d.Length < n) throw new InvalidDataException($"{name}: the real log answered {d.Length} of {n} bytes at {off}");
+            Buffer.BlockCopy(d, 0, outp, 0, n); got = n;
+        }
+        if (got < len) Buffer.BlockCopy(tail, (int)(off + got - bas), outp, got, len - got);
+        return outp;
     }
     /// <summary>Saves the overlay's append logs under DIR/append/.</summary>
-    public void Flush() { var d = Path.Combine(dir, "append"); Directory.CreateDirectory(d); foreach (var kv in appends) lock (kv.Value.Gate) File.WriteAllBytes(Path.Combine(d, Convert.ToHexString(System.Text.Encoding.UTF8.GetBytes(kv.Key)).ToLowerInvariant() + ".log"), kv.Value.Data); }
+    /// <summary>0.13.81: the file holds the shadow's own appends only; "&lt;hex&gt;.base" says how many bytes of the real blob came before them.</summary>
+    public void Flush() { var d = Path.Combine(dir, "append"); Directory.CreateDirectory(d); foreach (var kv in appends) lock (kv.Value.Gate) { var f = Path.Combine(d, Convert.ToHexString(System.Text.Encoding.UTF8.GetBytes(kv.Key)).ToLowerInvariant()); File.WriteAllBytes(f + ".log", kv.Value.Tail); File.WriteAllText(f + ".base", kv.Value.Base.ToString(System.Globalization.CultureInfo.InvariantCulture)); } }
 
     // ---- reads: overlay first, then the real store
     public async Task<IReadOnlyList<BlobEntry>> ListAsync(string prefix, bool withTags, bool withMetadata, CancellationToken ct)
@@ -41,7 +60,9 @@ public sealed class ShadowStore : IStore
     public async Task<ConditionalResult> GetIfChangedAsync(string name, string? etag, CancellationToken ct) => await local.GetAsync(name, ct) != null ? await local.GetIfChangedAsync(name, etag, ct) : Gone(name) ? new(true, false, null, null) : await real.GetIfChangedAsync(name, etag, ct);
     public async Task<IReadOnlyDictionary<string, string>?> GetTagsAsync(string name, CancellationToken ct) => await local.GetTagsAsync(name, ct) ?? (Gone(name) ? null : await real.GetTagsAsync(name, ct));
     public async Task<BlobProps?> HeadAsync(string name, CancellationToken ct) => await local.HeadAsync(name, ct) ?? (Gone(name) ? null : await real.HeadAsync(name, ct));
-    public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) => await local.HeadAsync(name, ct) != null ? await local.GetRangeAsync(name, off, len, ifMatch, ct) : Gone(name) ? new(null, false) : await real.GetRangeAsync(name, off, len, ifMatch, ct);
+    public async Task<RangeRead> GetRangeAsync(string name, long off, int len, string? ifMatch, CancellationToken ct) =>
+        appends.TryGetValue(name, out var al) ? new(await ReadLogAsync(name, al, off, len, ct), false)   // 0.13.81: an append blob the shadow has touched reads as the shadow sees it
+        : await local.HeadAsync(name, ct) != null ? await local.GetRangeAsync(name, off, len, ifMatch, ct) : Gone(name) ? new(null, false) : await real.GetRangeAsync(name, off, len, ifMatch, ct);
     /// <summary>0.13.32: a download from the real store is kept under DIR/dl (keyed by name, size and ETag), so a repeat open is a local copy, as the node's zip and work caches make it; only writes are redirected.</summary>
     public async Task DownloadToFileAsync(string name, string path, CancellationToken ct)
     {
@@ -128,17 +149,18 @@ public sealed class ShadowStore : IStore
         var l = await LogAsync(name, ct); if (l == null) return new(AppendOutcome.NotFound);
         lock (l.Gate)
         {
-            if (l.Sealed) return new(AppendOutcome.Sealed); if (appendPos >= 0 && l.Data.Length != appendPos) return new(AppendOutcome.PositionMismatch);
-            l.Data = [.. l.Data, .. data]; return new(AppendOutcome.Ok, l.Data.Length, 1);
+            if (l.Sealed) return new(AppendOutcome.Sealed); if (appendPos >= 0 && l.Length != appendPos) return new(AppendOutcome.PositionMismatch);
+            l.Tail = [.. l.Tail, .. data]; return new(AppendOutcome.Ok, l.Length, 1);
         }
     }
     public async Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct)
     {
         var l = await LogAsync(name, ct); if (l == null) return new([], 0, false, 0, true);
-        lock (l.Gate) { var from = (int)Math.Min(Math.Max(0, offset), l.Data.Length); var n = Math.Min(maxLen, l.Data.Length - from); return new(l.Data.AsSpan(from, n).ToArray(), l.Data.Length, l.Sealed, 1); }
+        long len; bool sealedNow; lock (l.Gate) { len = l.Length; sealedNow = l.Sealed; }
+        return new(await ReadLogAsync(name, l, offset, maxLen, ct), len, sealedNow, 1);
     }
-    public async Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) { var l = await LogAsync(name, ct); if (l == null) return null; lock (l.Gate) { if (l.Data.Length != appendPos) return false; l.Sealed = true; return true; } }
-    public async Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) { var l = await LogAsync(name, ct); if (l == null) return null; lock (l.Gate) return new(l.Data.Length, l.Sealed, 1); }
+    public async Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) { var l = await LogAsync(name, ct); if (l == null) return null; lock (l.Gate) { if (l.Length != appendPos) return false; l.Sealed = true; return true; } }
+    public async Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) { var l = await LogAsync(name, ct); if (l == null) return null; lock (l.Gate) return new(l.Length, l.Sealed, 1); }
 
     // ---- block blobs (the aggregate): reads pass through, writes are dropped
     public Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct) { Interlocked.Increment(ref BlockedWrites); return Task.CompletedTask; }
