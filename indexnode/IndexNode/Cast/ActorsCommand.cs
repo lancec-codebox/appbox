@@ -50,7 +50,7 @@ public static class ActorsCommand
     public static async Task<int> RunAsync(Args a)
     {
         var sub = a.Positional.FirstOrDefault(); if (sub == "build") return await ActorsBuild.Main2(a);
-        if (sub is not ("add" or "run" or "index" or "rows")) throw new ArgumentException(Use);
+        if (sub is not ("add" or "run" or "index" or "rows" or "announce")) throw new ArgumentException(Use);
         var (cfg, store, paths, http) = CentersCommands.OpenStore(a); using var _h = http; bool dry = a.Has("dry-run"); var ct = CancellationToken.None; var outLocal = a.Get("out-local");
         if (outLocal != null) outLocal = Path.GetFullPath(outLocal);
         var ids = a.Positional.Skip(1).Where(x => x.Length > 0).Distinct(StringComparer.Ordinal).ToList(); var ops0 = StoreMeter.Current.Total;
@@ -81,11 +81,28 @@ public static class ActorsCommand
             int reqs = await ActorRows.WriteAsync(table, rows, ct);
             Console.WriteLine($"{rows.Count} actor rows written to partition '{ActorRows.Partition}' ({reqs} table requests); store ops {StoreMeter.Current.Total - ops0}"); return 0;
         }
+        if (sub == "announce")
+        {   // 0.13.75: announce an actor index version in the processing queue (as the actors-index stage's done line does), for a version built by hand: nodes follow the queue's announcement, and an announced version that was pruned leaves them with no index at all (2026-11-26: v217 announced, gone; every actors job read every predecessor's units file and hit its budget)
+            int v = int.Parse(a.Positional.ElementAtOrDefault(1) ?? throw new ArgumentException("actors announce <version>"));
+            var head = await store.GetAsync(paths.Prefix + "actors/head.json", ct) ?? throw new InvalidOperationException("no actors/head.json");
+            int hv = (int?)System.Text.Json.Nodes.JsonNode.Parse(head.Data)?["version"] ?? 0;
+            if (hv != v) throw new ArgumentException($"head.json is at v{hv}, not v{v}: announce the head's version");
+            var annQ = await JobQueue.OpenAsync(store, paths, "cli", false, ct); int was = annQ.Read(st => st.ActorsIndexVer);
+            await annQ.AppendLinesAsync([new QLine { T = "done", S = "actors-index", Stage = "actors-index", Ver = v, At = Protocol.NowUtc() }], ct);
+            Console.WriteLine($"actor index v{v} announced (was v{was}); store ops {StoreMeter.Current.Total - ops0}"); return 0;
+        }
         if (sub == "index")
         {
             Dictionary<string, VideoJson.Doc?>? aiDocs = null;   // the whole aggregate, read once on the first check (no per-upload reads for the uploads it holds)
             var rep = await ActorsIndex.BuildAsync(io, ct, async id => { aiDocs ??= await VideoJson.ReadManyAsync(store, paths, new List<string>(), ct, all: true); return ActorsStage.AiFlag((aiDocs.TryGetValue(id, out var d) ? d : await VideoJson.ReadAsync(store, paths, id, ct))?.Root); }, 2);
-            Console.WriteLine(rep.Note); foreach (var l in io.Log) Console.WriteLine("  " + l); Console.WriteLine($"store ops {StoreMeter.Current.Total - ops0}"); return 0;
+            Console.WriteLine(rep.Note); foreach (var l in io.Log) Console.WriteLine("  " + l);
+            // 0.13.75: a build by hand announces its version in the processing queue too (the stage's done line does it for the stage): an unannounced build left v217 announced until it was pruned (2026-11-26)
+            if (!a.Has("dry-run") && a.Get("out-local") == null && await store.GetAsync(paths.Prefix + "actors/head.json", ct) is { } hj && (int?)System.Text.Json.Nodes.JsonNode.Parse(hj.Data)?["version"] is int built and > 0)
+            {
+                var annQ2 = await JobQueue.OpenAsync(store, paths, "cli", false, ct);
+                if (annQ2.Read(st => st.ActorsIndexVer) < built) { await annQ2.AppendLinesAsync([new QLine { T = "done", S = "actors-index", Stage = "actors-index", Ver = built, At = Protocol.NowUtc() }], ct); Console.WriteLine($"actor index v{built} announced in the queue"); }
+            }
+            Console.WriteLine($"store ops {StoreMeter.Current.Total - ops0}"); return 0;
         }
         if (ids.Count == 0) throw new ArgumentException(Use);
         var probe = await ActorsBuild.ResolveProbeAsync(store, paths, a.Get("child-probe"), ct) ?? throw new InvalidOperationException($"no child probe: give --child-probe <file> or upload it to {ActorsBuild.StoreProbe(paths)} (without it no child unit is left out)");
