@@ -76,6 +76,8 @@ public sealed class EngineOptions
     public int Threads { get; init; } = 1;
     public bool Once { get; init; }
     public int? MaxJobs { get; init; }
+    /// <summary>0.13.76: --youtube-gap: seconds between this node's YouTube job starts (samples, downloads); wins over control downloads.youtubeGapSeconds.</summary>
+    public int? YoutubeGapSeconds { get; init; }
     /// <summary>0.13.30: a shadow run records claims in-process: a subject taken once (done or failed) is never claimed again in this run, by any lane.</summary>
     public bool Shadow { get; init; }
     /// <summary>0.13.37 run --repair-only.</summary>

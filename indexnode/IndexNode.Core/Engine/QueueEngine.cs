@@ -183,6 +183,7 @@ public sealed partial class NodeEngine
     private async Task<bool> TryFetchFromServiceAsync(int lane, CancellationToken ct)
     {
         if (o.FetchNext == null || !o.DownloaderOnly || DateTimeOffset.UtcNow < nextFetch || StorageHalted()) return false;
+        if (!YoutubePaceAllows()) return false;   // 0.13.76: a hand-over is a YouTube job too
         // 0.13.60: read the work queue's tail and any announced control change BEFORE asking. Since 0.13.55 the node asks the service first and goes round again whenever it is handed work,
         // so it never reached the look at the queue that refreshes control: on 2026-11-26 two nodes went on downloading for 14 minutes after download=stop (15 downloads nobody asked for).
         try { await queue.PollAsync(ct); await Control.RefreshIfAnnouncedAsync(queue.Read(st => st.ControlETag), ct); }
@@ -274,6 +275,10 @@ public sealed partial class NodeEngine
 
     /// <summary>Claims one candidate subject (limits, per-IP cap, then the protocol's claim) and runs it. False when nothing was claimed.</summary>
     private int limitNoted; private string? lastLimitStage;
+    // 0.13.76: the per-exit pace (a node is one VPN exit)
+    private readonly YoutubePace pace = new();
+    public int? YoutubeGap => o.YoutubeGapSeconds ?? Control.Current.Downloads?.YoutubeGapSeconds;
+    private bool YoutubePaceAllows() => pace.Allows(YoutubeGap, DateTimeOffset.UtcNow, Log.Info);
     private async Task<bool> TryClaimAndRunAsync(int lane, QSubject subject, List<QEntry> runnable, CancellationToken ct)
     {
         var id = subject.Id;
@@ -287,6 +292,7 @@ public sealed partial class NodeEngine
             if (Interlocked.Exchange(ref limitNoted, 1) == 0 || lastLimitStage != first) { lastLimitStage = first; Log.Info($"limits: {first} work is ready ({id} first) but this node's limit refuses {first} now ({(o.Limits.Budget is { } bd ? $"full-download budget {o.Limits.Remaining} of {bd} left" : "no budget set")}; schedule window or sample budget otherwise): it is skipped until the limit allows it"); }
             return false;
         }
+        if (runnable.Any(e => e.Stage is "download" or "sample") && !YoutubePaceAllows()) { o.Limits?.Release(first, false); return false; }   // 0.13.76: the per-exit pace
         if (runnable.Any(e => e.Stage is "download" or "sample"))
         {
             bool allowed;
@@ -680,5 +686,27 @@ public sealed partial class NodeEngine
             await MarkStopAsync(w, stage == "process" && ctx?.Stage is { } ms ? ms : stage, outcome switch { Outcome.Transient or Outcome.Paused or Outcome.Bot => "transient", Outcome.Released => "released", _ => "failed" });
         if (stage is "process" or "describe" or "translate" || true) StageZipStore.Stage(store)?.DiscardStaged(id, Protocol.IsStep(stage) || stage is "download" ? stage : null);
         Log.Info($"[claim#{lane}] {id}: {stage} {outcome}{(error != null ? " (" + Redact.Sas(error) + ")" : "")}");
+    }
+}
+
+/// <summary>0.13.76: the start times of one node's YouTube jobs (samples, downloads): at least the gap (+-20% jitter) apart. A node is one VPN exit, so this paces an exit.</summary>
+public sealed class YoutubePace(Func<double>? random = null)
+{
+    readonly object gate = new(); DateTimeOffset next = DateTimeOffset.MinValue, noted = DateTimeOffset.MinValue;
+    readonly Func<double> rnd = random ?? Random.Shared.NextDouble;
+    public DateTimeOffset Next { get { lock (gate) return next; } }
+    /// <summary>True: a YouTube job may start at <paramref name="now"/> (the next slot is booked); false: the gap since the last start has not passed (said at most every 5 minutes).</summary>
+    public bool Allows(int? gapSeconds, DateTimeOffset now, Action<string>? say = null)
+    {
+        if (gapSeconds is not > 0) return true;
+        lock (gate)
+        {
+            if (now < next)
+            {
+                if (now - noted > TimeSpan.FromMinutes(5)) { noted = now; say?.Invoke($"pace: next YouTube job at {Protocol.Utc(next)} (gap {gapSeconds} s, this node is one exit)"); }
+                return false;
+            }
+            next = now + TimeSpan.FromSeconds(gapSeconds.Value * (0.8 + 0.4 * rnd())); return true;
+        }
     }
 }

@@ -155,11 +155,22 @@ public sealed class ControlWatcher(IStore store, Paths paths)
     }
 
     /// <summary>indexnode control --max-per-ip N|off: the per-IP download cap (downloads.maxPerIp); off removes it. Everything else in the file stays.</summary>
+    /// <summary>0.13.76: indexnode control --youtube-gap N|off: the minimum seconds between one node's YouTube job starts (downloads.youtubeGapSeconds). Everything else in the file stays.</summary>
+    public static async Task<ControlFile> SetYoutubeGapAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
+    {
+        int? gap = value.Equals("off", StringComparison.OrdinalIgnoreCase) ? null : int.TryParse(value, out var n) && n > 0 ? n : throw new ArgumentException("--youtube-gap must be a positive number of seconds or off");
+        var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
+        cur.Downloads ??= new DownloadsControl(); cur.Downloads.YoutubeGapSeconds = gap; if (gap == null && cur.Downloads.MaxPerIp == null) cur.Downloads = null;
+        cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
+        await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);
+        return cur;
+    }
+
     public static async Task<ControlFile> SetMaxPerIpAsync(IStore store, Paths paths, string value, string changedBy, CancellationToken ct)
     {
         var cur = ControlFile.Parse((await store.GetAsync(paths.Control, ct))?.Data);
-        if (value.Equals("off", StringComparison.OrdinalIgnoreCase) || value == "0") cur.Downloads = null;
-        else if (int.TryParse(value, out var n) && n > 0) cur.Downloads = new DownloadsControl { MaxPerIp = n };
+        if (value.Equals("off", StringComparison.OrdinalIgnoreCase) || value == "0") { if (cur.Downloads != null) { cur.Downloads.MaxPerIp = null; if (cur.Downloads.YoutubeGapSeconds == null) cur.Downloads = null; } }
+        else if (int.TryParse(value, out var n) && n > 0) { cur.Downloads ??= new DownloadsControl(); cur.Downloads.MaxPerIp = n; }
         else throw new ArgumentException("--max-per-ip must be a positive number or off");
         cur.V = 1; cur.ChangedAt = Protocol.NowUtc(); cur.ChangedBy = changedBy;
         await store.PutAsync(paths.Control, cur.ToBytes(), null, null, false, ct); await AnnounceAsync(store, paths, changedBy, ct);

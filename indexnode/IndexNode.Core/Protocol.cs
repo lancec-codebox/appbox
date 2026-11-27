@@ -461,6 +461,8 @@ public sealed class DownloadsControl
 {
     /// <summary>At most this many downloads at once across the nodes that share one public address (same IPv4 or IPv6 /64). Best effort: two nodes may start at the same moment.</summary>
     public int? MaxPerIp { get; set; }
+    /// <summary>0.13.76 (owner, 2026-11-26: "we should start throttling the downloads ... at least those coming from a particular exit"): each node waits at least this many seconds (with +-20% jitter) between the starts of its YouTube jobs (samples and downloads). Each runner node has its own VPN exit, so this is a per-exit rate. A node's --youtube-gap wins.</summary>
+    public int? YoutubeGapSeconds { get; set; }
 }
 
 public sealed class GpuControl
