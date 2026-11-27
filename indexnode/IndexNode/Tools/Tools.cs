@@ -19,15 +19,18 @@ public sealed class Tools(HttpClient http, NodeConfig? config = null) : ITools
         ["yt-dlp_macos"] = "0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa",
     };
 
-    /// <summary>The pinned ffmpeg build (BtbN autobuild of the n9.0 branch, GPL, with libsvtav1): one asset per platform, with its sha256.</summary>
-    public const string FfmpegVersion = "n9.0.2-57-gd838f9f9ae";
+    /// <summary>The pinned ffmpeg build (BtbN autobuild of the n9.0 branch, GPL, with libsvtav1): one asset per platform, with its sha256.
+    /// 0.13.78: served from our own mirror release (unchanged copies of BtbN autobuild-2026-11-27-12-42), because BtbN deletes autobuilds
+    /// after about two weeks: the earlier pin (autobuild-2026-11-13-12-43) answered 404 on 2026-11-27 and new nodes could not sample.</summary>
+    public const string FfmpegVersion = "n9.0.2-982-g836df4e858";
     public sealed record FfmpegAsset(string Url, string Sha256, bool Zip);
-    private const string FfmpegBase = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-13-12-43/ffmpeg-n9.0.2-57-gd838f9f9ae-";
+    public const string FfmpegMirrorTag = "tools-ffmpeg-" + FfmpegVersion;
+    private const string FfmpegBase = "https://github.com/lancec-codebox/appbox/releases/download/" + FfmpegMirrorTag + "/ffmpeg-" + FfmpegVersion + "-";
 
     public static FfmpegAsset FfmpegFor(bool windows, bool arm) => windows
-        ? new(FfmpegBase + "win64-gpl-9.0.zip", "ae2b8d3f88cf9a1dd22d4e29a27d933dc51abff28a39172b8282488a3030b3e3", true)
-        : arm ? new(FfmpegBase + "linuxarm64-gpl-9.0.tar.xz", "ad525931f3a90c185c41fe6c978db125324658f12773e7c547f25911b8ce2786", false)
-              : new(FfmpegBase + "linux64-gpl-9.0.tar.xz", "01f1a5a6721de2d4e2e49dbadf6eb30bb750934429f685f6f5a389168ac27e23", false);
+        ? new(FfmpegBase + "win64-gpl-9.0.zip", "a9c7e217d2fdbac732c90aa080bda550a75240f2c290ecb7d09cc78a5ef17679", true)
+        : arm ? new(FfmpegBase + "linuxarm64-gpl-9.0.tar.xz", "c384a7a2bc6268a51b0a4d2d79ac647cd5e0360379f13db563646262dd3525da", false)
+              : new(FfmpegBase + "linux64-gpl-9.0.tar.xz", "a236601b679237dece06c8dbf1662cdb138f197c8109c9fa4ae5f0e884d61ffb", false);
 
     /// <summary>Set by tests: replaces the yt-dlp process (same arguments as the real run, after the JS-runtime flags).</summary>
     public Func<IReadOnlyList<string>, CancellationToken, Action<string>?, Task<ProcResult>>? YtDlpOverride { get; set; }

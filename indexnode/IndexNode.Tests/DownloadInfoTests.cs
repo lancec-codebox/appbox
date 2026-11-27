@@ -103,7 +103,7 @@ public class DownloadInfoTests
         foreach (var (win, arm) in new[] { (true, false), (false, false), (false, true) })
         {
             var a = Tools.FfmpegFor(win, arm);
-            Assert.Contains("autobuild-2026-11-13-12-43", a.Url);
+            Assert.StartsWith("https://github.com/lancec-codebox/appbox/releases/download/" + Tools.FfmpegMirrorTag + "/", a.Url);   // our mirror: BtbN prunes autobuilds
             Assert.DoesNotContain("latest", a.Url);
             Assert.Matches("^[0-9a-f]{64}$", a.Sha256);
             Assert.Equal(win, a.Zip);
