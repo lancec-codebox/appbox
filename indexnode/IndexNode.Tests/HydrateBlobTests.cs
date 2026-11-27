@@ -66,6 +66,37 @@ public class HydrateBlobTests
     }
 
     [Fact]
+    public async Task A_proxy_form_sas_url_keeps_the_proxy_host_and_the_account_container_segment()
+    {   // 0.13.80: ddindex-blob, https://<proxy>/<account>-<container>/<blob>?<sas>; the SDK on a non-Azure host takes the first segment as the container
+        var handler = new UriHandler();
+        var options = new BlobClientOptions { Transport = new HttpClientTransport(new HttpClient(handler)) };
+        options.Retry.MaxRetries = 0;
+        var client = new BlockBlobClient(new Uri("https://ddindex-blob.example.io/acct-media/index/videos/x/video.mp4?sv=2021-12-02&sig=abc"), options);
+        var tags = new Dictionary<string, string> { ["ghostd_state"] = "ghost", ["ghostd_block_prefix"] = "gd+x+", ["ghostd_size"] = "10" };
+        await DehydrateOperation.HydrateBlobAsync(client, tags, null, null, CancellationToken.None);
+        handler.Uris.Should().NotBeEmpty();
+        handler.Uris.Should().OnlyContain(u => u.Host == "ddindex-blob.example.io" && u.AbsolutePath == "/acct-media/index/videos/x/video.mp4" && u.Query.Contains("sig=abc"));
+
+        var rs = new IndexNode.RestStore(new HttpClient(), "https://ddindex-blob.example.io/acct-media?sv=2021-12-02&sig=abc");
+        rs.BlobUri("index/videos/x/video.json").ToString().Should().Be("https://ddindex-blob.example.io/acct-media/index/videos/x/video.json?sv=2021-12-02&sig=abc");
+        IndexNode.Program.ClientName("proc 18/x").Should().Be("proc-18-x");
+    }
+
+    private sealed class UriHandler : HttpMessageHandler
+    {
+        public List<Uri> Uris = new();
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Uris.Add(request.RequestUri!);
+            HttpResponseMessage resp = request.Method == HttpMethod.Get && request.RequestUri!.Query.Contains("comp=blocklist")
+                ? new(HttpStatusCode.OK) { Content = new StringContent("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><UncommittedBlocks><Block><Name>gd+x+00000</Name><Size>5</Size></Block><Block><Name>gd+x+00001</Name><Size>5</Size></Block></UncommittedBlocks></BlockList>", Encoding.UTF8, "application/xml") }
+                : new(HttpStatusCode.Created);
+            resp.Headers.ETag = new System.Net.Http.Headers.EntityTagHeaderValue("\"0x1\"");
+            return Task.FromResult(resp);
+        }
+    }
+
+    [Fact]
     public async Task HydrateBlobAsync_fails_when_block_sizes_do_not_match_tag()
     {
         var handler = new FakeHandler { BlockSize = 4 };

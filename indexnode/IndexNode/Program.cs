@@ -131,6 +131,14 @@ public static class Program
         All commands take --prefix (default index/). INDEXNODE_SAS_URL overrides the stored SAS.
         """;
 
+    /// <summary>0.13.80: the x-indexnode-node value: the node name, else the machine name; letters, digits, '-', '_', '.' only, at most 64 characters.</summary>
+    internal static string ClientName(string? nodeName)
+    {
+        var raw = string.IsNullOrWhiteSpace(nodeName) ? Environment.MachineName : nodeName.Trim();
+        var clean = new string(raw.Select(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' ? c : '-').ToArray());
+        return clean.Length > 64 ? clean[..64] : clean;
+    }
+
     public static async Task<int> Main(string[] argv)
     {
         try
@@ -143,6 +151,7 @@ public static class Program
             var cmd = a.Positional[0].ToLowerInvariant();
             a.Positional.RemoveAt(0);
             try { FramesCache.Configure(NodeConfig.Load()); } catch (Exception e) when (e is not OperationCanceledException) { }
+            try { RestStore.ClientName = ClientName(a.Get("node-name") ?? NodeConfig.Load().NodeName); } catch (Exception e) when (e is not OperationCanceledException) { RestStore.ClientName = ClientName(null); }   // 0.13.80: x-indexnode-node for the storage proxy
             StoreMeter.Current.Limits = NodeConfig.TryLoadStorageLimits();   // 0.13.18: the breaker settings (config storage.*)
             if (a.Get("storage-max") is { } smax) { var n = int.Parse(smax); StoreMeter.Current.Limits.MaxPerStep = n; StoreMeter.Current.Limits.MaxPerMin = Math.Max(StoreMeter.Current.Limits.MaxPerMin, n); StoreMeter.Current.Limits.WarnPerMin = Math.Max(StoreMeter.Current.Limits.WarnPerMin, n); StoreMeter.Current.CliMax = n; }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
             var rc = await Dispatch(cmd, a);

@@ -154,10 +154,15 @@ public sealed class RestStore : IStore
 
     private string Scrub(string s) => Redact.Sas(s, sasUrl);
 
+    /// <summary>0.13.80: the name this process sends as x-indexnode-node on every store request (the node name, else the machine), so a storage proxy
+    /// (ddindex-blob, owner 2026-11-27) counts traffic per node. Azure ignores the header. Set once at start-up; null sends nothing.</summary>
+    public static string? ClientName { get; set; }
+
     private HttpRequestMessage Req(HttpMethod m, Uri uri)
     {
         var r = new HttpRequestMessage(m, uri);
         r.Headers.TryAddWithoutValidation("x-ms-version", Protocol.ApiVersion);
+        if (ClientName is { Length: > 0 } cn) r.Headers.TryAddWithoutValidation("x-indexnode-node", cn);
         return r;
     }
 
