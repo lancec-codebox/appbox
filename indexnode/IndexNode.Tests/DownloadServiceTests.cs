@@ -189,6 +189,22 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task A_claimed_item_does_not_keep_equal_priority_samples_out_of_a_full_work_queue()
+    {
+        // 0.13.77 (2026-11-26): a full work queue of priority-0 samples, one priority-200 download handed out (claimed); 200 samples in the full queue must still get in
+        var lines = Enumerable.Range(0, 12).Select(i => Add("old" + i.ToString("00"), "sample", $"2026-11-{1 + i:00}T00:00:00Z", 0)).ToList();
+        lines.AddRange(Checked("pick0")); lines.Add(new QLine { T = "pri", S = "pick0", Pri = 200 });
+        var r = await Rig.Make(10, lines.ToArray());
+        Assert.Equal(10, await r.Svc.TopUpAsync(default));   // full: ten priority-0 samples
+        var dl = await r.Svc.NextAsync("node1", ["download"], default); Assert.Equal("pick0", dl!.Subject);   // the 200 download is handed out and claimed
+        await r.Full.AppendLinesAsync([Add("pick1", "sample", "2026-11-30T00:00:00Z", 200), Add("pick2", "sample", "2026-11-30T00:00:00Z", 200)], default);
+        Assert.Equal(2, await r.Svc.TopUpAsync(default));     // before 0.13.77: 0 (the claimed download set the bar at 200)
+        var ids = r.Work.Read(w => w.Subjects.Values.Select(s => s.Id).ToHashSet()); Assert.Contains("pick1", ids); Assert.Contains("pick2", ids);
+        await r.Full.AppendLinesAsync([Add("pick3", "sample", "2026-11-30T00:00:00Z", 200)], default);
+        Assert.Equal(0, await r.Svc.TopUpAsync(default));     // idle samples at 200 are waiting now: an equal one waits for them, as before
+    }
+
+    [Fact]
     public async Task Top_up_stops_at_the_max_goes_newest_first_keeps_priority_and_leaves_listed_and_hold_items()
     {
         var lines = Enumerable.Range(0, 30).Select(i => Add("v" + i.ToString("00"), "sample", $"2026-11-{1 + i % 28:00}T00:00:00Z", i == 3 ? 9 : 0)).ToList();

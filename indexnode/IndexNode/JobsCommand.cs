@@ -22,8 +22,17 @@ public static class JobsCommand
                 }
                 catch (InvalidOperationException e) { Console.Error.WriteLine("indexnode: " + e.Message); return 1; }
             }
+            case "work":
+            {   // 0.13.77 (read only): the download work queue the service fills: live entries by stage, state, priority and readiness
+                var wq = new JobQueue(store, paths.DownloadWork, "cli"); await wq.LoadAsync(default); var now = Protocol.NowUtc();
+                var rows = wq.Read(st => st.Subjects.Values.SelectMany(x => x.Entries.Values.Where(e => !e.Final).Select(e => (x.Id, e.Stage, e.State, e.Priority, Ready: string.CompareOrdinal(e.Due ?? "", now) <= 0, Claimed: x.ClaimBy != null))).ToList());
+                foreach (var g in rows.GroupBy(r => (r.Stage, r.State, r.Priority, r.Ready, r.Claimed)).OrderByDescending(g => g.Key.Priority).ThenBy(g => g.Key.Stage))
+                    Console.WriteLine($"{g.Count(),6}  {g.Key.Stage,-9} {g.Key.State,-10} pri {g.Key.Priority,4}  {(g.Key.Ready ? "ready" : "due later")}{(g.Key.Claimed ? ", claimed" : "")}   e.g. {g.First().Id}");
+                Console.WriteLine($"{rows.Count} live entries");
+                return 0;
+            }
             case "list": case null:
-                return await ListAsync(a, await Load(store, paths));
+                return await ListAsync(a, a.Has("download") ? await JobQueue.OpenAsync(store, paths, "cli", true, default) : await Load(store, paths));   // 0.13.77: --download lists the full download queue
             case "states":
             {   // 0.13.74 (read only): every entry of the given uploads in the processing and the download queue, one line per upload: id <tab> realm:stage=state[:hold] ...
                 var ids = File.ReadAllLines(a.Get("ids") ?? throw new ArgumentException("jobs states --ids=<file> [--out=<file>]")).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();

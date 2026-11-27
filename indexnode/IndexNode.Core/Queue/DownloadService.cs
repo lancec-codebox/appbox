@@ -291,7 +291,9 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     /// <summary>0.13.39: the ready items of the full queue with a priority above the work queue's highest live priority join the work queue (see <see cref="TopUpAsync"/>).</summary>
     async Task<int> JumpAsync(string now, CancellationToken ct)
     {
-        int top = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Values.Where(e => !e.Final && !IsRun(e.Stage))).Select(e => e.Priority).DefaultIfEmpty(int.MinValue).Max());
+        // 0.13.77: the bar is the highest priority among the work queue's IDLE items (unclaimed, pending): an item a node holds is no longer waiting. Before, a claimed download at 200 kept every
+        // other sample at 200 out of a work queue full of priority-0 samples (2026-11-26: the owner's picks stalled while the runners sampled leftovers)
+        int top = work.Read(w => w.Subjects.Values.Where(s => s.ClaimBy == null).SelectMany(s => s.Entries.Values.Where(e => !e.Final && !IsRun(e.Stage) && e.State == "pending")).Select(e => e.Priority).DefaultIfEmpty(int.MinValue).Max());
         var have = work.Read(w => w.Subjects.Values.SelectMany(s => s.Entries.Keys.Select(k => s.Id + "/" + k)).ToHashSet(StringComparer.Ordinal));
         var jump = full.Read(st => st.Subjects.Values.Where(s => s.ClaimBy == null && s.Id != null && !s.Id.StartsWith("ch-") && !s.Id.StartsWith("pl-"))
             .Select(s => (S: s, E: s.Entries.Values.Where(e => e.Stage is "sample" && Ready(e, now) && e.Priority > top).FirstOrDefault()))
