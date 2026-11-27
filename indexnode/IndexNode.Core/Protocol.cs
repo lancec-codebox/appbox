@@ -463,6 +463,8 @@ public sealed class DownloadsControl
     public int? MaxPerIp { get; set; }
     /// <summary>0.13.76 (owner, 2026-11-26: "we should start throttling the downloads ... at least those coming from a particular exit"): each node waits at least this many seconds (with +-20% jitter) between the starts of its YouTube jobs (samples and downloads). Each runner node has its own VPN exit, so this is a per-exit rate. A node's --youtube-gap wins.</summary>
     public int? YoutubeGapSeconds { get; set; }
+    /// <summary>0.13.79 (owner, 2026-11-27: "Can we switch to downloading the H.264 version instead of the AV1 version ... have that in the control file"): the video codec a download prefers among the formats of its chosen resolution: h264, vp9 or av01. Unset = yt-dlp's own order (AV1, VP9, H.264). Resolution still wins. A node's --video-codec wins.</summary>
+    public string? VideoCodec { get; set; }
 }
 
 public sealed class GpuControl

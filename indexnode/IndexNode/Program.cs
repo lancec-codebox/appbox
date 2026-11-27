@@ -340,7 +340,7 @@ public static class Commands
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
-            RepairOnly = a.Has("repair-only"), Shadow = a.Has("shadow"), ControlOverride = a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (c => WhatIf.Apply(c, shadowSets)) : null, MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, YoutubeGapSeconds = a.Get("youtube-gap") is { } yg ? int.Parse(yg) : null, Limits = limits,
+            RepairOnly = a.Has("repair-only"), Shadow = a.Has("shadow"), ControlOverride = a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (c => WhatIf.Apply(c, shadowSets)) : null, MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, YoutubeGapSeconds = a.Get("youtube-gap") is { } yg ? int.Parse(yg) : null, VideoCodec = a.Get("video-codec") is { } nvc ? YtDlp.NormalizeCodec(nvc) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");
@@ -689,6 +689,12 @@ public static class Commands
     {
         var (cfg, store, paths, _) = Open(a);
         var level = a.Positional.FirstOrDefault()?.ToLowerInvariant();
+        if (a.Get("video-codec") is { } vcs)
+        {   // 0.13.79: the codec downloads prefer
+            var vc = await ControlWatcher.SetVideoCodecAsync(store, paths, vcs, cfg.NodeName ?? Environment.UserName, default);
+            Console.WriteLine($"control: downloads prefer video codec = {vc.Downloads?.VideoCodec ?? "default (yt-dlp order: AV1, VP9, H.264)"} (resolution first)");
+            return 0;
+        }
         if (a.Get("youtube-gap") is { } ygs)
         {   // 0.13.76: the per-exit pace of YouTube jobs
             var yc = await ControlWatcher.SetYoutubeGapAsync(store, paths, ygs, cfg.NodeName ?? Environment.UserName, default);

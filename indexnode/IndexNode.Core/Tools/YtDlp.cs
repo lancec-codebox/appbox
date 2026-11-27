@@ -16,9 +16,20 @@ public static class YtDlp
     /// </summary>
     public const string DefaultSelector = "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b";
 
-    /// <summary>The format arguments for yt-dlp: <c>-S res:H -f ...</c>, or just <c>-f format</c> when the job sets one.</summary>
-    public static string[] FormatArgs(int maxHeight, string? format) =>
-        !string.IsNullOrWhiteSpace(format) ? ["-f", format] : ["-S", $"res:{maxHeight}", "-f", DefaultSelector];
+    /// <summary>The format arguments for yt-dlp: <c>-S res:H[,vcodec:C] -f ...</c>, or just <c>-f format</c> when the job sets one.
+    /// 0.13.79: a preferred codec (control downloads.videoCodec) comes after the resolution, so it only breaks the tie among formats of that resolution.</summary>
+    public static string[] FormatArgs(int maxHeight, string? format, string? codec = null) =>
+        !string.IsNullOrWhiteSpace(format) ? ["-f", format] : ["-S", NormalizeCodec(codec) is { } c ? $"res:{maxHeight},vcodec:{c}" : $"res:{maxHeight}", "-f", DefaultSelector];
+
+    /// <summary>0.13.79: the yt-dlp sort name of a codec setting (h264/avc/avc1 -> h264, vp9 -> vp9, av1/av01 -> av01); null for unset, "default" or "off". Anything else is refused.</summary>
+    public static string? NormalizeCodec(string? codec) => codec?.Trim().ToLowerInvariant() switch
+    {
+        null or "" or "default" or "off" => null,
+        "h264" or "avc" or "avc1" or "h.264" => "h264",
+        "vp9" => "vp9",
+        "av1" or "av01" => "av01",
+        var x => throw new ArgumentException($"video codec must be h264, vp9, av01 or default (got {x})"),
+    };
 
     private static readonly Regex[] Bot =
     [

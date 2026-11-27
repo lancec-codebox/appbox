@@ -78,6 +78,8 @@ public sealed class EngineOptions
     public int? MaxJobs { get; init; }
     /// <summary>0.13.76: --youtube-gap: seconds between this node's YouTube job starts (samples, downloads); wins over control downloads.youtubeGapSeconds.</summary>
     public int? YoutubeGapSeconds { get; init; }
+    /// <summary>0.13.79: --video-codec: the codec this node's downloads prefer (h264, vp9, av01); wins over control downloads.videoCodec.</summary>
+    public string? VideoCodec { get; init; }
     /// <summary>0.13.30: a shadow run records claims in-process: a subject taken once (done or failed) is never claimed again in this run, by any lane.</summary>
     public bool Shadow { get; init; }
     /// <summary>0.13.37 run --repair-only.</summary>
@@ -227,6 +229,7 @@ public sealed partial class NodeEngine
         Control = new ControlWatcher(store, paths); if (o.ControlOverride != null) Control.SetOverride(o.ControlOverride);
         Control.Changed += OnControlChanged;
         o.Limits?.Apply(Control.Current);
+        if (handlers.TryGetValue("download", out var dh) && dh is DownloadStage ds) ds.Codec = () => o.VideoCodec ?? Control.Current.Downloads?.VideoCodec;   // 0.13.79
     }
 
     // ---------------------------------------------------------------- registry

@@ -28,6 +28,9 @@ public sealed class DownloadGate(Func<TimeSpan, CancellationToken, Task>? delay 
 
 public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate) : IStageHandler
 {
+    /// <summary>0.13.79: the preferred video codec at the moment a download starts (node --video-codec, else control downloads.videoCodec); set by the node engine.</summary>
+    public Func<string?>? Codec { get; set; }
+
     /// <summary>False (`indexnode download --no-process`): the video is stored but no processing jobs are queued; `indexnode unprocessed` lists it.</summary>
     public bool QueueProcessing { get; init; } = true;
 
@@ -103,7 +106,8 @@ public sealed class DownloadStage(ITools tools, IStore store, DownloadGate gate)
             ctx.Report("download", "starting");
 
             var main = new List<string>(common);
-            main.AddRange(YtDlp.FormatArgs(job.MaxHeight ?? 480, job.Format));
+            string? codec = null; try { codec = YtDlp.NormalizeCodec(Codec?.Invoke()); } catch (ArgumentException ex) { ctx.Report("download", "ignoring " + ex.Message); }
+            main.AddRange(YtDlp.FormatArgs(job.MaxHeight ?? 480, job.Format, codec));
             main.AddRange(new[] {
                 "--merge-output-format", "mp4", "--write-info-json", "--write-thumbnail", "--convert-thumbnails", "jpg",
                 "-o", "video.%(ext)s", job.Url,

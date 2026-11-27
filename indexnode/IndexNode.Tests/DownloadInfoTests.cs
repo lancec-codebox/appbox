@@ -60,6 +60,19 @@ public class DownloadInfoTests
         Assert.Equal(["-S", "res:480", "-f", "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b"], YtDlp.FormatArgs(480, null));
         Assert.Equal(["-S", "res:360", "-f", "bv*+ba[acodec=opus][abr<=80]/bv*+ba/b"], YtDlp.FormatArgs(360, ""));
         Assert.Equal(["-f", "worst"], YtDlp.FormatArgs(480, "worst")); // an explicit format wins and there is no -S
+    }
+
+    [Fact]
+    public void A_preferred_codec_comes_after_the_resolution_and_bad_names_are_refused()
+    {   // 0.13.79: control downloads.videoCodec
+        Assert.Equal(["-S", "res:480,vcodec:h264", "-f", YtDlp.DefaultSelector], YtDlp.FormatArgs(480, null, "h264"));
+        Assert.Equal(["-S", "res:480,vcodec:h264", "-f", YtDlp.DefaultSelector], YtDlp.FormatArgs(480, null, "AVC1"));
+        Assert.Equal(["-S", "res:480,vcodec:av01", "-f", YtDlp.DefaultSelector], YtDlp.FormatArgs(480, null, "av1"));
+        Assert.Equal(["-S", "res:480", "-f", YtDlp.DefaultSelector], YtDlp.FormatArgs(480, null, "default"));
+        Assert.Equal(["-f", "worst"], YtDlp.FormatArgs(480, "worst", "h264"));   // an explicit format still wins
+        Assert.Throws<ArgumentException>(() => YtDlp.NormalizeCodec("mpeg2"));
+        var c = new ControlFile { Downloads = new DownloadsControl { VideoCodec = "h264" } };
+        Assert.Equal("h264", ControlFile.Parse(c.ToBytes()).Downloads?.VideoCodec);
         Assert.Equal("worst", YtDlp.Selector(480, "worst"));
     }
 
