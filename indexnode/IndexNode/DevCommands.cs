@@ -11,6 +11,10 @@ public static class DevCommands
     {
         var sub = a.Positional.FirstOrDefault() ?? throw new ArgumentException("dev clip|ocr|asr|embed-text --video <file> --out <dir> [--offset <sec>] [--threads N]");
         var cfg = NodeConfig.Load(); var http = Commands.NewHttp(); var tools = new Tools(http, cfg);
+        // 0.13.82: --device / INDEXNODE_DEVICE / config device, as `run` and `stages` read it; before, dev steps always ran on the CPU provider (found on the T4 and A100 one-off runs, 2026-11-27)
+        OrtOptions.Device = OrtOptions.ParseDevice(a.Get("device") ?? Environment.GetEnvironmentVariable("INDEXNODE_DEVICE") ?? cfg.Device);
+        OrtOptions.DeviceId = int.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_CUDA_DEVICE"), out var cudaDev) ? cudaDev : 0;
+        Console.Error.WriteLine($"dev: device {OrtOptions.Device}");
         var video = a.Get("video"); var outDir = a.Get("out") ?? Path.Combine(Path.GetTempPath(), "indexnode-dev");
         Directory.CreateDirectory(outDir);
         int threads = a.Get("threads") is { } t ? int.Parse(t) : Math.Min(Environment.ProcessorCount, 4);
