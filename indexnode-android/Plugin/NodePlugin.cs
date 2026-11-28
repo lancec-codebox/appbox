@@ -19,7 +19,7 @@ internal sealed class HostLogWriter(IHost host) : TextWriter
 /// </summary>
 public sealed class NodePlugin : IPlugin
 {
-    public const string Version = "0.1.2";
+    public const string Version = "0.1.3";
 
     public Task<string> SmokeAsync(IHost host)
     {
@@ -43,6 +43,28 @@ public sealed class NodePlugin : IPlugin
         return await RunWithStoreAsync(host, restStore, args, ct);
     }
 
+    /// <summary>0.1.3 (owner 2026-11-27: "I shouldn't need to scan anything"): when the setup names a check server and the store's index/service.json names
+    /// another (the service moved: the check server went from a sandbox to the container app ddindex-check-westus2), the host settings checkUrl and checkToken
+    /// are set to the store's, so the next download run and the Search tab use the new address with no new setup QR. A setup without a check server is left as it is.</summary>
+    public static async Task<bool> FollowServiceFileAsync(IHost host, IStore store, Paths paths, CancellationToken ct)
+    {
+        try
+        {
+            var cur = host.GetSetting("checkUrl"); if (string.IsNullOrWhiteSpace(cur)) return false;
+            var b = await store.GetAsync(paths.Prefix + "service.json", ct); if (b == null) return false;
+            if (JsonNode.Parse(b.Data) is not JsonObject o || (string?)o["url"] is not { Length: > 0 } url) return false;
+            url = url.Trim().TrimEnd('/');
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var u) || u.Scheme != "https") return false;
+            var tok = (string?)o["token"] is { Length: > 0 } t ? t.Trim() : null;
+            bool urlSame = string.Equals(cur.Trim().TrimEnd('/'), url, StringComparison.OrdinalIgnoreCase), tokSame = tok == null || tok == host.GetSetting("checkToken");
+            if (urlSame && tokSame) return false;
+            host.SetSetting("checkUrl", url); if (tok != null) host.SetSetting("checkToken", tok);
+            host.Log($"service: the store names the check server {url}{(urlSame ? " (new token)" : $" (was {cur})")}: settings updated");
+            return true;
+        }
+        catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException or HttpRequestException or IOException) { host.Log("service: index/service.json not followed: " + e.Message); return false; }
+    }
+
     /// <summary>The node loop over any store (tests pass a FakeStore).</summary>
     public async Task<string> RunWithStoreAsync(IHost host, IStore baseStore, string args, CancellationToken ct)
     {
@@ -60,6 +82,7 @@ public sealed class NodePlugin : IPlugin
         var paths = new Paths(prefix);
         var tools = host.Tools;
         var gate = new DownloadGate();
+        await FollowServiceFileAsync(host, store, paths, ct);   // 0.1.3: the check server moved? the store says where (no new setup QR)
         // the check server (`indexnode serve`): from the setup (host settings checkUrl and checkToken); without it the node works from the work queue only and a sample's check runs in a processing node
         var settings = new DownloaderSettings { CheckUrl = host.GetSetting("checkUrl"), CheckToken = host.GetSetting("checkToken") };
         Redact.Register(settings.CheckToken);

@@ -155,4 +155,18 @@ public class PluginTests
         Assert.Empty(tools.Urls);
         Assert.Equal("pending", Q(s).Entry("stoppedjob1", "download")!.State);
     }
+    [Fact]
+    public async Task A_moved_check_server_is_taken_from_the_store_and_a_setup_without_one_is_left_alone()
+    {   // 0.1.3: index/service.json names the new address; the setup's old one is replaced with no new setup QR
+        var s = new FakeStore(); var host = Host(new FakeTools());
+        await s.PutAsync("index/service.json", Encoding.UTF8.GetBytes("""{"v":1,"url":"https://new.example.io/","token":"T2"}"""), null, null, false, default);
+        Assert.False(await NodePlugin.FollowServiceFileAsync(host, s, P, default));   // no check server in the setup: nothing changes
+        Assert.Null(host.GetSetting("checkUrl"));
+        host.SetSetting("checkUrl", "https://old.example.io"); host.SetSetting("checkToken", "T1");
+        Assert.True(await NodePlugin.FollowServiceFileAsync(host, s, P, default));
+        Assert.Equal("https://new.example.io", host.GetSetting("checkUrl")); Assert.Equal("T2", host.GetSetting("checkToken"));
+        Assert.False(await NodePlugin.FollowServiceFileAsync(host, s, P, default));   // already the same
+        await s.PutAsync("index/service.json", Encoding.UTF8.GetBytes("""{"url":"http://plain.example.io"}"""), null, null, false, default);
+        Assert.False(await NodePlugin.FollowServiceFileAsync(host, s, P, default)); Assert.Equal("https://new.example.io", host.GetSetting("checkUrl"));   // https only
+    }
 }
