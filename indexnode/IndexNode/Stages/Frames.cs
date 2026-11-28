@@ -133,8 +133,8 @@ public static class Frames
         File.Delete(file);
     }
 
-    public static async Task<Produced> ProduceAsync(Tools tools, string video, string work, FrameSettings st, int segments, double duration, Action<string> progress, Func<string, byte[], string, Task> put, CancellationToken ct)
-    {
+    public static async Task<Produced> ProduceAsync(Tools tools, string video, string work, FrameSettings st, int segments, double duration, Action<string> progress, Func<string, byte[], string, Task> put, CancellationToken ct, OcrBandTap? tap = null)
+    {   // 0.13.94: with a tap, every decode also writes the subtitle band at the OCR rate (lossless) for the OCR step: one decode for both
         var ffmpeg = await tools.FfmpegAsync(ct);
         var probe = await tools.FfprobeAsync(ct);
         var pr = await Proc.RunAsync(probe, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", video], ct);
@@ -164,13 +164,17 @@ public static class Frames
             await Task.WhenAll(Enumerable.Range(0, parts).Select(async k =>
             {
                 int a0 = s0 + (s1 - s0) * k / parts, a1 = s0 + (s1 - s0) * (k + 1) / parts; files[k] = Path.Combine(work, $"raw{c}_{k}.rgb");
+                var band = tap == null ? null : Path.Combine(tap.Dir, $"band{c}_{k}.mkv");
+                string[] bandOut = band == null ? [] : ["-map", "[bo]", .. OcrBandTap.EncodeArgs, band];
                 var r = await Proc.RunAsync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1", "-ss", a0.ToString(CultureInfo.InvariantCulture), "-t", (a1 - a0).ToString(CultureInfo.InvariantCulture), "-i", absVideo, "-an", "-sn", "-filter_threads", "1",
                     .. (jpeg
                         // one decode, two outputs: raw rgb for the fingerprints and pruning, and the stored frames as JPEG (no separate encode step).
                         // JPEG decoders assume BT.601 full range: convert with that matrix explicitly (the source is tagged BT.709; leaving it shifted colours, -2 dB), 4:4:4 like a plain RGB->JPEG encode
-                        ? new[] { "-filter_complex_threads", "1", "-filter_complex", $"[0:v]fps=1,scale={SW}:{SH}:flags=bicubic,format=rgb24,split=2[r][j0];[j0]scale=out_color_matrix=bt601:out_range=full,format=yuvj444p[j]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k], "-map", "[j]", "-c:v", "mjpeg", "-q:v", st.JpegQ.ToString(CultureInfo.InvariantCulture), "-f", "mjpeg", files[k] + ".mjpeg" }
-                        : new[] { "-vf", $"fps=1,scale={SW}:{SH}:flags=bicubic", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k] })], ct);
+                        ? new[] { "-filter_complex_threads", "1", "-filter_complex", (band == null ? "[0:v]" : $"[0:v]split=2[v][b];[b]{tap!.Filter}[bo];[v]") + $"fps=1,scale={SW}:{SH}:flags=bicubic,format=rgb24,split=2[r][j0];[j0]scale=out_color_matrix=bt601:out_range=full,format=yuvj444p[j]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k], "-map", "[j]", "-c:v", "mjpeg", "-q:v", st.JpegQ.ToString(CultureInfo.InvariantCulture), "-f", "mjpeg", files[k] + ".mjpeg" }.Concat(bandOut).ToArray()
+                        : band == null ? new[] { "-vf", $"fps=1,scale={SW}:{SH}:flags=bicubic", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k] }
+                        : new[] { "-filter_complex_threads", "1", "-filter_complex", $"[0:v]split=2[v][b];[b]{tap!.Filter}[bo];[v]fps=1,scale={SW}:{SH}:flags=bicubic[r]", "-map", "[r]", "-pix_fmt", "rgb24", "-f", "rawvideo", files[k] }.Concat(bandOut).ToArray())], ct);
                 if (r.ExitCode != 0) throw new InvalidOperationException($"ffmpeg frames {c}/{k} failed: {r.Stderr.Trim()}");
+                if (band != null) tap!.Parts.Add(new BandPart(a0, a1, band));
                 // fingerprint every sampled frame here, in parallel with the other segments (the sequential prune below only compares)
                 var fl = new List<float[]>(); var fbuf = new byte[frameBytes];
                 await using (var fs = new FileStream(files[k], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20))

@@ -96,11 +96,15 @@ public static class OcrSubs
 
     /// <summary>Every frame of the band at 4 fps, in parallel segments (ffmpeg -threads 1 each, one OCR worker per segment).</summary>
     public static async Task<OcrResult> ReadAsync(Tools tools, string video, string ocrDet, string ocrRec, string dict, int w, int h, int bandY, int bandH,
-        double start, double duration, int workers, Action<string> progress, CancellationToken ct, bool exactSegments = false, bool useGate = true, bool preCrop = false, double squeeze = Squeeze, bool reread = false)
+        double start, double duration, int workers, Action<string> progress, CancellationToken ct, bool exactSegments = false, bool useGate = true, bool preCrop = false, double squeeze = Squeeze, bool reread = false,
+        IReadOnlyList<BandPart>? bandParts = null)
     {
         var sw = Stopwatch.StartNew();
         var ffmpeg = await tools.FfmpegAsync(ct);
-        var plan = PlanSegments(duration, exactSegments ? Math.Max(1, workers) * QueueParts : Segments(workers, Environment.ProcessorCount)).Select(s => (Start: start + s.Start, End: start + s.End)).ToList();
+        // 0.13.94: band parts the frames step decoded (OcrBandTap): the segments are those parts, and each is read from its small lossless file instead of the video
+        var tapParts = bandParts?.OrderBy(p => p.Start).ToList();
+        var plan = tapParts != null ? tapParts.Select(p => (Start: p.Start, End: p.End)).ToList()
+            : PlanSegments(duration, exactSegments ? Math.Max(1, workers) * QueueParts : Segments(workers, Environment.ProcessorCount)).Select(s => (Start: start + s.Start, End: start + s.End)).ToList();
         var perSeg = new List<FrameText>[plan.Count];
         var gate = new StyleGate(w, bandH); // one style per drama, learned from the first lines any segment reads
         int frameBytes = w * bandH * 3, total = 0, nEmpty = 0, nReused = 0, nRead = 0, nSafety = 0, nMiss = 0, nSameRead = 0, nSameSafety = 0;
@@ -115,7 +119,8 @@ public static class OcrSubs
             try {
             var list = new List<FrameText>(); perSeg[k] = list;
             var psi = new ProcessStartInfo(ffmpeg) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-            foreach (var a in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1", "-ss", seg.Start.ToString("F3", CultureInfo.InvariantCulture), "-t", (seg.End - seg.Start).ToString("F3", CultureInfo.InvariantCulture),
+            foreach (var a in tapParts != null ? new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1", "-i", tapParts[k].File, "-an", "-f", "rawvideo", "-pix_fmt", "bgr24", "-" }
+                : new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1", "-ss", seg.Start.ToString("F3", CultureInfo.InvariantCulture), "-t", (seg.End - seg.Start).ToString("F3", CultureInfo.InvariantCulture),
                 "-i", video, "-an", "-vf", $"fps={OcrCues.Fps},crop={w}:{bandH}:0:{bandY}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-" }) psi.ArgumentList.Add(a);
             using var p = Process.Start(psi)!;
             using var reg = ct.Register(() => Proc.Kill(p));

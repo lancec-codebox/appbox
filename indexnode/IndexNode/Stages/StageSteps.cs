@@ -29,27 +29,49 @@ public static class StageSteps
     }
 
     /// <summary>Burned-in subtitles: find the band, read it every 0.5 s with the style gate, at most <paramref name="threads"/> parts at once.</summary>
-    public static async Task<string> TextAsync(Tools tools, HttpClient http, string video, double duration, int threads, Put put, Action<string> progress, CancellationToken ct)
+    public static async Task<string> TextAsync(Tools tools, HttpClient http, string video, double duration, int threads, Put put, Action<string> progress, CancellationToken ct, string? tapId = null)
     {
         var sw = Stopwatch.StartNew();
         var det = await Models.EnsureAsync(Models.OcrDet, http, ct); var rec = await Models.EnsureAsync(Models.OcrRec, http, ct); var dict = await Models.EnsureAsync(Models.OcrDict, http, ct);
         if (duration <= 0) duration = await Frames.DurationAsync(tools, video, ct);
         var (w, h) = await OcrSubs.SizeAsync(tools, video, ct);
         int workers = Math.Max(1, threads);
-        var band = await OcrSubs.FindBandAsync(tools, det, rec, dict, video, w, h, 0, duration, workers, _ => { }, ct);
+        // 0.13.94: the frames step on this node may have found the band and decoded it already (OcrBandTap); anything that does not match and OCR decodes the video itself
+        var tap = tapId != null && OcrBandTap.On ? OcrBandTap.Load(tapId, w, h, duration) : null;
+        if (tapId != null) Log.Info($"ocrsubs {tapId}: {(tap == null ? "no band from the frames step's decode: decoding the video" : tap.NoBand ? "the frames step found no subtitle band" : $"the band from the frames step's decode ({tap.Parts.Count} parts)")}");
+        var band = tap != null ? (tap.NoBand ? null : ((int Y, int H)?)(tap.Y, tap.H)) : await OcrSubs.FindBandAsync(tools, det, rec, dict, video, w, h, 0, duration, workers, _ => { }, ct);
         OcrResult res;
+        try
+        {
         if (band == null) { progress("no subtitle band: no burned-in subtitles"); res = new OcrResult([], [], 0, 0, w, 0, 0); }
         else
         {
             progress($"subtitle band y={band.Value.Y} h={band.Value.H} in {sw.Elapsed.TotalSeconds:F1}s");
-            res = await OcrSubs.ReadAsync(tools, video, det, rec, dict, w, h, band.Value.Y, band.Value.H, 0, duration, workers, progress, ct, exactSegments: true);
+            res = await OcrSubs.ReadAsync(tools, video, det, rec, dict, w, h, band.Value.Y, band.Value.H, 0, duration, workers, progress, ct, exactSegments: true, bandParts: tap?.Parts.ToList());
         }
+        }
+        finally { if (tapId != null) OcrBandTap.Delete(tapId); }
         var enc = System.Text.Encoding.UTF8;
         await put("ocr/subs.zh.vtt", enc.GetBytes(OcrCues.ToVtt(res.Zh, false)), "text/vtt");
         await put("ocr/subs.zh-Hans.vtt", enc.GetBytes(OcrCues.ToVtt(res.Zh, true)), "text/vtt");
         await put("ocr/lines.json", OcrCues.ToJson(res.Zh, res.En, res.BandY, res.BandH, res.Width), "application/json");
         if (res.En.Count > 0) await put("ocr/subs.en.vtt", enc.GetBytes(OcrCues.ToVtt(res.En, false)), "text/vtt");
         return $"{res.Zh.Count} zh cues, {res.En.Count} en cues, {sw.Elapsed.TotalSeconds:F1}s";
+    }
+
+    /// <summary>0.13.94: the subtitle band for the frames step's decode to write (OcrBandTap): the OCR step's own band search, run before the frames decode. Null when the shared decode
+    /// is off or this ffmpeg cannot write the lossless band; a tap with NoBand when the video has no burned-in subtitles.</summary>
+    public static async Task<OcrBandTap?> BandTapAsync(Tools tools, HttpClient http, string video, double duration, int threads, string id, CancellationToken ct)
+    {
+        if (!OcrBandTap.On || !await OcrBandTap.EncoderAvailableAsync(await tools.FfmpegAsync(ct), ct)) return null;
+        var sw = Stopwatch.StartNew();
+        var det = await Models.EnsureAsync(Models.OcrDet, http, ct); var rec = await Models.EnsureAsync(Models.OcrRec, http, ct); var dict = await Models.EnsureAsync(Models.OcrDict, http, ct);
+        if (duration <= 0) duration = await Frames.DurationAsync(tools, video, ct);
+        var (w, h) = await OcrSubs.SizeAsync(tools, video, ct);
+        var band = await OcrSubs.FindBandAsync(tools, det, rec, dict, video, w, h, 0, duration, Math.Max(1, threads), _ => { }, ct);
+        OcrBandTap.Delete(id); Directory.CreateDirectory(OcrBandTap.DirFor(id));
+        Log.Info($"frames {id}: subtitle band for the OCR step {(band == null ? "not found" : $"y={band.Value.Y} h={band.Value.H}")} in {sw.Elapsed.TotalSeconds:F1}s");
+        return new OcrBandTap { Y = band?.Y ?? 0, H = band?.H ?? 0, SrcW = w, SrcH = h, Duration = duration, NoBand = band == null, Dir = OcrBandTap.DirFor(id) };
     }
 
     /// <summary>Faces from the stored frames (one per shot, buffalo_s), plus the credits read from the stored frames of the first and last 3 minutes.</summary>

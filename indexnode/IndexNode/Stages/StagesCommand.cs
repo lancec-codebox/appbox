@@ -108,8 +108,11 @@ public static class StagesCommand
                         double fetch = sw.Elapsed.TotalSeconds;
                         var duration = await Frames.DurationAsync(tools, video, ct);
                         var st = FrameSettings.From(cfg) with { Keyframes = a.Has("keyframes") };
+                        // 0.13.94: with the text stage in the same run, one decode for both (OcrBandTap), as in a node's claim
+                        var tap = stages.Contains("text") ? await StageSteps.BandTapAsync(tools, http, video, duration, threads, id, ct) : null;
                         var r = await Frames.ProduceAsync(tools, video, work, st, threads, duration, m => P(stage, m),
-                            (n, b, type) => store.PutAsync(paths.Video(id, n), b, null, null, false, ct, type), ct);
+                            (n, b, type) => store.PutAsync(paths.Video(id, n), b, null, null, false, ct, type), ct, tap is { NoBand: false } ? tap : null);
+                        if (tap != null) await tap.SaveAsync(ct);
                         frameSet = null;
                         Console.WriteLine($"frames: {r.Kept}/{r.Sampled} frames kept, {r.FrameBytes / 1048576.0:F1} MB, {duration:F0}s of video; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
@@ -120,7 +123,7 @@ public static class StagesCommand
                         var video = await Video(); double fetch = sw.Elapsed.TotalSeconds;
                         if (stage == "transcribe" && a.Get("asr-piece") is { } ap) Transcribe.PieceSeconds = int.Parse(ap);
                         var msg = stage == "transcribe" ? await StageSteps.TranscribeAsync(tools, http, video, 0, threads, Put, m => P(stage, m), ct)
-                                                        : await StageSteps.TextAsync(tools, http, video, 0, threads, Put, m => P(stage, m), ct);
+                                                        : await StageSteps.TextAsync(tools, http, video, 0, threads, Put, m => P(stage, m), ct, stages.Contains("frames") ? id : null);
                         Console.WriteLine($"{stage}: {msg}; fetch {fetch:F1}s, total {sw.Elapsed.TotalSeconds:F1}s");
                         break;
                     }

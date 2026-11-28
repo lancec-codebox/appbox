@@ -151,7 +151,16 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             {
                 ctx.Report("frames", null);
                 int segs = ctx.ThreadShare();
-                var r = await Frames.ProduceAsync(tools, video, work, FrameSettings.From(config), segs, duration, p => ctx.Report("frames", p), (name, bytes, type) => wst.PutAsync(paths.Video(id, name), bytes, null, null, false, ct, type), ct);
+                // 0.13.94: one decode for frames and OCR: when the OCR step is still to run, this decode also writes the subtitle band for it (OcrBandTap)
+                OcrBandTap? tap = null;
+                if (OcrBandTap.On && !Has("ocr/lines.json"))
+                {
+                    OcrBandTap.Sweep();
+                    try { ctx.Report("frames", "subtitle band"); tap = await StageSteps.BandTapAsync(tools, http, video, duration, segs, id, ct); }
+                    catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"process {id}: no shared decode ({e.Message}); the OCR step decodes the video itself"); tap = null; }
+                }
+                var r = await Frames.ProduceAsync(tools, video, work, FrameSettings.From(config), segs, duration, p => ctx.Report("frames", p), (name, bytes, type) => wst.PutAsync(paths.Video(id, name), bytes, null, null, false, ct, type), ct, tap is { NoBand: false } ? tap : null);
+                if (tap != null) await tap.SaveAsync(ct);
                 frameCount = r.Kept;
                 await Commit("frames");
                 // frames.zip is up, so the three GPU steps are ready now: one marker each wakes the on-demand GPU node
@@ -225,7 +234,7 @@ public sealed class ProcessStage(Tools tools, IStore store, NodeConfig config, H
             if (need["ocrsubs"])
             {
                 ctx.Report("ocrsubs", null);
-                Log.Info($"process {id}: text {await StageSteps.TextAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("ocrsubs", p), ct)}");
+                Log.Info($"process {id}: text {await StageSteps.TextAsync(tools, http, video, duration, ctx.ThreadShare(), Put, p => ctx.Report("ocrsubs", p), ct, tapId: id)}");   // 0.13.94: the band the frames step decoded, when it is here
                 await Commit("ocrsubs");
             }
             if (need["cast"])
