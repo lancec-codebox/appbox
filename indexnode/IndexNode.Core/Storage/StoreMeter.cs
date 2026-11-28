@@ -83,6 +83,10 @@ public sealed class StoreMeter
             if (label != null && sc.Ops > 0) Log.Info($"{label}: {sc.Ops} store ops ({sc.Cells.Values.Sum(x => x.Failed)} failed); top sites: {Top(Rows(sc.Cells), 5)}");
         }
     }
+    /// <summary>0.13.88: everything inside the scope is outside the current step's budget (a cache fill such as the frame codes log's re-sync); the per-minute
+    /// window and the totals still count every op.</summary>
+    public IDisposable OutsideStep() { var prev = step.Value; step.Value = null; return new Restore(prev); }
+    sealed class Restore(StepScope? prev) : IDisposable { public void Dispose() => step.Value = prev; }
     /// <summary>The ops of the current step so far (0 outside a step scope).</summary>
     public long StepOps => step.Value?.Ops ?? 0;
     public IReadOnlyList<SiteRow> StepTable() => Rows(step.Value?.Cells);

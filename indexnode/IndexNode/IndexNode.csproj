@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.13.87</Version>
+    <Version>0.13.88</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
@@ -44,10 +44,10 @@
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu.Linux" Version="1.23.2" />
   </ItemGroup>
   <PropertyGroup Condition="'$(IndexNodeGpu)' == 'true'">
-    <SherpaMsortUrl>https://github.com/lancec-codebox/appbox/releases/download/tools-sherpa-onnx-2.0.1-msort-1.23.2/</SherpaMsortUrl>
-    <SherpaMsortDir>$(MSBuildProjectDirectory)/obj/sherpa-msort/</SherpaMsortDir>
-    <SherpaCApiSha256>D999B69387BEA8FE53542C013B70AAB1277B4C1E766887C90630DBC2FB5F4F20</SherpaCApiSha256>
-    <SherpaCxxApiSha256>F441A1C9C855AF4A78828D58925F1B94E53776D4EF3304A0DEE3016C398591A8</SherpaCxxApiSha256>
+    <SherpaMsortUrl>https://github.com/lancec-codebox/appbox/releases/download/tools-sherpa-onnx-2.0.1-msort-1.23.2-glibc2.34/</SherpaMsortUrl>
+    <SherpaMsortDir>$(MSBuildProjectDirectory)/obj/sherpa-msort-g234/</SherpaMsortDir>
+    <SherpaCApiSha256>AA6FED6D316D883B6B99032AA0D2CF21E3C39D7E9C4F80DAF0CCBD33605971C4</SherpaCApiSha256>
+    <SherpaCxxApiSha256>4BAC0DA160CE758F4069C5C412C54DD6030C69F94134944A0DD9E35C32FEE524</SherpaCxxApiSha256>
   </PropertyGroup>
   <Target Name="IndexNodeGpuNatives" AfterTargets="ResolvePackageAssets" Condition="'$(IndexNodeGpu)' == 'true'">
     <DownloadFile SourceUrl="$(SherpaMsortUrl)libsherpa-onnx-c-api.so" DestinationFolder="$(SherpaMsortDir)" Condition="!Exists('$(SherpaMsortDir)libsherpa-onnx-c-api.so')" />

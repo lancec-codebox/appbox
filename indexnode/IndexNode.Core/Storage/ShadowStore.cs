@@ -19,6 +19,7 @@ public sealed class ShadowStore : IStore
     public void NoteBlockedWrite() => Interlocked.Increment(ref BlockedWrites);
 
     bool Gone(string n) => deleted.ContainsKey(n);
+    /// <summary>0.13.88: the overlay copy of an append blob, made at the shadow's first WRITE to it (reads before that go to the live blob: see the read methods).</summary>
     async Task<Log0?> LogAsync(string name, CancellationToken ct)
     {
         if (appends.TryGetValue(name, out var l)) return l;
@@ -155,12 +156,12 @@ public sealed class ShadowStore : IStore
     }
     public async Task<AppendRead> ReadAppendAsync(string name, long offset, int maxLen, CancellationToken ct)
     {
-        var l = await LogAsync(name, ct); if (l == null) return new([], 0, false, 0, true);
+        if (!appends.TryGetValue(name, out var l)) return Gone(name) ? new([], 0, false, 0, true) : await real.ReadAppendAsync(name, offset, maxLen, ct);   // 0.13.88: not written by the shadow: the live blob
         long len; bool sealedNow; lock (l.Gate) { len = l.Length; sealedNow = l.Sealed; }
         return new(await ReadLogAsync(name, l, offset, maxLen, ct), len, sealedNow, 1);
     }
     public async Task<bool?> SealAppendBlobAsync(string name, long appendPos, CancellationToken ct) { var l = await LogAsync(name, ct); if (l == null) return null; lock (l.Gate) { if (l.Length != appendPos) return false; l.Sealed = true; return true; } }
-    public async Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) { var l = await LogAsync(name, ct); if (l == null) return null; lock (l.Gate) return new(l.Length, l.Sealed, 1); }
+    public async Task<AppendInfo?> GetAppendInfoAsync(string name, CancellationToken ct) { if (!appends.TryGetValue(name, out var l)) return Gone(name) ? null : await real.GetAppendInfoAsync(name, ct); lock (l.Gate) return new(l.Length, l.Sealed, 1); }   // 0.13.88: live until written
 
     // ---- block blobs (the aggregate): reads pass through, writes are dropped
     public Task PutBlockAsync(string name, string blockId, byte[] data, CancellationToken ct) { Interlocked.Increment(ref BlockedWrites); return Task.CompletedTask; }

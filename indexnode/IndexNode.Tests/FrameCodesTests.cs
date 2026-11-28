@@ -107,6 +107,26 @@ public class FrameCodesTests
     }
 
     [Fact]
+    public async Task Two_caches_syncing_one_local_file_at_once_append_each_part_once()
+    {   // 0.13.88: proc-25 (2026-11-27): two caches of one process appended the same parts to the one local copy; every later pointer read "bad magic"
+        var (f, idx, _) = await Seed(6);
+        Assert.Equal(6, await FrameCodes.FillAsync(f, P, idx, 60, 0, _ => { }, default));
+        var dir = Tmp();
+        try
+        {
+            var a = new FrameCodesCache(dir) { RangeBytes = 4096, Streams = 1 }; var b = new FrameCodesCache(dir) { RangeBytes = 4096, Streams = 1 };   // small windows: many appends to race on
+            var views = await Task.WhenAll(Enumerable.Range(0, 8).Select(i => Task.Run(async () => { try { return await (i % 2 == 0 ? a : b).ViewAsync(f, P, idx, default); } catch (InvalidDataException) { return null; } })));
+            var log = (await f.GetAppendInfoAsync(FrameCodes.Segment(P, idx.MeanVersion, 0), default))!.Length;
+            var local = Directory.GetFiles(dir, "log-0000*.bin", SearchOption.AllDirectories).Select(x => new FileInfo(x).Length).Max();
+            Assert.Equal(log, local);   // each part once: the copy is exactly the store's log
+            var ok = views.Where(v => v != null).ToList(); Assert.NotEmpty(ok);
+            Assert.All(ok, v => { Assert.Equal(0, v!.Missing); Assert.Equal(360, v.Frames); });
+            Assert.Equal(0, (await new FrameCodesCache(dir).ViewAsync(f, P, idx, default)).Missing);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public async Task The_per_frame_lookup_on_codes_finds_each_query_frame_in_its_own_upload_and_leaves_the_excluded_one_out()
     {
         var (f, idx, xs) = await Seed(3);

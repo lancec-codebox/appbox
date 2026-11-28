@@ -60,6 +60,22 @@ public class ShadowStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task An_append_blob_the_shadow_never_wrote_reads_live_and_one_it_wrote_freezes_at_its_first_write()
+    {   // 0.13.88: the codes log grows while a shadow runs; reads must see it until the shadow appends
+        var real = new FakeStore(); await real.CreateAppendBlobAsync("index/search/codes/m1/log-0000.bin", true, default);
+        await real.AppendBlockAsync("index/search/codes/m1/log-0000.bin", [1, 2, 3], 0, default);
+        var s = new ShadowStore(real, dir);
+        Assert.Equal(3, (await s.GetAppendInfoAsync("index/search/codes/m1/log-0000.bin", default))!.Length);
+        await real.AppendBlockAsync("index/search/codes/m1/log-0000.bin", [4, 5], 3, default);   // another node appends
+        Assert.Equal(5, (await s.GetAppendInfoAsync("index/search/codes/m1/log-0000.bin", default))!.Length);   // seen: nothing was frozen by the read
+        Assert.Equal(new byte[] { 4, 5 }, (await s.GetRangeAsync("index/search/codes/m1/log-0000.bin", 3, 2, null, default)).Data);
+        Assert.Equal(AppendOutcome.Ok, (await s.AppendBlockAsync("index/search/codes/m1/log-0000.bin", [9], 5, default)).Outcome);   // the shadow writes: frozen at 5 + its own
+        await real.AppendBlockAsync("index/search/codes/m1/log-0000.bin", [7], 5, default);
+        Assert.Equal(6, (await s.GetAppendInfoAsync("index/search/codes/m1/log-0000.bin", default))!.Length);
+        Assert.Equal(new byte[] { 9 }, (await s.GetRangeAsync("index/search/codes/m1/log-0000.bin", 5, 1, null, default)).Data);
+    }
+
+    [Fact]
     public async Task Aggregate_block_writes_are_dropped()
     {
         var real = new FakeStore(); var s = new ShadowStore(real, dir);

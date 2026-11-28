@@ -362,9 +362,12 @@ public sealed unsafe class FrameCodesUpload
 /// </summary>
 public sealed class FrameCodesCache(string root)
 {
-    static FrameCodesCache? shared;
-    /// <summary>0.13.72: the process's one cache under the config dir (the check, the group step and the search share it).</summary>
-    public static FrameCodesCache Shared => shared ??= new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes"));
+    static readonly Lazy<FrameCodesCache> shared = new(() => new FrameCodesCache(Path.Combine(NodeConfig.ConfigDir(), "frame-codes")), LazyThreadSafetyMode.ExecutionAndPublication);
+    /// <summary>0.13.72: the process's one cache under the config dir (the check, the group step and the search share it). 0.13.88: made once (Lazy); it was
+    /// `??=`, and lanes claiming at once could make two caches that appended the same parts to the one local file.</summary>
+    public static FrameCodesCache Shared => shared.Value;
+    /// <summary>0.13.88: one lock per local file for the whole process, whatever cache instance syncs it.</summary>
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> fileLocks = new(StringComparer.Ordinal);
     readonly SemaphoreSlim gate = new(1, 1);
     FrameCodesView? view;
     readonly Dictionary<(int Mv, int Seg), MappedLog> maps = new();
@@ -462,6 +465,14 @@ public sealed class FrameCodesCache(string root)
     async Task SyncAsync(IStore store, Paths paths, int mv, int seg, long lastOffset, CancellationToken ct)
     {
         var name = FrameCodes.Segment(paths, mv, seg); var path = LocalFile(mv, seg); Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var fl = fileLocks.GetOrAdd(Path.GetFullPath(path), _ => new SemaphoreSlim(1, 1));
+        await fl.WaitAsync(ct);
+        try { using (StoreMeter.Current.OutsideStep()) await SyncLockedAsync(store, name, path, seg, lastOffset, ct); }   // 0.13.88: a cache fill, not the step's reads
+        finally { fl.Release(); }
+    }
+
+    async Task SyncLockedAsync(IStore store, string name, string path, int seg, long lastOffset, CancellationToken ct)
+    {
         long have = File.Exists(path) ? new FileInfo(path).Length : 0;
         bool Whole() { if (have <= lastOffset) return false; using var fh = File.OpenHandle(path); var h = new byte[FrameCodes.Fixed]; return RandomAccess.Read(fh, h, lastOffset) == h.Length && lastOffset + FrameCodes.LengthAt(h) <= have; }
         if (Whole()) return;
@@ -482,7 +493,12 @@ public sealed class FrameCodesCache(string root)
             // whole parts go to the local copy; a part cut at the end of the window is carried into the next
             var d = new byte[carry.Length + got]; carry.CopyTo(d, 0); long w = carry.Length; foreach (var b in bufs) { b.CopyTo(d, w); w += b.Length; }
             int used = 0; while (true) { int len = FrameCodes.LengthAt(d.AsSpan(used)); if (len == 0 || used + len > d.Length) break; used += len; }
-            if (used > 0) { using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read); fs.Write(d, 0, used); have += used; }
+            if (used > 0)
+            {   // 0.13.88: the parts are appended only where this read began: a file that changed under us is not appended to (the next view fetches again)
+                using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+                if (fs.Length != have) throw new InvalidDataException($"frame codes log {seg}: the local copy is {fs.Length} bytes, not the {have} this read began at; not appended");
+                fs.Write(d, 0, used); have += used;
+            }
             carry = d[used..];
         }
         if (!Whole()) throw new InvalidDataException($"frame codes log {seg}: the part at {lastOffset} is not whole at the end ({info.Length})");
