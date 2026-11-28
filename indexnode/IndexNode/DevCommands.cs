@@ -247,7 +247,9 @@ public static class DevCommands
             }
             case "asr":
             {
-                var m = await Models.EnsureAsync(Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vad = await Models.EnsureAsync(Models.Vad, http, ct);
+                var m = await Models.EnsureAsync(OrtOptions.Cuda ? Models.AsrModelFp32 : Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vad = await Models.EnsureAsync(Models.Vad, http, ct);   // 0.13.83: fp32 on CUDA
+                if (a.Get("asr-batch-seconds") is { } abs) Transcribe.GpuBatchSeconds = double.Parse(abs, CultureInfo.InvariantCulture);
+                Console.Error.WriteLine($"asr: provider {Transcribe.Provider}, model {Path.GetFileName(m)}");
                 var a0 = sw.Elapsed.TotalSeconds;
                 var audio = a.Get("asr-workers") is { } aw0 ? await Transcribe.ReadAudioParallelAsync(tools, video!, await Frames.DurationAsync(tools, video!, ct), int.Parse(aw0), ct) : await Transcribe.ReadAudioAsync(tools, video!, 0, 0, ct);
                 var t0 = sw.Elapsed.TotalSeconds; Console.Error.WriteLine($"{t0:F1}s audio read in {t0 - a0:F1}s ({audio.Length / 16000.0:F0}s of audio)");

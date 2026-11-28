@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.13.82</Version>
+    <Version>0.13.83</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
@@ -35,10 +35,31 @@
     <PackageReference Include="QRCoder" Version="1.6.0" />
   </ItemGroup>
 
-  <!-- GPU build: dotnet publish -p:IndexNodeGpu=true -r linux-x64 (CUDA 12 + cuDNN 9 libraries come from the container) -->
-  <ItemGroup Condition="'$(IndexNodeGpu)' == 'true'">
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu.Linux" Version="1.23.2" />
-  </ItemGroup>
+  <!-- GPU build: dotnet publish -p:IndexNodeGpu=true -r linux-x64 (CUDA 12 + cuDNN 9 libraries come from the container).
+       0.13.83: the CUDA onnxruntime is sherpa-onnx 2.0.1's own CUDA package (onnxruntime 1.28.2 GPU), not Microsoft.ML.OnnxRuntime.Gpu.Linux 1.23.2: sherpa's
+       libsherpa-onnx-c-api.so needs exactly VERS_1.28.2, so with 1.23.2 transcribe could not load on any GPU box. The managed ORT 1.23.2 runs against native 1.28.2
+       (the CPU build has always done so with sherpa's CPU onnxruntime). The package is downloaded once per obj folder and its sha256 checked. -->
+  <PropertyGroup Condition="'$(IndexNodeGpu)' == 'true'">
+    <SherpaGpuName>sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu</SherpaGpuName>
+    <SherpaGpuUrl>https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$(SherpaGpuName).tar.bz2</SherpaGpuUrl>
+    <SherpaGpuSha256>2AA541A65C1E7D921A053283419B70B30C1F6AE0A0F52F64B947EBE88C5F2A77</SherpaGpuSha256>
+    <SherpaGpuDir>$(MSBuildProjectDirectory)/obj/sherpa-gpu/</SherpaGpuDir>
+    <SherpaGpuLib>$(SherpaGpuDir)$(SherpaGpuName)/lib/</SherpaGpuLib>
+  </PropertyGroup>
+  <Target Name="IndexNodeGpuNatives" AfterTargets="ResolvePackageAssets" Condition="'$(IndexNodeGpu)' == 'true'">
+    <DownloadFile SourceUrl="$(SherpaGpuUrl)" DestinationFolder="$(SherpaGpuDir)" DestinationFileName="$(SherpaGpuName).tar.bz2" Condition="!Exists('$(SherpaGpuDir)$(SherpaGpuName).tar.bz2')" />
+    <GetFileHash Files="$(SherpaGpuDir)$(SherpaGpuName).tar.bz2" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="_SherpaGpuHash" />
+    </GetFileHash>
+    <Error Condition="'$(_SherpaGpuHash)' != '$(SherpaGpuSha256)'" Text="sherpa-onnx GPU package: sha256 $(_SherpaGpuHash), expected $(SherpaGpuSha256)" />
+    <Exec Command="tar -xjf &quot;$(SherpaGpuName).tar.bz2&quot; &quot;$(SherpaGpuName)/lib&quot;" WorkingDirectory="$(SherpaGpuDir)" Condition="!Exists('$(SherpaGpuLib)libonnxruntime_providers_cuda.so')" />
+    <ItemGroup>
+      <_SherpaGpuLibs Include="$(SherpaGpuLib)libonnxruntime.so;$(SherpaGpuLib)libonnxruntime_providers_cuda.so;$(SherpaGpuLib)libonnxruntime_providers_shared.so;$(SherpaGpuLib)libsherpa-onnx-c-api.so;$(SherpaGpuLib)libsherpa-onnx-cxx-api.so" />
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)" Condition="'%(Filename)%(Extension)' == 'libonnxruntime.so' or '%(Filename)%(Extension)' == 'libsherpa-onnx-c-api.so' or '%(Filename)%(Extension)' == 'libsherpa-onnx-cxx-api.so' or '%(Filename)%(Extension)' == 'libonnxruntime_providers_shared.so'" />
+      <NativeCopyLocalItems Include="@(_SherpaGpuLibs)" AssetType="native" DestinationSubPath="%(Filename)%(Extension)" NuGetPackageId="sherpa-onnx-cuda" NuGetPackageVersion="2.0.1" CopyLocal="true" />
+    </ItemGroup>
+    <Message Importance="high" Text="IndexNode GPU build: CUDA natives from $(SherpaGpuName) (onnxruntime 1.28.2 GPU)" />
+  </Target>
 
   <ItemGroup>
     <InternalsVisibleTo Include="IndexNode.Tests" />

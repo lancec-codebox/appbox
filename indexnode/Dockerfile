@@ -8,6 +8,8 @@
 # or baked in with --build-arg BAKE_MODELS=1 (a bigger image, a faster cold start: worth it for an on-demand job).
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+# 0.13.83: the GPU build unpacks sherpa-onnx's CUDA package (.tar.bz2) in IndexNode.csproj
+RUN apt-get update && apt-get install -y --no-install-recommends bzip2 && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # the same repo-relative paths as in the repo, so the ProjectReferences (IndexNode -> IndexNode.Core -> indexnode-android/Contract) resolve
 COPY indexnode/IndexNode/IndexNode.csproj indexnode/IndexNode/

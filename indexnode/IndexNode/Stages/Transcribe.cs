@@ -127,7 +127,7 @@ public static class Transcribe
     /// <summary>The SenseVoice recogniser, loaded once per process (per model file and thread count) and used by every worker at once: sherpa-onnx's OfflineRecognizer.Decode takes a stream of its own per call and the ONNX Runtime session under it allows concurrent runs, so no lock. Never disposed by the caller.</summary>
     public static OfflineRecognizer SharedRecognizer(string modelPath, string tokensPath, int threads)
     {
-        var key = $"{Path.GetFullPath(modelPath)}|{Math.Max(1, threads)}";
+        var key = $"{Path.GetFullPath(modelPath)}|{Math.Max(1, threads)}|{Provider}";
         Lazy<OfflineRecognizer> l;
         lock (recognisers) { if (!recognisers.TryGetValue(key, out l!)) recognisers[key] = l = new Lazy<OfflineRecognizer>(() => NewRecognizer(modelPath, tokensPath, threads), LazyThreadSafetyMode.ExecutionAndPublication); }
         return l.Value;
@@ -150,9 +150,32 @@ public static class Transcribe
         rc.ModelConfig.SenseVoice.UseInverseTextNormalization = 1;
         rc.ModelConfig.Tokens = tokensPath;
         rc.ModelConfig.NumThreads = Math.Max(1, threads);
-        rc.ModelConfig.Provider = "cpu";
+        rc.ModelConfig.Provider = Provider;
         rc.ModelConfig.Debug = 0;
         return new OfflineRecognizer(rc);
+    }
+
+    /// <summary>0.13.83: the sherpa-onnx provider: "cuda" when the node runs on CUDA (the GPU build ships sherpa's CUDA package), else "cpu".</summary>
+    public static string Provider => OrtOptions.Cuda ? "cuda" : "cpu";
+
+    /// <summary>0.13.83: on CUDA, segments are decoded in batches of at most this much audio (longest first, so a batch pads little). A T4 (16 GB) took
+    /// 14 x 30 s at once and ran out of memory at 112 x 30 s.</summary>
+    public static double GpuBatchSeconds = 240; public static int GpuBatchMax = 64;
+
+    /// <summary>The order and grouping of segments for batched decoding: indices longest first, cut into batches of at most <paramref name="maxSeconds"/>
+    /// of audio and <paramref name="maxCount"/> segments (a single longer segment is a batch of its own).</summary>
+    public static List<List<int>> Batches(IReadOnlyList<int> lengths, double maxSeconds, int maxCount)
+    {
+        var order = Enumerable.Range(0, lengths.Count).OrderByDescending(i => lengths[i]).ThenBy(i => i).ToList();
+        var batches = new List<List<int>>(); var cur = new List<int>(); double secs = 0;
+        foreach (var i in order)
+        {
+            double s = lengths[i] / (double)SampleRate;
+            if (cur.Count > 0 && (secs + s > maxSeconds || cur.Count >= maxCount)) { batches.Add(cur); cur = []; secs = 0; }
+            cur.Add(i); secs += s;
+        }
+        if (cur.Count > 0) batches.Add(cur);
+        return batches;
     }
 
     static VoiceActivityDetector NewVad(string vadPath)
@@ -239,13 +262,18 @@ public static class Transcribe
 
         loading.Wait(ct); double loadSecs = (Stopwatch.GetTimestamp() - loadTicks) / (double)Stopwatch.Frequency, waitLoad = wall.Elapsed.TotalSeconds - vadSecs;
         var res = new AsrSegment?[segs.Count]; int next = -1, done = 0; batch = Math.Max(1, batch); long decodeSum = 0;
-        Parallel.For(0, Math.Max(1, workers), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, workers), CancellationToken = ct }, w =>
+        // 0.13.83: on CUDA one recogniser decodes batches by audio length (longest first); on the CPU the workers take fixed-size batches in order, as before
+        bool gpu = Provider == "cuda";
+        var plan = gpu ? Batches(segs.Select(s => s.Samples.Length).ToList(), GpuBatchSeconds, GpuBatchMax) : null;
+        int decoders = gpu ? 1 : Math.Max(1, workers);
+        Parallel.For(0, decoders, new ParallelOptions { MaxDegreeOfParallelism = decoders, CancellationToken = ct }, w =>
         {
             var rec = recs[SharedModel ? 0 : w];
             while (true)
             {
                 var idx = new List<int>(); int i;
-                while (idx.Count < batch && (i = Interlocked.Increment(ref next)) < segs.Count) idx.Add(i);
+                if (plan != null) { int b = Interlocked.Increment(ref next); if (b < plan.Count) idx.AddRange(plan[b]); }
+                else while (idx.Count < batch && (i = Interlocked.Increment(ref next)) < segs.Count) idx.Add(i);
                 if (idx.Count == 0) break;
                 ct.ThrowIfCancellationRequested();
                 var streams = idx.Select(j => { var st = rec.CreateStream(); st.AcceptWaveform(SampleRate, segs[j].Samples); return st; }).ToList();
@@ -261,7 +289,7 @@ public static class Transcribe
             }
         });
         if (!SharedModel) foreach (var rr in recs) rr.Dispose(); // the shared one lives as long as the process
-        Log.Info($"transcribe: {(SharedModel ? "one shared model, " : "")}voice detection {vadSecs:F1}s ({pieces} pieces), recognition {wall.Elapsed.TotalSeconds - vadSecs:F1}s ({segs.Count} segments, {speech:F0}s of speech; {workers} recognisers x {threadsPer} thread(s), batch {batch}), wall {wall.Elapsed.TotalSeconds:F1}s; model load {loadSecs:F1}s (alongside voice detection; {waitLoad:F1}s waited after it), decode time summed over recognisers {decodeSum / (double)Stopwatch.Frequency:F1}s");
+        Log.Info($"transcribe: provider {Provider}, {(SharedModel ? "one shared model, " : "")}voice detection {vadSecs:F1}s ({pieces} pieces), recognition {wall.Elapsed.TotalSeconds - vadSecs:F1}s ({segs.Count} segments, {speech:F0}s of speech; {(plan != null ? $"1 recogniser, {plan.Count} batches of <= {GpuBatchSeconds:F0}s" : $"{workers} recognisers x {threadsPer} thread(s), batch {batch}")}), wall {wall.Elapsed.TotalSeconds:F1}s; model load {loadSecs:F1}s (alongside voice detection; {waitLoad:F1}s waited after it), decode time summed over recognisers {decodeSum / (double)Stopwatch.Frequency:F1}s");
         return res.Where(r => r != null).Select(r => r!).ToList();
     }
 
@@ -311,7 +339,7 @@ public static class Transcribe
         rc.ModelConfig.SenseVoice.UseInverseTextNormalization = 1;
         rc.ModelConfig.Tokens = tokensPath;
         rc.ModelConfig.NumThreads = Math.Max(1, threads);
-        rc.ModelConfig.Provider = "cpu";
+        rc.ModelConfig.Provider = Provider;   // 0.13.83
         rc.ModelConfig.Debug = 0;
         using var rec = new OfflineRecognizer(rc);
 

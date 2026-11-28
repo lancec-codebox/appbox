@@ -29,6 +29,8 @@ public static class Models
     public static readonly ModelFile OcrDict = new("ocr-dict", "ppocrv5_dict.txt", Rapid + "paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile/ppocrv5_dict.txt", "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b", 74_012, "Apache-2.0");
 
     public static readonly ModelFile AsrModel = new("asr-model", "sensevoice-small.int8.onnx", SenseVoice + "model.int8.onnx", "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51", 239_233_841, "FunASR Model Open Source License 1.1");
+    /// <summary>0.13.83: the fp32 SenseVoice, for the CUDA provider (the int8 model runs slower on the card than on the CPU).</summary>
+    public static readonly ModelFile AsrModelFp32 = new("asr-model-fp32", "sensevoice-small.fp32.onnx", SenseVoice + "model.onnx", "977016bd9c79f9eb343430b5cc305e07ab64d5212dff41b0dcfa1694bee9a8cb", 937_617_178, "FunASR Model Open Source License 1.1");
     public static readonly ModelFile AsrTokens = new("asr-tokens", "sensevoice-small.tokens.txt", SenseVoice + "tokens.txt", "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc", 315_894, "FunASR Model Open Source License 1.1");
     public static readonly ModelFile Vad = new("silero-vad", "silero_vad.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx", "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6", 643_854, "MIT");
 

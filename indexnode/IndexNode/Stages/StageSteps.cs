@@ -17,7 +17,7 @@ public static class StageSteps
     public static async Task<string> TranscribeAsync(Tools tools, HttpClient http, string video, double duration, int threads, Put put, Action<string> progress, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        var m = await Models.EnsureAsync(Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vad = await Models.EnsureAsync(Models.Vad, http, ct);
+        var m = await Models.EnsureAsync(OrtOptions.Cuda ? Models.AsrModelFp32 : Models.AsrModel, http, ct); var tk = await Models.EnsureAsync(Models.AsrTokens, http, ct); var vad = await Models.EnsureAsync(Models.Vad, http, ct);   // 0.13.83: fp32 on CUDA
         if (duration <= 0) duration = await Frames.DurationAsync(tools, video, ct);
         var audio = await Transcribe.ReadAudioParallelAsync(tools, video, duration, threads, ct);
         progress($"audio read in {sw.Elapsed.TotalSeconds:F1}s ({audio.Length / (double)Transcribe.SampleRate:F0}s)");
