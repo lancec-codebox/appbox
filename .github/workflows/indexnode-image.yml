@@ -1,0 +1,65 @@
+name: indexnode-image
+
+# Builds the IndexNode CPU container (indexnode/Dockerfile.cpu: `indexnode serve`, ffmpeg and the serve models baked in, no credentials) and pushes it to
+# GHCR as ghcr.io/<owner>/indexnode:<version> and :latest, when the IndexNode version in the source has no image yet (a version bump), like indexnode-gpu.
+# Used by the container app ddindex-check-westus2 (check, search and download service; owner 2026-11-27).
+on:
+  push:
+    branches: [main]
+    paths: ["indexnode/**", "indexnode-android/Contract/**", ".github/workflows/indexnode-image.yml"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "image tag (default: the IndexNode version in the source); a manual run pushes even when the tag exists"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: indexnode-cpu-image
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          SRC="$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' indexnode/IndexNode/IndexNode.csproj | head -1)"
+          [ -n "$SRC" ] || { echo "cannot read <Version> from indexnode/IndexNode/IndexNode.csproj"; exit 1; }
+          V="${INPUT_VERSION:-$SRC}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/indexnode"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || ! docker buildx imagetools inspect "$IMAGE:$V" >/dev/null 2>&1; then
+            echo "push=true" >> "$GITHUB_OUTPUT"; echo "pushing $IMAGE:$V"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"; echo "$IMAGE:$V exists already: nothing to do"
+          fi
+      - uses: docker/build-push-action@v6
+        if: steps.v.outputs.push == 'true'
+        with:
+          context: .
+          file: indexnode/Dockerfile.cpu
+          push: true
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+          tags: |
+            ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
+            ${{ steps.v.outputs.image }}:latest
+          cache-from: type=gha,scope=cpu
+          cache-to: type=gha,mode=max,scope=cpu

@@ -1,0 +1,39 @@
+# IndexNode CPU image (0.13.83): `indexnode serve` as a container app (owner 2026-11-27: the check server / search / download service moves from a
+# sandbox to a container app, ddindex-check-westus2, because a sandbox resume can come back as a cold boot with nothing running).
+#
+#   docker build -t indexnode -f indexnode/Dockerfile.cpu .      (from the repo root, like the GPU Dockerfile)
+#   docker run --rm -p 8080:8080 -e INDEXNODE_SAS_URL=... -e INDEXNODE_SERVE_TOKEN=... indexnode      # serve --download-service on :8080
+#
+# No credentials in the image: the SAS and the token come from the environment (container app secrets). ffmpeg (the pinned build, from our mirror)
+# and the models serve loads are baked in, so a restart is a cold start of seconds, not a download.
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY indexnode/IndexNode/IndexNode.csproj indexnode/IndexNode/
+COPY indexnode/IndexNode.Core/IndexNode.Core.csproj indexnode/IndexNode.Core/
+COPY indexnode-android/Contract/Contract.csproj indexnode-android/Contract/
+RUN dotnet restore indexnode/IndexNode/IndexNode.csproj -r linux-x64
+COPY indexnode/IndexNode/ indexnode/IndexNode/
+COPY indexnode/IndexNode.Core/ indexnode/IndexNode.Core/
+COPY indexnode-android/Contract/ indexnode-android/Contract/
+ARG VERSION=0.0.0
+RUN dotnet publish indexnode/IndexNode/IndexNode.csproj -c Release -r linux-x64 --self-contained false -p:Version=${VERSION} -o /out
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out /opt/indexnode
+ENV INDEXNODE_CONFIG_DIR=/opt/indexnode-home INDEXNODE_REGION=westus2 PORT=8080
+# bake the pinned ffmpeg and the models `serve` loads (SSCD int8, SenseVoice + tokens, the AI-frames model)
+RUN mkdir -p "$INDEXNODE_CONFIG_DIR" \
+ && /opt/indexnode/indexnode tools install --ffmpeg \
+ && /opt/indexnode/indexnode tools install --models serve \
+ && /opt/indexnode/indexnode --version
+COPY indexnode/deploy/serve-entry.sh /opt/indexnode/serve-entry.sh
+RUN chmod 0755 /opt/indexnode/serve-entry.sh
+EXPOSE 8080
+LABEL org.opencontainers.image.source="https://github.com/lancec-codebox/appbox" \
+      org.opencontainers.image.description="IndexNode (CPU): indexnode serve for the check, search and download service; no credentials in the image"
+ENTRYPOINT ["/opt/indexnode/serve-entry.sh"]
