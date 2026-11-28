@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>0.13.85</Version>
+    <Version>0.13.86</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>indexnode</ToolCommandName>
@@ -36,29 +36,31 @@
   </ItemGroup>
 
   <!-- GPU build: dotnet publish -p:IndexNodeGpu=true -r linux-x64 (CUDA 12 + cuDNN 9 libraries come from the container).
-       0.13.83: the CUDA onnxruntime is sherpa-onnx 2.0.1's own CUDA package (onnxruntime 1.28.2 GPU), not Microsoft.ML.OnnxRuntime.Gpu.Linux 1.23.2: sherpa's
-       libsherpa-onnx-c-api.so needs exactly VERS_1.28.2, so with 1.23.2 transcribe could not load on any GPU box. The managed ORT 1.23.2 runs against native 1.28.2
-       (the CPU build has always done so with sherpa's CPU onnxruntime). The package is downloaded once per obj folder and its sha256 checked. -->
+       0.13.86: Microsoft's onnxruntime 1.23.2 GPU for everything, and sherpa-onnx 2.0.1's C API rebuilt against it (appbox release
+       tools-sherpa-onnx-2.0.1-msort-1.23.2, built by tools/build-sherpa-msort.sh; sherpa's own prebuilt c-api needs VERS_1.28.2). 0.13.83-0.13.85 shipped
+       sherpa's CUDA package with its onnxruntime 1.28.2 instead, which made transcribe work on the card but the OCR reader ~3x slower (T4, 2026-11-27).
+       The sherpa runtime package's CPU libonnxruntime.so and c/cxx api are replaced; the rebuilt ones are downloaded once per obj folder, sha256-checked. -->
+  <ItemGroup Condition="'$(IndexNodeGpu)' == 'true'">
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu.Linux" Version="1.23.2" />
+  </ItemGroup>
   <PropertyGroup Condition="'$(IndexNodeGpu)' == 'true'">
-    <SherpaGpuName>sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu</SherpaGpuName>
-    <SherpaGpuUrl>https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$(SherpaGpuName).tar.bz2</SherpaGpuUrl>
-    <SherpaGpuSha256>2AA541A65C1E7D921A053283419B70B30C1F6AE0A0F52F64B947EBE88C5F2A77</SherpaGpuSha256>
-    <SherpaGpuDir>$(MSBuildProjectDirectory)/obj/sherpa-gpu/</SherpaGpuDir>
-    <SherpaGpuLib>$(SherpaGpuDir)$(SherpaGpuName)/lib/</SherpaGpuLib>
+    <SherpaMsortUrl>https://github.com/lancec-codebox/appbox/releases/download/tools-sherpa-onnx-2.0.1-msort-1.23.2/</SherpaMsortUrl>
+    <SherpaMsortDir>$(MSBuildProjectDirectory)/obj/sherpa-msort/</SherpaMsortDir>
+    <SherpaCApiSha256>D999B69387BEA8FE53542C013B70AAB1277B4C1E766887C90630DBC2FB5F4F20</SherpaCApiSha256>
+    <SherpaCxxApiSha256>F441A1C9C855AF4A78828D58925F1B94E53776D4EF3304A0DEE3016C398591A8</SherpaCxxApiSha256>
   </PropertyGroup>
   <Target Name="IndexNodeGpuNatives" AfterTargets="ResolvePackageAssets" Condition="'$(IndexNodeGpu)' == 'true'">
-    <DownloadFile SourceUrl="$(SherpaGpuUrl)" DestinationFolder="$(SherpaGpuDir)" DestinationFileName="$(SherpaGpuName).tar.bz2" Condition="!Exists('$(SherpaGpuDir)$(SherpaGpuName).tar.bz2')" />
-    <GetFileHash Files="$(SherpaGpuDir)$(SherpaGpuName).tar.bz2" Algorithm="SHA256">
-      <Output TaskParameter="Hash" PropertyName="_SherpaGpuHash" />
-    </GetFileHash>
-    <Error Condition="'$(_SherpaGpuHash)' != '$(SherpaGpuSha256)'" Text="sherpa-onnx GPU package: sha256 $(_SherpaGpuHash), expected $(SherpaGpuSha256)" />
-    <Exec Command="tar -xjf &quot;$(SherpaGpuName).tar.bz2&quot; &quot;$(SherpaGpuName)/lib&quot;" WorkingDirectory="$(SherpaGpuDir)" Condition="!Exists('$(SherpaGpuLib)libonnxruntime_providers_cuda.so')" />
+    <DownloadFile SourceUrl="$(SherpaMsortUrl)libsherpa-onnx-c-api.so" DestinationFolder="$(SherpaMsortDir)" Condition="!Exists('$(SherpaMsortDir)libsherpa-onnx-c-api.so')" />
+    <DownloadFile SourceUrl="$(SherpaMsortUrl)libsherpa-onnx-cxx-api.so" DestinationFolder="$(SherpaMsortDir)" Condition="!Exists('$(SherpaMsortDir)libsherpa-onnx-cxx-api.so')" />
+    <GetFileHash Files="$(SherpaMsortDir)libsherpa-onnx-c-api.so" Algorithm="SHA256"><Output TaskParameter="Hash" PropertyName="_CApiHash" /></GetFileHash>
+    <GetFileHash Files="$(SherpaMsortDir)libsherpa-onnx-cxx-api.so" Algorithm="SHA256"><Output TaskParameter="Hash" PropertyName="_CxxApiHash" /></GetFileHash>
+    <Error Condition="'$(_CApiHash)' != '$(SherpaCApiSha256)' or '$(_CxxApiHash)' != '$(SherpaCxxApiSha256)'" Text="rebuilt sherpa-onnx libraries: sha256 mismatch (c-api $(_CApiHash), cxx-api $(_CxxApiHash))" />
     <ItemGroup>
-      <_SherpaGpuLibs Include="$(SherpaGpuLib)libonnxruntime.so;$(SherpaGpuLib)libonnxruntime_providers_cuda.so;$(SherpaGpuLib)libonnxruntime_providers_shared.so;$(SherpaGpuLib)libsherpa-onnx-c-api.so;$(SherpaGpuLib)libsherpa-onnx-cxx-api.so" />
-      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)" Condition="'%(Filename)%(Extension)' == 'libonnxruntime.so' or '%(Filename)%(Extension)' == 'libsherpa-onnx-c-api.so' or '%(Filename)%(Extension)' == 'libsherpa-onnx-cxx-api.so' or '%(Filename)%(Extension)' == 'libonnxruntime_providers_shared.so'" />
-      <NativeCopyLocalItems Include="@(_SherpaGpuLibs)" AssetType="native" DestinationSubPath="%(Filename)%(Extension)" NuGetPackageId="sherpa-onnx-cuda" NuGetPackageVersion="2.0.1" CopyLocal="true" />
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)" Condition="'%(NuGetPackageId)' == 'org.k2fsa.sherpa.onnx.runtime.linux-x64' and ('%(Filename)%(Extension)' == 'libonnxruntime.so' or '%(Filename)%(Extension)' == 'libsherpa-onnx-c-api.so' or '%(Filename)%(Extension)' == 'libsherpa-onnx-cxx-api.so')" />
+      <_SherpaMsortLibs Include="$(SherpaMsortDir)libsherpa-onnx-c-api.so;$(SherpaMsortDir)libsherpa-onnx-cxx-api.so" />
+      <NativeCopyLocalItems Include="@(_SherpaMsortLibs)" AssetType="native" DestinationSubPath="%(Filename)%(Extension)" NuGetPackageId="sherpa-onnx-msort" NuGetPackageVersion="2.0.1" CopyLocal="true" />
     </ItemGroup>
-    <Message Importance="high" Text="IndexNode GPU build: CUDA natives from $(SherpaGpuName) (onnxruntime 1.28.2 GPU)" />
+    <Message Importance="high" Text="IndexNode GPU build: Microsoft onnxruntime 1.23.2 GPU + sherpa-onnx 2.0.1 rebuilt against it" />
   </Target>
 
   <ItemGroup>
