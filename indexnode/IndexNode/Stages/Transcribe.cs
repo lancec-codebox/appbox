@@ -161,6 +161,8 @@ public static class Transcribe
     /// <summary>0.13.83: on CUDA, segments are decoded in batches of at most this much audio (longest first, so a batch pads little). A T4 (16 GB) took
     /// 14 x 30 s at once and ran out of memory at 112 x 30 s.</summary>
     public static double GpuBatchSeconds = 240; public static int GpuBatchMax = 64;
+    /// <summary>0.13.93: batches that came back all empty (a decode sherpa failed and swallowed) and were decoded again one segment at a time.</summary>
+    public static int EmptyBatchRetries;
 
     /// <summary>The order and grouping of segments for batched decoding: indices longest first, cut into batches of at most <paramref name="maxSeconds"/>
     /// of audio and <paramref name="maxCount"/> segments (a single longer segment is a batch of its own).</summary>
@@ -278,6 +280,14 @@ public static class Transcribe
                 ct.ThrowIfCancellationRequested();
                 var streams = idx.Select(j => { var st = rec.CreateStream(); st.AcceptWaveform(SampleRate, segs[j].Samples); return st; }).ToList();
                 long d0 = Stopwatch.GetTimestamp(); if (streams.Count == 1) rec.Decode(streams[0]); else rec.Decode(streams); Interlocked.Add(ref decodeSum, Stopwatch.GetTimestamp() - d0);
+                if (streams.Count > 1 && streams.All(s => s.Result.Text.Trim().Length == 0))
+                {   // 0.13.93: sherpa catches a failed batch decode itself ("Caught exception ... Return an empty result", e.g. a CUDA arena that cannot grow) and hands back empty
+                    // text for every stream: speech segments the voice detection found do not all come back empty. Decode them again one at a time (a fraction of the memory).
+                    Log.Info($"transcribe: a batch of {streams.Count} speech segments came back empty (a failed decode): decoding them one at a time");
+                    foreach (var s in streams) s.Dispose();
+                    streams = idx.Select(j => { var st = rec.CreateStream(); st.AcceptWaveform(SampleRate, segs[j].Samples); rec.Decode(st); return st; }).ToList();
+                    Interlocked.Increment(ref EmptyBatchRetries);
+                }
                 for (int q = 0; q < idx.Count; q++)
                 {
                     var (s0, sm) = segs[idx[q]]; double start = offset + (double)s0 / SampleRate;
