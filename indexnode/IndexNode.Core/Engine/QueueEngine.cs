@@ -582,7 +582,7 @@ public sealed partial class NodeEngine
             using (o.Meter.BeginStep(o.Meter.Limits.StepLimitFor("process:" + step), $"[process:{step}#{lane}] {id}"))   // the step's marks count against its own budget too
             {
                 await MarkStartAsync(w, step);
-                await handlers[step].RunAsync(ctx);
+                using (await GpuGate.EnterAsync(o.Device?.Invoke(), step, token)) await handlers[step].RunAsync(ctx);   // 0.13.92: one GPU step on the card at a time, across lanes
             }   // 0.13.32: each step has its own named budget
             done.Add(step); ran.Add(step); avail.Add(step + ".zip");
             var stepLines = new List<QLine> { new() { T = "done", Stage = "process", Step = step, StepVer = Array.IndexOf(StepVersions.Steps, step) >= 0 ? ctx.StepVersion ?? StepVersions.Code(step) : null } };

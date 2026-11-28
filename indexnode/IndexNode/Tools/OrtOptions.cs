@@ -32,6 +32,9 @@ public static class OrtOptions
 
     public static SessionOptions Make(int intraThreads, bool quiet = false) => Make(intraThreads, quiet, Device, DeviceId);
 
+    /// <summary>0.13.92: the CUDA arena's growth (env INDEXNODE_CUDA_ARENA; default kSameAsRequested).</summary>
+    public static string CudaArena => Environment.GetEnvironmentVariable("INDEXNODE_CUDA_ARENA") is "kNextPowerOfTwo" ? "kNextPowerOfTwo" : "kSameAsRequested";
+
     /// <summary>0.13.85: the cuDNN convolution algorithm search for a CUDA session: null = the provider's default (EXHAUSTIVE: best for fixed shapes such as SSCD's),
     /// "HEURISTIC" or "DEFAULT" for models whose input shape changes call to call (the OCR reader), where an exhaustive search for every new shape costs more than it saves.</summary>
     public static string? CheckConvSearch(string? v) => v == null ? null : v.Trim().ToUpperInvariant() is "EXHAUSTIVE" or "HEURISTIC" or "DEFAULT" ? v.Trim().ToUpperInvariant() : throw new ArgumentException($"cudnn conv algo search: EXHAUSTIVE, HEURISTIC or DEFAULT (got '{v}')");
@@ -46,13 +49,15 @@ public static class OrtOptions
             try
             {
                 if (!OrtEnv.Instance().GetAvailableProviders().Contains("CUDAExecutionProvider")) throw new InvalidOperationException("CUDAExecutionProvider is not available in this ONNX Runtime build");
-                if (CheckConvSearch(convSearch) is { } cs)
-                {
-                    using var cuda = new OrtCUDAProviderOptions();
-                    cuda.UpdateOptions(new Dictionary<string, string> { ["device_id"] = deviceId.ToString(System.Globalization.CultureInfo.InvariantCulture), ["cudnn_conv_algo_search"] = cs });
-                    so.AppendExecutionProvider_CUDA(cuda);
-                }
-                else so.AppendExecutionProvider_CUDA(deviceId);
+                // 0.13.92: every CUDA session takes options. The arena grows by what is asked (kSameAsRequested), not in powers of two: with two lanes on the T4 the
+                // default arenas filled the 16 GB card and the OCR session could not start (CUBLAS_STATUS_ALLOC_FAILED, 2026-11-28). Env overrides for measuring:
+                // INDEXNODE_CUDA_ARENA (kSameAsRequested | kNextPowerOfTwo), INDEXNODE_CUDA_MAX_WORKSPACE (1 | 0: cuDNN's largest convolution workspace).
+                using var cuda = new OrtCUDAProviderOptions();
+                var o = new Dictionary<string, string> { ["device_id"] = deviceId.ToString(System.Globalization.CultureInfo.InvariantCulture), ["arena_extend_strategy"] = CudaArena };
+                if (CheckConvSearch(convSearch) is { } cs) o["cudnn_conv_algo_search"] = cs;
+                if (Environment.GetEnvironmentVariable("INDEXNODE_CUDA_MAX_WORKSPACE") is "0" or "1") o["cudnn_conv_use_max_workspace"] = Environment.GetEnvironmentVariable("INDEXNODE_CUDA_MAX_WORKSPACE")!;
+                cuda.UpdateOptions(o);
+                so.AppendExecutionProvider_CUDA(cuda);
             }
             catch (Exception e)
             {
