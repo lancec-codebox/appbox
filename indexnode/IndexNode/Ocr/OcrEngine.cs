@@ -21,11 +21,20 @@ public sealed class OcrEngine : IDisposable
 
     public OcrEngine(string detPath, string recPath, string dictPath, int threads = 1)
     {
-        det = OrtOptions.Shared(detPath, threads);
-        rec = OrtOptions.Shared(recPath, threads);
+        det = OrtOptions.Shared(detPath, threads, convSearch: ConvSearch);
+        rec = OrtOptions.Shared(recPath, threads, convSearch: ConvSearch);
         ctc = CtcDecoder.FromFile(dictPath);
         detIn = det.InputMetadata.Keys.First(); recIn = rec.InputMetadata.Keys.First();
     }
+
+    /// <summary>0.13.85: on CUDA the OCR sessions use cuDNN's HEURISTIC algorithm choice (the reader's input shape changes call to call; the default exhaustive search
+    /// ran again for each new shape). INDEXNODE_OCR_CONV_SEARCH overrides it (EXHAUSTIVE, HEURISTIC, DEFAULT). Null on the CPU.</summary>
+    public static string? ConvSearch => !OrtOptions.Cuda ? null : Environment.GetEnvironmentVariable("INDEXNODE_OCR_CONV_SEARCH") is { Length: > 0 } v ? OrtOptions.CheckConvSearch(v) : "HEURISTIC";
+    /// <summary>0.13.85: on CUDA the reader's batch width is rounded up to a multiple of this (so only a few dozen shapes occur); 1 on the CPU (as before).
+    /// INDEXNODE_OCR_REC_BUCKET overrides it on CUDA (1 = off).</summary>
+    public static int RecBucket => !OrtOptions.Cuda ? 1 : int.TryParse(Environment.GetEnvironmentVariable("INDEXNODE_OCR_REC_BUCKET"), out var b) && b >= 1 ? b : 64;
+    /// <summary>The reader's batch width: at least the minimum, rounded up to the bucket, at most the maximum.</summary>
+    public static int BucketWidth(int w, int bucket) => Math.Min(RecMaxWidth, Math.Max(RecMinWidth, bucket <= 1 ? w : (w + bucket - 1) / bucket * bucket));
 
     public static int DetSide(int v) => Math.Max(32, (int)Math.Round(v / 32.0) * 32);
 
@@ -97,7 +106,7 @@ public sealed class OcrEngine : IDisposable
         {
             var idx = order.Skip(g).Take(RecBatch).ToList();
             int maxW = Math.Min(RecMaxWidth, idx.Max(Rw));
-            maxW = Math.Max(RecMinWidth, maxW);
+            maxW = BucketWidth(Math.Max(RecMinWidth, maxW), RecBucket);   // 0.13.85: a bucketed width on CUDA (padding is 0 in the normalised tensor, as before)
             int plane = RecHeight * maxW, need = idx.Count * 3 * plane;
             if (recBuf.Length < need) recBuf = new float[need];
             Array.Clear(recBuf, 0, need); // right padding is 0 after normalisation... (x/255-0.5)/0.5 of 0 would be -1: PaddleOCR pads with 0 in the normalised tensor

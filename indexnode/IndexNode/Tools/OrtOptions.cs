@@ -32,7 +32,11 @@ public static class OrtOptions
 
     public static SessionOptions Make(int intraThreads, bool quiet = false) => Make(intraThreads, quiet, Device, DeviceId);
 
-    public static SessionOptions Make(int intraThreads, bool quiet, string device, int deviceId = 0)
+    /// <summary>0.13.85: the cuDNN convolution algorithm search for a CUDA session: null = the provider's default (EXHAUSTIVE: best for fixed shapes such as SSCD's),
+    /// "HEURISTIC" or "DEFAULT" for models whose input shape changes call to call (the OCR reader), where an exhaustive search for every new shape costs more than it saves.</summary>
+    public static string? CheckConvSearch(string? v) => v == null ? null : v.Trim().ToUpperInvariant() is "EXHAUSTIVE" or "HEURISTIC" or "DEFAULT" ? v.Trim().ToUpperInvariant() : throw new ArgumentException($"cudnn conv algo search: EXHAUSTIVE, HEURISTIC or DEFAULT (got '{v}')");
+
+    public static SessionOptions Make(int intraThreads, bool quiet, string device, int deviceId = 0, string? convSearch = null)
     {
         var so = new SessionOptions { IntraOpNumThreads = Math.Max(1, intraThreads), InterOpNumThreads = 1 };
         foreach (var (k, v) in ConfigEntries) so.AddSessionConfigEntry(k, v);
@@ -42,7 +46,13 @@ public static class OrtOptions
             try
             {
                 if (!OrtEnv.Instance().GetAvailableProviders().Contains("CUDAExecutionProvider")) throw new InvalidOperationException("CUDAExecutionProvider is not available in this ONNX Runtime build");
-                so.AppendExecutionProvider_CUDA(deviceId);
+                if (CheckConvSearch(convSearch) is { } cs)
+                {
+                    using var cuda = new OrtCUDAProviderOptions();
+                    cuda.UpdateOptions(new Dictionary<string, string> { ["device_id"] = deviceId.ToString(System.Globalization.CultureInfo.InvariantCulture), ["cudnn_conv_algo_search"] = cs });
+                    so.AppendExecutionProvider_CUDA(cuda);
+                }
+                else so.AppendExecutionProvider_CUDA(deviceId);
             }
             catch (Exception e)
             {
@@ -55,9 +65,9 @@ public static class OrtOptions
     }
 
     /// <summary>A session on the configured device; logs the provider the first time.</summary>
-    public static InferenceSession Session(string path, int intraThreads, bool quiet = false)
+    public static InferenceSession Session(string path, int intraThreads, bool quiet = false, string? convSearch = null)
     {
-        var so = Make(intraThreads, quiet);
+        var so = Make(intraThreads, quiet, Device, DeviceId, convSearch);
         try
         {
             var s = new InferenceSession(path, so);
@@ -73,11 +83,11 @@ public static class OrtOptions
     /// One loaded copy per model file, device and thread count for the whole process: every worker (and every step instance) uses it, so two workers hold one model in memory, not two.
     /// InferenceSession.Run is documented as thread-safe (concurrent calls share the session's thread pool and read-only weights), so no lock is needed. The caller must NOT dispose it.
     /// </summary>
-    public static InferenceSession Shared(string path, int intraThreads, bool quiet = false)
+    public static InferenceSession Shared(string path, int intraThreads, bool quiet = false, string? convSearch = null)
     {
-        var key = $"{Path.GetFullPath(path)}|{Device}:{DeviceId}|{intraThreads}";
+        var key = $"{Path.GetFullPath(path)}|{Device}:{DeviceId}|{intraThreads}|{convSearch}";
         Lazy<InferenceSession> l;
-        lock (shared) { if (!shared.TryGetValue(key, out l!)) shared[key] = l = new Lazy<InferenceSession>(() => Session(path, intraThreads, quiet), LazyThreadSafetyMode.ExecutionAndPublication); }
+        lock (shared) { if (!shared.TryGetValue(key, out l!)) shared[key] = l = new Lazy<InferenceSession>(() => Session(path, intraThreads, quiet, convSearch), LazyThreadSafetyMode.ExecutionAndPublication); }
         return l.Value;
     }
     /// <summary>Disposes every shared session and forgets it: the next Shared() loads again. A batch calls this between stages so only one stage's models are in memory; nothing may be running on them.</summary>
