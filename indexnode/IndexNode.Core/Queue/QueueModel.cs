@@ -301,7 +301,7 @@ public sealed class QueueState
     private static void EndClaim(QSubject sub, QLine l) { if (l.Epoch == null || l.Epoch == sub.Epoch) { sub.ClaimBy = null; sub.ClaimStages = null; } }
 
     /// <summary>A finished entry keeps no body in the state (the snapshot stays small): the fields a status line or the site needs survive.</summary>
-    private static JobDescriptor? Slim(JobDescriptor? j) => j == null ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Priority = j.Priority, Title = j.Title, ChannelName = j.ChannelName, Duration = j.Duration, Source = j.Source, Name = j.Name, Kind = j.Kind, Id = j.Id, Network = j.Network, ElapsedSeconds = j.ElapsedSeconds, Pub = j.Pub, PubSource = j.PubSource };
+    private static JobDescriptor? Slim(JobDescriptor? j) => j == null ? null : new JobDescriptor { Stage = j.Stage, JobId = j.JobId, Priority = j.Priority, Title = j.Title, ChannelName = j.ChannelName, Duration = j.Duration, Source = j.Source, Name = j.Name, Kind = j.Kind, Id = j.Id, Network = j.Network, ElapsedSeconds = j.ElapsedSeconds, Pub = j.Pub, PubSource = j.PubSource, Reason = j.Reason is { } rr && rr.StartsWith("resample ", StringComparison.Ordinal) ? rr : null };   // 0.13.84: a re-sample count outlives the sample's finish
 
     /// <summary>The subjects with something this node can run now, best first: highest priority, then the oldest added entry, then the id. <paramref name="skip"/> leaves out subjects another node holds.</summary>
     public List<(QSubject Subject, List<QEntry> Runnable)> Candidates(string nowUtc, Func<string, bool> stageOk, Func<QSubject, QEntry, bool>? canRun = null, Func<string, bool>? skip = null, ReadyOptions? ready = null)

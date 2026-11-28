@@ -240,6 +240,25 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task A_header_only_sample_is_sampled_again_twice_then_failed_for_good()
+    {   // 0.13.84 (owner): header-only samples go back for re-sampling
+        var r = await Rig.Make(10, Add("b1", "sample", "2026-11-01T00:00:00Z", 0, "done"));
+        int calls = 0; r.Svc = new DownloadService(r.Full, r.Work, r.Proc, (id, ct) => { calls++; throw new BrokenSampleException(id, "sample0.mp4 is 261 bytes (no video)"); }, 10);
+        for (int k = 1; k <= DownloadService.MaxResamples; k++)
+        {
+            Assert.Equal(1, await r.Svc.CheckSamplesAsync(default));
+            var e = r.Full.Read(f => f.Entry("b1", "sample"))!;
+            Assert.Equal("pending", e.State); Assert.StartsWith($"resample {k}:", e.Job!.Reason); Assert.Null(r.Full.Read(f => f.Entry("b1", "check")));
+            await r.Full.AppendLinesAsync([new QLine { T = "done", S = "b1", Stage = "sample", State = "done", At = At }], default);   // a node samples it again
+        }
+        Assert.Equal(1, await r.Svc.CheckSamplesAsync(default));
+        var last = r.Full.Read(f => f.Entry("b1", "sample"))!;
+        Assert.Equal("failed", last.State); Assert.True(last.Permanent); Assert.Contains("unusable sample", last.LastError);
+        Assert.Null(r.Full.Read(f => f.Entry("b1", "download")));   // never downloaded without a check
+        Assert.Equal(0, await r.Svc.CheckSamplesAsync(default)); Assert.Equal(DownloadService.MaxResamples + 1, calls);
+    }
+
+    [Fact]
     public async Task A_finished_sample_is_checked_then_a_full_download_goes_to_work_or_the_upload_enters_as_metadata_only()
     {
         var r = await Rig.Make(10, Add("n1", "sample", "2026-11-01T00:00:00Z"), Add("d1", "sample", "2026-11-02T00:00:00Z"), Add("a1", "sample", "2026-11-03T00:00:00Z"));

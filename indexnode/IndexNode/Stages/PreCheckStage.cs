@@ -127,7 +127,13 @@ public sealed class PreCheckStage(Tools tools, IPreCheckAnalyzer analyzer, PreCh
             if (segs.Count == 0) return SkipOf(ctx, strict, "sample.json names no segment");
             string? audio = null;
             if ((string?)m["audio"] is { Length: > 0 } an) { audio = Path.Combine(work, an); await store.DownloadToFileAsync(paths.Video(id, SampleStage.Dir + an), audio, ct); }
-            return await FinishAsync(ctx, segs, (double)m["duration"]!, info, keepSample, 0, sw, "sample", strict, audio);
+            // 0.13.84: when the analysis cannot run and a segment file is header-only (no video), the sample is unusable: the download service has it sampled again
+            var small = segs.Select(x => new FileInfo(x.Path)).FirstOrDefault(fi => fi.Exists && fi.Length < BrokenSampleException.MinSegmentBytes);
+            Run? run;
+            try { run = await FinishAsync(ctx, segs, (double)m["duration"]!, info, keepSample, 0, sw, "sample", strict, audio); }
+            catch (InvalidOperationException e) when (small != null && e.Message.StartsWith("pre-check could not run", StringComparison.Ordinal)) { throw new BrokenSampleException(id, $"{small.Name} is {small.Length} bytes (no video); {e.Message}"); }
+            if (run == null && small != null) throw new BrokenSampleException(id, $"{small.Name} is {small.Length} bytes (no video)");
+            return run;
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }

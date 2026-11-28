@@ -8,6 +8,14 @@ namespace IndexNode;
 /// is added, a duplicate or an AI upload is settled: "enter" with data precheck, or held); hand every finished download to processing ("enter", data full, AFTER its "done download" is in the full log; a crash in between is repaired by
 /// <see cref="Handoff.RepairAsync"/>); top the work queue up (newest first, priorities kept) when it is under half full; clear finished items out of it. Downloaders never touch the processing queue.
 /// </summary>
+/// <summary>0.13.84: the stored sample cannot be checked because a segment file holds no video (header only): the upload is sampled again.</summary>
+public sealed class BrokenSampleException(string id, string why) : Exception($"the sample of {id} is unusable: {why}")
+{
+    public string Id { get; } = id;
+    /// <summary>A segment file smaller than this holds no video (a real 300 s sample is megabytes; the broken ones seen were 261 bytes).</summary>
+    public const long MinSegmentBytes = 32 * 1024;
+}
+
 public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue processing, Func<string, CancellationToken, Task<JsonObject?>> check, int workMax = QueueSplit.DefaultWorkMax, IStore? store = null)
 {
     public int WorkMax { get; } = Math.Max(2, workMax);
@@ -203,6 +211,27 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
         return n;
     }
 
+    /// <summary>0.13.84: how many times a sample is taken again because its files were unusable, before it is failed for good.</summary>
+    public const int MaxResamples = 2;
+
+    /// <summary>0.13.84: an unusable sample (see <see cref="BrokenSampleException"/>) goes back to pending so a node samples it again; the count rides in the job's
+    /// Reason ("resample N: ..."). Past <see cref="MaxResamples"/> it is failed for good instead: no download without a sample check.</summary>
+    async Task ResampleAsync(string id, QEntry sm, string why, CancellationToken ct)
+    {
+        int n = sm.Job?.Reason is { } r && System.Text.RegularExpressions.Regex.Match(r, @"^resample (\d+)") is { Success: true } m ? int.Parse(m.Groups[1].Value) : 0;
+        var at = full.NowUtc();
+        if (n >= MaxResamples)
+        {
+            Log.Info($"download service: {why}; sampled {n} times already: the sample is failed for good (no download without a check)");
+            await full.AppendLinesAsync([new QLine { T = "failed", S = id, Stage = "sample", State = "failed", Permanent = true, Error = $"unusable sample after {n} re-samples: {why}", At = at }], ct);
+            return;
+        }
+        var job = sm.Job == null ? new JobDescriptor { Stage = "sample", JobId = id } : System.Text.Json.JsonSerializer.Deserialize<JobDescriptor>(System.Text.Json.JsonSerializer.Serialize(sm.Job))!;
+        job.Reason = $"resample {n + 1}: {why}";
+        Log.Info($"download service: {why}: sampled again ({n + 1} of {MaxResamples})");
+        await full.AppendLinesAsync([new QLine { T = "retry", S = id, Stage = "sample", At = at, Due = at, Job = job }], ct);
+    }
+
     /// <summary>A finished sample is checked once (the full queue has no "check" entry for it yet): a duplicate settles it, AI holds its download, anything else adds the full download.</summary>
     public async Task<int> CheckSamplesAsync(CancellationToken ct)
     {
@@ -218,7 +247,9 @@ public sealed class DownloadService(JobQueue full, JobQueue work, JobQueue proce
     {
         {
             if (full.Read(st => st.Entry(id, "check") != null || st.Entry(id, "download") != null)) return true;   // 0.13.50: decided since the caller looked (a node's call and the pass can both list the same sample)
-            JsonObject? rec; try { rec = await check(id, ct); } catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: check of {id} failed ({e.Message}); it is asked again on the next pass"); return false; }
+            JsonObject? rec; try { rec = await check(id, ct); }
+            catch (BrokenSampleException b) { await ResampleAsync(id, sm, b.Message, ct); return true; }   // 0.13.84
+            catch (Exception e) when (e is not OperationCanceledException) { Log.Info($"download service: check of {id} failed ({e.Message}); it is asked again on the next pass"); return false; }
             if (rec == null) return false;
             var decision = (string?)rec["decision"] ?? "new"; var at = full.NowUtc(); bool skip = PreCheckDecision.IsSkip(decision); bool ai = AiHold.Flagged(rec);
             var url = sm.Job?.Url ?? "https://www.youtube.com/watch?v=" + id; var top = (rec["top"] as JsonArray)?.OfType<JsonObject>().FirstOrDefault();
