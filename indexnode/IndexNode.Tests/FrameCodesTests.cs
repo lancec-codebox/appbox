@@ -127,6 +127,27 @@ public class FrameCodesTests
     }
 
     [Fact]
+    public async Task A_local_copy_restored_with_a_torn_tail_is_trimmed_and_completed_from_the_store()
+    {   // 0.13.90: a copy restored from the persistent cache can end in part of a part (written back mid-append)
+        var (f, idx, _) = await Seed(4);
+        Assert.Equal(4, await FrameCodes.FillAsync(f, P, idx, 60, 0, _ => { }, default));
+        string a = Tmp(), b = Tmp();
+        try
+        {
+            Assert.Equal(0, (await new FrameCodesCache(a) { RangeBytes = 4096, Streams = 2 }.ViewAsync(f, P, idx, default)).Missing);
+            var src = Directory.GetFiles(a, "log-0000*.bin", SearchOption.AllDirectories).Single();
+            var dst = Path.Combine(b, Path.GetRelativePath(a, src)); Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+            var whole = File.ReadAllBytes(src); var first = FrameCodes.LengthAt(whole);
+            File.WriteAllBytes(dst, whole[..(first + 10)]);   // the first part whole, then 10 bytes of the next
+            Assert.Equal(first, FrameCodesCache.WholeEnd(dst, first + 10));
+            var view = await new FrameCodesCache(b) { RangeBytes = 4096, Streams = 2 }.ViewAsync(f, P, idx, default);
+            Assert.Equal(0, view.Missing); Assert.Equal(240, view.Frames);
+            Assert.Equal(whole, File.ReadAllBytes(dst));   // trimmed, then the rest fetched: the store's log exactly
+        }
+        finally { foreach (var d in new[] { a, b }) try { Directory.Delete(d, true); } catch { } }
+    }
+
+    [Fact]
     public async Task The_per_frame_lookup_on_codes_finds_each_query_frame_in_its_own_upload_and_leaves_the_excluded_one_out()
     {
         var (f, idx, xs) = await Seed(3);

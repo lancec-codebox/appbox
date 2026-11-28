@@ -457,8 +457,23 @@ public sealed class FrameCodesCache(string root)
     }
 
     /// <summary>0.13.71: ranges of this size are read <see cref="Streams"/> at a time. Measured 2026-11-26 on the hexad host (West US 2): one stream ~21 MB/s (the 961 MB log in 54 s), 16 parallel 16 MB ranges ~250 MB/s (curl); with 32 streams the cold load of the log is 6.4 s, from the local copy 1.3 s.</summary>
-    public int RangeBytes { get; init; } = 16 << 20;
-    public int Streams { get; init; } = 32;
+    /// <summary>0.13.90 (owner: "The reads should use 64 mb reads"): 64 MB ranges, 8 at a time (a 512 MB window): the 1.6 GB log is ~26 reads instead of ~100, which matters against the per-minute op limit.</summary>
+    public int RangeBytes { get; init; } = 64 << 20;
+    public int Streams { get; init; } = 8;
+    /// <summary>0.13.90: local copies whose tail this process has checked (trimmed to the last whole part) once.</summary>
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> tailChecked = new(StringComparer.Ordinal);
+
+    /// <summary>0.13.90: the end of the last whole part of a local copy (a copy restored from the persistent cache, or one a crash cut mid-append, can end in a torn part).</summary>
+    public static long WholeEnd(string path, long length)
+    {
+        using var fh = File.OpenHandle(path); var h = new byte[FrameCodes.Fixed]; long off = 0;
+        while (off + h.Length <= length && RandomAccess.Read(fh, h, off) == h.Length)
+        {
+            int len; try { len = FrameCodes.LengthAt(h); } catch (InvalidDataException) { break; }   // not a part header here: the good data ends at off
+            if (len <= 0 || off + len > length) break; off += len;
+        }
+        return off;
+    }
 
     /// <summary>Reads segment <paramref name="seg"/> from the end of the local copy until the part at <paramref name="lastOffset"/> is whole here: one HEAD for the length, then windows of
     /// <see cref="Streams"/> parallel ranged reads. Keeps complete parts only (a part cut at the end of a window waits for the next one).</summary>
@@ -474,6 +489,16 @@ public sealed class FrameCodesCache(string root)
     async Task SyncLockedAsync(IStore store, string name, string path, int seg, long lastOffset, CancellationToken ct)
     {
         long have = File.Exists(path) ? new FileInfo(path).Length : 0;
+        bool firstHere = tailChecked.TryAdd(Path.GetFullPath(path), 0);   // a copy this process starts or first touches; one it wrote itself is never trimmed later
+        if (have > 0 && firstHere && WholeEnd(path, have) is var end && end != have)
+        {   // 0.13.90: the first sync of a copy this process found on disk: a torn tail is cut off (the parts after it are fetched again below)
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) fs.SetLength(end);
+                Log.Info($"frame codes log {seg}: the local copy ended in a torn part ({have - end} bytes after {end}): trimmed"); have = end;
+            }
+            catch (IOException e) { Log.Info($"frame codes log {seg}: the local copy ends in a torn part but could not be trimmed ({e.Message}); the view's own check drops it"); }
+        }
         bool Whole() { if (have <= lastOffset) return false; using var fh = File.OpenHandle(path); var h = new byte[FrameCodes.Fixed]; return RandomAccess.Read(fh, h, lastOffset) == h.Length && lastOffset + FrameCodes.LengthAt(h) <= have; }
         if (Whole()) return;
         var info = await store.GetAppendInfoAsync(name, ct) ?? throw new FileNotFoundException(name); Reads++;

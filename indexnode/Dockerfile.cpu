@@ -22,7 +22,7 @@ RUN dotnet publish indexnode/IndexNode/IndexNode.csproj -c Release -r linux-x64 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && apt-get install -y --no-install-recommends ca-certificates curl xz-utils rsync \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out /opt/indexnode
 ENV INDEXNODE_CONFIG_DIR=/opt/indexnode-home INDEXNODE_REGION=westus2 PORT=8080
