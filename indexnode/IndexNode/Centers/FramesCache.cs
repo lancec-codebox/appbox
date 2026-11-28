@@ -17,7 +17,13 @@ public sealed class FramesCache(string dir, long maxBytes)
     /// <summary>Eviction never deletes a file used in the last this-many seconds (a check's own files are in use while it reads them).</summary>
     public int ProtectSeconds = 60;
     public int Evicted; public Action<string>? OnEvicted, OnAdded;
-    public JsonObject Stats() => new() { ["files"] = Directory.Exists(Dir) ? Directory.GetFiles(Dir, "*.bin").Length : 0, ["maxMb"] = MaxBytes / (1024 * 1024), ["hits"] = Hits, ["downloads"] = Downloads, ["evicted"] = Evicted };
+    public JsonObject Stats() => new() { ["files"] = Directory.Exists(Dir) ? Directory.GetFiles(Dir, "*.bin").Length : 0, ["maxMb"] = MaxBytes / (1024 * 1024), ["hits"] = Hits, ["downloads"] = Downloads, ["evicted"] = Evicted, ["mirrorHits"] = MirrorHits, ["mirrorUploads"] = MirrorUploads };
+    /// <summary>0.13.91: files taken from the cache mirror instead of the store, and files uploaded to it.</summary>
+    public int MirrorHits, MirrorUploads;
+    /// <summary>0.13.91: this cache's mirror (null: the process's, <see cref="CacheMirror.Current"/>).</summary>
+    public ICacheMirror? Mirror { get; set; }
+    static readonly SemaphoreSlim mirrorUploadGate = new(4, 4);
+    static int mirrorWarned;
     readonly ConcurrentDictionary<string, Lazy<Task<string>>> inflight = new(StringComparer.Ordinal);
     readonly object evictGate = new();
 
@@ -41,6 +47,17 @@ public sealed class FramesCache(string dir, long maxBytes)
     {
         Directory.CreateDirectory(Dir);
         var tmp = path + "." + Guid.NewGuid().ToString("N")[..6] + ".part";
+        var mirror = Mirror ?? CacheMirror.Current; var mrel = "frames-cache/" + Path.GetFileName(path);
+        if (mirror != null)
+        {   // 0.13.91: the mirror first (a restart refills from the share, not the store; the name carries the content hash and size, so a copy there is the same file)
+            try
+            {
+                if (await mirror.DownloadAsync(mrel, tmp, CancellationToken.None) && (size <= 0 || new FileInfo(tmp).Length == size))
+                { File.Move(tmp, path, true); Interlocked.Increment(ref MirrorHits); OnAdded?.Invoke(path); Evict(path); return path; }
+            }
+            catch (Exception e) when (e is IOException or HttpRequestException or TaskCanceledException) { if (Interlocked.Exchange(ref mirrorWarned, 1) == 0) Log.Info($"frames cache: the cache mirror did not answer ({e.Message}); the store is read"); }
+            finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
+        }
         try
         {
             await FetchGate.WaitAsync();
@@ -49,10 +66,19 @@ public sealed class FramesCache(string dir, long maxBytes)
             if (size > 0 && len != size) throw new StaleZipException(blob);
             File.Move(tmp, path, true);
             Interlocked.Increment(ref Downloads); Interlocked.Add(ref DownloadedBytes, len); OnAdded?.Invoke(path);
+            if (mirror != null) _ = UploadToMirrorAsync(mirror, mrel, path);   // 0.13.91: in the background; a failure only means the next restart reads the store
         }
         finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
         Evict(path);
         return path;
+    }
+
+    async Task UploadToMirrorAsync(ICacheMirror m, string rel, string path)
+    {
+        await mirrorUploadGate.WaitAsync();
+        try { await CacheMirror.UploadAsync(m, rel, path, CancellationToken.None); Interlocked.Increment(ref MirrorUploads); }
+        catch (Exception e) when (e is IOException or HttpRequestException or TaskCanceledException or UnauthorizedAccessException) { if (Interlocked.Exchange(ref mirrorWarned, 1) == 0) Log.Info($"frames cache: upload to the cache mirror failed ({e.Message})"); }
+        finally { mirrorUploadGate.Release(); }
     }
 
     /// <summary>0.13.21: at most this many whole-file GETs are in flight in the process (a vote-first check fetches up to 20 files at once).</summary>

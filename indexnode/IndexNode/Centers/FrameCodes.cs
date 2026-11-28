@@ -486,8 +486,46 @@ public sealed class FrameCodesCache(string root)
         finally { fl.Release(); }
     }
 
+    /// <summary>0.13.91: the mirror's name of a local copy (generations are local only), and the per-process facts about each mirror file (keyed by cache root + name).</summary>
+    string MirrorRel(string path) => "frame-codes/" + System.Text.RegularExpressions.Regex.Replace(Path.GetRelativePath(root, path).Replace('\\', '/'), @"\.g\d+\.bin$", ".bin");
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> mirrorRestored = new(StringComparer.Ordinal), mirrorBroken = new(StringComparer.Ordinal);
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> mirrorLength = new(StringComparer.Ordinal);
+    public int MirrorRestores { get; private set; }
+    /// <summary>0.13.91: this cache's mirror (null: the process's, <see cref="CacheMirror.Current"/>).</summary>
+    public ICacheMirror? Mirror { get; init; }
+
+    /// <summary>0.13.91: bytes just appended to the local copy at <paramref name="at"/>, written to the mirror at the same offset. A mirror that is not the local copy up to
+    /// <paramref name="at"/> (another generation, a failed write) is rewritten from the local copy first. A failure turns the mirror off for this file in this process.</summary>
+    async Task MirrorAppendAsync(ICacheMirror m, string rel, string path, long at, ReadOnlyMemory<byte> data, CancellationToken ct)
+    {
+        var key = Path.GetFullPath(root) + "|" + rel;
+        if (mirrorBroken.ContainsKey(key)) return;
+        try
+        {
+            if (!mirrorLength.TryGetValue(key, out var len)) len = await m.LengthAsync(rel, ct) ?? -1;
+            if (len != at)
+            {
+                await m.SetLengthAsync(rel, at, ct);
+                using var fh = File.OpenHandle(path); var buf = new byte[AzureFilesMirror.Batch];
+                for (long o = 0; o < at;) { int n = RandomAccess.Read(fh, buf.AsSpan(0, (int)Math.Min(buf.Length, at - o)), o); if (n <= 0) break; await m.WriteAsync(rel, o, buf.AsMemory(0, n), ct); o += n; }
+            }
+            await m.SetLengthAsync(rel, at + data.Length, ct);
+            await m.WriteAsync(rel, at, data, ct);
+            mirrorLength[key] = at + data.Length;
+        }
+        catch (Exception e) when (e is IOException or HttpRequestException || (e is TaskCanceledException && !ct.IsCancellationRequested))
+        { mirrorBroken[key] = 0; mirrorLength.TryRemove(key, out _); Log.Info($"frame codes: the cache mirror is off for {rel} in this process ({e.Message})"); }
+    }
+
     async Task SyncLockedAsync(IStore store, string name, string path, int seg, long lastOffset, CancellationToken ct)
     {
+        var mirror = Mirror ?? CacheMirror.Current; var mrel = MirrorRel(path);
+        if (mirror != null && !File.Exists(path) && mirrorRestored.TryAdd(Path.GetFullPath(root) + "|" + mrel, 0))
+        {   // 0.13.91: a restart: the mirror's copy instead of the whole log from the store (once per process: a copy the view then drops is not restored again)
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try { if (await mirror.DownloadAsync(mrel, path, ct)) { MirrorRestores++; mirrorLength[Path.GetFullPath(root) + "|" + mrel] = new FileInfo(path).Length; Log.Info($"frame codes log {seg}: restored from the cache mirror ({new FileInfo(path).Length / (1 << 20)} MB in {sw.Elapsed.TotalSeconds:0.0} s)"); } }
+            catch (Exception e) when (e is IOException or HttpRequestException || (e is TaskCanceledException && !ct.IsCancellationRequested)) { Log.Info($"frame codes log {seg}: not restored from the cache mirror ({e.Message}); read from the store"); }
+        }
         long have = File.Exists(path) ? new FileInfo(path).Length : 0;
         bool firstHere = tailChecked.TryAdd(Path.GetFullPath(path), 0);   // a copy this process starts or first touches; one it wrote itself is never trimmed later
         if (have > 0 && firstHere && WholeEnd(path, have) is var end && end != have)
@@ -522,8 +560,9 @@ public sealed class FrameCodesCache(string root)
             {   // 0.13.88: the parts are appended only where this read began: a file that changed under us is not appended to (the next view fetches again)
                 using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
                 if (fs.Length != have) throw new InvalidDataException($"frame codes log {seg}: the local copy is {fs.Length} bytes, not the {have} this read began at; not appended");
-                fs.Write(d, 0, used); have += used;
+                fs.Write(d, 0, used); fs.Flush(); have += used;
             }
+            if (used > 0 && mirror != null) await MirrorAppendAsync(mirror, mrel, path, have - used, d.AsMemory(0, used), ct);   // 0.13.91
             carry = d[used..];
         }
         if (!Whole()) throw new InvalidDataException($"frame codes log {seg}: the part at {lastOffset} is not whole at the end ({info.Length})");

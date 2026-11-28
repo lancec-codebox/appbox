@@ -15,6 +15,9 @@ public class FrameCodesTests
     static string Tmp() => Path.Combine(Path.GetTempPath(), "fc-" + Guid.NewGuid().ToString("N")[..8]);
 
     /// <summary>n uploads of 60 frames each, their frames files in the store, and a built (not filled) index version.</summary>
+    /// <summary>0.13.91: the same seed for other test classes.</summary>
+    internal static Task<(FakeStore F, SearchData Idx, Dictionary<string, float[]> X)> SeedFor(int n) => Seed(n);
+
     static async Task<(FakeStore F, SearchData Idx, Dictionary<string, float[]> X)> Seed(int n)
     {
         var f = new FakeStore(); var xs = new Dictionary<string, float[]>();

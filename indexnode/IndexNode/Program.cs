@@ -151,6 +151,7 @@ public static class Program
             var cmd = a.Positional[0].ToLowerInvariant();
             a.Positional.RemoveAt(0);
             try { FramesCache.Configure(NodeConfig.Load()); } catch (Exception e) when (e is not OperationCanceledException) { }
+            try { CacheMirror.Current = CacheMirror.FromEnvironment(Environment.GetEnvironmentVariable(NodeConfig.NodeNameEnv) ?? Environment.MachineName); } catch (Exception e) when (e is not OperationCanceledException) { Console.Error.WriteLine("indexnode: no cache mirror (" + e.Message + ")"); }   // 0.13.91
             try { RestStore.ClientName = ClientName(a.Get("node-name") ?? NodeConfig.Load().NodeName); } catch (Exception e) when (e is not OperationCanceledException) { RestStore.ClientName = ClientName(null); }   // 0.13.80: x-indexnode-node for the storage proxy
             StoreMeter.Current.Limits = NodeConfig.TryLoadStorageLimits();   // 0.13.18: the breaker settings (config storage.*)
             if (a.Get("storage-max") is { } smax) { var n = int.Parse(smax); StoreMeter.Current.Limits.MaxPerStep = n; StoreMeter.Current.Limits.MaxPerMin = Math.Max(StoreMeter.Current.Limits.MaxPerMin, n); StoreMeter.Current.Limits.WarnPerMin = Math.Max(StoreMeter.Current.Limits.WarnPerMin, n); StoreMeter.Current.CliMax = n; }   // 0.13.9: the node's local copy of the frames files (index.local-cache-gb)
