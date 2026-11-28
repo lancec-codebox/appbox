@@ -60,10 +60,16 @@ public static class StageSteps
         if (det == null || rec == null) { var s = await Models.EnsureBuffaloSAsync(http, ct); det ??= s.Det; rec ??= s.Rec; }
         var cm = CastLogic.BuffaloS; var outDir = Path.Combine(work, "cast-out"); if (Directory.Exists(outDir)) Directory.Delete(outDir, true);
         var msg = await CastFrames.RunAsync(tools, frames, shots, outDir, new CastFrames.Settings(det, rec, cm.Id, cm.Threshold, cm.Merge, Math.Max(1, threads), AlsoRec: alsoRec), progress, ct, null, ocrLines);
-        var credits = await CastFrames.CreditsAsync(tools, http, frames, duration, Math.Max(1, threads), progress, ct);
-        await File.WriteAllTextAsync(Path.Combine(outDir, "cast", "credits.json"), JsonSerializer.Serialize(new { v = 1, source = "frames", lines = credits.Select(c => new { start = c.Start, end = c.End, text = c.Text }) }), ct);
+        // 0.13.87 (owner 2026-11-27: "I don't think credits is really worth it for ocr. Ultimately actual attribution has to be handled by describe anyway"):
+        // no credits OCR and no cast/credits.json unless CastStage.Credits is set; describe reads credits.json only when it exists
+        List<(double Start, double End, string Text)> credits = [];
+        if (CastStage.Credits)
+        {
+            credits = await CastFrames.CreditsAsync(tools, http, frames, duration, Math.Max(1, threads), progress, ct);
+            await File.WriteAllTextAsync(Path.Combine(outDir, "cast", "credits.json"), JsonSerializer.Serialize(new { v = 1, source = "frames", lines = credits.Select(c => new { start = c.Start, end = c.End, text = c.Text }) }), ct);
+        }
         foreach (var f in Directory.GetFiles(Path.Combine(outDir, "cast"))) await put("cast/" + Path.GetFileName(f), await File.ReadAllBytesAsync(f, ct), TypeOf(f));
-        return $"{msg}, {credits.Count} credit lines, {sw.Elapsed.TotalSeconds:F1}s";
+        return $"{msg}{(CastStage.Credits ? $", {credits.Count} credit lines" : "")}, {sw.Elapsed.TotalSeconds:F1}s";
     }
 
     /// <summary>English subtitles from the Chinese (OCR or transcript) with a glossary: subs/ai/en.vtt and en.json. Skipped when the source text and the glossary seed are unchanged (unless <paramref name="force"/>).</summary>

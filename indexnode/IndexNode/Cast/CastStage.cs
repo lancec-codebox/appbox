@@ -246,14 +246,20 @@ public static class CastStage
             await File.WriteAllBytesAsync(Path.Combine(castDir, "faces.f16"), FacesF16(faces, cm.Dim), ct);
             await File.WriteAllTextAsync(Path.Combine(castDir, "faces.json"), JsonSerializer.Serialize(new { v = 1, model = cm.Id, dim = cm.Dim, threshold = thr, keyframes = nkf, faces = faces.Select((f, i) => new { i, t = f.T, box = new[] { MathF.Round(f.X, 1), MathF.Round(f.Y, 1), MathF.Round(f.W, 1), MathF.Round(f.H, 1) }, score = MathF.Round(f.Score, 3), blur = f.Blur, quality = f.Quality, cluster = f.Cluster, masked = hs.ContainsKey(f) ? (bool?)f.Masked : null }) }), ct);
             await File.WriteAllTextAsync(Path.Combine(castDir, "clusters.json"), JsonSerializer.Serialize(new { v = 1, model = cm.Id, threshold = thr, mergeAt, borderAt, rawClusters, merges = merges.Select(m => new { into = m.Into, from = m.From, dist = m.Dist, vis = m.Vis }), clusters }), ct);
-            progress("credits");
-            List<(double Start, double End, string Text)> credits; using (stats.Phase("credits-ocr")) credits = await CreditsAsync(tools, video, w, h, duration, opt.Threads, modelsDir, ct);
+            if (Credits)
+            {   // 0.13.87: off by default (owner: attribution is describe's job; the credits OCR cost a second OCR pass)
+                progress("credits");
+                List<(double Start, double End, string Text)> credits; using (stats.Phase("credits-ocr")) credits = await CreditsAsync(tools, video, w, h, duration, opt.Threads, modelsDir, ct);
+                await File.WriteAllTextAsync(Path.Combine(castDir, "credits.json"), JsonSerializer.Serialize(new { v = 1, lines = credits.Select(c => new { start = c.Start, end = c.End, text = c.Text }) }), ct);
+            }
             stats.Log(nkf, "keyframes", opt.Threads);
-            await File.WriteAllTextAsync(Path.Combine(castDir, "credits.json"), JsonSerializer.Serialize(new { v = 1, lines = credits.Select(c => new { start = c.Start, end = c.End, text = c.Text }) }), ct);
             return $"{cm.Id}: {nkf} keyframes, {faces.Count} faces, {faces.Select(f => f.Cluster).Where(c => c >= 0).Distinct().Count()} clusters, {main.Count} main";
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }
+
+    /// <summary>0.13.87: the cast step reads no credits (owner 2026-11-27); true brings back the credits OCR and cast/credits.json.</summary>
+    public static bool Credits = false;
 
     /// <summary>Seconds between the credits frames: 1 on the CPU (as before), 2 on the GPU (a credit line stays on screen for several seconds; the window is the same, the work halves).</summary>
     public static int CreditsStep => OrtOptions.Cuda ? 2 : 1;
