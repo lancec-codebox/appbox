@@ -50,7 +50,7 @@ public sealed class Args
 public static class Program
 {
     public const string Usage = """
-        indexnode run [--shadow --out-local <dir> [--set versions.cast=2]... [--with-import process,group]] [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
+        indexnode run [--shadow --out-local <dir> [--set versions.cast=2]... [--with-import process,group]] [--set stage.check=stop]... (0.13.89: a live node's own stage switches, stop|drain only) [--no-precheck] [--stages download,process,comments] [--no-refresh] [--gpu] [--device cpu|cuda] [--exit-when-idle 10m] [--allow-out-of-region] [--lanes 1] [--ai-stages] [--gpu-fallback 30m|off] [--once] [--max-jobs N] [--jobs process=2,download=1] [--threads N] [--node-name N]
                       [--status-out <file> [--status-every 60s]] [--budget N] [--schedule "<cron>" --window 3h] [--ai-base-url U --ai-key K --ai-text-model M --ai-vision-model M --ai-api chat|responses|auto --ai-session-id S]
         indexnode cast recluster <id>|--ids <file> [--merge-at D] [--split [--split-sim S] [--split-min N]] [--threshold T] [--min-faces N] [--local <root>] [--out-local <dir>]   (0.13.23: re-clusters a drama's stored faces (cast.zip), read-only; old against new groups, merges with distances, proposed splits)
         indexnode cast reembed <id>|--ids <file> --rec w600k_mbf|w600k_r50|glintr100 [--rec-path <file.onnx>] [--decoder libjpeg|ffmpeg] [--fp32] [--out-local <dir>] [--threads N] [--local <root>]   (0.13.23, a dev tool; --fp32 also writes faces_<model>.f32, unrounded: re-embeds a drama's stored faces from the stored frames and landmarks with another recognizer; writes faces_<model>.f16 + json locally, read-only on the store)
@@ -291,6 +291,10 @@ public static class Commands
             if (rv.Warning != null) Console.Error.WriteLine("indexnode: " + rv.Warning);
             if (!rv.Run) { Console.Error.WriteLine(rv.Error); return 4; }
         }
+        if (!a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } liveSets && liveSets.FirstOrDefault(s => !WhatIf.IsLocalStageSet(s)) is { } badSet)
+        {   // 0.13.89: versions.*, mode and the rest change what the node WRITES: shadow only
+            Console.Error.WriteLine($"indexnode: --set {badSet}: a live node takes only stage.<stage>=stop|drain (its own stage switches); anything else needs --shadow"); return 2;
+        }
         TimeSpan? exitIdle = a.Get("exit-when-idle") is { } ew ? RefreshStage.ParseEvery(ew) : null;
         foreach (var old in new[] { "jobs", "max-heavy", "workers", "batch", "batch-hours" }) if (a.Get(old) != null) Console.Error.WriteLine($"indexnode: --{old} is ignored since 0.13.0 (one video per claim; --lanes N runs more claims at once)");
         int lanes = a.Get("lanes") is { } ln ? int.Parse(ln) : 1;
@@ -349,7 +353,7 @@ public static class Commands
             HeadBuiltAt = async ct => (await SearchData.LoadAsync(store, paths, null, ct))?.BuiltAt,
             EnsureVideoJson = async (st, pa, vid, t) => { await VideosBackfill.EnsureAsync(st, pa, vid, new PreCheckSettings().AiFlag, t); },
             Kind = gpu ? "gpu" : "desktop",
-            RepairOnly = a.Has("repair-only"), Shadow = a.Has("shadow"), ControlOverride = a.Has("shadow") && a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (c => WhatIf.Apply(c, shadowSets)) : null, MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, YoutubeGapSeconds = a.Get("youtube-gap") is { } yg ? int.Parse(yg) : null, VideoCodec = a.Get("video-codec") is { } nvc ? YtDlp.NormalizeCodec(nvc) : null, Limits = limits,
+            RepairOnly = a.Has("repair-only"), Shadow = a.Has("shadow"), ControlOverride = a.Multi.GetValueOrDefault("set") is { Count: > 0 } shadowSets ? (a.Has("shadow") ? (c => WhatIf.Apply(c, shadowSets)) : (c => WhatIf.ApplyLocalStages(c, shadowSets))) : null,   // 0.13.89: a live node takes stage.<stage>=stop|drain MaxJobs = a.Get("max-jobs") is { } mj ? int.Parse(mj) : null, YoutubeGapSeconds = a.Get("youtube-gap") is { } yg ? int.Parse(yg) : null, VideoCodec = a.Get("video-codec") is { } nvc ? YtDlp.NormalizeCodec(nvc) : null, Limits = limits,
             StorageHost = Uri.TryCreate(cfg.Sas, UriKind.Absolute, out var sasUri) ? sasUri.Host : null, StorageRegion = cfg.StorageRegion ?? "westus2",
         };
         if (aiStages && !ai.Configured) Console.Error.WriteLine("indexnode: --ai-stages needs an AI endpoint (--ai-base-url ... or the config); describe and translate stay off");

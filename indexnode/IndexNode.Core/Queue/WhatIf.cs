@@ -27,6 +27,29 @@ public static class WhatIf
         return cur;
     }
 
+    /// <summary>0.13.89: whether a --set line is one a LIVE node takes: stage.&lt;stage&gt;=stop|drain (it only narrows what this node claims).</summary>
+    public static bool IsLocalStageSet(string set)
+    {
+        var eq = set.IndexOf('='); if (eq <= 0) return false;
+        var k = set[..eq].Trim(); var v = set[(eq + 1)..].Trim().ToLowerInvariant();
+        return k.StartsWith("stage.", StringComparison.OrdinalIgnoreCase) && k.Length > 6 && v is "stop" or "drain";
+    }
+
+    /// <summary>0.13.89: a live node's own stage switches over the store's control file: each named stage gets the STRICTER of its effective level
+    /// in control and the asked one, so a node can stop or drain a stage for itself but never run one control has stopped.</summary>
+    public static ControlFile ApplyLocalStages(ControlFile c, IEnumerable<string> sets)
+    {
+        var cur = ControlFile.Parse(c.ToBytes());
+        foreach (var set in sets)
+        {
+            if (!IsLocalStageSet(set)) throw new ArgumentException($"--set {set}: a live node takes only stage.<stage>=stop|drain");
+            var eq = set.IndexOf('='); var st = Protocol.CanonicalStage(set[6..eq].Trim()); var want = ControlFile.ParseLevel(set[(eq + 1)..].Trim());
+            var lv = (Level)Math.Max((int)c.Effective(st), (int)want);
+            (cur.Stages ??= new())[st] = lv switch { Level.Stop => "stop", Level.Drain => "drain", _ => "run" };
+        }
+        return cur;
+    }
+
     static readonly string[] SeqOrdered = ["group", "actors", "cast"];
 
     public static Report Run(QueueState st, string stage, ControlFile ctl, string nowUtc, ReadyOptions? ro = null, int top = 20, Func<string, bool>? leaseLive = null)
